@@ -22,6 +22,7 @@ describe('PrometheusService', () => {
     service.ammUnclassifiedTotal.inc(3);
     service.nftSkippedTotal.inc(2);
     service.objectsUnclassifiedTotal.inc(4);
+    service.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, 2);
     service.nftStateLagLedgers.set(12);
     service.nftDirtyLedgers.set(34);
     service.nftCollectionsPending.set(5);
@@ -56,6 +57,14 @@ describe('PrometheusService', () => {
         'by range-ingest runs of this process.\n# TYPE syncer_objects_unclassified_total counter\n',
     );
     expect(text).toMatch(/^syncer_objects_unclassified_total 4$/m);
+    expect(text).toMatch(/^# TYPE syncer_parser_anomalies_total counter$/m);
+    expect(text).toContain(
+      '# HELP syncer_parser_anomalies_total Things a parser found in a ledger that the network cannot produce and stored in a ' +
+        'safe form, by kind (import_minted_negative: an Xahau Import whose minted drops came out below 0 and were stored as 0), ' +
+        'over the ledgers written by the live ingest and by range-ingest runs of this process.\n' +
+        '# TYPE syncer_parser_anomalies_total counter\n',
+    );
+    expect(text).toMatch(/^syncer_parser_anomalies_total\{kind="import_minted_negative"\} 2$/m);
     expect(text).toMatch(/^# TYPE syncer_nft_state_lag_ledgers gauge$/m);
     expect(text).toMatch(/^syncer_nft_state_lag_ledgers 12$/m);
     expect(text).toMatch(/^# TYPE syncer_nft_dirty_ledgers gauge$/m);

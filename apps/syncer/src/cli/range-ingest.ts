@@ -89,11 +89,15 @@ export interface RangeIngestOptions {
   /**
    * Where `syncer_amm_unclassified_total` (the pools of AMM transactions the parser could make no row for) and
    * `syncer_nft_skipped_total` (the NFT events it dropped for an MPT amount) and `syncer_objects_unclassified_total` (the
-   * escrow, check, channel and delegation changes it could give no event) are counted, for the ledgers this run wrote
+   * escrow, check, channel and delegation changes it could give no event) and `syncer_parser_anomalies_total` (the Xahau
+   * Imports whose minted drops it clamped to 0, `kind="import_minted_negative"`) are counted, for the ledgers this run wrote
    * (once per write that committed; a ledger found committed and skipped adds nothing).
    * Default: a `PrometheusService`, whose counters are the process-wide ones. Tests pass their own.
    */
-  metrics?: Pick<PrometheusService, 'ammUnclassifiedTotal' | 'nftSkippedTotal' | 'objectsUnclassifiedTotal'>;
+  metrics?: Pick<
+    PrometheusService,
+    'ammUnclassifiedTotal' | 'nftSkippedTotal' | 'objectsUnclassifiedTotal' | 'parserAnomaliesTotal'
+  >;
 }
 
 export interface RangeLogger {
@@ -314,7 +318,7 @@ class RangeRunner {
   private readonly redone = new Set<number>();
   private readonly metrics: Pick<
     PrometheusService,
-    'ammUnclassifiedTotal' | 'nftSkippedTotal' | 'objectsUnclassifiedTotal'
+    'ammUnclassifiedTotal' | 'nftSkippedTotal' | 'objectsUnclassifiedTotal' | 'parserAnomaliesTotal'
   >;
   /** Pools of AMM transactions the parser made no row for, in what this run wrote: for the log at the end. */
   private ammUnclassified = 0;
@@ -322,6 +326,8 @@ class RangeRunner {
   private nftSkipped = 0;
   /** Escrow, check, channel and delegation changes the parser could give no event, in what this run wrote: for the log at the end. */
   private objectsUnclassified = 0;
+  /** Xahau Imports whose minted drops were clamped to 0, in what this run wrote: for the warning at the end. */
+  private importMintedNegative = 0;
 
   private chunksDone = 0;
   /** Of `chunksDone`, the chunks that needed no write. */
@@ -437,6 +443,13 @@ class RangeRunner {
         `${this.objectsUnclassified} object change${this.objectsUnclassified === 1 ? '' : 's'} in the ledgers written ` +
           `${this.objectsUnclassified === 1 ? 'was' : 'were'} given no event (a change by a transaction type the object ` +
           'history does not expect): see syncer_objects_unclassified_total',
+      );
+    }
+    if (this.importMintedNegative > 0) {
+      this.logger.warn(
+        `${this.importMintedNegative} Import${this.importMintedNegative === 1 ? '' : 's'} in the ledgers written minted a ` +
+          `negative amount (the balance fell by more than the Fee) and ${this.importMintedNegative === 1 ? 'was' : 'were'} ` +
+          'stored as 0: see syncer_parser_anomalies_total{kind="import_minted_negative"}',
       );
     }
     if (failure !== undefined) throw failure;
@@ -594,6 +607,10 @@ class RangeRunner {
         if (written.objectsUnclassified > 0) {
           this.objectsUnclassified += written.objectsUnclassified;
           this.metrics.objectsUnclassifiedTotal.inc(written.objectsUnclassified);
+        }
+        if (written.importMintedNegative > 0) {
+          this.importMintedNegative += written.importMintedNegative;
+          this.metrics.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, written.importMintedNegative);
         }
         return ledgers;
       } catch (err) {

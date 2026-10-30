@@ -28,6 +28,12 @@ export interface LedgerWriteResult {
    * `syncer_objects_unclassified_total`.
    */
   objectsUnclassified: number;
+  /**
+   * Successful Xahau `Import`s whose minted drops came out below 0 and were stored as 0 (`LedgerRows.diagnostics`; the network
+   * cannot produce one). Counted like `ammUnclassified`: the caller adds it to `syncer_parser_anomalies_total` with
+   * `kind="import_minted_negative"`.
+   */
+  importMintedNegative: number;
 }
 
 export interface LedgerWriterOptions {
@@ -101,7 +107,9 @@ export class LedgerWriter {
    * Resolves to the diagnostics of the batch once it is committed; a failure throws and reports nothing.
    */
   async write(ledgers: RawLedger[]): Promise<LedgerWriteResult> {
-    if (ledgers.length === 0) return { ammUnclassified: 0, nftSkipped: 0, objectsUnclassified: 0 };
+    if (ledgers.length === 0) {
+      return { ammUnclassified: 0, nftSkipped: 0, objectsUnclassified: 0, importMintedNegative: 0 };
+    }
 
     // Parsing is pure and throws before anything has been written.
     const built = ledgers.map((raw) => buildLedgerRows(raw, this.ctx));
@@ -133,6 +141,7 @@ export class LedgerWriter {
       ammUnclassified: byIndex.reduce((sum, rows) => sum + rows.diagnostics.ammUnclassified, 0),
       nftSkipped: byIndex.reduce((sum, rows) => sum + rows.diagnostics.nftSkipped, 0),
       objectsUnclassified: byIndex.reduce((sum, rows) => sum + rows.diagnostics.objectsUnclassified, 0),
+      importMintedNegative: byIndex.reduce((sum, rows) => sum + rows.diagnostics.importMintedNegative, 0),
     };
   }
 

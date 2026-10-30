@@ -283,6 +283,7 @@ describe('AggregatorService tokens job (e2e)', () => {
         ammUnclassifiedTotal: { inc: NOOP },
         nftSkippedTotal: { inc: NOOP },
         objectsUnclassifiedTotal: { inc: NOOP },
+        parserAnomaliesTotal: { inc: NOOP },
       } as never,
     });
     expect(result.ledgers).toBe(ledgers.length);

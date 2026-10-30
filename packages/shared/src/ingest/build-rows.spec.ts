@@ -8,6 +8,7 @@ import { EXPIRED_ACCEPT_BASE, withTecExpiredAccept } from '../../test/synthetic-
 import { foldNftEvents } from '../aggregate/nft-state';
 import {
   DOMAIN_PARSER_VERSION,
+  MINT_PARSER_VERSION,
   NFT_PARSER_VERSION,
   OBJECT_PARSER_VERSION,
   PARSER_VERSION,
@@ -16,10 +17,12 @@ import {
 import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
 import { AmmParser } from '../parsers/amm.parser';
+import { ImportParser } from '../parsers/import.parser';
 import { NftParser, ParsedNft, rolesOf } from '../parsers/nft.parser';
 import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, parseContextFor, toParserTx } from '../parsers/parser.interface';
 import { PaymentParser } from '../parsers/payment.parser';
+import { RewardsParser } from '../parsers/rewards.parser';
 import { StateTouchesParser } from '../parsers/state-touches.parser';
 import { deepFreeze } from '../test-utils/deep-freeze';
 import { objectCase, objectFixturesDir } from '../test-utils/object-cases';
@@ -138,6 +141,18 @@ const STATE_TOUCHES_XRPL: FixtureSet = {
   name: 'recorded state touch cases (xrpl)',
   ctx: XRPL,
   dir: join(FIXTURES, 'xrpl', 'state-touches'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
+/**
+ * The recorded Imports of Xahau with their parent ledgers, and the two hand-made ledgers (`test/fixtures/xahau/mint`, D7
+ * Task 1): the only fixtures with `imports` rows. No `SETS` entry either.
+ */
+const MINT_XAHAU: FixtureSet = {
+  name: 'recorded mint cases (xahau)',
+  ctx: XAHAU,
+  dir: join(FIXTURES, 'xahau', 'mint'),
   minNativeChecked: 0,
   minTrustlinesChecked: 0,
 };
@@ -1404,11 +1419,15 @@ describe('AMM rows (parser version 2)', () => {
       [Table.ObjectChanges, 'objectChanges'],
       [Table.AccountObjectChanges, 'accountObjectChanges'],
       [Table.StateTouches, 'stateTouches'],
+      [Table.GenesisMints, 'genesisMints'],
+      [Table.Imports, 'imports'],
+      [Table.RewardClaims, 'rewardClaims'],
     ];
 
     // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter. The Domain rows are in
     // the recorded Xahau and XRPL ledgers: the Xahau flag ledger and 26540188 hold account roots with a Domain. The object
-    // rows are in the recorded escrow, check, channel and delegation ledgers.
+    // rows are in the recorded escrow, check, channel and delegation ledgers. The mint rows are in the recorded Xahau ledgers
+    // 26540187 (a ClaimReward) and 26540188 (a GenesisMint); the Import rows only in the mint cases.
     const recorded = (): Built[] => [
       ...builtOf(AMM_SET),
       ...builtOf(NFT_SET),
@@ -1417,6 +1436,7 @@ describe('AMM rows (parser version 2)', () => {
       ...builtOf(OBJECTS_XRPL),
       ...builtOf(OBJECTS_XAHAU),
       ...builtOf(STATE_TOUCHES_XRPL),
+      ...builtOf(MINT_XAHAU),
     ];
 
     it.each(tables)('%s', (table, key) => {
@@ -1446,15 +1466,16 @@ describe('AMM rows (parser version 2)', () => {
           nftSkipped: 0,
           invalidDomains: 0,
           objectsUnclassified: 0,
+          importMintedNegative: 0,
         });
         for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
       }
     });
 
-    it('stores parser_version 8 (the touch index of the token aggregate, after the object history of 7)', () => {
-      expect(PARSER_VERSION).toBe(8);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(8);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(8);
+    it('stores parser_version 9 (Xahau minting, after the touch index of the token aggregate of 8)', () => {
+      expect(PARSER_VERSION).toBe(9);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(9);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(9);
     });
   });
 
@@ -1473,6 +1494,7 @@ describe('AMM rows (parser version 2)', () => {
           nftSkipped: 0,
           invalidDomains: 0,
           objectsUnclassified: 0,
+          importMintedNegative: 0,
         });
         total += expected;
       }
@@ -1505,6 +1527,7 @@ describe('AMM rows (parser version 2)', () => {
         nftSkipped: 0,
         invalidDomains: 0,
         objectsUnclassified: 0,
+        importMintedNegative: 0,
       });
       expect(rows.ammPoolStates).toEqual([]);
       expect(rows.exchanges).toEqual([]);
@@ -1859,16 +1882,16 @@ describe('NFT rows (parser version 5)', () => {
   });
 
   describe('parser_version', () => {
-    it('stamps the parser version of the build on the ledger row: 8, with the NFT parser still at 5, the domain parser at 6 and the object parser at 7', () => {
-      expect(PARSER_VERSION).toBe(8);
+    it('stamps the parser version of the build on the ledger row: 9, with the NFT parser still at 5, the domain parser at 6, the object parser at 7 and the token parser at 8', () => {
+      expect([PARSER_VERSION, MINT_PARSER_VERSION]).toEqual([9, 9]);
       expect(NFT_PARSER_VERSION).toBe(5);
       expect(DOMAIN_PARSER_VERSION).toBe(6);
       expect(OBJECT_PARSER_VERSION).toBe(7);
       expect(TOKEN_PARSER_VERSION).toBe(8);
       for (const set of [NFT_SET, URITOKEN_SET, RIPPLE_MOCK]) {
-        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(8);
+        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(9);
       }
-      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(8);
+      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(9);
     });
   });
 
@@ -2350,9 +2373,9 @@ describe('ledger objects (parser version 7)', () => {
     },
   );
 
-  it('stamps parser_version 8 on the object ledgers: OBJECT_PARSER_VERSION, the first version with object rows, stays 7', () => {
+  it('stamps parser_version 9 on the object ledgers: OBJECT_PARSER_VERSION, the first version with object rows, stays 7', () => {
     expect(OBJECT_PARSER_VERSION).toBe(7);
-    expect(PARSER_VERSION).toBe(8);
+    expect(PARSER_VERSION).toBe(9);
     for (const set of [OBJECTS_XRPL, OBJECTS_XAHAU]) {
       for (const { rows } of builtOf(set)) {
         expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
@@ -2455,6 +2478,333 @@ describe('state touches (parser version 8)', () => {
       },
     ]);
     expect(buildLedgerRows(ledgerOf([]), XRPL).stateTouches).toEqual([]);
+  });
+});
+
+// -- Xahau mint rows --------------------------------------------------------------------------------------------
+
+describe('Xahau mint rows (parser version 9)', () => {
+  const rewardsParser = new RewardsParser();
+  const importParser = new ImportParser();
+
+  const CLAIM_HASH = '3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C';
+  const MINT_HASH = 'E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D';
+  const HOOK_HASH = '610F33B8EBF7EC795F822A454FB852156AEFE50BE0CB8326338A81CD74801864';
+  const GOVERNANCE_PARENT = 'DE1FEAEA69ABF97EA8D95341A6C9B79094746CD8F35C0557583BB986867BB48D';
+  const CLAIMER = 'rDitc4S7Y1GF2yzM4S2dayA4jYuK6YewSz';
+  const HOOK_ACCOUNT = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+
+  /** The ledgers of the mint directory that the manifest's `cases` mark as hand-made, by the file name they come from. */
+  function handMadeLedgers(): Set<number> {
+    const { cases } = JSON.parse(readFileSync(join(MINT_XAHAU.dir, 'manifest.json'), 'utf8')) as {
+      cases: Record<string, { file?: string }>;
+    };
+    const files = Object.values(cases)
+      .map((c) => c.file)
+      .filter((file): file is string => file !== undefined);
+    const present = readdirSync(MINT_XAHAU.dir);
+    for (const file of files) expect(present).toContain(file);
+    return new Set(files.map((file) => Number(/^(\d+)-/.exec(file)?.[1])));
+  }
+
+  /** The amendment id of XahauGenesis, from the definitions of the network. */
+  function xahauGenesisId(): string {
+    const { features } = JSON.parse(
+      readFileSync(join(PACKAGE_ROOT, 'config', 'definitions', 'xahau.json'), 'utf8'),
+    ) as {
+      features: Record<string, { name: string }>;
+    };
+    const found = Object.entries(features).find(([, feature]) => feature.name === 'XahauGenesis');
+    if (!found) throw new Error('XahauGenesis is not in the definitions of xahau');
+    return found[0];
+  }
+
+  it('is parser version 9 for both the build and the first version that has the rows, which readers gate on', () => {
+    expect([PARSER_VERSION, MINT_PARSER_VERSION]).toEqual([9, 9]);
+    expect(PARSER_VERSION).toBeGreaterThanOrEqual(MINT_PARSER_VERSION);
+    for (const set of [XAHAU_SET, MINT_XAHAU]) {
+      for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(MINT_PARSER_VERSION);
+    }
+  });
+
+  it('gives the recorded ClaimReward of 26540187 its reward_claims row (the ledger has no snapshot)', () => {
+    const { raw, rows } = ledgerNamed(XAHAU_SET, 26540187);
+    expect(raw.header.close_time).toBe(845_372_730 + 946_684_800);
+    expect(rows.rewardClaims).toEqual([
+      {
+        ledger_index: 26540187,
+        tx_index: 9,
+        tx_hash: CLAIM_HASH,
+        close_time: raw.header.close_time,
+        account: CLAIMER,
+        issuer: HOOK_ACCOUNT,
+        opt_out: 0,
+      },
+    ]);
+    expect(rows.genesisMints).toEqual([]);
+    expect(rows.imports).toEqual([]);
+    expect(rows.diagnostics.importMintedNegative).toBe(0);
+  });
+
+  it('gives the recorded GenesisMint of 26540188 one genesis_mints row per entry, in entry order, with its parent and hook', () => {
+    const { raw, rows } = ledgerNamed(XAHAU_SET, 26540188);
+    expect(rows.genesisMints.map((r) => [r.mint_index, r.destination, r.amount])).toEqual([
+      [0, 'rDitc4S7Y1GF2yzM4S2dayA4jYuK6YewSz', '11755654'],
+      [1, 'rD74dUPRFNfgnY2NzrxxYRXN4BrfGSN6Mv', '587351'],
+      [2, 'rN7XCq12KBvBLKad3wWsVUwmb3dNx1fx3e', '587351'],
+      [3, 'ra7MQw7YoMjUw6thxmSGE6jpAEY3LTHxev', '587351'],
+      [4, 'rfMB6RCNdWSB6TJXYwCEU5HvDC2eArJp8h', '587351'],
+      [5, 'r4FF5jjJMS2XqWDyTYStWrgARsj3FjaJ2J', '587351'],
+      [6, 'r4FRPZbLnyuVeGiSi1Ap6uaaPvPXYZh1XN', '587351'],
+      [7, 'rHsh4MNWJKXN2YGtSf95aEzFYzMqwGiBve', '587351'],
+    ]);
+    for (const row of rows.genesisMints) {
+      expect(row).toMatchObject({
+        ledger_index: 26540188,
+        tx_index: 0,
+        tx_hash: MINT_HASH,
+        close_time: raw.header.close_time,
+        parent_tx_hash: CLAIM_HASH,
+        emit_hook_hash: HOOK_HASH,
+      });
+    }
+    expect(rows.genesisMints.reduce((sum, r) => sum + BigInt(r.amount), 0n)).toBe(15_867_111n);
+    expect(rows.rewardClaims).toEqual([]);
+    expect(rows.imports).toEqual([]);
+  });
+
+  it('gives each recorded Import its imports row: a created account (Fee 0) and an account that existed (Fee 100)', () => {
+    const created = ledgerNamed(MINT_XAHAU, 24508587);
+    expect(created.rows.imports).toEqual([
+      {
+        ledger_index: 24508587,
+        tx_index: 80,
+        tx_hash: 'A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843',
+        close_time: created.raw.header.close_time,
+        account: 'rBPKXGERk7KrzZDGXscchv4eQoS2k6nV6M',
+        minted: '2000000',
+        account_created: 1,
+      },
+    ]);
+    const existing = ledgerNamed(MINT_XAHAU, 2609053);
+    expect(existing.rows.imports).toEqual([
+      {
+        ledger_index: 2609053,
+        tx_index: 1,
+        tx_hash: '3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE',
+        close_time: existing.raw.header.close_time,
+        account: 'rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge',
+        minted: '11',
+        account_created: 0,
+      },
+    ]);
+    // Their parent ledgers hold none of the three types.
+    for (const parent of [24508586, 2609052]) {
+      const { rows } = ledgerNamed(MINT_XAHAU, parent);
+      expect([rows.genesisMints, rows.imports, rows.rewardClaims]).toEqual([[], [], []]);
+    }
+  });
+
+  it('reads the two hand-made ledgers: an opt-out without an Issuer, and a mint whose parent is no claim', () => {
+    const optOut = ledgerNamed(MINT_XAHAU, 26540187).rows.rewardClaims;
+    expect(optOut).toHaveLength(1);
+    expect(optOut[0]).toMatchObject({ tx_hash: CLAIM_HASH, account: CLAIMER, issuer: '', opt_out: 1 });
+    const governance = ledgerNamed(MINT_XAHAU, 26540188).rows.genesisMints;
+    expect(governance).toHaveLength(8);
+    for (const row of governance) expect(row.parent_tx_hash).toBe(GOVERNANCE_PARENT);
+  });
+
+  it.each([XAHAU_SET, MINT_XAHAU])(
+    'are the rows of the parsers for each transaction, in the order of the transactions, over $name',
+    (set) => {
+      let claims = 0;
+      let mints = 0;
+      let imported = 0;
+      for (const { raw, rows } of builtOf(set)) {
+        const base = { ledger_index: raw.header.ledger_index, close_time: raw.header.close_time };
+        const claimRows: Json[] = [];
+        const mintRows: Json[] = [];
+        const importRows: Json[] = [];
+        for (const transaction of raw.transactions) {
+          const t = deepFreeze(toParserTx(transaction, raw.header, null));
+          const rewards = rewardsParser.parse(t, set.ctx);
+          if (rewards.claim) {
+            claimRows.push({
+              ...base,
+              tx_index: t.tx_index,
+              tx_hash: t.hash,
+              account: rewards.claim.account,
+              issuer: rewards.claim.issuer,
+              opt_out: rewards.claim.opt_out ? 1 : 0,
+            });
+          }
+          for (const mint of rewards.mints) {
+            mintRows.push({
+              ledger_index: base.ledger_index,
+              tx_index: t.tx_index,
+              mint_index: mint.mint_index,
+              tx_hash: t.hash,
+              close_time: base.close_time,
+              destination: mint.destination,
+              amount: mint.amount,
+              parent_tx_hash: mint.parent_tx_hash,
+              emit_hook_hash: mint.emit_hook_hash,
+            });
+          }
+          const parsed = importParser.parse(t, set.ctx);
+          if (parsed) {
+            importRows.push({
+              ...base,
+              tx_index: t.tx_index,
+              tx_hash: t.hash,
+              account: parsed.account,
+              minted: parsed.minted,
+              account_created: parsed.account_created ? 1 : 0,
+            });
+          }
+        }
+        expect(rows.rewardClaims).toEqual(claimRows);
+        expect(rows.genesisMints).toEqual(mintRows);
+        expect(rows.imports).toEqual(importRows);
+        claims += claimRows.length;
+        mints += mintRows.length;
+        imported += importRows.length;
+      }
+      // the check is not vacuous: each set holds rows of the types it was recorded for
+      if (set === XAHAU_SET) expect([claims, mints, imported]).toEqual([1, 8, 0]);
+      else expect([claims, mints, imported]).toEqual([1, 8, 2]);
+    },
+  );
+
+  it('mints what the header grew by plus the fees, on every recorded parent and child', () => {
+    const genesisId = xahauGenesisId();
+    const handMade = handMadeLedgers();
+    expect([...handMade].sort()).toEqual([26540187, 26540188]);
+
+    let pairs = 0;
+    let genesis = 0n;
+    let imported = 0n;
+    for (const [set, excluded] of [
+      [XAHAU_SET, new Set<number>()],
+      [MINT_XAHAU, handMade],
+    ] as const) {
+      const ledgers = new Map(builtOf(set).map((b) => [b.raw.header.ledger_index, b] as const));
+      for (const [index, child] of ledgers) {
+        const parent = ledgers.get(index - 1);
+        if (excluded.has(index) || !parent || excluded.has(index - 1)) continue;
+        // XahauGenesis changes total_coins once, at the network's start: the supply it began with, not a mint.
+        const starts = child.raw.transactions.some(
+          (t) => t.tx.TransactionType === 'EnableAmendment' && t.tx.Amendment === genesisId,
+        );
+        if (starts) continue;
+
+        const fromGenesis = child.rows.genesisMints.reduce((sum, r) => sum + BigInt(r.amount), 0n);
+        const fromImports = child.rows.imports.reduce((sum, r) => sum + BigInt(r.minted), 0n);
+        const grown = BigInt(child.rows.ledger.total_coins) - BigInt(parent.rows.ledger.total_coins);
+        expect([index, fromGenesis + fromImports]).toEqual([index, grown + BigInt(child.rows.ledger.fee_total)]);
+        genesis += fromGenesis;
+        imported += fromImports;
+        pairs++;
+      }
+    }
+    expect(pairs).toBeGreaterThanOrEqual(2);
+    // not vacuous: both kinds of mint were part of it
+    expect(genesis).toBeGreaterThan(0n);
+    expect(imported).toBeGreaterThan(0n);
+  });
+
+  it.each([
+    [Table.GenesisMints, 'genesisMints', ['ledger_index', 'tx_index', 'mint_index']],
+    [Table.Imports, 'imports', ['ledger_index', 'tx_index']],
+    [Table.RewardClaims, 'rewardClaims', ['ledger_index', 'tx_index']],
+  ] as const)('%s has a unique ORDER BY key over the recorded Xahau ledgers', (table, key, columns) => {
+    expect(orderByColumns(table)).toEqual([...columns]);
+    for (const set of [XAHAU_SET, MINT_XAHAU]) {
+      const rows = collect(builtOf(set), key);
+      const seen = new Set(rows.map((row) => JSON.stringify(columns.map((c) => row[c]))));
+      expect(seen.size).toBe(rows.length);
+    }
+    expect(collect([...builtOf(XAHAU_SET), ...builtOf(MINT_XAHAU)], key).length).toBeGreaterThan(0);
+  });
+
+  it('gives every recorded XRPL ledger the three arrays empty', () => {
+    let ledgers = 0;
+    for (const set of [...SETS.filter((s) => s.ctx === XRPL), NFT_SET, OBJECTS_XRPL, STATE_TOUCHES_XRPL]) {
+      for (const { rows } of builtOf(set)) {
+        expect([rows.genesisMints, rows.imports, rows.rewardClaims]).toEqual([[], [], []]);
+        expect(rows.diagnostics.importMintedNegative).toBe(0);
+        ledgers++;
+      }
+    }
+    expect(ledgers).toBeGreaterThan(100);
+    expect(buildLedgerRows(sampleLedger(), XRPL).imports).toEqual([]);
+  });
+
+  describe('a hand-built ledger', () => {
+    const created = (address: string, balance: string): Json => ({
+      CreatedNode: { LedgerEntryType: 'AccountRoot', NewFields: { Account: address, Balance: balance, Sequence: 1 } },
+    });
+    const importTx = (index: number, who: string, fee: string, nodes: Json[], result = 'tesSUCCESS'): Json =>
+      rawTx({ TransactionType: 'Import', Account: who, Fee: fee }, index, String(index).repeat(64), nodes, result);
+
+    const ledger = (): RawLedger =>
+      ledgerOf([
+        importTx(0, NEWBIE, '100', [account(NEWBIE, '1000000', '999911')]),
+        // the account lost more than the Fee it paid: cannot happen on the network (F5), so it is clamped and counted
+        importTx(1, SENDER, '100', [account(SENDER, '1000000', '999000')]),
+        importTx(2, TAKER, '100', [account(TAKER, '1000000', '999000')], 'tecNO_PERMISSION'),
+        importTx(3, RECEIVER, '0', [created(RECEIVER, '2000000')]),
+        importTx(4, PROVIDER, '100', [account(PROVIDER, '500', '300')]),
+      ]);
+
+    it('counts the clamped imports in diagnostics.importMintedNegative and writes them with minted 0', () => {
+      const rows = buildLedgerRows(ledger(), XAHAU);
+      expect(rows.diagnostics.importMintedNegative).toBe(2);
+      expect(rows.imports.map((r) => [r.tx_index, r.account, r.minted, r.account_created])).toEqual([
+        [0, NEWBIE, '11', 0],
+        [1, SENDER, '0', 0],
+        [3, RECEIVER, '2000000', 1],
+        [4, PROVIDER, '0', 0],
+      ]);
+    });
+
+    it('writes the claim of a failed ClaimReward, and no mint for a failed GenesisMint', () => {
+      const mint = (index: number, entries: unknown, result: string): Json =>
+        rawTx(
+          { TransactionType: 'GenesisMint', Account: HOOK_ACCOUNT, Fee: '0', GenesisMints: entries },
+          index,
+          String(index).repeat(64),
+          [],
+          result,
+        );
+      const rows = buildLedgerRows(
+        ledgerOf([
+          rawTx(
+            { TransactionType: 'ClaimReward', Account: SENDER, Issuer: HOOK_ACCOUNT, Flags: 0 },
+            0,
+            '0'.repeat(64),
+            [],
+            'tecNO_PERMISSION',
+          ),
+          mint(1, [{ GenesisMint: { Destination: RECEIVER, Amount: '5' } }], 'tecNO_PERMISSION'),
+          mint(
+            2,
+            [{ GenesisMint: { Destination: RECEIVER, Amount: '7' } }, { GenesisMint: { Destination: NEWBIE } }],
+            'tesSUCCESS',
+          ),
+          // a ledger cannot hold this; the build must still not throw
+          mint(3, 'not a list', 'tesSUCCESS'),
+        ]),
+        XAHAU,
+      );
+      expect(rows.rewardClaims.map((r) => [r.tx_index, r.account, r.issuer, r.opt_out])).toEqual([
+        [0, SENDER, HOOK_ACCOUNT, 0],
+      ]);
+      expect(rows.genesisMints.map((r) => [r.tx_index, r.mint_index, r.destination, r.amount])).toEqual([
+        [2, 0, RECEIVER, '7'],
+      ]);
+      expect(rows.imports).toEqual([]);
+    });
   });
 });
 
@@ -2565,7 +2915,7 @@ const NFT_ROW_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /** Row fields that hold drops as an unsigned integer string. */
-const DROPS_FIELDS = new Set(['fee', 'fee_total', 'fee_min', 'fee_max', 'total_coins']);
+const DROPS_FIELDS = new Set(['fee', 'fee_total', 'fee_min', 'fee_max', 'total_coins', 'minted']);
 
 describe.each(SETS)('invariants over $name', (set) => {
   const built = () => builtOf(set);

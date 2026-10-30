@@ -30,6 +30,7 @@ import { LedgerNotValidatedError } from '../src/ingest/rpc-ledger-source';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
 import {
   ammTemplate,
+  mintTemplate,
   nftTemplate,
   objectTemplate,
   range,
@@ -590,8 +591,11 @@ describe('LiveRunner (e2e)', () => {
     orphanTransactions = 0;
     onFailure?: () => void;
 
-    constructor(private readonly svc: ClickHouseService) {
-      super(svc, ctx);
+    constructor(
+      private readonly svc: ClickHouseService,
+      private readonly parse: typeof ctx = ctx,
+    ) {
+      super(svc, parse);
     }
 
     override async write(ledgers: RawLedger[]): Promise<LedgerWriteResult> {
@@ -604,7 +608,7 @@ describe('LiveRunner (e2e)', () => {
       };
       try {
         // Same runId: these inserts are this writer's, and recovery must wait for exactly them.
-        return await new LedgerWriter(commitFails, ctx, { runId: this.runId }).write(ledgers);
+        return await new LedgerWriter(commitFails, this.parse, { runId: this.runId }).write(ledgers);
       } catch (err) {
         const first = Math.min(...ledgers.map((l) => l.header.ledger_index));
         this.orphanTransactions = await count(this.svc, Table.Transactions, `ledger_index >= ${first}`);
@@ -851,6 +855,97 @@ describe('LiveRunner (e2e)', () => {
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
       await expectRows(svc, L(12), OBJECT_CHAIN);
       expect(await unclassifiedObjects(metrics)).toBe(before + 12 * UPDATES_PER_LEDGER);
+    });
+  });
+
+  describe('mint rows and syncer_parser_anomalies_total', () => {
+    const xahau = parseContextFor(getNetworkProfile('xahau'));
+    /** Successful Imports per ledger whose minted drops come out below 0 and are stored as 0 (see `mintTemplate`). */
+    const CLAMPED_PER_LEDGER = 2;
+    // Every ledger: a recorded Import, ClaimReward and GenesisMint of 8 entries (rows in all three mint tables) and 2
+    // clamped Imports.
+    const MINT_CHAIN = syntheticChain(L(1), 12, { template: mintTemplate(CLAMPED_PER_LEDGER) });
+
+    /** The counter now, for the one kind. It is process-wide, so a test compares it with its value before. */
+    const clamped = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.parserAnomaliesTotal.get()).values.find((v) => v.labels.kind === 'import_minted_negative')
+        ?.value ?? 0;
+
+    const MINT_TABLES: ReadonlyArray<[Table, 'genesisMints' | 'imports' | 'rewardClaims']> = [
+      [Table.GenesisMints, 'genesisMints'],
+      [Table.Imports, 'imports'],
+      [Table.RewardClaims, 'rewardClaims'],
+    ];
+
+    /** The rows of the three mint tables that writing the ledgers `L(1)` .. `last` of the chain gives. */
+    const expectedMint = (last: number): Counts =>
+      Object.fromEntries(
+        MINT_TABLES.map(([table, key]) => [
+          table,
+          MINT_CHAIN.filter((l) => l.index <= last).reduce(
+            (sum, l) => sum + buildLedgerRows(l.raw, xahau)[key].length,
+            0,
+          ),
+        ]),
+      );
+    const storedMint = async (svc: ClickHouseService): Promise<Counts> =>
+      Object.fromEntries(
+        await Promise.all(MINT_TABLES.map(async ([table]) => [table, await count(svc, table)] as const)),
+      );
+
+    it('the chain has rows for all three mint tables and two clamped Imports per ledger', () => {
+      const total = MINT_CHAIN.reduce(
+        (sum, l) => sum + buildLedgerRows(l.raw, xahau).diagnostics.importMintedNegative,
+        0,
+      );
+      expect(total).toBe(12 * CLAMPED_PER_LEDGER);
+      // per ledger: 1 recorded Import and the 2 clamped ones, 1 ClaimReward, 8 mints
+      expect(expectedMint(L(12))).toEqual({ genesis_mints: 12 * 8, imports: 12 * 3, reward_claims: 12 });
+    });
+
+    it('writes the mint rows with the ledgers and adds the clamped Imports to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await clamped(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), MINT_CHAIN), {
+        metrics,
+        writer: new LedgerWriter(svc, xahau),
+      });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 Xahau mint ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await storedMint(svc)).toEqual(expectedMint(L(12)));
+      expect(await clamped(metrics)).toBe(before + 12 * CLAMPED_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without Xahau mints', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await clamped(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await storedMint(svc)).toEqual({ genesis_mints: 0, imports: 0, reward_claims: 0 });
+      expect(await clamped(metrics)).toBe(before);
+    });
+
+    it('counts a batch once: not for a write that failed and was recovered, only for the one that committed', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await clamped(metrics);
+      // The second batch fails after its child rows went in; recovery deletes them and writes the batch again.
+      const writer = new FailOnSecondWrite(svc, xahau);
+      const { runner } = makeRunner(svc, new TestSource(L(12), MINT_CHAIN), { metrics, writer });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 Xahau mint ledgers through a failed write');
+
+      expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await storedMint(svc)).toEqual(expectedMint(L(12)));
+      expect(await clamped(metrics)).toBe(before + 12 * CLAMPED_PER_LEDGER);
     });
   });
 

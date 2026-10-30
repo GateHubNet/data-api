@@ -95,8 +95,9 @@ const OBJECT_LEDGER_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectC
 const TOUCH_LEDGER_TABLES: Table[] = [Table.StateTouches];
 
 /**
- * The ledger tables of the Xahau mints (migration 015): child tables like the others. No parser fills them yet, and the
- * ripple-mock ledgers are XRPL's, which never will.
+ * The ledger tables of the Xahau mints (migration 015, parser version 9): child tables like the others, with rows from the
+ * rewards and import parsers. The ripple-mock ledgers are XRPL's, which has none of the three transaction types, so they give
+ * these tables no row.
  */
 const MINT_LEDGER_TABLES: Table[] = [Table.GenesisMints, Table.Imports, Table.RewardClaims];
 
@@ -202,6 +203,15 @@ const oIndex = (i: number): number => OBJECT_LEDGERS[i].header.ledger_index;
 
 /** The object fixture ledgers. */
 const expectedObjectCounts = (keep?: (ledgerIndex: number) => boolean): Counts => countsOf(OBJECT_BUILT, keep);
+
+/** The Xahau mint fixture ledgers (`xahau/mint`): what writing them gives. */
+const expectedMintCounts = (keep?: (ledgerIndex: number) => boolean): Counts =>
+  countsOf(
+    FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xahau/mint'))
+      .list()
+      .map((raw) => buildLedgerRows(raw, parseContextFor(getNetworkProfile('xahau')))),
+    keep,
+  );
 
 describe('LedgerWriter and ingest state (e2e)', () => {
   let ch: StartedClickHouse;
@@ -469,8 +479,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // The child tables that have rows (the 12 of the Ripple data, the 2 state tables, the path payments and their index
       // by account, account_domains, which the last ledger has two rows for, the 2 object tables, which the ledgers of
       // a recorded EscrowCreate and of two channel claims have rows for, and state_touches, which the ledgers of 11119620 and
-      // 11618225 have rows for: these ledgers have no AMM or NFT activity, so the 5 AMM tables and the 5 NFT tables get no
-      // insert) start together, before any of them has finished.
+      // 11618225 have rows for: these ledgers have no AMM, NFT or Xahau mint activity, so the 5 AMM tables, the 5 NFT tables
+      // and the 3 mint tables get no insert) start together, before any of them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
       );
@@ -485,7 +495,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(childTables).toContain(Table.AccountDomains);
       const firstStarts = events.slice(0, childTables.size);
       expect(new Set(firstStarts)).toEqual(new Set([...childTables].map((t) => `start:${t}`)));
-      const noInsert = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES];
+      const noInsert = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES, ...MINT_LEDGER_TABLES];
       expect(events.filter((e) => e.startsWith('start:') && noInsert.includes(e.slice(6) as Table))).toEqual([]);
 
       const lastChildEnd = Math.max(
@@ -940,6 +950,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         ammUnclassified: AMM_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
         nftSkipped: 0,
         objectsUnclassified: AMM_BUILT.reduce((sum, r) => sum + r.diagnostics.objectsUnclassified, 0),
+        importMintedNegative: 0,
       });
       for (const [table, key, orderBy] of AMM_KEYS) {
         const built = AMM_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -999,11 +1010,13 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         ammUnclassified: 0,
         nftSkipped: 0,
         objectsUnclassified: 0,
+        importMintedNegative: 0,
       });
       expect(await new LedgerWriter(svc, ctx).write([])).toEqual({
         ammUnclassified: 0,
         nftSkipped: 0,
         objectsUnclassified: 0,
+        importMintedNegative: 0,
       });
     });
 
@@ -1168,6 +1181,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         ammUnclassified: NFT_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
         nftSkipped: 0,
         objectsUnclassified: NFT_BUILT.reduce((sum, r) => sum + r.diagnostics.objectsUnclassified, 0),
+        importMintedNegative: 0,
       });
       for (const [table, key, orderBy] of NFT_KEYS) {
         const built = NFT_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -1284,6 +1298,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         ammUnclassified: OBJECT_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
         nftSkipped: 0,
         objectsUnclassified: 0,
+        importMintedNegative: 0,
       });
       for (const [table, key, orderBy] of OBJECT_KEYS) {
         const built = OBJECT_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -1413,6 +1428,98 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // And the range can be written again without duplicates.
       await new LedgerWriter(svc, ctx).write(OBJECT_LEDGERS.slice(4, 16));
       await expectStored(svc, OBJECT_BUILT);
+    });
+  });
+
+  describe('Xahau mint ledgers (the recorded Imports with their parents, and the two hand-made ledgers)', () => {
+    const XAHAU_CTX = parseContextFor(getNetworkProfile('xahau'));
+    const MINT_LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xahau/mint')).list();
+    const MINT_BUILT = MINT_LEDGERS.map((raw) => buildLedgerRows(raw, XAHAU_CTX));
+
+    /** The rows of a mint table as ClickHouse returns them, `close_time` as unix seconds, in the order of `orderBy`. */
+    const readBack = (svc: ClickHouseService, table: Table, orderBy: string): Promise<Array<Json>> =>
+      svc.query<Json>(
+        `SELECT * EXCEPT close_time, toUnixTimestamp(close_time) AS close_time FROM ${table} ORDER BY ${orderBy}`,
+      );
+
+    /** A built row as it reads back: the drops of these fixtures are far below 2^53, so a UInt64 comes back as a number. */
+    const asRead = (row: Json): Json => ({
+      ...row,
+      ...(typeof row.amount === 'string' ? { amount: Number(row.amount) } : {}),
+      ...(typeof row.minted === 'string' ? { minted: Number(row.minted) } : {}),
+    });
+
+    const MINT_KEYS: Array<[Table, ChildRowsKey, string]> = [
+      [Table.GenesisMints, 'genesisMints', 'ledger_index, tx_index, mint_index'],
+      [Table.Imports, 'imports', 'ledger_index, tx_index'],
+      [Table.RewardClaims, 'rewardClaims', 'ledger_index, tx_index'],
+    ];
+
+    /** `raw` as a ledger of its own: a deep copy at another index whose Imports each lost 1000 drops more than their Fee. */
+    function withLostImports(raw: RawLedger, ledgerIndex: number): RawLedger {
+      const copy = JSON.parse(JSON.stringify(raw)) as RawLedger;
+      copy.header.ledger_index = ledgerIndex;
+      copy.header.ledger_hash = ledgerIndex.toString(16).toUpperCase().padStart(64, '0');
+      let lost = 0;
+      for (const t of copy.transactions.filter((each) => each.tx.TransactionType === 'Import')) {
+        for (const node of t.meta.AffectedNodes as Array<Record<string, any>>) {
+          const modified = node.ModifiedNode;
+          if (modified?.LedgerEntryType !== 'AccountRoot' || modified.FinalFields.Account !== t.tx.Account) continue;
+          modified.FinalFields.Balance = String(BigInt(modified.PreviousFields.Balance) - 1000n);
+          lost++;
+        }
+      }
+      expect(lost).toBe(1);
+      return copy;
+    }
+
+    it('lands in the three tables: counts and every row as built, and no clamped import is reported', async () => {
+      const expected = expectedMintCounts();
+      // the two hand-made ledgers hold the mints (8 entries) and the claim (1); the two recorded Imports are the 2
+      expect([Table.GenesisMints, Table.Imports, Table.RewardClaims].map((t) => expected[t])).toEqual([8, 2, 1]);
+
+      const svc = await freshService();
+      const result = await new LedgerWriter(svc, XAHAU_CTX).write(MINT_LEDGERS);
+
+      await expectStored(svc, MINT_BUILT);
+      expect(result).toEqual({ ammUnclassified: 0, nftSkipped: 0, objectsUnclassified: 0, importMintedNegative: 0 });
+      for (const [table, key, orderBy] of MINT_KEYS) {
+        const built = MINT_BUILT.flatMap((r) => r[key] as unknown as Json[]).map(asRead);
+        expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderBy.split(', '))]);
+      }
+    });
+
+    it('sums the clamped imports of the batch into importMintedNegative, and stores them with minted 0', async () => {
+      const existing = MINT_LEDGERS.find((l) => l.header.ledger_index === 2609053)!;
+      const lost = [withLostImports(existing, 2609054), withLostImports(existing, 2609055)];
+      expect(lost.map((raw) => buildLedgerRows(raw, XAHAU_CTX).diagnostics.importMintedNegative)).toEqual([1, 1]);
+
+      const svc = await freshService();
+      const result = await new LedgerWriter(svc, XAHAU_CTX).write([...MINT_LEDGERS, ...lost]);
+      expect(result.importMintedNegative).toBe(2);
+      expect(
+        await svc.query(
+          `SELECT ledger_index, toString(minted) AS minted FROM ${Table.Imports} WHERE ledger_index > 2609053 AND ledger_index < 3000000 ORDER BY ledger_index`,
+        ),
+      ).toEqual([
+        { ledger_index: 2609054, minted: '0' },
+        { ledger_index: 2609055, minted: '0' },
+      ]);
+      // (the copies repeat the transactions of 2609053, so tx_by_hash collapses them: the mint tables are counted alone)
+      expect(await count(svc, Table.Imports)).toBe(2 + 2);
+      expect(await count(svc, Table.Ledgers)).toBe(MINT_LEDGERS.length + 2);
+    });
+
+    it('recovery deletes the mint rows above a checkpoint, and keeps the ones below', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, XAHAU_CTX).write(MINT_LEDGERS);
+      const checkpoint = 2609053;
+      await deleteLedgersAbove(svc, checkpoint);
+      const keep = (i: number): boolean => i <= checkpoint;
+      await expectStored(svc, MINT_BUILT, keep);
+      expect(await count(svc, Table.Imports)).toBe(1);
+      expect(await count(svc, Table.GenesisMints)).toBe(0);
+      expect(await count(svc, Table.RewardClaims)).toBe(0);
     });
   });
 

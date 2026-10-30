@@ -87,6 +87,8 @@ interface Scenario {
   objects?: boolean;
   /** The ledgers are the recorded AccountSet and Clawback cases of the token aggregate: `state_touches` gets rows of both kinds. */
   touches?: boolean;
+  /** The ledgers are the recorded Xahau mint cases (Imports with their parent ledgers, and two hand-made ledgers): the three mint tables get rows. */
+  mint?: boolean;
 }
 
 const SCENARIOS: Scenario[] = [
@@ -133,6 +135,15 @@ const SCENARIOS: Scenario[] = [
     ledgers: 3,
     touches: true,
   },
+  // The recorded Xahau Imports (an account created, an account that existed) with their parent ledgers, and the two hand-made ledgers: the mint rows.
+  {
+    name: 'recorded mint cases xahau',
+    database: 'rows_mint',
+    network: 'xahau',
+    dir: 'xahau/mint',
+    ledgers: 6,
+    mint: true,
+  },
 ];
 
 /** The five NFT tables, with the property of `LedgerRows` that holds their rows. */
@@ -142,6 +153,13 @@ const NFT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.CollectionNftEvents, 'collectionNftEvents'],
   [Table.NftSales, 'nftSales'],
   [Table.NftTouches, 'nftTouches'],
+];
+
+/** The three Xahau mint tables, with the property of `LedgerRows` that holds their rows. */
+const MINT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
+  [Table.GenesisMints, 'genesisMints'],
+  [Table.Imports, 'imports'],
+  [Table.RewardClaims, 'rewardClaims'],
 ];
 
 /** The two object tables, with the property of `LedgerRows` that holds their rows. */
@@ -248,6 +266,21 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
           const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
           expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
         }
+      });
+    }
+
+    if (scenario.mint) {
+      it('the mint fixtures land in all three tables, and the drops of an Import read back exactly', async () => {
+        for (const [table, key] of MINT_TABLES) {
+          const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
+          expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
+        }
+        const minted = await svc.query<{ minted: string }>(
+          `SELECT minted FROM ${Table.Imports} ORDER BY ledger_index`,
+          {},
+          READ_SETTINGS,
+        );
+        expect(minted.map((r) => r.minted)).toEqual(['11', '2000000']);
       });
     }
 

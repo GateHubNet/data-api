@@ -40,12 +40,16 @@ import type { TomlAccount, TomlCurrency, TomlValidator } from '../tomls/toml-rea
  *       none of these; `--reprocess` rewrites them.
  *  - 8: the touch index of the token aggregate (`state_touches`). A ledger written by an older version has none; the job
  *       never applies a window that holds one (`TOKEN_PARSER_VERSION`).
+ *  - 9: Xahau minting (`genesis_mints`, `imports`, `reward_claims`); `MINT_PARSER_VERSION`. A Xahau ledger written with an
+ *       older version lacks these rows, and the minted supply is counted from the first ledger that has them;
+ *       `--reprocess` rewrites them. XRPL has none of the three transaction types, so its ledgers hold no mint row of any
+ *       version.
  *
  * A reader that depends on a feature compares a ledger's version with that feature's constant (`AMM_PARSER_VERSION`,
  * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`, `NFT_PARSER_VERSION`, `DOMAIN_PARSER_VERSION`, `OBJECT_PARSER_VERSION`,
- * `TOKEN_PARSER_VERSION`), never with `PARSER_VERSION`.
+ * `TOKEN_PARSER_VERSION`, `MINT_PARSER_VERSION`), never with `PARSER_VERSION`.
  */
-export const PARSER_VERSION = 8;
+export const PARSER_VERSION = 9;
 
 /** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
 export const AMM_PARSER_VERSION = 2;
@@ -88,6 +92,13 @@ export const OBJECT_PARSER_VERSION = 7;
  * with this constant, never with `PARSER_VERSION`, which later features move on.
  */
 export const TOKEN_PARSER_VERSION = 8;
+
+/**
+ * The first parser version that writes `genesis_mints`, `imports` and `reward_claims`, the Xahau mints the supply adds up: a
+ * ledger written by an older one lacks their rows. Readers of the three tables (the `supply` job and the minted days) gate on
+ * this constant, never on `PARSER_VERSION`, which later features move on.
+ */
+export const MINT_PARSER_VERSION = 9;
 
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;

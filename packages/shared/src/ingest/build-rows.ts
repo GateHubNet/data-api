@@ -46,11 +46,13 @@ import { AmmParser } from '../parsers/amm.parser';
 import { BalanceChangesParser } from '../parsers/balance-changes.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
+import { ImportParser } from '../parsers/import.parser';
 import { NftParser, rolesOf } from '../parsers/nft.parser';
 import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
 import { PathPaymentParser } from '../parsers/path-payments.parser';
 import { PaymentParser } from '../parsers/payment.parser';
+import { RewardsParser } from '../parsers/rewards.parser';
 import { StateTouchesParser } from '../parsers/state-touches.parser';
 import { TrustLineStatesParser } from '../parsers/trust-line-states.parser';
 import { RawLedger } from './raw-ledger';
@@ -115,13 +117,13 @@ export interface LedgerRows {
    */
   stateTouches: StateTouchesRow[];
   /**
-   * The native entries of a successful `GenesisMint` (migration 015, parser version 9: `MINT_PARSER_VERSION`). Always empty until
-   * the parser that fills it exists, and on XRPL for good.
+   * The native entries of a successful `GenesisMint` (migration 015, parser version 9: `MINT_PARSER_VERSION`), one row per entry.
+   * Empty on XRPL, which has no such transaction.
    */
   genesisMints: GenesisMintsRow[];
-  /** The successful `Import`s with the drops each minted (migration 015). As `genesisMints`: empty until its parser exists. */
+  /** The successful `Import`s with the drops each minted (migration 015). Empty on XRPL, as `genesisMints`. */
   imports: ImportsRow[];
-  /** Every `ClaimReward`, whatever its result (migration 015). As `genesisMints`: empty until its parser exists. */
+  /** Every `ClaimReward`, whatever its result (migration 015). Empty on XRPL, as `genesisMints`. */
   rewardClaims: RewardClaimsRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
@@ -150,6 +152,11 @@ export interface LedgerDiagnostics {
    * expects (the rows of event `update`, spec §2.2), summed over the ledger's transactions: `syncer_objects_unclassified_total`.
    */
   objectsUnclassified: number;
+  /**
+   * Successful `Import`s whose minted drops came out below 0 and were stored as 0 (spec §2; the network cannot produce one, F5),
+   * summed over the ledger's transactions: `syncer_parser_anomalies_total{kind="import_minted_negative"}`.
+   */
+  importMintedNegative: number;
 }
 
 /**
@@ -210,6 +217,8 @@ const accountStatesParser = new AccountStatesParser();
 const accountDomainsParser = new AccountDomainsParser();
 const trustLineStatesParser = new TrustLineStatesParser();
 const stateTouchesParser = new StateTouchesParser();
+const rewardsParser = new RewardsParser();
+const importParser = new ImportParser();
 const ammParser = new AmmParser();
 const nftParser = new NftParser();
 const objectChangesParser = new ObjectChangesParser();
@@ -334,7 +343,13 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     genesisMints: [],
     imports: [],
     rewardClaims: [],
-    diagnostics: { ammUnclassified: 0, nftSkipped: 0, invalidDomains: 0, objectsUnclassified: 0 },
+    diagnostics: {
+      ammUnclassified: 0,
+      nftSkipped: 0,
+      invalidDomains: 0,
+      objectsUnclassified: 0,
+      importMintedNegative: 0,
+    },
   };
 
   const typeCounts = new Map<string, number>();
@@ -858,6 +873,48 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     // A narrow row per line or issuer the transaction changed, the key range the tokens job reads by ledger.
     for (const touch of stateTouchesParser.parse(t, ctx)) {
       rows.stateTouches.push({ ledger_index: header.ledger_index, tx_index: txIndex, ...touch });
+    }
+
+    // Xahau's mints (migration 015): the claim of a ClaimReward whatever its result, one row per native entry of a successful
+    // GenesisMint, and the drops a successful Import minted. Neither parser throws (a throw here halts the ingest): a field a
+    // ledger cannot hold reads as empty or 0, and the XRPL, which has none of the three types, gets no row.
+    const rewards = rewardsParser.parse(t, ctx);
+    if (rewards.claim) {
+      rows.rewardClaims.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        account: rewards.claim.account,
+        issuer: rewards.claim.issuer,
+        opt_out: rewards.claim.opt_out ? 1 : 0,
+      });
+    }
+    for (const mint of rewards.mints) {
+      rows.genesisMints.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        mint_index: mint.mint_index,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        destination: mint.destination,
+        amount: mint.amount,
+        parent_tx_hash: mint.parent_tx_hash,
+        emit_hook_hash: mint.emit_hook_hash,
+      });
+    }
+    const imported = importParser.parse(t, ctx);
+    if (imported) {
+      if (imported.negative) rows.diagnostics.importMintedNegative += 1;
+      rows.imports.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        account: imported.account,
+        minted: imported.minted,
+        account_created: imported.account_created ? 1 : 0,
+      });
     }
   }
 

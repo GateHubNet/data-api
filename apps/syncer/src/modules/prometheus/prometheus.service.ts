@@ -66,6 +66,12 @@ const metrics = {
     help: 'Changes of an escrow, check, payment channel or delegation that no event of the object history expects (the event update, spec section 2.2), over the ledgers written by the live ingest and by range-ingest runs of this process.',
     registers: [registry],
   }),
+  parserAnomaliesTotal: new Counter({
+    name: 'syncer_parser_anomalies_total',
+    help: 'Things a parser found in a ledger that the network cannot produce and stored in a safe form, by kind (import_minted_negative: an Xahau Import whose minted drops came out below 0 and were stored as 0), over the ledgers written by the live ingest and by range-ingest runs of this process.',
+    labelNames: ['kind'],
+    registers: [registry],
+  }),
   validationsFlushedTotal: new Counter({
     name: 'syncer_validations_flushed_total',
     help: 'Validation rows flushed to ClickHouse.',
@@ -292,6 +298,7 @@ export class PrometheusService implements OnModuleInit {
   readonly ammUnclassifiedTotal = metrics.ammUnclassifiedTotal;
   readonly nftSkippedTotal = metrics.nftSkippedTotal;
   readonly objectsUnclassifiedTotal = metrics.objectsUnclassifiedTotal;
+  readonly parserAnomaliesTotal = metrics.parserAnomaliesTotal;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
   readonly validationsErrorsTotal = metrics.validationsErrorsTotal;
   readonly validationsDroppedTotal = metrics.validationsDroppedTotal;

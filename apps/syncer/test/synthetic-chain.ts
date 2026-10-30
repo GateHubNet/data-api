@@ -169,6 +169,70 @@ export function objectTemplate(unclassified = 0): Record<string, unknown> {
   return { ...ledgerOf(OBJECT_TEMPLATE_TRANSACTIONS[0][0]), transactions };
 }
 
+/** The recorded Xahau fixtures of the mint rows (`xahau/mint` and `xahau/recorded`, D7 Task 1). */
+const XAHAU_FIXTURES_DIR = join(__dirname, '../../../packages/shared/test/fixtures/xahau');
+
+/**
+ * The three recorded transactions `mintTemplate` copies, each `[file, hash]`: an Import into an account that existed (the
+ * first one's ledger gives the template its header), a ClaimReward and a GenesisMint with 8 entries, so that a ledger made of
+ * them has rows in all three mint tables (1 `imports`, 1 `reward_claims`, 8 `genesis_mints`).
+ */
+const MINT_TEMPLATE_TRANSACTIONS: ReadonlyArray<readonly [file: string, hash: string]> = [
+  ['mint/2609053.json.gz', '3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE'],
+  ['recorded/26540187.json.gz', '3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C'],
+  ['recorded/26540188.json.gz', 'E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D'],
+];
+
+/**
+ * The template of a chain with Xahau minting (parse it with the Xahau context): the three recorded transactions of
+ * `MINT_TEMPLATE_TRANSACTIONS` (an Import, a ClaimReward, a GenesisMint of 8 entries), plus `clamped` transactions
+ * `synthetic-clamped-import-<k>` that are successful Imports whose account lost 900 drops more than it gained (a balance
+ * from 1,000,000 to 999,000 under a Fee of 100): the network cannot produce one (F5), so the Import parser clamps its minted
+ * drops to 0 and counts it (+1 on `syncer_parser_anomalies_total{kind="import_minted_negative"}`). The recorded transactions
+ * alone clamp nothing. Like `ammTemplate` for the AMM pools, the synthetic ones are built here and say so; the header is the
+ * first recorded ledger's.
+ */
+export function mintTemplate(clamped = 0): Record<string, unknown> {
+  const ledgers = new Map<string, Json>();
+  const ledgerOf = (file: string): Json => {
+    let ledger = ledgers.get(file);
+    if (!ledger) {
+      ledger = JSON.parse(gunzipSync(readFileSync(join(XAHAU_FIXTURES_DIR, file))).toString('utf8')).ledger as Json;
+      ledgers.set(file, ledger);
+    }
+    return ledger;
+  };
+  const transactions: Json[] = MINT_TEMPLATE_TRANSACTIONS.map(([file, hash], at) => {
+    const recorded = (ledgerOf(file).transactions as Json[]).find((tx) => tx.hash === hash);
+    if (!recorded) throw new Error(`transaction ${hash} is not in ${file} of ${XAHAU_FIXTURES_DIR}`);
+    return { ...structuredClone(recorded), metaData: { ...recorded.metaData, TransactionIndex: at } };
+  });
+  for (let k = 0; k < clamped; k++) {
+    const account = `rClampedImportAccount${k}xxxxxxxxx`;
+    transactions.push({
+      Account: account,
+      TransactionType: 'Import',
+      Fee: '100',
+      Sequence: 1 + k,
+      hash: `B${k.toString(16).toUpperCase()}`.padEnd(64, 'B'),
+      metaData: {
+        TransactionIndex: transactions.length,
+        TransactionResult: 'tesSUCCESS',
+        AffectedNodes: [
+          {
+            ModifiedNode: {
+              LedgerEntryType: 'AccountRoot',
+              FinalFields: { Account: account, Balance: '999000' },
+              PreviousFields: { Balance: '1000000' },
+            },
+          },
+        ],
+      },
+    });
+  }
+  return { ...ledgerOf(MINT_TEMPLATE_TRANSACTIONS[0][0]), transactions };
+}
+
 /** A ledger hash (64 upper-case hex digits) that depends only on the index and the salt. */
 export function syntheticHash(index: number, salt = 'main'): string {
   return createHash('sha256').update(`synthetic-ledger:${salt}:${index}`).digest('hex').toUpperCase();

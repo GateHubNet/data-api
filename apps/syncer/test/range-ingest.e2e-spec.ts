@@ -22,7 +22,7 @@ import { join } from 'node:path';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { rangeIngest, RangeIngestOptions } from '../src/cli/range-ingest';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { ammTemplate, nftTemplate, objectTemplate, range, syntheticChain } from './synthetic-chain';
+import { ammTemplate, mintTemplate, nftTemplate, objectTemplate, range, syntheticChain } from './synthetic-chain';
 
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 
@@ -63,6 +63,14 @@ const UPDATES_PER_LEDGER = 2;
  * PaymentChannelCreate and DelegateSet (rows in both object tables) and `UPDATES_PER_LEDGER` changes that no event expects.
  */
 const OBJECT_RAW = syntheticChain(L(1), 30, { template: objectTemplate(UPDATES_PER_LEDGER) }).map((l) => l.raw);
+
+/** Successful Imports per ledger of `MINT_RAW` whose minted drops come out below 0 and are stored as 0 (see `mintTemplate`). */
+const CLAMPED_PER_LEDGER = 2;
+/**
+ * The same 30 ledgers with Xahau minting (parse them with the Xahau context): each holds a recorded Import, ClaimReward and
+ * GenesisMint of 8 entries (rows in all three mint tables) and `CLAMPED_PER_LEDGER` clamped Imports.
+ */
+const MINT_RAW = syntheticChain(L(1), 30, { template: mintTemplate(CLAMPED_PER_LEDGER) }).map((l) => l.raw);
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 /**
@@ -1208,6 +1216,141 @@ describe('rangeIngest (e2e)', () => {
       await expectRows(svc, OBJECT_RAW.slice(0, 14), CHAIN_TABLES);
       await expectNoDuplicateObjectRows(svc);
       expect(await unclassifiedObjects(metrics)).toBe(before + 14 * UPDATES_PER_LEDGER);
+    });
+  });
+
+  describe('Xahau mint ledgers (parser version 9)', () => {
+    const xahau = parseContextFor(getNetworkProfile('xahau'));
+    const MINT_TABLES = [Table.GenesisMints, Table.Imports, Table.RewardClaims];
+
+    /** The counter now, for the one kind. It is process-wide, so a test compares it with its value before. */
+    const clamped = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.parserAnomaliesTotal.get()).values.find((v) => v.labels.kind === 'import_minted_negative')
+        ?.value ?? 0;
+
+    /** The rows of the three mint tables that writing `ledgers` gives, from the rows `buildLedgerRows` makes. */
+    const expectedMint = (ledgers: RawLedger[]): Counts => {
+      const counts: Counts = { genesis_mints: 0, imports: 0, reward_claims: 0 };
+      for (const raw of ledgers) {
+        const rows = buildLedgerRows(raw, xahau);
+        counts.genesis_mints += rows.genesisMints.length;
+        counts.imports += rows.imports.length;
+        counts.reward_claims += rows.rewardClaims.length;
+      }
+      return counts;
+    };
+
+    /** `count() == uniqExact(<sorting key>)` in each mint table: no row is there twice, and there are rows. */
+    async function expectNoDuplicateMintRows(svc: ClickHouseService): Promise<void> {
+      for (const table of MINT_TABLES) {
+        const key = (
+          await svc.queryOne<{ sorting_key: string }>(
+            'SELECT sorting_key FROM system.tables WHERE database = currentDatabase() AND name = {t:String}',
+            { t: table },
+          )
+        )?.sorting_key;
+        const row = await svc.queryOne<{ n: string | number; u: string | number }>(
+          `SELECT count() AS n, uniqExact(${key}) AS u FROM ${table}`,
+        );
+        expect([table, Number(row?.n) > 0, Number(row?.n)]).toEqual([table, true, Number(row?.u)]);
+      }
+    }
+
+    it('the ledgers have rows for all three mint tables, and two clamped Imports per ledger', () => {
+      // per ledger: the recorded Import and the 2 clamped ones, the ClaimReward, the 8 entries of the GenesisMint
+      expect(expectedMint(MINT_RAW)).toEqual({ genesis_mints: 30 * 8, imports: 30 * 3, reward_claims: 30 });
+      const total = MINT_RAW.reduce(
+        (sum, raw) => sum + buildLedgerRows(raw, xahau).diagnostics.importMintedNegative,
+        0,
+      );
+      expect(total).toBe(30 * CLAMPED_PER_LEDGER);
+    });
+
+    it('writes the mint tables, and adds the clamped Imports to syncer_parser_anomalies_total', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await clamped(metrics);
+
+      const result = await rangeIngest(new TestSource(MINT_RAW), svc, xahau, {
+        from: L(1),
+        to: L(30),
+        ...FAST,
+        metrics,
+      });
+
+      expect(result).toEqual({ chunksDone: 2, ledgers: 30 });
+      expect(await tableCounts(svc, MINT_TABLES)).toEqual(expectedMint(MINT_RAW));
+      await expectNoDuplicateMintRows(svc);
+      expect(await clamped(metrics)).toBe(before + 30 * CLAMPED_PER_LEDGER);
+    });
+
+    it('names syncer_parser_anomalies_total in a warning at the end, and leaves its final line as it is', async () => {
+      const svc = await freshService();
+      const mint = captureLogger();
+      await rangeIngest(new TestSource(MINT_RAW), svc, xahau, { from: L(1), to: L(14), ...FAST, logger: mint });
+      const total = 14 * CLAMPED_PER_LEDGER;
+      expect(mint.lines.filter((l) => l.level === 'warn').map((l) => l.message)).toEqual([
+        `${total} Imports in the ledgers written minted a negative amount (the balance fell by more than the Fee) and were stored as 0: see syncer_parser_anomalies_total{kind="import_minted_negative"}`,
+      ]);
+      // the clamp is not part of the final line: it says what it always said
+      expect(mint.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(
+        /, 0 unclassified AMM pools, 0 skipped NFT events, 0 unclassified object changes$/,
+      );
+
+      // a range without any has no warning
+      const none = captureLogger();
+      await rangeIngest(new TestSource(CHAIN_RAW), await freshService(), xahau, {
+        from: L(1),
+        to: L(5),
+        ...FAST,
+        logger: none,
+      });
+      expect(none.lines.some((l) => l.message.includes('syncer_parser_anomalies_total'))).toBe(false);
+    });
+
+    it('counts only what it wrote: ledgers it finds committed add nothing, and a reprocess rewrites the mint rows without duplicates, counting them once', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, xahau).write(MINT_RAW.slice(0, 5)); // L(1)..L(5)
+      const metrics = new PrometheusService();
+      const before = await clamped(metrics);
+
+      await rangeIngest(new TestSource(MINT_RAW), svc, xahau, { from: L(1), to: L(14), ...FAST, metrics });
+      expect(await clamped(metrics)).toBe(before + 9 * CLAMPED_PER_LEDGER);
+      const written = await tableCounts(svc, MINT_TABLES);
+      expect(written).toEqual(expectedMint(MINT_RAW.slice(0, 14)));
+
+      await rangeIngest(new TestSource(MINT_RAW), svc, xahau, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+        metrics,
+      });
+      expect(await clamped(metrics)).toBe(before + (9 + 14) * CLAMPED_PER_LEDGER);
+      // the same rows as before: the rewrite deleted what it replaced
+      expect(await tableCounts(svc, MINT_TABLES)).toEqual(written);
+      await expectNoDuplicateMintRows(svc);
+    });
+
+    it('reprocess gives ledgers written without mint rows (parser version 8) their mint rows, without duplicates', async () => {
+      const svc = await freshService();
+      await rangeIngest(new TestSource(MINT_RAW), svc, xahau, { from: L(1), to: L(14), ...FAST });
+      // What parser version 8 wrote: no rows in the mint tables.
+      for (const table of MINT_TABLES) {
+        await svc.command(`DELETE FROM ${table} WHERE 1`, {}, { settings: { lightweight_deletes_sync: '2' } });
+        expect(await count(svc, table)).toBe(0);
+      }
+
+      const result = await rangeIngest(new TestSource(MINT_RAW), svc, xahau, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+      });
+
+      expect(result.ledgers).toBe(14);
+      expect(await tableCounts(svc, MINT_TABLES)).toEqual(expectedMint(MINT_RAW.slice(0, 14)));
+      await expectNoDuplicateMintRows(svc);
     });
   });
 
