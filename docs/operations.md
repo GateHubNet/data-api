@@ -30,7 +30,7 @@ no `GH_CLICKHOUSE_DATABASE`, so each network's database is the name its profile 
 | Account network names | `INSERT INTO xrpl.account_network_names ...` (or `xahau.`), shows within 60 s on that network only: [Name an account on one network](#name-an-account-on-one-network) |
 | Labels | `INSERT INTO shared.account_labels ...`, shows within 60 s: [Label an address](#label-an-address) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
-| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `nft_state`, `escrows`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `nft_collections`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`) |
+| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `nft_state`, `escrows`, `pair_hourly`, `markets_live`, `tokens`, `stats_live`, `stats_dirty`, `amm_daily`, `nft_collections`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`, `tokens_dirty`) |
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
 | NFT data | `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending`, `syncer_nft_skipped_total`, the `nft_state` / `nft_state_dirty` / `nft_collections` error labels, [the NFT data](#the-nft-data) |
 | Ledger objects | `syncer_escrows_lag_ledgers`, `syncer_escrows_open`, `syncer_objects_unclassified_total`, the `escrows` / `escrows_dirty` error labels; the rollout and the re-ingest: [Ledger objects and delegation](#ledger-objects-and-delegation) |
@@ -802,12 +802,12 @@ objects are 404 or start in the middle until they are re-ingested).
   1,000,000 ledgers, each a handful of narrow reads and the writes of the escrows it touched; on a full parser-7 history of the XRP Ledger (from ledger 32,570, so from
   32,569) that is about 108 steps: the first 28 or so, below the Escrow amendment (28,685,313), hold no escrow and are cheap, and about 80 can hold escrows. The
   budget is checked before a step and **never inside one** (a step cannot resume partway: its sentinel is its last write), so a heavy step runs past the 2 s, the rest of the
-  tick waits for it (see the 23 of 30 s below), and the job goes on at the next tick where it stopped: expect `syncer_escrows_lag_ledgers` to fall in jumps of up to a million, and the
+  tick waits for it (see the 27 of 30 s below), and the job goes on at the next tick where it stopped: expect `syncer_escrows_lag_ledgers` to fall in jumps of up to a million, and the
   later jobs of those ticks (`stats_live` among them) to be short of time until it is at the head. The watermark is in the table (`through_ledger` of the sentinel), so a restart
   goes on where it was.
-- **The budget of a tick.** The jobs before `stats_live` have 23 of the 30 s of a tick when each uses its whole budget (`volume_live` 5, `volume_daily` 4, `amm_pools` 3, `nft_state` 3, `escrows` 2,
-  `pair_hourly` 3, `markets_live` 3), so `stats_live` gets the 7 s that are left in the worst tick; in the steady state the escrows step is a few narrow reads.
-- **A failing `escrows` hook re-runs its slice's hooks.** The hook is the last of a slice's hooks. When it fails, the slice fails and stays in `agg_dirty`, and at the next tick the
+- **The budget of a tick.** The jobs before `stats_live` have 27 of the 30 s of a tick when each uses its whole budget (`volume_live` 5, `volume_daily` 4, `amm_pools` 3, `nft_state` 3, `escrows` 2,
+  `pair_hourly` 3, `markets_live` 3, `tokens` 4), so `stats_live` gets the 3 s that are left in the worst tick, and `stats_dirty` nothing if `stats_live` takes them; in the steady state the escrows step is a few narrow reads.
+- **A failing `escrows` hook re-runs its slice's hooks.** The hook of `tokens` is the last of a slice's hooks and this one comes before it. When it fails, the slice fails and stays in `agg_dirty`, the hook of `tokens` is skipped for the tick, and at the next tick the
   earlier hooks of the slice run again (they are idempotent; the hook of `nft_state` marks its `nft_dirty` range once more, and at most three failing ranges are tried in a tick),
   with no backoff. `syncer_aggregator_errors_total{job="escrows_dirty"}` rises each tick and `SELECT count() FROM xrpl.agg_dirty` does not fall: look for
   `Aggregator job escrows_dirty failed in <from> - <to>: ...` in the log, fix the cause, and the next tick drains the queue.
@@ -931,7 +931,7 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 
 ### What a re-ingest does to them
 
-`range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)), and a fourth, of `nft_state`, marks the slice's ledgers in `nft_dirty` ([The NFT data](#the-nft-data)), and a fifth, of `escrows`, recomputes the escrows of the slice's ledgers ([Ledger objects and delegation](#ledger-objects-and-delegation)):
+`range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)), and a fourth, of `nft_state`, marks the slice's ledgers in `nft_dirty` ([The NFT data](#the-nft-data)), a fifth, of `escrows`, recomputes the escrows of the slice's ledgers ([Ledger objects and delegation](#ledger-objects-and-delegation)), and, last, a sixth, of `tokens`, marks the slice for the repair of the generations of the issued tokens (the next run of the `tokens` job applies it):
 
 - **Rates**: the days of the slice and the 14 after it that have a valid set are marked stale (a day's rate reads the trades of the 14 days before it). Until `rates_daily` has computed them again, newest first, the API values those days on read, so `syncer_rates_daily_missing_days` rises by up to the range plus 14 days and falls again; expect the
   slower path for the window of the range, and `api_rates_on_read_total` to show it. While ranges of the re-ingest wait in `agg_dirty`, `rates_daily` leaves the days they reach (the range and the 14 days after it) for after they are drained, so the gauge falls only as the queue empties. A range
@@ -939,7 +939,7 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 - **Hours**: the hours of the slice in the last 31 days are recomputed at once (after an AMM `--reprocess` this is what puts the swaps into the `amm` rows of the Markets, see [the AMM data additions](#the-amm-data-additions)).
 - **Heavy accounts**: every account whose rollups cover a day of the slice has that day recomputed (a new rollup set under a new version), and the partitions of the range are recounted by the next discovery.
 
-Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`) says which.
+Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`, `tokens_dirty`) says which.
 
 ### The AMM data additions
 

@@ -2,17 +2,20 @@ import {
   configVersionOf,
   DailyRates,
   EscrowsStep,
+  getNetworkProfile,
   MarketsConfig,
   NFT_VOLUME_CONFIG_VERSION,
   RatesService,
   StatsRecomputeAborted,
   Table,
+  TokenGenerationsRow,
   TRADE_LIVE_PERIODS,
   VOLUME_DAY_SETTLE_MS,
   VolumeMetric,
   VolumeRecomputeAborted,
 } from '@gatehub/data-api-shared';
 import { AFTER_NOW, DAY, FakeClickHouse, HOUR, iso, NOW, NOW_SECONDS, QUIET, unix } from '../../test/aggregator-fakes';
+import { AggregateFunctions } from './aggregate-job-deps';
 import {
   AGGREGATOR_AMM_DAILY_BUDGET_MS,
   AGGREGATOR_DIRTY_BUDGET_MS,
@@ -20,6 +23,7 @@ import {
   AGGREGATOR_LIVE_BUDGET_MS,
   AGGREGATOR_SHUTDOWN_WAIT_MS,
   AGGREGATOR_TICK_BUDGET_MS,
+  AGGREGATOR_TOKENS_BUDGET_MS,
   AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS,
   AGGREGATOR_VOLUME_DAILY_BUDGET_MS,
   AGGREGATOR_VOLUME_LIVE_BUDGET_MS,
@@ -28,6 +32,7 @@ import {
   AggregatorService,
   MAX_SLICE_SECONDS,
   sliceRange,
+  TokensFunctions,
   VOLUME_BACKFILL_MAX_RETRY_MS,
   VOLUME_BACKFILL_RETRY_MS,
 } from './aggregator.service';
@@ -971,6 +976,10 @@ describe('AggregatorService volume jobs', () => {
     nftCollectionsPending: { set: jest.Mock };
     escrowsLagLedgers: { set: jest.Mock };
     escrowsOpen: { set: jest.Mock };
+    tokensLive: { set: jest.Mock };
+    tokensLagLedgers: { set: jest.Mock };
+    tokensBuilding: { set: jest.Mock };
+    tokensRepairLedgers: { set: jest.Mock };
   };
   const created: AggregatorService[] = [];
 
@@ -1028,6 +1037,10 @@ describe('AggregatorService volume jobs', () => {
       nftCollectionsPending: { set: jest.fn() },
       escrowsLagLedgers: { set: jest.fn() },
       escrowsOpen: { set: jest.fn() },
+      tokensLive: { set: jest.fn() },
+      tokensLagLedgers: { set: jest.fn() },
+      tokensBuilding: { set: jest.fn() },
+      tokensRepairLedgers: { set: jest.fn() },
     };
     events = [];
     liveCalls = [];
@@ -1757,6 +1770,164 @@ describe('AggregatorService volume jobs', () => {
       await svc.tick();
       expect(recomputeEscrows).toHaveBeenCalledTimes(2);
       expect(ch.dirty).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('the tokens job', () => {
+    /** The account and market jobs over an empty world: no hour, day or partition to back-fill, and a set at each tick. */
+    const quietAggregates = (): Partial<AggregateFunctions> => ({
+      newestLedgerClose: async () => NOW_SECONDS - 3,
+      firstLedgerClose: async () => NOW_SECONDS - 3,
+      pairHourSets: async () => new Map(),
+      computePairHourSets: async (_c, _r, from, to) => (to - from) / HOUR,
+      computeMarketsSet: async () => ({
+        written: true,
+        pairs: 1,
+        startTime: NOW_SECONDS - DAY,
+        endTime: NOW_SECONDS,
+        ammShareKnown: true,
+      }),
+      marketsSetEndTimes: async () => new Map(),
+      marketsAmmShareKnown: async () => new Map(),
+      firstNativeTradeDay: async () => '2026-10-16',
+      validRateDays: async () => new Map(),
+      markRatesStale: async (_c, days) => days.length,
+      dirtyDaySpans: async () => [],
+      partitionSetVersions: async () => new Map(),
+      heavyAccounts: async () => new Map(),
+      rollupStates: async () => new Map(),
+    });
+
+    /**
+     * The `tokens` functions over the rows of `token_generations` in memory, in a world whose head is 1000. By default the account
+     * pass never ends (an account at every ask, `passMs` of the fake clock each), so the job always has more to do than its budget;
+     * with `pass: 'done'` it has none, and the first run makes a generation live. A write that sets `repair_from` (the hook's)
+     * fails while `hookFails` is set.
+     */
+    function tokensWorld(o: { passMs?: number; pass?: 'never-ends' | 'done' } = {}) {
+      const rows = new Map<number, TokenGenerationsRow>();
+      const state = { passes: 0, hookFails: undefined as Error | undefined };
+      const fns: Partial<TokensFunctions> = {
+        readTokenGenerations: async () => [...rows.values()],
+        writeTokenGeneration: async (_c, row) => {
+          if (row.repair_from > 0 && state.hookFails) throw state.hookFails;
+          rows.set(row.generation, row);
+        },
+        stateCoverageStart: async () => 1,
+        tokensVersionFloor: async () => '0',
+        head: async () => 1000,
+        nextPassAccounts: async () => {
+          if (o.pass === 'done') return [];
+          state.passes++;
+          if (o.passMs) jest.setSystemTime(Date.now() + o.passMs);
+          return [`rAccount${state.passes}`];
+        },
+        writePassLines: async () => undefined,
+        passTokens: async () => [],
+        touchesOfWindow: async (_c, from, head) => ({ to: head, lines: [], issuers: [] }),
+        parserFloorOf: async () => null,
+      };
+      return { fns, rows, state };
+    }
+
+    const rangeRates = { nativeCurrency: 'XRP', ledgersClosedIn: async () => ({ min: 100, max: 200 }) } as never;
+
+    it('runs tokens after markets_live and before stats_live, with its own budget', async () => {
+      expect(AGGREGATOR_TOKENS_BUDGET_MS).toBe(4000);
+      caughtUp();
+      // the gauges of the account and market jobs, which these tests of the volume jobs have not needed so far
+      for (const gauge of [
+        'pairHourlyMissingHours',
+        'marketsLiveAgeSeconds',
+        'marketsLiveAmmShareKnown',
+        'ratesDailyMissingDays',
+        'accountRollupsHeavyAccounts',
+        'accountRollupsPendingAccounts',
+      ]) {
+        Object.assign(metrics, { [gauge]: { set: jest.fn() } });
+      }
+      const world = tokensWorld({ passMs: 1000 });
+      await service({
+        aggregates: { rates: RATES, accountRollupMinRows: 0 },
+        aggregateFunctions: quietAggregates(),
+        tokens: { profile: getNetworkProfile('xrpl'), rates: RATES },
+        tokensFunctions: world.fns,
+      }).tick();
+      const jobs = metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job);
+      expect(jobs).toEqual([
+        'volume_live',
+        'volume_daily',
+        'pair_hourly',
+        'markets_live',
+        'tokens',
+        'stats_live',
+        'stats_dirty',
+        'rates_daily',
+        'account_rollups',
+        'volume_backfill',
+      ]);
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      // a batch of the pass a second, the 4 s of the job: it used its budget and no more, and the generation is still building
+      expect(world.state.passes).toBe(AGGREGATOR_TOKENS_BUDGET_MS / 1000);
+      expect(metrics.tokensBuilding.set).toHaveBeenLastCalledWith(1);
+      expect(metrics.tokensLive.set).toHaveBeenLastCalledWith(0);
+
+      // the budget is the option's when it is given
+      const short = tokensWorld({ passMs: 1000 });
+      await service({
+        budgetsMs: { tokens: 1500 },
+        tokens: { profile: getNetworkProfile('xrpl'), rates: RATES },
+        tokensFunctions: short.fns,
+      }).tick();
+      expect(short.state.passes).toBe(2);
+    });
+
+    it('does not run without the option, and the hook of a slice does not exist either', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      await service().tick();
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).not.toContain('tokens');
+      expect(metrics.tokensLive.set).not.toHaveBeenCalled();
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('counts a failure of the tokens hook as tokens_dirty and fails the slice', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      const world = tokensWorld({ pass: 'done' });
+      world.state.hookFails = new Error('DB::Exception: memory limit');
+      const svc = service({
+        tokens: { profile: getNetworkProfile('xrpl'), rates: rangeRates },
+        tokensFunctions: world.fns,
+      });
+      await svc.tick();
+
+      // the first run made a generation live; the hook could not write the mark of the slice
+      expect([...world.rows.values()].map((g) => [g.generation, g.state, g.through_ledger])).toEqual([
+        [1, 'live', 1000],
+      ]);
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'tokens_dirty' }]]);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        'Aggregator job tokens_dirty failed in 2026-05-01T00:00:00Z - 2026-05-01T03:00:00Z: DB::Exception: memory limit',
+      );
+      // the slice failed: the range is still there, and the jobs after stats_dirty were not kept from running
+      expect(ch.dirty).toEqual([mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')]);
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
+        'volume_live',
+        'volume_daily',
+        'tokens',
+        'stats_live',
+        'stats_dirty',
+        'volume_backfill',
+      ]);
+
+      // and the next tick does it again, and removes the range; the mark is the first ledger of the slice
+      world.state.hookFails = undefined;
+      await svc.tick();
+      expect(ch.dirty).toEqual([]);
+      expect(world.rows.get(1)?.repair_from).toBeGreaterThan(0);
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
     });
   });

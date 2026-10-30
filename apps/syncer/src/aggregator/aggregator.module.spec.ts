@@ -19,7 +19,7 @@ import { AggregatorService } from './aggregator.service';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 
-/** The metrics of the aggregator, of the account and market jobs, of the NFT jobs and of the escrows job, over fakes. */
+/** The metrics of the aggregator, of the account and market jobs, of the NFT jobs, of the escrows job and of the tokens job, over fakes. */
 const fakeMetrics = () => ({
   aggregatorRunsTotal: { inc: jest.fn() },
   aggregatorErrorsTotal: { inc: jest.fn() },
@@ -35,6 +35,10 @@ const fakeMetrics = () => ({
   nftCollectionsPending: { set: jest.fn() },
   escrowsLagLedgers: { set: jest.fn() },
   escrowsOpen: { set: jest.fn() },
+  tokensLive: { set: jest.fn() },
+  tokensLagLedgers: { set: jest.fn() },
+  tokensBuilding: { set: jest.fn() },
+  tokensRepairLedgers: { set: jest.fn() },
 });
 
 describe('AggregatorModule', () => {
@@ -111,6 +115,16 @@ describe('AggregatorModule', () => {
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'escrows' });
     expect(metrics.escrowsLagLedgers.set).toHaveBeenCalledWith(0);
     expect(metrics.escrowsOpen.set).toHaveBeenCalledWith(0);
+    // and the tokens job, which has no ledger to build a generation from over an empty database, and sets its four gauges
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'tokens' });
+    for (const gauge of [
+      metrics.tokensLive,
+      metrics.tokensLagLedgers,
+      metrics.tokensBuilding,
+      metrics.tokensRepairLedgers,
+    ]) {
+      expect(gauge.set).toHaveBeenCalledWith(0);
+    }
     // and the NFT collections job, which finds no collection behind in an empty database and sets its gauge
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_collections' });
     expect(metrics.nftCollectionsPending.set).toHaveBeenCalledWith(0);
@@ -126,6 +140,8 @@ describe('AggregatorModule', () => {
     expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(15);
     expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(8);
     expect(written).not.toContain(Table.AmmPools);
+    // no ledger, so no generation is started
+    expect(written).not.toContain(Table.TokenGenerations);
     const sentinels = insert.mock.calls.filter(([table]) => table === Table.Escrows);
     expect(sentinels.map(([, rows]) => rows)).toEqual([
       [expect.objectContaining({ escrow_id: '', amount_drops: '0', open_count: 0, through_ledger: 0 })],
@@ -203,6 +219,25 @@ describe('AggregatorModule', () => {
       aggregatorOptions(ch, profile, { accountRollupMinRows: 0 } as SyncerConfig, { log: jest.fn() } as never)
         .aggregates?.accountRollupMinRows,
     ).toBe(0);
+  });
+
+  it('turns the tokens job on with the profile and the rates', () => {
+    const ch = {} as ClickHouseService;
+    const profile = getNetworkProfile('xrpl');
+    const log = jest.fn();
+    const options = aggregatorOptions(ch, profile, { accountRollupMinRows: 1234 } as SyncerConfig, { log } as never);
+    // the profile of the network (the tomls its tokens are matched with) and the one RatesService the other jobs share
+    expect(options.tokens?.profile).toBe(profile);
+    expect(options.tokens?.rates).toBe(options.volumes?.rates);
+    // the knobs are the tests': the job's own defaults hold
+    expect(options.tokens?.configVersion).toBeUndefined();
+    expect(options.tokens?.retiredKeepMs).toBeUndefined();
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^Tokens job on: /));
+    const xahau = getNetworkProfile('xahau');
+    expect(
+      aggregatorOptions(ch, xahau, { accountRollupMinRows: 1 } as SyncerConfig, { log: jest.fn() } as never).tokens
+        ?.profile,
+    ).toBe(xahau);
   });
 
   it('refuses to boot on a markets config that is not valid, and says what is wrong with it', async () => {

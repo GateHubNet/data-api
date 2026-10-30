@@ -423,8 +423,9 @@ history that starts in the middle, with no `created`, and says `complete: false`
    those days**, although only the rows of the delegated transactions changed: `stats_hourly` and the daily volume sets of each day, the AMM pools with a state row in
    the slice and the `amm_daily` sets of its days, the rates of its days and of the 14 days after them (marked stale, then computed again), its hours of
    `pair_hourly`, the day rollups of the heavy accounts, the ledgers marked in `nft_dirty` (the dirty sweep of `nft_state` then rebuilds every NFT touched in those
-   days) and, last, **the `escrows` hook**, which recomputes the escrows of the slice's ledgers as of the job's watermark and reads the total again if one changed
-   ([syncer](syncer.md#the-escrows-job)). Until a slice is drained its hours show the old numbers. Watch the queue drain (only `range-ingest` adds to it):
+   days), **the `escrows` hook**, which recomputes the escrows of the slice's ledgers as of the job's watermark and reads the total again if one changed
+   ([syncer](syncer.md#the-escrows-job)), and, last, **the `tokens` hook**, which marks the slice for the repair of the generations of the issued tokens (the next run of the `tokens` job applies the
+   touches of those ledgers again; [syncer](syncer.md#76-the-agg_dirty-hooks)). Until a slice is drained its hours show the old numbers. Watch the queue drain (only `range-ingest` adds to it):
 
    ```sql
    SELECT count() FROM xrpl.agg_dirty;

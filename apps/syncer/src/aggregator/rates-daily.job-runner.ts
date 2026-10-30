@@ -14,7 +14,7 @@ import {
 import type { AggregatorJob, AggregatorTick } from './aggregator.service';
 
 /**
- * The `rates_daily` job of the aggregator (job 12 of a tick, see spec 3 and 3.1): the rate of every asset against the native
+ * The `rates_daily` job of the aggregator (job 13 of a tick, see spec 3 and 3.1): the rate of every asset against the native
  * currency for each closed, final UTC day, in `native_rates_daily`, and the hook of the slices of `agg_dirty` (`ofSlice`). The
  * state of the job (the waits of the days that failed, the announcement it has made, the day of the first native trade) is its
  * own; the database, the clock, the budget and the rule of failure are the deps'.
