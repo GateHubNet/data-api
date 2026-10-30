@@ -393,15 +393,16 @@ export async function startSupplyCycle(
  * One account range (spec 4.3): the existing accounts of `[lo, hi)` at L and their owner counts, the pool accounts left out. The
  * state of an account at L is its newest row at or before L (`argMax` over the key's place); a row written twice gives the same
  * state. `account >= lo AND account < hi` is a range of the primary key `(account, ledger_index, tx_index, node_index)`, and the read
- * never touches `fields`. Exported for the test that pins the key condition.
+ * never touches `fields`. A plain `GROUP BY`: the spec's `optimize_aggregation_in_order` is not set, because on ClickHouse 26.8 it
+ * needs several times the memory of the hash aggregation and more with every part (spec 4.3, amendment of the Task 7 fix round).
+ * Exported for the test that pins the key condition.
  */
 export const SUPPLY_ACCOUNTS_SQL = `SELECT toString(count()) AS accounts, toString(sum(s.1)) AS owner_count
 FROM (SELECT account, argMax(tuple(owner_count, deleted), (ledger_index, tx_index, node_index)) AS s
         FROM ${Table.AccountStates}
        WHERE account >= {lo:String} AND account < {hi:String} AND ledger_index <= {L:UInt32}
        GROUP BY account)
-WHERE s.2 = 0 AND NOT has({pools:Array(String)}, account)
-SETTINGS optimize_aggregation_in_order = 1`;
+WHERE s.2 = 0 AND NOT has({pools:Array(String)}, account)`;
 
 /**
  * The fees paid in the ledgers of one slice (spec 4.4, Xahau). The inner select keeps the first row of each ledger (the table can
@@ -583,9 +584,9 @@ export function supplySnapshotRow(cycle: SupplyCycle, computedAt: number, versio
 
 /**
  * Writes the snapshot of a cycle whose steps are all done, in one insert, under a version above the clock and above the newest
- * snapshot of the same ledger (a cycle redone at one ledger is a newer version of its key). An aborted `signal` is checked before
- * the work and again just before the insert: nothing is written after it, and the call throws `AggregateSetAborted`. Returns the
- * row it wrote.
+ * snapshot of the same ledger (a cycle redone at one ledger is a newer version of its key). A cycle with steps left throws, with
+ * nothing read and nothing written: its sums are partial. An aborted `signal` is checked before the work and again just before the
+ * insert: nothing is written after it, and the call throws `AggregateSetAborted`. Returns the row it wrote.
  */
 export async function writeSupplySnapshot(
   ch: ClickHouseService,
@@ -594,6 +595,9 @@ export async function writeSupplySnapshot(
   signal?: AbortSignal,
 ): Promise<NetworkSupplyRow> {
   throwIfSetAborted(signal);
+  if (cycle.pending.length > 0) {
+    throw new Error(`supply: the cycle at ledger ${cycle.ledger} still has ${cycle.pending.length} steps to run`);
+  }
   const version = await nextSetVersion(ch, Table.NetworkSupply, 'ledger_index = {l:UInt32}', { l: cycle.ledger });
   const row = supplySnapshotRow(cycle, computedAt, version);
   throwIfSetAborted(signal);

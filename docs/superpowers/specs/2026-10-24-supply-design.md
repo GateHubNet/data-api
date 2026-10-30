@@ -375,6 +375,19 @@ SETTINGS optimize_aggregation_in_order = 1
 unmerged part) gives the same `argMax`. The read never touches `fields` (the wide column). `optimize_aggregation_in_order` streams the
 groups in key order, so memory stays small; the API's `max_memory_usage` guard applies to the syncer's reads too.
 
+*Amended 2026-10-30 by the D7 Task 7 fix round (the text above stays as the plan wrote it). The read is a plain `GROUP BY`: the `SETTINGS
+optimize_aggregation_in_order = 1` line is dropped, because on ClickHouse 26.8.14.3 it does not keep memory small, it raises it and makes it
+grow with the number of parts. The answer and `read_rows` are the same with and without it (checked against a brute-force read). Measured on
+the real `account_states` DDL with merges stopped, the read as written, peak `memory_usage` from `system.query_log`, at `max_threads` 16 / 8 / 4
+/ 2: with 65,000 accounts in 29.9 million rows and 88 parts, in order 2.23 / 2.66 / 2.38 / 2.38 GiB against 384 / 279 / 140 / 105 MiB for the
+hash aggregation; with 200,000 accounts in 60 million rows and 92 parts, in order 2.60 / 3.18 / 4.65 / 7.02 GiB against 1.07 GiB / 796 / 399 /
+367 MiB. In order the memory grows with the parts the read opens (16 parts 438 MiB, 24 parts 607 MiB, 48 parts 1.19 GiB, 88 parts 2.46 GiB:
+about 27 MiB a part); the hash aggregation does not grow with the rows (1.2 GiB at 20 million rows, 1.07 GiB at 60 million, the same 200,000
+accounts). The wall time is about the same (287 ms in order, 243 ms hash, at 88 parts). `max_block_size = 8192` brings the in-order read to
+1.74 to 1.97 GiB and `aggregation_in_order_max_block_bytes = 1000000` to 1.56 GiB, so neither fixes it. Under a cap the in-order read fails
+with Code 241 at a `max_memory_usage` of 1 GB and of 2 GB, and the hash read answers at 1 GB. The seed holds about 57,000 of the range's
+accounts in every part, unmerged: the high end of what production will see, where merged history has fewer parts and fewer groups in each.*
+
 **Cost.** Each cycle reads every row of `account_states` up to L once (four narrow columns and the key). Today that is the rows since
 PR #20's deploy; at full XRPL history the plan estimates some billions of rows, about a minute or two of reads a cycle, so 20 to 40 ticks
 of 5 s. Should a cycle take longer than an hour, cycles simply run back to back: the snapshot says its own ledger and time, and

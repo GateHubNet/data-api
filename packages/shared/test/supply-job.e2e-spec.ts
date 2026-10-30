@@ -2078,6 +2078,17 @@ describe('startSupplyCycle (e2e)', () => {
         expect(await newestSnapshot(ch)).toBeUndefined();
       });
 
+      it('refuses a cycle that still has steps to run, with nothing read and nothing written', async () => {
+        const ch = await fresh();
+        const query = jest.spyOn(ch, 'query');
+        const insert = jest.spyOn(ch, 'insert');
+        const unfinished = { ...full(), pending: [{ kind: 'burned', from: 1, to: 2 } as SupplyStep] };
+        await expect(writeSupplySnapshot(ch, unfinished, 1_761_000_100)).rejects.toThrow('1 steps to run');
+        expect(query).not.toHaveBeenCalled();
+        expect(insert).not.toHaveBeenCalled();
+        expect(await newestSnapshot(ch)).toBeUndefined();
+      });
+
       it('writes when its signal is not aborted', async () => {
         const ch = await fresh();
         const written = await writeSupplySnapshot(ch, full(), 1_761_000_100, new AbortController().signal);
@@ -2271,7 +2282,7 @@ describe('startSupplyCycle (e2e)', () => {
 
       describe('an amm step', () => {
         // two pools (the base and the counter of a pair are the native side of one each), each with 30,000 rows below the window of
-        // the fill-forward, 2,000 in it, 30,000 after L; and 30,000 rows of other pools each side of them, in the same part
+        // the fill-forward, 2,000 in it, 30,000 after L; and 15,000 rows of other pools each side of them, in the same part
         const AL = 1_000_000;
         const FROM = AL - AMM_FILL_WINDOW_LEDGERS;
         const BELOW = 30_000;
