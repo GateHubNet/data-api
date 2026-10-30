@@ -98,12 +98,18 @@ interface Seen {
   head: number;
 }
 
+/** The step of the first rebuild check in the streaks (it belongs to no generation). */
+const CHECK_STEP = 'check';
+
 /** The three streams of touches, each with a window of its own (the repair reads ledgers the live touches have long passed). */
 type Role = 'live' | 'repair' | 'building';
 
-/** A step that failed: how many times in a row, the generation it belongs to (to forget it with the generation), and when it may go on. */
+/**
+ * A step that failed: how many times in a row, the generation it belongs to (to forget it with the generation; none for a step of
+ * the job as a whole or of a retired generation, which is forgotten when it works), and when it may go on.
+ */
 interface Streak {
-  generation: number;
+  generation?: number;
   failures: number;
   backoff?: Backoff;
 }
@@ -123,8 +129,10 @@ interface Streak {
  *
  * **Liveness.** A failure never stops the other steps of a run, and a run that failed sets the gauges all the same (from a read of
  * the generations and the head, `reportAfterFailure`). The first housekeeping does only the rebuild check, never the holders (one
- * read of every line of the generation) or the sweep. A window that fails twice in a row waits, `NFT_RETRY_MS` and twice as long
- * for each failure after that, up to `NFT_MAX_RETRY_MS`; the touches of the other generation and the pass go on. The window a
+ * read of every line of the generation) or the sweep. A step that fails twice in a row (a window, a batch of the pass, a drop, the
+ * first rebuild check) waits, `NFT_RETRY_MS` and twice as long for each failure after that, up to `NFT_MAX_RETRY_MS`; the touches
+ * of the other generation and the pass go on. A step that keeps failing cannot stall the hook of `agg_dirty` either: the hook
+ * depends only on the reads that open a run (`beginFailed`), not on how the steps of the run ended. The window a
  * heavy ledger halved is kept, so that the next window does not read the lines of a full one to halve it again. The repair takes at
  * most half of the budget, so that a repair of years cannot keep the housekeeping and the pass from running.
  */
@@ -135,8 +143,11 @@ export class TokensJobRunner {
   private checked = false;
   /** The highest version given out or stored, as read at the first run; undefined until the first run has read it. */
   private floor?: bigint;
-  /** Whether the last run failed: the hook of a slice must not write after a run that did (`ofSlice`). */
-  private lastRunFailed = false;
+  /**
+   * Whether the reads that open the last run (the generations, the head, the version floor) failed: the hook of a slice needs
+   * them to be sure of its floor and of what it reads (`ofSlice`). How the steps of the run ended does not matter to the hook.
+   */
+  private beginFailed = false;
   /** The window (ledgers) each stream requests; halved by `touchesOfWindow` while a window holds too many lines. */
   private readonly windows: Record<Role, number> = {
     live: TOKENS_TOUCH_WINDOW,
@@ -187,17 +198,24 @@ export class TokensJobRunner {
     let seen: Seen | undefined;
     try {
       seen = await this.begin();
+      this.beginFailed = false;
     } catch (error) {
+      this.beginFailed = true;
       failures.push(error);
     }
     if (seen !== undefined) {
       const sight = seen;
       await part(() => this.liveTouches(tick, sight));
       await part(() => this.repair(tick, sight));
-      if (!this.checked || (n - 1) % TOKENS_HOUSEKEEPING_EVERY_TICKS === 0) {
-        const first = !this.checked;
+      const first = !this.checked;
+      // the first check is made at every run until it works, unless it keeps failing: then it waits like any step
+      if (
+        (first && !this.waiting(undefined, CHECK_STEP)) ||
+        (!first && (n - 1) % TOKENS_HOUSEKEEPING_EVERY_TICKS === 0)
+      ) {
         await part(async () => {
-          this.checked = (await this.rebuildCheck(tick, sight)) || this.checked;
+          const made = await this.guarded(undefined, CHECK_STEP, () => this.rebuildCheck(tick, sight));
+          this.checked = made || this.checked;
         });
         if (!first) {
           await part(() => this.holders(tick, sight));
@@ -207,7 +225,6 @@ export class TokensJobRunner {
       await part(() => this.building(tick, sight));
       await part(() => this.drop(tick, sight));
     }
-    this.lastRunFailed = failures.length > 0;
     if (failures.length === 0 && seen !== undefined) {
       this.setGauges(seen.gens, seen.head);
       return;
@@ -222,13 +239,15 @@ export class TokensJobRunner {
    * ledger of the slice `[start, end)` (unix seconds) to the lower of its value and that ledger (no lower than the generation's
    * `coverage_from`: a slice below it is left to the rebuild check), one generation row each; the next run applies the repair. It
    * does no other work, and writes nothing when `repair_from` would not change. A version needs the floor of a run: before the first
-   * run has read it, or after a run that failed (it may have written some of its rows, and its read of the generations is no
-   * longer the state), it throws before reading anything, so that the slice fails and its range stays in `agg_dirty`.
+   * run has read it, or after a run whose opening reads (the generations, the head, the floor) failed, it throws before reading
+   * anything, so that the slice fails and its range stays in `agg_dirty`. A run whose steps failed (a window, a drop, the
+   * housekeeping) does not stop the hook: the floor is in memory and above everything written, the hook reads the generations
+   * itself, and a hook that fails at every tick for a step that keeps failing would keep `agg_dirty` from draining for every job.
    */
   async ofSlice(start: number, end: number, tick: AggregatorTick): Promise<void> {
     if (this.ctx.closing()) return;
     if (this.floor === undefined) throw new Error('the tokens job has not read its version floor yet');
-    if (this.lastRunFailed) throw new Error('the tokens step of this tick failed');
+    if (this.beginFailed) throw new Error('the tokens job could not read its generations at its last run');
     const ledgers = await this.tokens.rates.ledgersClosedIn(new Date(start * 1000), new Date(end * 1000));
     if (ledgers === null || this.ctx.closing()) return;
     const seen: Seen = { gens: await this.fns.readTokenGenerations(this.ctx.ch), head: 0 };
@@ -253,7 +272,9 @@ export class TokensJobRunner {
     if (this.floor === undefined) this.floor = BigInt(await this.fns.tokensVersionFloor(this.ctx.ch));
     const active = new Set(gens.filter((g) => g.state !== 'retired').map((g) => g.generation));
     for (const set of [this.stale, this.blocked]) for (const g of set) if (!active.has(g)) set.delete(g);
-    for (const [key, streak] of this.streaks) if (!active.has(streak.generation)) this.streaks.delete(key);
+    for (const [key, streak] of this.streaks) {
+      if (streak.generation !== undefined && !active.has(streak.generation)) this.streaks.delete(key);
+    }
     return { gens, head };
   }
 
@@ -327,18 +348,18 @@ export class TokensJobRunner {
   // Failures: a step that keeps failing waits
   // -------------------------------------------------------------------------------------------------------------------
 
-  private waiting(generation: number, step: string): boolean {
-    const until = this.streaks.get(`${generation}:${step}`)?.backoff?.until ?? 0;
+  private waiting(generation: number | undefined, step: string): boolean {
+    const until = this.streaks.get(`${generation ?? '-'}:${step}`)?.backoff?.until ?? 0;
     return until > this.ctx.clock();
   }
 
   /**
-   * Runs a step of a generation. One that fails is tried again at the next run; one that fails twice in a row waits `NFT_RETRY_MS`,
+   * Runs a step of a generation (or of the job: no generation). One that fails is tried again at the next run; one that fails twice in a row waits `NFT_RETRY_MS`,
    * and twice as long after each further failure, up to `NFT_MAX_RETRY_MS` (the rule of the NFTs that fail on their own); one that
    * works forgets it. Neither the shutdown nor an abort is a failure of the step.
    */
-  private async guarded<T>(generation: number, step: string, work: () => Promise<T>): Promise<T> {
-    const key = `${generation}:${step}`;
+  private async guarded<T>(generation: number | undefined, step: string, work: () => Promise<T>): Promise<T> {
+    const key = `${generation ?? '-'}:${step}`;
     try {
       const done = await work();
       this.streaks.delete(key);
@@ -354,7 +375,7 @@ export class TokensJobRunner {
         this.streaks.set(key, { generation, failures, backoff });
         if (backoff) {
           this.ctx.logger.warn(
-            `tokens: generation ${generation} ${step} failed ${failures} times in a row (${describe(err)}); ` +
+            `tokens: ${generation === undefined ? '' : `generation ${generation} `}${step} failed ${failures} times in a row (${describe(err)}); ` +
               `it waits ${Math.round(backoff.delayMs / 60_000)} min`,
           );
         }
@@ -542,8 +563,8 @@ export class TokensJobRunner {
     const live = liveGenerationOf(seen.gens);
     let building = buildingGenerationOf(seen.gens);
     if (building !== undefined && isStale(building)) {
-      this.ctx.logger.log(`tokens: generation ${building.generation} is stale while it builds; it is retired`);
       await this.change(tick, seen, building, { state: 'retired' });
+      this.ctx.logger.log(`tokens: generation ${building.generation} was stale while it built; it is retired`);
       building = undefined;
     }
     if (building === undefined && (live === undefined || isStale(live))) {
@@ -696,10 +717,12 @@ export class TokensJobRunner {
     if (!ready) return false;
     await this.change(tick, seen, building, { state: 'live' });
     this.ctx.logger.log(
-      `tokens: generation ${building.generation} is live (through ledger ${building.through_ledger})` +
-        (live ? `, generation ${live.generation} is retired` : ''),
+      `tokens: generation ${building.generation} is live (through ledger ${building.through_ledger})`,
     );
-    if (live !== undefined) await this.change(tick, seen, live, { state: 'retired' });
+    if (live !== undefined) {
+      await this.change(tick, seen, live, { state: 'retired' });
+      this.ctx.logger.log(`tokens: generation ${live.generation} is retired`);
+    }
     return true;
   }
 
@@ -708,7 +731,9 @@ export class TokensJobRunner {
     const live = liveGenerationOf(seen.gens);
     if (live === undefined) return;
     for (const g of [...seen.gens]) {
-      if (g.state === 'live' && g.generation < live.generation) await this.change(tick, seen, g, { state: 'retired' });
+      if (g.state !== 'live' || g.generation >= live.generation) continue;
+      await this.change(tick, seen, g, { state: 'retired' });
+      this.ctx.logger.log(`tokens: generation ${g.generation} is retired (generation ${live.generation} is live)`);
     }
   }
 
@@ -718,14 +743,18 @@ export class TokensJobRunner {
 
   /**
    * Drops the partitions of every generation retired more than `retiredKeepMs` ago. Once per generation and process: a restart
-   * drops them again, which is harmless (a partition that is not there is nothing). A drop that fails is tried again at the next run.
+   * drops them again, which is harmless (a partition that is not there is nothing). A drop that fails is tried again at the next
+   * run, and one that fails twice in a row waits like any step (a privilege the user lacks would otherwise fail every run); its
+   * streak is not owned by a generation, as a retired one is not active and its streaks are forgotten at the start of a run.
    */
   private async drop(tick: AggregatorTick, seen: Seen): Promise<void> {
     for (const g of seen.gens) {
       if (g.state !== 'retired' || this.dropped.has(g.generation)) continue;
       if (this.ctx.clock() - Math.round(g.changed_at * 1000) <= this.retiredKeepMs) continue;
+      const step = `drop:${g.generation}`;
+      if (this.waiting(undefined, step)) continue;
       if (!this.go(tick)) return;
-      await this.fns.dropTokenGeneration(this.ctx.ch, g.generation);
+      await this.guarded(undefined, step, () => this.fns.dropTokenGeneration(this.ctx.ch, g.generation));
       this.dropped.add(g.generation);
       this.ctx.logger.log(`tokens: the partitions of retired generation ${g.generation} are dropped`);
     }

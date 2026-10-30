@@ -628,6 +628,18 @@ describe('TokensJobRunner', () => {
       expect(world.parserCalls.filter((c) => c.from === 299)).toHaveLength(1);
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('parser'));
     });
+
+    it('a restart finds the mark of an older-parser repair window again, because the row keeps repair_from', async () => {
+      // what the table holds after a process marked the rebuild and was stopped before the housekeeping that starts it
+      world.head = 1600;
+      world.seed(gen(1, 'live', { through_ledger: 1600, repair_from: 300 }));
+      world.parserFloor = (from) => (from < 1000 ? TOKEN_PARSER_VERSION - 1 : TOKEN_PARSER_VERSION);
+      world.slowBuild();
+      await run(make()); // a new process, with nothing in memory
+      expect(world.parserCalls.filter((c) => c.from === 299)).toHaveLength(1);
+      expect(world.g(1)).toMatchObject({ state: 'live', repair_from: 300 });
+      expect(world.g(2)).toMatchObject({ state: 'building', head_ledger: 1600 });
+    });
   });
 
   describe('an older parser', () => {
@@ -811,6 +823,29 @@ describe('TokensJobRunner', () => {
         'row g1 building t1500',
         'row g1 live t1500',
       ]);
+    });
+
+    it('logs a retirement only once its row is written', async () => {
+      const logged = (): string => logger.log.mock.calls.map((c) => String(c[0])).join('\n');
+      world.seed(
+        gen(1, 'live', { through_ledger: 1500 }),
+        gen(2, 'building', { pass_done: 1, head_ledger: 1500, through_ledger: 1500 }),
+      );
+      world.fail('write', undefined, new Error('insert failed')); // the live row works, the retired one does not
+      const r = make();
+      await expect(run(r)).rejects.toThrow('insert failed');
+      expect(logged()).toContain('generation 2 is live');
+      expect(logged()).not.toContain('generation 1 is retired');
+      await run(r);
+      expect(logged()).toContain('generation 1 is retired');
+
+      // and a stale building generation that could not be retired
+      logger.log.mockClear();
+      world.seed(gen(3, 'building', { pass_done: 0 }));
+      world.slowBuild();
+      world.fail('write', new Error('insert failed'));
+      await expect(run(make({ configVersion: TOKENS_CONFIG_VERSION + 1 }))).rejects.toThrow('insert failed');
+      expect(logged()).not.toMatch(/retired/);
     });
 
     it('finishes a promotion whose retirement of the old generation failed', async () => {
@@ -1168,14 +1203,13 @@ describe('TokensJobRunner', () => {
       expect(ledgersClosedIn).not.toHaveBeenCalled();
     });
 
-    it('throws before any read or write when the last run failed, and works again after one that did not', async () => {
-      world.seed(gen(1, 'live', { through_ledger: 1000 }));
-      slice = { min: 1100, max: 1200 };
+    it('throws before any read or write when the reads that open the last run failed, and works again after a run that did not', async () => {
+      world.seed(gen(1, 'live', { through_ledger: 1500 }));
+      slice = { min: 1300, max: 1400 };
       const r = make();
       await run(r); // reads the floor
-      world.fail('apply', new Error('Memory limit exceeded'));
-      world.head = 1600;
-      await expect(run(r)).rejects.toThrow('Memory limit exceeded');
+      world.fail('read', new Error('connection refused'));
+      await expect(run(r)).rejects.toThrow('connection refused');
       world.events = [];
       ledgersClosedIn.mockClear();
       await expect(r.ofSlice(SLICE_START, SLICE_END, tick())).rejects.toThrow('tokens');
@@ -1185,7 +1219,123 @@ describe('TokensJobRunner', () => {
       await run(r);
       world.written = [];
       await r.ofSlice(SLICE_START, SLICE_END, tick());
-      expect(world.written.map((w) => [w.generation, w.repair_from])).toEqual([[1, 1100]]);
+      expect(world.written.map((w) => [w.generation, w.repair_from])).toEqual([[1, 1300]]);
+    });
+
+    it('is not held by a run whose steps failed (a window, the rebuild check, a drop): the hook still marks', async () => {
+      world.seed(gen(1, 'live', { through_ledger: 1000 }), gen(2, 'retired', { changed_at: NOW_SECONDS - 3600 }));
+      slice = { min: 900, max: 950 };
+      const r = make();
+      world.fail('apply', new Error('Memory limit exceeded'));
+      world.fail('coverage', new Error('Memory limit exceeded'));
+      world.fail('drop', new Error('Not enough privileges'));
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded');
+      expect(failed).toHaveBeenCalledTimes(2); // the other two failures of the run
+      world.written = [];
+      await r.ofSlice(SLICE_START, SLICE_END, tick());
+      expect(world.written.map((w) => [w.generation, w.repair_from])).toEqual([[1, 900]]);
+    });
+
+    it('a drop that keeps failing fails one run per backoff, and the hook works on the runs between', async () => {
+      world.seed(gen(1, 'live', { through_ledger: 1500 }), gen(2, 'retired', { changed_at: NOW_SECONDS - 3600 }));
+      const boom = new Error('Code: 497. Not enough privileges');
+      world.fail('drop', boom, boom, boom, boom);
+      const r = make();
+      const tries = (): number => world.events.filter((e) => e === 'drop g2').length;
+      /** A slice that lowers the mark each time, so that the hook writes: the mark it left. */
+      let min = 1400;
+      const hook = async (): Promise<number> => {
+        min -= 10;
+        slice = { min, max: min + 5 };
+        await r.ofSlice(SLICE_START, SLICE_END, tick());
+        return world.g(1).repair_from;
+      };
+      await expect(run(r)).rejects.toThrow('Not enough privileges'); // the first failure: tried again at the next run
+      expect(await hook()).toBe(1390);
+      await expect(run(r)).rejects.toThrow('Not enough privileges'); // the second: now it waits
+      expect(tries()).toBe(2);
+      expect(await hook()).toBe(1380);
+
+      jest.setSystemTime(Date.now() + 1000);
+      await run(r); // waiting: not tried, not a failure
+      expect(tries()).toBe(2);
+      expect(await hook()).toBe(1370);
+
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS);
+      await expect(run(r)).rejects.toThrow('Not enough privileges'); // one run fails per backoff
+      expect(tries()).toBe(3);
+      expect(await hook()).toBe(1360);
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS + 1000);
+      await run(r); // twice as long now
+      expect(tries()).toBe(3);
+      expect(await hook()).toBe(1350);
+
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS);
+      await expect(run(r)).rejects.toThrow('Not enough privileges');
+      expect(tries()).toBe(4);
+      world.failures.clear();
+      jest.setSystemTime(Date.now() + 4 * NFT_RETRY_MS + 1); // the wait after the fourth failure
+      await run(r);
+      expect(world.dropped).toEqual([2]);
+    });
+
+    it('a first rebuild check that keeps failing waits like any step, and the hook is not held by it', async () => {
+      world.seed(gen(1, 'live', { through_ledger: 1500 }));
+      const boom = new Error('Code: 241. Memory limit exceeded');
+      world.fail('coverage', boom, boom, boom);
+      const r = make();
+      const tries = (): number => world.events.filter((e) => e === 'coverage').length;
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded');
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded'); // now it waits
+      expect(tries()).toBe(2);
+      slice = { min: 1300, max: 1400 };
+      await r.ofSlice(SLICE_START, SLICE_END, tick());
+      expect(world.g(1).repair_from).toBe(1300);
+
+      jest.setSystemTime(Date.now() + 1000);
+      await run(r);
+      expect(tries()).toBe(2);
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS);
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded');
+      expect(tries()).toBe(3);
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS + 1000);
+      await run(r);
+      expect(tries()).toBe(3);
+
+      // after the wait it is made, and as the first check it does nothing else
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS);
+      await run(r);
+      expect(tries()).toBe(4);
+      expect(world.events.filter((e) => e.startsWith('holders') || e.startsWith('sweep'))).toEqual([]);
+    });
+
+    it('a mark of the hook on the generation that builds survives its promotion and is then worked off', async () => {
+      world.seed(
+        gen(1, 'live', { through_ledger: 1500 }),
+        gen(2, 'building', { pass_done: 0, head_ledger: 1300, through_ledger: 1300 }),
+      );
+      world.slowBuild();
+      const r = make();
+      await run(r);
+      slice = { min: 1250, max: 1280 };
+      await r.ofSlice(SLICE_START, SLICE_END, tick());
+      expect(world.g(1).repair_from).toBe(1250);
+      expect(world.g(2)).toMatchObject({ state: 'building', repair_from: 1250 });
+
+      // the pass ends and it catches up: promoted with its mark, the old generation retired
+      world.accounts = [];
+      world.costs.clear();
+      await run(r);
+      expect(world.g(2)).toMatchObject({ state: 'live', through_ledger: 1500, repair_from: 1250 });
+      expect(world.g(1).state).toBe('retired');
+
+      // the next run repairs it, as the live generation, from its mark
+      world.applied = [];
+      world.windows = [];
+      await run(r);
+      expect(world.windows).toEqual([{ from: 1249, head: 1500, window: 500 }]);
+      expect(world.applied.map((a) => [a.generation, a.atLedger])).toEqual([[2, 1500]]);
+      expect(world.g(2)).toMatchObject({ state: 'live', repair_from: 0, through_ledger: 1500 });
     });
 
     it('does nothing once the shutdown has begun', async () => {
