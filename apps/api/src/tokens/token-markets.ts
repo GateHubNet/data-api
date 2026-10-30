@@ -1,13 +1,16 @@
-import { ratio } from '@gatehub/data-api-shared';
+import { MarketsPeriod, ratio } from '@gatehub/data-api-shared';
+import { Injectable } from '@nestjs/common';
 import BigNumber from 'bignumber.js';
+import { CacheService } from '../common/cache.service';
 import { fmtTime, precision8 } from '../common/format';
 import { changePercent, StoredMarket } from '../network/markets-object';
+import { MarketsService } from '../network/markets.service';
 import type { TokenMarket } from './token-objects';
 import type { TokenRef } from './token-param';
 
 /**
- * The pure part of `TokenMarkets` (spec 5.5): the price, the volume and the markets of a token from the newest `include` sets of
- * `markets_live` (`day` and `30day`), indexed by asset. The service that reads and keeps the sets is Task 10's.
+ * `TokenMarkets` (spec 5.5): the price, the volume and the markets of a token from the newest `include` sets of `markets_live`
+ * (`day` and `30day`), indexed by asset. The class at the end reads and keeps the sets; the functions are pure.
  */
 
 /** The price and volume of a token, as the list and the detail show them. A fact that is not known is not there. */
@@ -175,4 +178,43 @@ function toTokenMarket({ stored, count, other }: Listed, token: TokenRef): Token
     last_time: fmtTime(Number(stored.last_time)),
     ...(typeof stored.amm_pool === 'number' && { amm_pool: stored.amm_pool === 1 }),
   };
+}
+
+/** How long a set is kept. */
+export const TOKEN_MARKETS_CACHE_MS = 30_000;
+
+/**
+ * The keys of the two sets in the global `CacheService`: fixed, so that no request chooses one (the cache is a 10,000-entry FIFO the
+ * coverage of every feature shares), the `/v2/test-cache/clear` route of the e2e suites empties them, and the misses that come while a
+ * set is read share that read.
+ */
+export const TOKEN_MARKETS_DAY_KEY = 'token-markets:day';
+export const TOKEN_MARKETS_MONTH_KEY = 'token-markets:30day';
+
+/**
+ * The newest `include` sets of the `day` and `30day` periods, as the maps from an asset to its pairs that the facts of a token and its
+ * markets are made from, kept 30 s (spec 5.5). `MarketsService` reads them; the sets are rewritten every minute (day) and five minutes
+ * (30day), so a minute of the price is what a token shows at most.
+ */
+@Injectable()
+export class TokenMarkets {
+  constructor(
+    private readonly markets: MarketsService,
+    private readonly cache: CacheService,
+  ) {}
+
+  /** The sets, each left out while there is none. The maps are shared by the requests: nothing writes to them. */
+  async snapshot(): Promise<MarketsSnapshot> {
+    const [day, month] = await Promise.all([
+      this.cache.wrap(TOKEN_MARKETS_DAY_KEY, TOKEN_MARKETS_CACHE_MS, () => this.read('day')),
+      this.cache.wrap(TOKEN_MARKETS_MONTH_KEY, TOKEN_MARKETS_CACHE_MS, () => this.read('30day')),
+    ]);
+    return { ...(day && { day }), ...(month && { month: { byAsset: month.byAsset } }) };
+  }
+
+  private async read(period: MarketsPeriod): Promise<NonNullable<MarketsSnapshot['day']> | undefined> {
+    const set = await this.markets.newestSet(period, 'include');
+    if (set === undefined) return undefined;
+    return { total_native_volume: set.total_native_volume, byAsset: indexMarkets(set.markets) };
+  }
 }

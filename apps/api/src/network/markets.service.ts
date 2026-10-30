@@ -55,7 +55,7 @@ export class MarketsService {
 
   /** The answer for a period and filter: its newest set, or the answer of no set while the syncer has not written one. */
   async markets(q: MarketsQuery): Promise<MarketsAnswer | NoMarketsAnswer> {
-    const set = await this.set(q.period, q.amm);
+    const set = await this.newestSet(q.period, q.amm);
     if (!set) return noMarketsAnswer(q.period, q.amm);
     // as the live volumes: the latest rate, not the daily one (`live: true`); a missing rate is 0
     const display = q.display
@@ -71,8 +71,11 @@ export class MarketsService {
     });
   }
 
-  /** The newest set of a period and filter, or `undefined` when there is none. */
-  private async set(period: MarketsPeriod, amm: AmmFilter): Promise<StoredMarketsSet | undefined> {
+  /**
+   * The newest set of a period and filter, or `undefined` when there is none. Public for `TokenMarkets` (the tokens routes read the
+   * `include` sets of `day` and `30day`, kept 30 s).
+   */
+  async newestSet(period: MarketsPeriod, amm: AmmFilter): Promise<StoredMarketsSet | undefined> {
     const rows = await this.ch.query<SetRow>(
       `SELECT base_currency, base_issuer, counter_currency, counter_issuer,
               toUInt64(count) AS count, base_volume, counter_volume, native_volume,

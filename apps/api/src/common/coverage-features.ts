@@ -1,4 +1,9 @@
-import { NetworkProfile, NFT_PARSER_VERSION, OBJECT_PARSER_VERSION } from '@gatehub/data-api-shared';
+import {
+  NetworkProfile,
+  NFT_PARSER_VERSION,
+  OBJECT_PARSER_VERSION,
+  STATE_PARSER_VERSION,
+} from '@gatehub/data-api-shared';
 
 /** Where a feature starts on a network (spec §4). */
 export type FeatureStart =
@@ -19,7 +24,8 @@ export interface CoverageFeature {
 
 /**
  * The features of program 2 whose coverage an answer states, by name. D3 registers `nfts`, D5 `escrows`, `payment_channels`,
- * `checks` and `delegations`; D6, D7 and D9 add their entries here and use `FeatureCoverageService`, and define no rule of their own.
+ * `checks` and `delegations`, D6 `issued_tokens` and `token_transfers`; D7 and D9 add their entries here and use
+ * `FeatureCoverageService`, and define no rule of their own.
  */
 export const COVERAGE_FEATURES = {
   // NFTs are an amendment on both families, by the family and not the network, so a testnet takes its mainnet's
@@ -53,6 +59,11 @@ export const COVERAGE_FEATURES = {
     startOf: (p) =>
       p.hasDelegation ? { kind: 'amendment', amendment: 'PermissionDelegationV1_1' } : { kind: 'unavailable' },
   },
+  // The issued tokens of D6 (spec 6). Trust lines need no amendment, so both start at the first ledger of the network (none on a
+  // testnet, whose coverage is therefore never complete). The aggregate is made of the state tables, written by the parser that
+  // records state; the transfers are payments, which every stored ledger has.
+  issued_tokens: { parserVersion: STATE_PARSER_VERSION, startOf: () => ({ kind: 'first_ledger' }) },
+  token_transfers: { parserVersion: 1, startOf: () => ({ kind: 'first_ledger' }) },
 } satisfies Record<string, CoverageFeature>;
 
 export type CoverageFeatureName = keyof typeof COVERAGE_FEATURES;

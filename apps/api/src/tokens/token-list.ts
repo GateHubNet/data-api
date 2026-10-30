@@ -4,6 +4,7 @@ import type { Coverage } from '../common/feature-coverage.service';
 import { fmtTime } from '../common/format';
 import { decodeMarker, encodeMarker, KeysetKey } from '../common/pagination';
 import { first, limitParam, Query } from '../common/params';
+import type { CsvRow } from '../nft/nft-objects';
 
 /**
  * The list of every kind of token, `GET /v2/tokens` (spec 5.1 and 8): the query and its checks, the marker, and the envelope
@@ -72,7 +73,8 @@ function minHoldersParam(query: Query): number {
 function searchParam(query: Query): string | undefined {
   const q = (first(query, 'q') ?? '').trim();
   if (q === '') return undefined;
-  if (q.length > MAX_SEARCH_LENGTH) throw badRequest('invalid search');
+  // characters, not UTF-16 units (as the search of the validators counts)
+  if ([...q].length > MAX_SEARCH_LENGTH) throw badRequest('invalid search');
   return q;
 }
 
@@ -126,8 +128,13 @@ export interface TokenListService<Row = unknown, Totals = unknown> {
   readonly kind: TokenKind;
   /** The coverage of the answer (issued tokens: the feature `issued_tokens` of `FeatureCoverageService`). */
   coverage(): Promise<Coverage>;
-  /** The page, or `undefined` while there is no data yet (the no-generation answer). */
+  /**
+   * The page, or `undefined` while there is no data yet (the no-generation answer). A marker that is none of the kind's is a 400 that
+   * the call throws before any read: the controller starts the list first, so that nothing else is read for a bad marker.
+   */
   list(q: TokenListQuery): Promise<TokenListPage<Row, Totals> | undefined>;
+  /** The row of the CSV for a row of the list: the kind's fixed columns, an empty cell where the row has no value. */
+  csvRow(row: Row): CsvRow;
 }
 
 /** The token that provides the services of the list, a `ReadonlyMap<TokenKind, TokenListService>`. */

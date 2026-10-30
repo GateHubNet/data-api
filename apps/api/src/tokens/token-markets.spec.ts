@@ -1,6 +1,16 @@
-import { ratio } from '@gatehub/data-api-shared';
-import { StoredMarket } from '../network/markets-object';
-import { assetKeyOf, indexMarkets, MarketsSnapshot, tokenMarketFacts, tokenMarkets } from './token-markets';
+import { MarketsPeriod, ratio } from '@gatehub/data-api-shared';
+import { CacheService } from '../common/cache.service';
+import { StoredMarket, StoredMarketsSet } from '../network/markets-object';
+import { MarketsService } from '../network/markets.service';
+import {
+  assetKeyOf,
+  indexMarkets,
+  MarketsSnapshot,
+  TOKEN_MARKETS_CACHE_MS,
+  tokenMarketFacts,
+  TokenMarkets,
+  tokenMarkets,
+} from './token-markets';
 import { TOKEN_MARKET_KEYS } from './token-objects';
 
 /** Freezes the whole structure: the functions are pure and a write to their input would throw. */
@@ -315,5 +325,88 @@ describe('tokenMarketFacts', () => {
       price: '0.41010000',
       price_time: '2026-10-24T14:02:51Z',
     });
+  });
+});
+
+describe('TokenMarkets', () => {
+  const setOf = (markets: StoredMarket[], total = '243.5'): StoredMarketsSet => ({
+    start_time: 0,
+    end_time: 0,
+    pairs_traded: markets.length,
+    total_count: 0,
+    total_native_volume: total,
+    total_amm_share: null,
+    markets,
+  });
+
+  /** A `TokenMarkets` over a stub of the sets, and the cache it reads through. */
+  function build(sets: Partial<Record<MarketsPeriod, StoredMarketsSet>>) {
+    const newestSet = jest.fn(async (period: MarketsPeriod) => Promise.resolve(sets[period]));
+    const cache = new CacheService();
+    const markets = new TokenMarkets({ newestSet } as unknown as MarketsService, cache);
+    return { newestSet, cache, markets };
+  }
+
+  afterEach(() => jest.useRealTimers());
+
+  it('is the newest include sets of day and 30day: the total of the day, and each set indexed by its assets', async () => {
+    const { newestSet, markets } = build({
+      day: setOf([TOKEN_XRP], '243.5'),
+      '30day': setOf([XRP_TOKEN, pair(['USD', OTHER], ['XRP', ''])], '999'),
+    });
+    const snapshot = await markets.snapshot();
+    expect(newestSet.mock.calls).toEqual([
+      ['day', 'include'],
+      ['30day', 'include'],
+    ]);
+    expect(snapshot.day?.total_native_volume).toBe('243.5');
+    expect(snapshot.day?.byAsset.get(assetKeyOf(TOKEN))).toEqual([TOKEN_XRP]);
+    expect(snapshot.month?.byAsset.get(assetKeyOf(TOKEN))).toEqual([XRP_TOKEN]);
+    expect(snapshot.month).not.toHaveProperty('total_native_volume');
+    // what the pure functions take
+    expect(tokenMarketFacts(snapshot, TOKEN, 'XRP').native_volume).toBe('7120000');
+  });
+
+  it('leaves out the set that is not there: no day, no month', async () => {
+    expect(await build({}).markets.snapshot()).toEqual({});
+    const onlyMonth = await build({ '30day': setOf([TOKEN_XRP]) }).markets.snapshot();
+    expect(Object.keys(onlyMonth)).toEqual(['month']);
+    const onlyDay = await build({ day: setOf([TOKEN_XRP]) }).markets.snapshot();
+    expect(Object.keys(onlyDay)).toEqual(['day']);
+  });
+
+  it('keeps each set 30 s in the global cache under a fixed key, and the misses that come together share one read', async () => {
+    jest.useFakeTimers({ now: new Date('2026-10-24T14:00:00Z') });
+    const { newestSet, cache, markets } = build({ day: setOf([TOKEN_XRP]), '30day': setOf([XRP_TOKEN]) });
+    const wrap = jest.spyOn(cache, 'wrap');
+
+    await Promise.all([markets.snapshot(), markets.snapshot(), markets.snapshot()]);
+    expect(newestSet).toHaveBeenCalledTimes(2);
+    // two keys and no other, whatever is asked: nothing of a request is in a key
+    expect([...new Set(wrap.mock.calls.map(([key, ttl]) => `${key} ${ttl}`))].sort()).toEqual([
+      `token-markets:30day ${TOKEN_MARKETS_CACHE_MS}`,
+      `token-markets:day ${TOKEN_MARKETS_CACHE_MS}`,
+    ]);
+    expect(TOKEN_MARKETS_CACHE_MS).toBe(30_000);
+
+    jest.setSystemTime(Date.now() + TOKEN_MARKETS_CACHE_MS - 1);
+    await markets.snapshot();
+    expect(newestSet).toHaveBeenCalledTimes(2);
+    jest.setSystemTime(Date.now() + 2);
+    await markets.snapshot();
+    expect(newestSet).toHaveBeenCalledTimes(4);
+  });
+
+  it('is read again once the cache is cleared (the clear route of the e2e suites), and a failed read is not kept', async () => {
+    const { newestSet, cache, markets } = build({ day: setOf([TOKEN_XRP]) });
+    await markets.snapshot();
+    cache.clear();
+    await markets.snapshot();
+    expect(newestSet).toHaveBeenCalledTimes(4);
+
+    cache.clear();
+    newestSet.mockRejectedValueOnce(new Error('clickhouse is down'));
+    await expect(markets.snapshot()).rejects.toThrow('clickhouse is down');
+    expect(Object.keys(await markets.snapshot())).toEqual(['day']);
   });
 });

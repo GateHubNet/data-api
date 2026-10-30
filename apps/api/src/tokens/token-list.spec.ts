@@ -89,6 +89,11 @@ describe('parseTokenListQuery', () => {
     expect(badRequestMessage(() => parseTokenListQuery({ q: ` ${'a'.repeat(65)} ` }))).toBe('invalid search');
   });
 
+  it('q counts characters, not UTF-16 units: 64 emoji pass, 65 are 400 `invalid search`', () => {
+    expect(parseTokenListQuery({ q: '\u{1F600}'.repeat(64) }).q).toBe('\u{1F600}'.repeat(64));
+    expect(badRequestMessage(() => parseTokenListQuery({ q: '\u{1F600}'.repeat(65) }))).toBe('invalid search');
+  });
+
   it('limit is 200 by default and at most 1000', () => {
     expect(parseTokenListQuery({ limit: '1000' }).limit).toBe(1000);
     expect(parseTokenListQuery({ limit: '5000' }).limit).toBe(1000);
