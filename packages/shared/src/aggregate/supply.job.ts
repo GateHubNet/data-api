@@ -1,13 +1,21 @@
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
-import { MINT_PARSER_VERSION } from '../clickhouse/rows';
+import { MINT_PARSER_VERSION, NetworkSupplyRow } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { firstCommittedLedger } from '../ingest/ingest-state';
 import { NetworkProfile } from '../network/network-profile';
 import { coverageFrom } from '../query/parser-coverage';
-import { mintSlices, MintSums } from '../query/supply';
+import { mintSlices, MintSums, mintSums } from '../query/supply';
 import { chunk } from '../util/helpers';
 import { feesOfSetFee } from '../util/set-fee';
-import { AMM_POOLS_CHUNK, committedHead, poolsChangedSince } from './amm-pools.job';
+import { nextSetVersion, throwIfSetAborted } from './aggregate-sets';
+import {
+  AMM_FILL_WINDOW_LEDGERS,
+  AMM_POOLS_CHUNK,
+  committedHead,
+  fillForward,
+  FillForwardQuery,
+  poolsChangedSince,
+} from './amm-pools.job';
 import { readEscrowed } from './escrows.job';
 import {
   AccountRange,
@@ -19,9 +27,11 @@ import {
 } from './supply';
 
 /**
- * The start of a supply cycle (spec 2026-10-24-supply-design.md, 4.1 to 4.4): the reads of the first tick, which must be taken
- * at the tick L is chosen, and the plan of steps that the later ticks work through. The steps and the job that runs them are in
- * the tasks that follow; this module reads and plans, and writes nothing.
+ * A supply cycle (spec 2026-10-24-supply-design.md, 4.1 to 4.4): the start, which takes the reads of the first tick (they must be
+ * taken at the tick L is chosen) and plans the steps that the later ticks work through; the steps (`runSupplyStep`: the account
+ * ranges, the AMM fill-forwards, the burned and minted slices of a network that mints); and the row they add up to
+ * (`supplySnapshotRow`, `writeSupplySnapshot`). The runner that spreads the steps over ticks is `apps/syncer`'s. The start and the
+ * steps write nothing; the one write is the snapshot's.
  *
  *  - **L** is the `through_ledger` of the escrows sentinel, and a cycle starts at it only when the sentinel exists (and says a
  *    ledger), the committed head is no more than `SUPPLY_MAX_LAG_LEDGERS` ahead of it, and the `ledgers` row of L is stored. During
@@ -250,8 +260,11 @@ interface AmmStart {
   steps: SupplyStep[];
 }
 
-/** A stored row's native drops, `null` when the row cannot say (the reserve is NULL or not a whole number of drops). */
-function storedNativeDrops(pool: PoolReserves, native: string): bigint | null {
+/**
+ * A pool's native drops (from its stored row, or from its state filled forward to L), `null` when it cannot say: the native side's
+ * reserve is NULL, or is not a whole number of drops. A deleted pool holds nothing whatever its reserve says.
+ */
+function readableNativeDrops(pool: PoolReserves, native: string): bigint | null {
   if (pool.deleted) return 0n;
   if (nativeSideReserve(pool, native) === null) return null;
   try {
@@ -288,7 +301,7 @@ async function ammStart(
   const poolsAtZero: string[] = [];
   for (const row of rows) {
     if (fill.has(row.amm_account)) continue;
-    const drops = storedNativeDrops({ ...row, deleted: Number(row.deleted) !== 0 }, native);
+    const drops = readableNativeDrops({ ...row, deleted: Number(row.deleted) !== 0 }, native);
     if (drops === null) {
       poolsAtZero.push(row.amm_account);
       continue;
@@ -370,4 +383,238 @@ export async function startSupplyCycle(
       steps: pending.length,
     },
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The steps
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * One account range (spec 4.3): the existing accounts of `[lo, hi)` at L and their owner counts, the pool accounts left out. The
+ * state of an account at L is its newest row at or before L (`argMax` over the key's place); a row written twice gives the same
+ * state. `account >= lo AND account < hi` is a range of the primary key `(account, ledger_index, tx_index, node_index)`, and the read
+ * never touches `fields`. Exported for the test that pins the key condition.
+ */
+export const SUPPLY_ACCOUNTS_SQL = `SELECT toString(count()) AS accounts, toString(sum(s.1)) AS owner_count
+FROM (SELECT account, argMax(tuple(owner_count, deleted), (ledger_index, tx_index, node_index)) AS s
+        FROM ${Table.AccountStates}
+       WHERE account >= {lo:String} AND account < {hi:String} AND ledger_index <= {L:UInt32}
+       GROUP BY account)
+WHERE s.2 = 0 AND NOT has({pools:Array(String)}, account)
+SETTINGS optimize_aggregation_in_order = 1`;
+
+/**
+ * The fees paid in the ledgers of one slice (spec 4.4, Xahau). The inner select keeps the first row of each ledger (the table can
+ * hold a row twice until a merge), in key order, so that the read is the slice's rows of the one table.
+ */
+const BURNED_SQL = `SELECT toString(sum(fee_total)) AS burned
+FROM (SELECT fee_total FROM ${Table.Ledgers}
+       WHERE ledger_index BETWEEN {from:UInt32} AND {to:UInt32}
+       ORDER BY ledger_index LIMIT 1 BY ledger_index)`;
+
+/** What an `amm` step fills forward: both reserves, and a window is taken for the whole history only when both have a value in it. */
+const AMM_FILL_QUERY: FillForwardQuery = {
+  fields: ['reserve_base', 'reserve_counter'],
+  required: ['filled_reserve_base', 'filled_reserve_counter'],
+};
+
+interface PoolFill {
+  filled_reserve_base: string | null;
+  filled_reserve_counter: string | null;
+}
+
+async function accountsStep(
+  ch: ClickHouseService,
+  cycle: SupplyCycle,
+  range: AccountRange,
+): Promise<Partial<SupplyCycle>> {
+  // only the pool accounts of the range go out: about 140 of 15,000, never the list (a request carries at most 128 KiB)
+  const pools = cycle.poolAccounts.filter((account) => account >= range.lo && account < range.hi);
+  const [row] = await ch.query<{ accounts: string; owner_count: string }>(SUPPLY_ACCOUNTS_SQL, {
+    lo: range.lo,
+    hi: range.hi,
+    L: cycle.ledger,
+    pools,
+  });
+  if (row === undefined) throw new Error(`supply: the read of the accounts from ${range.lo} answered no row`);
+  return { accounts: cycle.accounts + BigInt(row.accounts), ownerCount: cycle.ownerCount + BigInt(row.owner_count) };
+}
+
+async function ammStep(
+  ch: ClickHouseService,
+  profile: NetworkProfile,
+  cycle: SupplyCycle,
+  pools: readonly string[],
+): Promise<Partial<SupplyCycle>> {
+  if (cycle.amm === null) throw new Error('supply: an amm step for a cycle without an AMM');
+  // the state of each pool at L: its newest rows up to L, a window of ledgers back and, for a pool the window leaves incomplete,
+  // as far back as its values go. A pool with no row at or before L is not in the answer: it holds nothing at L.
+  const rows = await fillForward<PoolFill>(
+    ch,
+    [...pools],
+    cycle.ledger,
+    cycle.ledger - AMM_FILL_WINDOW_LEDGERS,
+    AMM_FILL_QUERY,
+  );
+  let amm = cycle.amm;
+  let ammPools = cycle.ammPools;
+  const unreadable: string[] = [];
+  for (const row of rows) {
+    const drops = readableNativeDrops(
+      {
+        base_currency: row.asset_base_currency,
+        base_issuer: row.asset_base_issuer,
+        counter_currency: row.asset_counter_currency,
+        counter_issuer: row.asset_counter_issuer,
+        reserve_base: row.filled_reserve_base,
+        reserve_counter: row.filled_reserve_counter,
+        deleted: Number(row.newest_deleted) !== 0,
+      },
+      profile.nativeCurrency,
+    );
+    if (drops === null) {
+      unreadable.push(row.amm_account);
+      continue;
+    }
+    amm += drops;
+    if (drops > 0n) ammPools++;
+  }
+  return { amm, ammPools, poolsAtZero: [...cycle.poolsAtZero, ...unreadable].sort() };
+}
+
+async function burnedStep(
+  ch: ClickHouseService,
+  cycle: SupplyCycle,
+  from: number,
+  to: number,
+): Promise<Partial<SupplyCycle>> {
+  const [row] = await ch.query<{ burned: string }>(BURNED_SQL, { from, to });
+  if (row === undefined)
+    throw new Error(`supply: the read of the fees of the ledgers ${from} to ${to} answered no row`);
+  return { burned: cycle.burned + BigInt(row.burned) };
+}
+
+async function mintedStep(
+  ch: ClickHouseService,
+  cycle: SupplyCycle,
+  from: number,
+  to: number,
+): Promise<Partial<SupplyCycle>> {
+  if (cycle.minted === null) throw new Error('supply: a minted step for a cycle that does not mint');
+  const sums = await mintSums(ch, from, to, false);
+  return {
+    minted: {
+      rewards: cycle.minted.rewards + sums.rewards,
+      import: cycle.minted.import + sums.import,
+      genesis_mint: cycle.minted.genesis_mint + sums.genesis_mint,
+    },
+  };
+}
+
+function resultOf(
+  ch: ClickHouseService,
+  profile: NetworkProfile,
+  cycle: SupplyCycle,
+  step: SupplyStep,
+): Promise<Partial<SupplyCycle>> {
+  switch (step.kind) {
+    case 'accounts':
+      return accountsStep(ch, cycle, step.range);
+    case 'amm':
+      return ammStep(ch, profile, cycle, step.pools);
+    case 'burned':
+      return burnedStep(ch, cycle, step.from, step.to);
+    case 'minted':
+      return mintedStep(ch, cycle, step.from, step.to);
+  }
+}
+
+/**
+ * Runs the step at the front of the plan and returns the cycle with its result added and the step off the plan. The cycle it is
+ * given is not changed, so that a step that throws (a read that fails: the caller counts it) leaves the cycle where it was and
+ * can be run again as it was. `steps`, how many steps the plan had at the start, stays as the start made it.
+ */
+export async function runSupplyStep(
+  ch: ClickHouseService,
+  profile: NetworkProfile,
+  cycle: SupplyCycle,
+): Promise<SupplyCycle> {
+  const step = cycle.pending[0];
+  if (step === undefined) throw new Error('supply: no step is left to run');
+  const result = await resultOf(ch, profile, cycle, step);
+  return { ...cycle, ...result, pending: cycle.pending.slice(1) };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The snapshot
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** A drops figure as the decimal text a `UInt64` column is written and read as; `null` stays `NULL`. */
+const dropsText = (value: bigint | null): string | null => (value === null ? null : value.toString());
+
+/**
+ * The `network_supply` row of a finished cycle (spec 1.4), in the columns' order. Every `UInt64` is a decimal string (no value
+ * passes through a float), the times are unix seconds. `amm`, the reserve values and the three `minted_*` are `NULL` where the
+ * cycle has none (a network without an AMM or without minting, no reserve value known at L). The reserves themselves are not a
+ * column: the api computes them from the accounts, the owner count and the two reserve values.
+ */
+export function supplySnapshotRow(cycle: SupplyCycle, computedAt: number, version: number): NetworkSupplyRow {
+  return {
+    ledger_index: cycle.ledger,
+    close_time: cycle.closeTime,
+    started_at: cycle.startedAt,
+    computed_at: computedAt,
+    total_coins: cycle.totalCoins.toString(),
+    burned: cycle.burned.toString(),
+    escrowed: cycle.escrowed.toString(),
+    escrow_count: String(cycle.escrowCount),
+    amm: dropsText(cycle.amm),
+    amm_pools: cycle.ammPools,
+    reserve_base: dropsText(cycle.reserveBase),
+    reserve_inc: dropsText(cycle.reserveInc),
+    accounts: cycle.accounts.toString(),
+    owner_count: cycle.ownerCount.toString(),
+    minted_rewards: dropsText(cycle.minted?.rewards ?? null),
+    minted_import: dropsText(cycle.minted?.import ?? null),
+    minted_genesis: dropsText(cycle.minted?.genesis_mint ?? null),
+    version: String(version),
+  };
+}
+
+/**
+ * Writes the snapshot of a cycle whose steps are all done, in one insert, under a version above the clock and above the newest
+ * snapshot of the same ledger (a cycle redone at one ledger is a newer version of its key). An aborted `signal` is checked before
+ * the work and again just before the insert: nothing is written after it, and the call throws `AggregateSetAborted`. Returns the
+ * row it wrote.
+ */
+export async function writeSupplySnapshot(
+  ch: ClickHouseService,
+  cycle: SupplyCycle,
+  computedAt: number,
+  signal?: AbortSignal,
+): Promise<NetworkSupplyRow> {
+  throwIfSetAborted(signal);
+  const version = await nextSetVersion(ch, Table.NetworkSupply, 'ledger_index = {l:UInt32}', { l: cycle.ledger });
+  const row = supplySnapshotRow(cycle, computedAt, version);
+  throwIfSetAborted(signal);
+  await ch.insert(Table.NetworkSupply, [row]);
+  return row;
+}
+
+/**
+ * A whole cycle in a row: the start, every step and the write. For tests, and nothing else: the job spreads the steps over ticks.
+ * Answers what the start waits for when it cannot start (and writes nothing). `amm` is what the `amm_pools` runner lends.
+ */
+export async function computeSupplyCycle(
+  ch: ClickHouseService,
+  profile: NetworkProfile,
+  startedAt: number,
+  computedAt: number,
+  amm?: SupplyAmmSight,
+): Promise<NetworkSupplyRow | SupplyStart> {
+  const started = await startSupplyCycle(ch, profile, startedAt, amm);
+  if (!('cycle' in started)) return started;
+  let cycle = started.cycle;
+  while (cycle.pending.length > 0) cycle = await runSupplyStep(ch, profile, cycle);
+  return writeSupplySnapshot(ch, cycle, computedAt);
 }

@@ -1,22 +1,44 @@
-import { AMM_POOLS_CHUNK, POOLS_CHANGED_SINCE_SQL, poolsChangedSince } from '../src/aggregate/amm-pools.job';
-import { supplyAccountRanges } from '../src/aggregate/supply';
+import { AggregateSetAborted } from '../src/aggregate/aggregate-sets';
 import {
+  AMM_FILL_WINDOW_LEDGERS,
+  AMM_POOLS_CHUNK,
+  POOLS_CHANGED_SINCE_SQL,
+  poolsChangedSince,
+} from '../src/aggregate/amm-pools.job';
+import { SUPPLY_ACCOUNT_PREFIXES, supplyAccountRanges } from '../src/aggregate/supply';
+import {
+  computeSupplyCycle,
+  runSupplyStep,
   stalePoolsUpTo,
   startSupplyCycle,
+  SUPPLY_ACCOUNTS_SQL,
   SUPPLY_AMM_TOUCHED_LIMIT,
   SUPPLY_INTERVAL_MS,
   SUPPLY_MAX_LAG_LEDGERS,
   SUPPLY_START_WAIT_TICKS,
   SupplyAmmSight,
   SupplyCycle,
+  supplySnapshotRow,
   SupplyStep,
+  writeSupplySnapshot,
 } from '../src/aggregate/supply.job';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
-import { AmmPoolsRow, EscrowsRow, MINT_PARSER_VERSION, NetworkStateRow } from '../src/clickhouse/rows';
+import {
+  AccountStatesRow,
+  AmmPoolsRow,
+  AmmPoolStatesRow,
+  EscrowsRow,
+  GenesisMintsRow,
+  ImportsRow,
+  MINT_PARSER_VERSION,
+  NetworkStateRow,
+  NetworkSupplyRow,
+  RewardClaimsRow,
+} from '../src/clickhouse/rows';
 import { Table } from '../src/clickhouse/tables';
 import { getNetworkProfile } from '../src/network';
-import { mintSlices } from '../src/query/supply';
+import { mintSlices, newestSnapshot } from '../src/query/supply';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 
 /**
@@ -26,6 +48,10 @@ import { startClickHouse, StartedClickHouse } from './clickhouse-container';
  * Part 1 is the choice of L and the waits. Part 2 is the reads of the first tick on both networks. Part 3 is the AMM: the pools
  * that count at their stored row, the pools to fill forward, the set-aside pools and the rows that cannot be read. Part 4 is the
  * plan of steps and the start of the minted steps. Part 5 pins what the reserve lookups read, over bulks they must skip.
+ *
+ * Then the steps and the row (`describe('a supply cycle')`): two whole cycles with every figure computed by hand in the test, the
+ * account ranges, the AMM steps (the fill-forward at L), a step on its own (the cycle it returns and the one it leaves alone), the
+ * snapshot row and its write, and what an account range, a burned slice and an AMM step read, over bulks they must skip.
  */
 
 const GRANULE = 8192;
@@ -122,6 +148,147 @@ const kinds = (cycle: SupplyCycle): string[] => cycle.pending.map((step) => step
 const stepsOf = <K extends SupplyStep['kind']>(cycle: SupplyCycle, kind: K): Array<Extract<SupplyStep, { kind: K }>> =>
   cycle.pending.filter((step): step is Extract<SupplyStep, { kind: K }> => step.kind === kind);
 
+// -- The steps and the snapshot (Task 7) ---------------------------------------------------------------------------------
+
+const COMPUTED_AT = STARTED_AT + 123;
+
+/** An `account_states` row: the state of an account after a transaction; the columns the supply reads, the rest filled in. */
+const accountState = (
+  account: string,
+  ledger_index: number,
+  owner_count: number,
+  over: Partial<AccountStatesRow> = {},
+): AccountStatesRow => ({
+  account,
+  ledger_index,
+  tx_index: 0,
+  node_index: 0,
+  tx_hash: `${account}-${ledger_index}-${over.tx_index ?? 0}`,
+  close_time: T0 + ledger_index,
+  balance: '100',
+  flags: 0,
+  sequence: 1,
+  owner_count,
+  fields: '{}',
+  deleted: 0,
+  ...over,
+});
+
+/** The row an AccountDelete writes: the account does not exist after it. */
+const deletedState = (account: string, ledger_index: number): AccountStatesRow =>
+  accountState(account, ledger_index, 0, { deleted: 1 });
+
+/** An `amm_pool_states` row of a pool whose pair is XRP/USD unless told; the reserves are the point. */
+const ammState = (
+  amm_account: string,
+  ledger_index: number,
+  over: Partial<AmmPoolStatesRow> = {},
+): AmmPoolStatesRow => ({
+  amm_account,
+  ledger_index,
+  tx_index: 0,
+  tx_hash: `${amm_account}-${ledger_index}`,
+  close_time: T0 + ledger_index,
+  tx_type: 'AMMDeposit',
+  base_currency: 'XRP',
+  base_issuer: '',
+  counter_currency: 'USD',
+  counter_issuer: ISSUER,
+  reserve_base: '10',
+  reserve_counter: '5',
+  lp_supply: null,
+  lp_currency: null,
+  reserve_base_f: null,
+  reserve_counter_f: null,
+  lp_supply_f: null,
+  trading_fee: null,
+  auction_holder: null,
+  auction_price: null,
+  auction_price_f: null,
+  auction_discounted_fee: null,
+  auction_expiration: null,
+  deleted: 0,
+  ...over,
+});
+
+/** A pool of the pair USD/XRP: the counter side is the native one. */
+const COUNTER_NATIVE = { base_currency: 'USD', base_issuer: ISSUER, counter_currency: 'XRP', counter_issuer: '' };
+
+const mintRow = (
+  ledger_index: number,
+  amount: number,
+  parent_tx_hash: string,
+  position: { tx_index?: number; mint_index?: number } = {},
+): GenesisMintsRow => ({
+  ledger_index,
+  tx_index: position.tx_index ?? 0,
+  mint_index: position.mint_index ?? 0,
+  tx_hash: `mint-${ledger_index}-${position.tx_index ?? 0}`,
+  close_time: T0 + ledger_index,
+  destination: 'rSyntheticDestination',
+  amount,
+  parent_tx_hash,
+  emit_hook_hash: parent_tx_hash === '' ? '' : 'AAAA',
+});
+
+const claimRow = (ledger_index: number, tx_hash: string, over: Partial<RewardClaimsRow> = {}): RewardClaimsRow => ({
+  ledger_index,
+  tx_index: 0,
+  tx_hash,
+  close_time: T0 + ledger_index,
+  account: 'rSyntheticClaimer',
+  issuer: '',
+  opt_out: 0,
+  ...over,
+});
+
+const importRow = (ledger_index: number, minted: number): ImportsRow => ({
+  ledger_index,
+  tx_index: 0,
+  tx_hash: `import-${ledger_index}`,
+  close_time: T0 + ledger_index,
+  account: 'rSyntheticImporter',
+  minted,
+  account_created: 0,
+});
+
+/** A cycle made by hand, for the steps that need no start: nothing counted, nothing pending, L = the L of the tests. */
+const cycleOf = (over: Partial<SupplyCycle> = {}): SupplyCycle => ({
+  ledger: L,
+  closeTime: T0 + L,
+  startedAt: STARTED_AT,
+  totalCoins: 1n,
+  escrowed: 0n,
+  escrowCount: 0,
+  reserveBase: null,
+  reserveInc: null,
+  poolAccounts: [],
+  amm: null,
+  ammPools: 0,
+  poolsAtStoredRow: [],
+  poolsAtZero: [],
+  accounts: 0n,
+  ownerCount: 0n,
+  burned: 0n,
+  minted: null,
+  pending: [],
+  steps: 0,
+  ...over,
+});
+
+/** Freezes a value and everything in it: a step that changes its cycle in place throws. */
+const deepFreeze = <T>(value: T): T => {
+  if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const inner of Object.values(value)) deepFreeze(inner);
+  }
+  return value;
+};
+
+/** The index of the account range an account falls in. */
+const rangeOf = (account: string): number =>
+  supplyAccountRanges().findIndex((range) => account >= range.lo && account < range.hi);
+
 describe('startSupplyCycle (e2e)', () => {
   let container: StartedClickHouse;
   const services: ClickHouseService[] = [];
@@ -180,6 +347,61 @@ describe('startSupplyCycle (e2e)', () => {
 
   /** The sight the amm_pools runner lends, with a cursor at `cursor` (the L of the tests unless told). */
   const sight = (cursor: number | undefined, setAside: string[] = []): SupplyAmmSight => ({ cursor, setAside });
+
+  interface Logged {
+    tables: string[];
+    read_rows: number;
+  }
+
+  /** The SELECTs on `tables` while `run` ran (`system.query_log`), in the order they started, with the rows each read. */
+  async function logged(ch: ClickHouseService, run: () => Promise<unknown>, ...names: Table[]): Promise<Logged[]> {
+    const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
+    await run();
+    await ch.command('SYSTEM FLUSH LOGS');
+    const rows = await ch.query<{ tables: string[]; read_rows: string }>(
+      `SELECT tables, read_rows FROM system.query_log
+        WHERE current_database = currentDatabase() AND type = 'QueryFinish' AND query_kind = 'Select'
+          AND query_start_time_microseconds >= {t:DateTime64(6)}
+          AND hasAny(tables, arrayMap(x -> concat(currentDatabase(), '.', x), {names:Array(String)}))
+        ORDER BY query_start_time_microseconds`,
+      { t, names },
+    );
+    return rows.map((r) => ({ tables: r.tables, read_rows: Number(r.read_rows) }));
+  }
+
+  /** The rows each SELECT read that read this table alone. */
+  const readsOf = (all: Logged[], table: Table): number[] =>
+    all.filter((r) => r.tables.length === 1 && r.tables[0].endsWith(`.${table}`)).map((r) => r.read_rows);
+
+  /** The active parts of a table that hold a row where `where` is true: the only parts a read of those rows opens. */
+  const partsWith = (
+    ch: ClickHouseService,
+    table: Table,
+    where: string,
+    params: Record<string, unknown>,
+  ): Promise<number> =>
+    countOf(ch, `SELECT count() AS n FROM (SELECT _part FROM ${table} WHERE ${where} GROUP BY _part)`, params);
+
+  const granuleOf = async (ch: ClickHouseService, table: Table): Promise<number> => {
+    const ddl =
+      (
+        await ch.queryOne<{ engine_full: string }>(
+          `SELECT engine_full FROM system.tables WHERE database = currentDatabase() AND name = {table:String}`,
+          { table },
+        )
+      )?.engine_full ?? '';
+    const declared = /index_granularity = (\d+)/.exec(ddl);
+    return declared ? Number(declared[1]) : GRANULE;
+  };
+
+  /** What a read of the rows where `where` is true may read: the rows it needs and two granules (of the table's own size) for each part. */
+  const bound = async (
+    ch: ClickHouseService,
+    table: Table,
+    needed: number,
+    where: string,
+    params: Record<string, unknown>,
+  ): Promise<number> => needed + 2 * (await granuleOf(ch, table)) * (await partsWith(ch, table, where, params));
 
   // -------------------------------------------------------------------------------------------------------------------
   describe('the choice of L', () => {
@@ -929,61 +1151,6 @@ describe('startSupplyCycle (e2e)', () => {
     /** The rows of `tx_by_type` that the SetFee lookup reads through: its type, up to the ledger. */
     const SET_FEES_UP_TO_L = 'tx_type = {type:String} AND ledger_index <= {l:UInt32}';
 
-    interface Logged {
-      tables: string[];
-      read_rows: number;
-    }
-
-    /** The SELECTs on `tables` while `run` ran (`system.query_log`), in the order they started, with the rows each read. */
-    async function logged(ch: ClickHouseService, run: () => Promise<unknown>, ...names: Table[]): Promise<Logged[]> {
-      const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
-      await run();
-      await ch.command('SYSTEM FLUSH LOGS');
-      const rows = await ch.query<{ tables: string[]; read_rows: string }>(
-        `SELECT tables, read_rows FROM system.query_log
-          WHERE current_database = currentDatabase() AND type = 'QueryFinish' AND query_kind = 'Select'
-            AND query_start_time_microseconds >= {t:DateTime64(6)}
-            AND hasAny(tables, arrayMap(x -> concat(currentDatabase(), '.', x), {names:Array(String)}))
-          ORDER BY query_start_time_microseconds`,
-        { t, names },
-      );
-      return rows.map((r) => ({ tables: r.tables, read_rows: Number(r.read_rows) }));
-    }
-
-    /** The rows each SELECT read that read this table alone. */
-    const readsOf = (all: Logged[], table: Table): number[] =>
-      all.filter((r) => r.tables.length === 1 && r.tables[0].endsWith(`.${table}`)).map((r) => r.read_rows);
-
-    /** The active parts of a table that hold a row where `where` is true: the only parts a read of those rows opens. */
-    const partsWith = (
-      ch: ClickHouseService,
-      table: Table,
-      where: string,
-      params: Record<string, unknown>,
-    ): Promise<number> =>
-      countOf(ch, `SELECT count() AS n FROM (SELECT _part FROM ${table} WHERE ${where} GROUP BY _part)`, params);
-
-    const granuleOf = async (ch: ClickHouseService, table: Table): Promise<number> => {
-      const ddl =
-        (
-          await ch.queryOne<{ engine_full: string }>(
-            `SELECT engine_full FROM system.tables WHERE database = currentDatabase() AND name = {table:String}`,
-            { table },
-          )
-        )?.engine_full ?? '';
-      const declared = /index_granularity = (\d+)/.exec(ddl);
-      return declared ? Number(declared[1]) : GRANULE;
-    };
-
-    /** What a read of the rows where `where` is true may read: the rows it needs and two granules (of the table's own size) for each part. */
-    const bound = async (
-      ch: ClickHouseService,
-      table: Table,
-      needed: number,
-      where: string,
-      params: Record<string, unknown>,
-    ): Promise<number> => needed + 2 * (await granuleOf(ch, table)) * (await partsWith(ch, table, where, params));
-
     describe('network_state', () => {
       let ch: ClickHouseService;
 
@@ -1148,6 +1315,1078 @@ describe('startSupplyCycle (e2e)', () => {
         const txBound = await bound(ch, Table.Transactions, 1, 'ledger_index = {l:UInt32}', { l: NEWEST_SETFEE });
         expect(typeReads[0]).toBeLessThanOrEqual(typeBound);
         expect(txReads[0]).toBeLessThanOrEqual(txBound);
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('a supply cycle', () => {
+    /** Runs the steps at the front of the plan while they are of `kind`. */
+    const runWhile = async (
+      ch: ClickHouseService,
+      profile: typeof xrpl,
+      cycle: SupplyCycle,
+      kind: SupplyStep['kind'],
+    ): Promise<SupplyCycle> => {
+      let current = cycle;
+      while (current.pending[0]?.kind === kind) current = await runSupplyStep(ch, profile, current);
+      return current;
+    };
+
+    /** One cycle from the start to the write; the row it wrote. */
+    const wholeCycle = async (ch: ClickHouseService, profile: typeof xrpl, amm?: SupplyAmmSight) => {
+      const answer = await computeSupplyCycle(ch, profile, STARTED_AT, COMPUTED_AT, amm);
+      if (!('ledger_index' in answer)) throw new Error(`no row was written: ${JSON.stringify(answer)}`);
+      return answer;
+    };
+
+    /** The snapshot as the api reads it, without its version (which is the clock's). */
+    const stored = async (ch: ClickHouseService): Promise<Omit<NetworkSupplyRow, 'version'>> => {
+      const { version, ...rest } = (await newestSnapshot(ch)) as NetworkSupplyRow;
+      expect(BigInt(version)).toBeGreaterThan(0n);
+      return rest;
+    };
+
+    let tokens = 0;
+    /** The same rows in the table twice, with merges stopped (the caller does): each insert has a token of its own, or the second is dropped. */
+    const insertTwice = async (ch: ClickHouseService, table: Table, rows: object[]): Promise<void> => {
+      const n = ++tokens;
+      await ch.insert(table, rows, { dedupToken: `${table}-${n}-a` });
+      await ch.insert(table, rows, { dedupToken: `${table}-${n}-b` });
+    };
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // The XRPL world. L is in the second partition of account_states (the ledgers from 10,000,000 on), the head 400 ledgers on, the
+    // AMM job's cursor 100 ledgers before L.
+    const XRPL_L = 10_000_500;
+    const XRPL_HEAD = 10_000_900;
+    const XRPL_CURSOR = 10_000_400;
+    const ID = {
+      lowest: 'r11LowestRange',
+      modified: 'r4BCreatedThenModified',
+      plain: 'r9dNeverModified',
+      sameLedger: 'rBmTwoRowsOfOneLedger',
+      shrunk: 'rEzOwnerCountShrinks',
+      deletedBefore: 'rKqDeletedBeforeL',
+      deletedAfter: 'rQaDeletedAfterL',
+      deletedAtL: 'rWrDeletedAtL',
+      recreated: 'rccDeletedThenCreatedAgain',
+      afterL: 'rhhCreatedAfterL',
+      highest: 'rzzHighestRange',
+    };
+    const COUNTED = [
+      ID.lowest,
+      ID.modified,
+      ID.plain,
+      ID.sameLedger,
+      ID.shrunk,
+      ID.deletedAfter,
+      ID.recreated,
+      ID.highest,
+    ];
+
+    async function seedXrpl(ch: ClickHouseService): Promise<void> {
+      await ready(ch, { through: XRPL_L, head: XRPL_HEAD });
+      // the reserves in force at L: the poll of L - 3; a poll after L does not count
+      await ch.insert(Table.NetworkState, [
+        stateRow(XRPL_L - 3, [1_000_000, 200_000]),
+        stateRow(XRPL_L + 100, [9_000_000, 900_000]),
+      ]);
+      await ch.insert(Table.AccountStates, [
+        accountState(ID.lowest, 4_000_000, 3),
+        accountState(ID.modified, 3_000_000, 2),
+        accountState(ID.modified, 10_000_100, 5),
+        accountState(ID.modified, XRPL_L + 5, 9), // after L
+        accountState(ID.plain, 9_999_990, 0),
+        accountState(ID.sameLedger, 10_000_050, 3),
+        accountState(ID.sameLedger, 10_000_050, 4, { tx_index: 7 }), // the later transaction of the ledger
+        accountState(ID.shrunk, 5_000_000, 8),
+        accountState(ID.shrunk, 10_000_400, 1),
+        accountState(ID.deletedBefore, 4_000_000, 11),
+        deletedState(ID.deletedBefore, 10_000_200),
+        accountState(ID.deletedAfter, 4_500_000, 6),
+        deletedState(ID.deletedAfter, XRPL_L + 1), // deleted after L: it exists at L
+        accountState(ID.deletedAtL, 4_000_001, 2),
+        deletedState(ID.deletedAtL, XRPL_L), // deleted in L itself: it does not exist at L
+        accountState(ID.recreated, 3_500_000, 1),
+        deletedState(ID.recreated, 9_000_000),
+        accountState(ID.recreated, 10_000_300, 2), // created again
+        accountState(ID.afterL, XRPL_L + 5, 5),
+        accountState(ID.highest, 6_000_000, 7),
+        // the accounts of the pools (one owner each): the pools of the cycle are left out
+        ...[1, 2, 4, 5, 7, 8].map((n) => accountState(acct(n), 10_000_100, 1)),
+        accountState(acct(3), 9_000_000, 1),
+        deletedState(acct(3), 10_000_160),
+        accountState(acct(6), 10_000_800, 1), // a pool created after L
+      ]);
+      // the newest row of each pool, as the amm_pools job left it
+      await ch.insert(Table.AmmPools, [
+        pool(acct(1), { last_ledger: 10_000_100, reserve_base: '1000.5' }),
+        pool(acct(2), { ...COUNTER_NATIVE, last_ledger: 10_000_150, reserve_base: '7', reserve_counter: '20.25' }),
+        pool(acct(3), { last_ledger: 10_000_160, reserve_base: '999', deleted: 1 }),
+        pool(acct(4), { base_currency: 'EUR', base_issuer: ISSUER, last_ledger: 10_000_170, reserve_base: '42' }),
+        pool(acct(5), { last_ledger: 10_000_600, reserve_base: '9999' }), // touched after L
+        pool(acct(6), { last_ledger: 10_000_800, reserve_base: '5000' }), // created after L
+        pool(acct(7), { last_ledger: 10_000_100, reserve_base: '1' }), // stale at L
+      ]);
+      const states = [
+        ammState(acct(1), 10_000_100, { reserve_base: '1000.5', reserve_counter: '5' }),
+        ammState(acct(2), 10_000_150, { ...COUNTER_NATIVE, reserve_base: '7', reserve_counter: '20.25' }),
+        ammState(acct(3), 10_000_160, { reserve_base: '999', deleted: 1 }),
+        ammState(acct(4), 10_000_170, { base_currency: 'EUR', base_issuer: ISSUER, reserve_base: '42' }),
+        ammState(acct(5), 10_000_200, { reserve_base: '300', reserve_counter: '4' }),
+        ammState(acct(5), 10_000_450, { reserve_base: '250.123456', reserve_counter: null }), // the counter is filled forward
+        ammState(acct(5), 10_000_600, { reserve_base: '9999', reserve_counter: '4' }), // after L
+        ammState(acct(6), 10_000_800, { reserve_base: '5000', reserve_counter: '1' }), // after L: all of it
+        ammState(acct(7), 10_000_100, { reserve_base: '1' }),
+        ammState(acct(7), 10_000_450, { reserve_base: '2.5' }), // the touch its row has not seen
+        ammState(acct(8), 10_000_450, { reserve_base: '12', reserve_counter: '1' }), // a pool with no amm_pools row yet
+      ];
+      await ch.insert(Table.AmmPoolStates, states);
+      await ch.insert(
+        Table.AmmPoolTouches,
+        states.map((s) => touch(s.ledger_index, s.amm_account)),
+      );
+    }
+
+    // The Xahau world: L = 2,300,000, three partitions of ledgers.
+    const XAHAU_L = 2_300_000;
+    const XAHAU_HEAD = XAHAU_L + 40;
+    const X = { one: 'rBmXahauOne', deleted: 'rKqXahauDeleted', three: 'rzzXahauThree', later: 'rEzXahauAfterL' };
+
+    type Put = (table: Table, rows: object[]) => Promise<void>;
+
+    async function seedXahau(ch: ClickHouseService, put: Put = (table, rows) => ch.insert(table, rows)): Promise<void> {
+      await ch.insert(Table.Escrows, [
+        sentinel({ amount_drops: '18406227318004', open_count: 2140, through_ledger: XAHAU_L, version: 1 }),
+      ]);
+      await put(Table.Ledgers, [
+        ledgerRow(2, { fee_total: 100 }),
+        ledgerRow(1_500_000, { fee_total: 2_000 }),
+        ledgerRow(1_999_999, { fee_total: 30 }),
+        ledgerRow(2_000_000, { fee_total: 400 }),
+        ledgerRow(XAHAU_L, { fee_total: 5, total_coins: '613401782117306' }),
+        ledgerRow(XAHAU_HEAD, { fee_total: 7_000_000 }), // after L
+      ]);
+      await put(Table.AccountStates, [
+        accountState(X.one, 100, 1),
+        accountState(X.one, 2_200_000, 2),
+        accountState(X.deleted, 50, 3),
+        deletedState(X.deleted, 2_250_000),
+        accountState(X.three, 70, 4),
+        accountState(X.later, XAHAU_L + 20, 9), // after L
+      ]);
+      await ch.insert(Table.RewardClaims, [
+        claimRow(1_999_990, 'CLAIM1'), // in the slice before the mint it is the parent of
+        claimRow(1_500_100, 'CLAIM2', { opt_out: 1 }),
+      ]);
+      await ch.insert(Table.GenesisMints, [
+        mintRow(2_000_003, 1_000_000, 'CLAIM1'), // a reward, whose claim is 13 ledgers back, in another slice
+        mintRow(1_500_104, 250_000, 'CLAIM2'), // a reward
+        mintRow(5, 120_000_000, ''), // no parent: a genesis mint
+        mintRow(1_200_000, 7, 'NOT-A-CLAIM'), // a parent that is no claim: a genesis mint
+        mintRow(XAHAU_L, 30, ''), // in L itself
+        mintRow(XAHAU_L + 30, 999, ''), // after L
+      ]);
+      await ch.insert(Table.Imports, [
+        importRow(3, 5_000_000),
+        importRow(1_700_000, 800_000),
+        importRow(2_100_000, 12_345),
+        importRow(XAHAU_L + 1, 77), // after L
+      ]);
+    }
+
+    describe('one full cycle, every figure computed by hand', () => {
+      it('XRPL: one full cycle writes the row computed by hand', async () => {
+        const ch = await fresh();
+        await seedXrpl(ch);
+        // the premises of the world: the accounts of the cycle are in several ranges, and the state is in two partitions of P7
+        expect(new Set(COUNTED.map(rangeOf)).size).toBeGreaterThanOrEqual(6);
+        expect(
+          await countOf(
+            ch,
+            `SELECT uniqExact(partition) AS n FROM system.parts
+              WHERE database = currentDatabase() AND table = 'account_states' AND active`,
+          ),
+        ).toBe(2);
+
+        const row = await wholeCycle(ch, xrpl, sight(XRPL_CURSOR));
+
+        // L = 10,000,500: closed at T0 + L; the cycle began at STARTED_AT and the row was written 123 s later.
+        // total_coins 99,985,312,374,716,318, so burned = 10^17 - that = 14,687,625,283,682 (XRPL has no history to read for it).
+        // escrowed and its count are the sentinel's.
+        // accounts: lowest, modified, plain, sameLedger, shrunk, deletedAfter, recreated, highest = 8, of owner counts
+        //   3 + 5 + 0 + 4 + 1 + 6 + 2 + 7 = 28 (the deleted ones, the one created after L and the 8 pools' accounts are left out).
+        // amm: the stored pools 1 and 2 (1,000.5 and 20.25 XRP: 1,000,500,000 + 20,250,000 drops; pool 3 is deleted, pool 4 has no
+        //   native side), and at L the pools 5 (250.123456 XRP), 7 (2.5 XRP) and 8 (12 XRP; no amm_pools row): 250,123,456 +
+        //   2,500,000 + 12,000,000; pool 6 has no state at L. 1,285,373,456 drops in 5 pools.
+        // reserves: the poll of L - 3.
+        expect(await stored(ch)).toEqual({
+          ledger_index: 10_000_500,
+          close_time: 1_770_000_500,
+          started_at: 1_760_099_999,
+          computed_at: 1_760_100_122,
+          total_coins: '99985312374716318',
+          burned: '14687625283682',
+          escrowed: '35212847105402318',
+          escrow_count: '12879',
+          amm: '1285373456',
+          amm_pools: 5,
+          reserve_base: '1000000',
+          reserve_inc: '200000',
+          accounts: '8',
+          owner_count: '28',
+          minted_rewards: null,
+          minted_import: null,
+          minted_genesis: null,
+        });
+        // the row it returned is the one it wrote
+        expect(await newestSnapshot(ch)).toEqual(row);
+      });
+
+      it('Xahau: one full cycle writes the row computed by hand', async () => {
+        const ch = await fresh();
+        await seedXahau(ch);
+
+        const row = await wholeCycle(ch, xahau);
+
+        // L = 2,300,000, closed at T0 + L. burned = the fees of the ledgers up to L: 100 + 2,000 + 30 + 400 + 5 = 2,535 (the 7,000,000
+        // of the ledger after L is not in it). minted: rewards 1,000,000 + 250,000 = 1,250,000; imports 5,000,000 + 800,000 + 12,345 =
+        // 5,812,345; genesis mints 120,000,000 + 7 + 30 = 120,000,037 (the 999 and the 77 after L are not in it). accounts: one and
+        // three, of 2 + 4 = 6 owners. No AMM, and neither a network_state row nor a SetFee: no reserve values.
+        expect(await stored(ch)).toEqual({
+          ledger_index: 2_300_000,
+          close_time: 1_762_300_000,
+          started_at: 1_760_099_999,
+          computed_at: 1_760_100_122,
+          total_coins: '613401782117306',
+          burned: '2535',
+          escrowed: '18406227318004',
+          escrow_count: '2140',
+          amm: null,
+          amm_pools: 0,
+          reserve_base: null,
+          reserve_inc: null,
+          accounts: '2',
+          owner_count: '6',
+          minted_rewards: '1250000',
+          minted_import: '5812345',
+          minted_genesis: '120000037',
+        });
+        expect(await newestSnapshot(ch)).toEqual(row);
+      });
+
+      it('answers what it waits for when the cycle cannot start, and writes nothing', async () => {
+        const ch = await fresh();
+        expect(await computeSupplyCycle(ch, xahau, STARTED_AT, COMPUTED_AT)).toEqual({ waiting: 'escrows' });
+        await ready(ch);
+        expect(await computeSupplyCycle(ch, xrpl, STARTED_AT, COMPUTED_AT)).toEqual({ waiting: 'amm_pools' });
+        expect(await newestSnapshot(ch)).toBeUndefined();
+      });
+
+      it('counts a ledger and an account state written twice once', async () => {
+        const ch = await fresh();
+        await stopMerges(ch, Table.Ledgers, Table.AccountStates);
+        await seedXahau(ch, (table, rows) => insertTwice(ch, table, rows));
+        // the premise: both are in the tables twice (no merge ran, and the second insert was not dropped by the dedup window)
+        expect(await countOf(ch, `SELECT count() AS n FROM ${Table.Ledgers}`)).toBe(2 * 6);
+        expect(await countOf(ch, `SELECT count() AS n FROM ${Table.AccountStates}`)).toBe(2 * 6);
+
+        await wholeCycle(ch, xahau);
+
+        // the figures of the world written once: burned 2,535 (not 5,070), 2 accounts of 6 owners (not 4 of 12)
+        expect(await stored(ch)).toMatchObject({ burned: '2535', accounts: '2', owner_count: '6' });
+      });
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('the account ranges', () => {
+      it('leaves out the accounts deleted at or before L and the AMM pool accounts', async () => {
+        const ch = await fresh();
+        await ready(ch, { head: L + 10 });
+        await ch.insert(Table.AccountStates, [
+          accountState('rLiveOne', 100, 2),
+          accountState('rLiveTwo', 100, 1),
+          accountState('rLiveTwo', 4_000, 3),
+          accountState('rDeletedBeforeL', 100, 9),
+          deletedState('rDeletedBeforeL', L - 1),
+          accountState('rDeletedAtL', 100, 9),
+          deletedState('rDeletedAtL', L),
+          accountState('rDeletedAfterL', 100, 6),
+          deletedState('rDeletedAfterL', L + 1),
+          accountState('rOnlyAfterL', L + 1, 4),
+          // the pools: one stored, one that is deleted (its account row is not), one that has no amm_pools row yet
+          accountState(acct(1), 100, 1),
+          accountState(acct(2), 100, 5),
+          accountState(acct(3), 4_900, 7),
+        ]);
+        await ch.insert(Table.AmmPools, [pool(acct(1)), pool(acct(2), { deleted: 1 })]);
+        await ch.insert(Table.AmmPoolStates, [ammState(acct(3), 4_900)]);
+        await ch.insert(Table.AmmPoolTouches, [touch(4_900, acct(3))]);
+
+        const cycle = await start(ch, xrpl, sight(4_000));
+        expect(cycle.poolAccounts).toEqual([acct(1), acct(2), acct(3)]);
+        const counted = await runWhile(ch, xrpl, cycle, 'accounts');
+        // rLiveOne, rLiveTwo (its newest row, 3) and rDeletedAfterL (6): 3 accounts of 2 + 3 + 6 = 11 owners
+        expect([counted.accounts, counted.ownerCount]).toEqual([3n, 11n]);
+        expect(counted.pending.every((step) => step.kind !== 'accounts')).toBe(true);
+      });
+
+      it('gives each range the pool accounts inside it and no other, a few hundred, never the whole list', async () => {
+        const ch = await fresh();
+        // 15,000 pool accounts spread over the prefixes: the whole list would be about 525 KB of query parameter, over the 128 KiB a
+        // request may carry
+        const pools = Array.from(
+          { length: 15_000 },
+          (_, i) =>
+            `r${SUPPLY_ACCOUNT_PREFIXES[(i * 7) % SUPPLY_ACCOUNT_PREFIXES.length]}Pool${String(i).padStart(8, '0')}`,
+        ).sort();
+        const query = jest.spyOn(ch, 'query');
+        const done = await runWhile(
+          ch,
+          xrpl,
+          cycleOf({
+            poolAccounts: pools,
+            pending: supplyAccountRanges().map((range) => ({ kind: 'accounts', range })),
+          }),
+          'accounts',
+        );
+        expect(done.pending).toEqual([]);
+        const sent = query.mock.calls
+          .filter(([sql]) => sql === SUPPLY_ACCOUNTS_SQL)
+          .map(([, params]) => params as { lo: string; hi: string; pools: string[] });
+        expect(sent).toHaveLength(106);
+        for (const { lo, hi, pools: inside } of sent) {
+          for (const account of inside) expect(account >= lo && account < hi).toBe(true);
+          expect(JSON.stringify(inside).length).toBeLessThan(16 * 1024);
+        }
+        // every pool account went out once
+        expect(sent.flatMap((s) => s.pools).sort()).toEqual(pools);
+      });
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('the AMM steps', () => {
+      /** A world at the XRPL's L with the head 200 ledgers on, so that the fill-forward window (160,000 ledgers) is below L. */
+      const world = async (): Promise<ClickHouseService> => {
+        const ch = await fresh();
+        await ready(ch, { through: XRPL_L, head: XRPL_L + 200 });
+        return ch;
+      };
+
+      it('fills a pool touched after L back to its state at L, the null of its newest row and a value out of the window included', async () => {
+        const ch = await world();
+        await ch.insert(Table.AmmPools, [
+          // the pool was rebuilt after L: its row holds the state after L
+          pool(acct(1), { last_ledger: XRPL_L + 100, reserve_base: '9999' }),
+          pool(acct(2), { ...COUNTER_NATIVE, last_ledger: XRPL_L + 7, reserve_base: '10', reserve_counter: '1' }),
+          pool(acct(3), { last_ledger: XRPL_L + 3, reserve_base: '500', deleted: 0 }),
+        ]);
+        await ch.insert(Table.AmmPoolStates, [
+          // pool 1, native on the base side: the newest row at or before L has the base reserve and no counter reserve (the counter
+          // is filled forward from the row before it)
+          ammState(acct(1), XRPL_L - 300, { reserve_base: '300', reserve_counter: '4' }),
+          ammState(acct(1), XRPL_L - 50, { reserve_base: '250.123456', reserve_counter: null }),
+          ammState(acct(1), XRPL_L + 100, { reserve_base: '9999', reserve_counter: '4' }),
+          // pool 2, native on the counter side: the counter reserve is null in the window and its value is about a million ledgers
+          // back (160,000 are looked at first), so the fill-forward has to go further than its window to give the state at L
+          ammState(acct(2), 9_000_000, { ...COUNTER_NATIVE, reserve_base: '8', reserve_counter: '77.5' }),
+          ammState(acct(2), XRPL_L - 20, { ...COUNTER_NATIVE, reserve_base: '9', reserve_counter: null }),
+          ammState(acct(2), XRPL_L + 7, { ...COUNTER_NATIVE, reserve_base: '10', reserve_counter: '1' }),
+          // pool 3 was deleted before L, by a transaction that holds no reserve: the 500 of its older row is filled forward, and a
+          // deleted pool holds nothing
+          ammState(acct(3), XRPL_L - 100, { reserve_base: '500', reserve_counter: '5' }),
+          ammState(acct(3), XRPL_L - 5, { reserve_base: null, reserve_counter: null, deleted: 1 }),
+        ]);
+
+        const cycle = await start(ch, xrpl, sight(XRPL_L));
+        expect(stepsOf(cycle, 'amm')).toEqual([{ kind: 'amm', pools: [acct(1), acct(2), acct(3)] }]);
+        expect([cycle.amm, cycle.ammPools]).toEqual([0n, 0]); // the rows past L are not counted at the start
+        const filled = await runWhile(ch, xrpl, await runWhile(ch, xrpl, cycle, 'accounts'), 'amm');
+        // pool 1: 250.123456 XRP; pool 2: 77.5 XRP
+        expect([filled.amm, filled.ammPools]).toEqual([327_623_456n, 2]);
+        expect(filled.poolsAtZero).toEqual([]);
+      });
+
+      it('a pool created after L holds nothing at L', async () => {
+        const ch = await world();
+        await ch.insert(Table.AmmPools, [
+          pool(acct(1), { last_ledger: 100, reserve_base: '10' }),
+          pool(acct(2), { last_ledger: XRPL_L + 50, reserve_base: '5000' }), // its only state row is past L
+        ]);
+        await ch.insert(Table.AmmPoolStates, [ammState(acct(2), XRPL_L + 50, { reserve_base: '5000' })]);
+        const cycle = await runWhile(ch, xrpl, await start(ch, xrpl, sight(XRPL_L)), 'accounts');
+        expect(cycle.pending).toEqual([{ kind: 'amm', pools: [acct(2)] }]);
+        expect([cycle.amm, cycle.ammPools]).toEqual([10_000_000n, 1]);
+
+        const after = await runSupplyStep(ch, xrpl, cycle);
+        // the fill finds no row at or before L: nothing is added and nothing is wrong
+        expect([after.amm, after.ammPools, after.poolsAtZero]).toEqual([10_000_000n, 1, []]);
+        expect(after.pending).toEqual([]);
+        expect(after.poolAccounts).toEqual([acct(1), acct(2)]);
+      });
+
+      it('counts a filled pool whose native reserve it cannot read at zero and lists it, so that no pool row stalls the cycle', async () => {
+        const ch = await world();
+        const pools = [
+          pool(acct(1), { last_ledger: XRPL_L + 5 }),
+          pool(acct(2), { last_ledger: XRPL_L + 5 }),
+          pool(acct(3), { last_ledger: XRPL_L + 5 }),
+          pool(acct(4), { ...COUNTER_NATIVE, last_ledger: XRPL_L + 5 }),
+          pool(acct(5), { last_ledger: XRPL_L + 5, deleted: 1 }),
+          pool(acct(6), { base_currency: 'EUR', base_issuer: ISSUER, last_ledger: XRPL_L + 5 }),
+          pool(acct(7), { last_ledger: XRPL_L + 5 }),
+        ];
+        await ch.insert(Table.AmmPools, pools);
+        const at = XRPL_L - 10;
+        await ch.insert(Table.AmmPoolStates, [
+          ammState(acct(1), at, { reserve_base: null, reserve_counter: '5' }), // the native side has never had a reserve
+          ammState(acct(2), at, { reserve_base: '0.0000001' }), // not a whole number of drops
+          ammState(acct(3), at, { reserve_base: 'abc' }),
+          ammState(acct(4), at, { ...COUNTER_NATIVE, reserve_base: '5', reserve_counter: null }),
+          ammState(acct(5), at, { reserve_base: null, deleted: 1 }), // deleted: nothing to know
+          ammState(acct(6), at, { base_currency: 'EUR', base_issuer: ISSUER, reserve_base: null }), // no native side: nothing to know
+          ammState(acct(7), at, { reserve_base: '20' }),
+        ]);
+
+        const cycle = await start(ch, xrpl, sight(XRPL_L));
+        expect(stepsOf(cycle, 'amm')[0].pools).toHaveLength(7);
+        const done = await runWhile(ch, xrpl, await runWhile(ch, xrpl, cycle, 'accounts'), 'amm');
+        // only pool 7 is read: 20 XRP
+        expect([done.amm, done.ammPools]).toEqual([20_000_000n, 1]);
+        expect(done.poolsAtZero).toEqual([1, 2, 3, 4].map(acct));
+        expect(done.pending).toEqual([]);
+      });
+
+      it('reads the deleted UInt8 of a filled pool as a number, whatever way the client writes it', async () => {
+        const ch = await world();
+        await ch.insert(Table.AmmPools, [
+          pool(acct(1), { last_ledger: XRPL_L + 5 }),
+          pool(acct(2), { last_ledger: XRPL_L + 5 }),
+        ]);
+        await ch.insert(Table.AmmPoolStates, [
+          ammState(acct(1), XRPL_L - 10, { reserve_base: '500', deleted: 0 }),
+          ammState(acct(1), XRPL_L - 5, { reserve_base: null, reserve_counter: null, deleted: 1 }),
+          ammState(acct(2), XRPL_L - 10, { reserve_base: '20', deleted: 0 }),
+        ]);
+        const cycle = await runWhile(ch, xrpl, await start(ch, xrpl, sight(XRPL_L)), 'accounts');
+        // a client that quotes its integers answers '0' (a text, and true) for a pool that is not deleted, and '1' for one that is
+        const read = ch.query.bind(ch);
+        jest
+          .spyOn(ch, 'query')
+          .mockImplementation((async (sql: string, params?: Record<string, unknown>) =>
+            (await read(sql, params)).map((row: Record<string, unknown>) =>
+              'newest_deleted' in row ? { ...row, newest_deleted: String(row.newest_deleted) } : row,
+            )) as typeof ch.query);
+        const done = await runSupplyStep(ch, xrpl, cycle);
+        expect([done.amm, done.ammPools]).toEqual([20_000_000n, 1]);
+      });
+
+      it('lists a pool it cannot read once, beside the pools the start could not read', async () => {
+        const ch = await world();
+        await ch.insert(Table.AmmPools, [
+          pool(acct(1), { last_ledger: 100, reserve_base: 'abc' }), // unreadable at the start
+          pool(acct(2), { last_ledger: XRPL_L + 5 }),
+          pool(acct(3), { last_ledger: XRPL_L + 5 }),
+        ]);
+        await ch.insert(Table.AmmPoolStates, [
+          ammState(acct(2), XRPL_L - 10, { reserve_base: '12abc' }),
+          ammState(acct(3), XRPL_L - 10, { reserve_base: '1' }),
+        ]);
+        const cycle = await start(ch, xrpl, sight(XRPL_L));
+        expect(cycle.poolsAtZero).toEqual([acct(1)]);
+        const done = await runWhile(ch, xrpl, await runWhile(ch, xrpl, cycle, 'accounts'), 'amm');
+        expect(done.poolsAtZero).toEqual([acct(1), acct(2)]);
+        expect([done.amm, done.ammPools]).toEqual([1_000_000n, 1]);
+      });
+
+      it('runs a step of 200 pools as one fill-forward and adds every pool of it', async () => {
+        const ch = await world();
+        const count = AMM_POOLS_CHUNK + 1; // two steps, the second of one pool
+        await ch.insert(
+          Table.AmmPools,
+          Array.from({ length: count }, (_, i) => pool(acct(i + 1), { last_ledger: XRPL_L + 5 })),
+        );
+        await ch.insert(
+          Table.AmmPoolStates,
+          Array.from({ length: count }, (_, i) => ammState(acct(i + 1), XRPL_L - 10, { reserve_base: String(i + 1) })),
+        );
+        const cycle = await runWhile(ch, xrpl, await start(ch, xrpl, sight(XRPL_L)), 'accounts');
+        expect(stepsOf(cycle, 'amm').map((s) => s.pools.length)).toEqual([AMM_POOLS_CHUNK, 1]);
+        const first = await runSupplyStep(ch, xrpl, cycle);
+        // pools 1 to 200 hold 1 to 200 XRP: 200 × 201 / 2 = 20,100 XRP
+        expect([first.amm, first.ammPools]).toEqual([20_100_000_000n, AMM_POOLS_CHUNK]);
+        const second = await runSupplyStep(ch, xrpl, first);
+        expect([second.amm, second.ammPools]).toEqual([20_100_000_000n + 201_000_000n, AMM_POOLS_CHUNK + 1]);
+      });
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('a step', () => {
+      const BURNED_AND_MINTED: SupplyStep[] = [
+        { kind: 'burned', from: 10, to: 11 },
+        { kind: 'minted', from: 10, to: 11 },
+        { kind: 'minted', from: 12, to: 12 },
+      ];
+
+      async function seedSmall(ch: ClickHouseService): Promise<void> {
+        await ch.insert(Table.Ledgers, [
+          ledgerRow(10, { fee_total: 7 }),
+          ledgerRow(11, { fee_total: 9 }),
+          ledgerRow(12, { fee_total: 1_000 }),
+        ]);
+        await ch.insert(Table.GenesisMints, [mintRow(10, 100, ''), mintRow(11, 20, 'CL'), mintRow(12, 4_000, '')]);
+        await ch.insert(Table.RewardClaims, [claimRow(10, 'CL')]);
+        await ch.insert(Table.Imports, [importRow(11, 3)]);
+      }
+
+      it('adds its result to the cycle, takes the step off the plan, and leaves the cycle it was given as it was', async () => {
+        const ch = await fresh();
+        await seedSmall(ch);
+        // a frozen cycle: a step that changes a cycle in place throws
+        const cycle = deepFreeze(
+          cycleOf({
+            burned: 5n,
+            minted: { rewards: 1n, import: 2n, genesis_mint: 3n },
+            pending: BURNED_AND_MINTED,
+            steps: 3,
+          }),
+        );
+        const burned = await runSupplyStep(ch, xahau, cycle);
+        // the fees of the ledgers 10 and 11: 7 + 9 = 16 (the 1,000 of ledger 12 is not in the slice)
+        expect(burned.burned).toBe(5n + 16n);
+        expect(burned.pending).toEqual(BURNED_AND_MINTED.slice(1));
+        expect(burned.minted).toEqual({ rewards: 1n, import: 2n, genesis_mint: 3n });
+
+        const minted = await runSupplyStep(ch, xahau, burned);
+        // the ledgers 10 and 11: a genesis mint of 100, a reward of 20 (its parent is the claim of ledger 10), an import of 3
+        expect(minted.minted).toEqual({ rewards: 1n + 20n, import: 2n + 3n, genesis_mint: 3n + 100n });
+        expect(minted.burned).toBe(21n);
+        expect(minted.pending).toEqual(BURNED_AND_MINTED.slice(2));
+
+        const last = await runSupplyStep(ch, xahau, minted);
+        // ledger 12: a genesis mint of 4,000
+        expect(last.minted).toEqual({ rewards: 21n, import: 5n, genesis_mint: 4_103n });
+        expect(last.pending).toEqual([]);
+
+        // the cycles it was given are as they were
+        expect(cycle.burned).toBe(5n);
+        expect(cycle.minted).toEqual({ rewards: 1n, import: 2n, genesis_mint: 3n });
+        expect(cycle.pending).toHaveLength(3);
+        expect(burned.minted).toEqual({ rewards: 1n, import: 2n, genesis_mint: 3n });
+        expect(minted.pending).toHaveLength(1);
+      });
+
+      it('leaves the count of steps of the plan as the start made it', async () => {
+        const ch = await fresh();
+        await seedSmall(ch);
+        const cycle = cycleOf({
+          minted: { rewards: 0n, import: 0n, genesis_mint: 0n },
+          pending: BURNED_AND_MINTED,
+          steps: 3,
+        });
+        let current = cycle;
+        while (current.pending.length > 0) current = await runSupplyStep(ch, xahau, current);
+        // it is how many steps the plan had, the number a log line gives, not how many are left or done
+        expect(current.steps).toBe(3);
+      });
+
+      it.each<[string, Partial<SupplyCycle>]>([
+        ['accounts', { pending: [{ kind: 'accounts', range: { lo: 'r', hi: 's' } }] }],
+        ['amm', { amm: 0n, pending: [{ kind: 'amm', pools: [acct(1)] }] }],
+        ['burned', { pending: [{ kind: 'burned', from: 1, to: 10 }] }],
+        [
+          'minted',
+          { minted: { rewards: 0n, import: 0n, genesis_mint: 0n }, pending: [{ kind: 'minted', from: 1, to: 10 }] },
+        ],
+      ])(
+        'the %s step that throws leaves the cycle as it was, so that it is run again as it was',
+        async (_kind, over) => {
+          const ch = await fresh();
+          const cycle = deepFreeze(cycleOf(over));
+          const before = structuredClone(cycle);
+          jest.spyOn(ch, 'query').mockRejectedValueOnce(new Error('the server went away'));
+          await expect(runSupplyStep(ch, xrpl, cycle)).rejects.toThrow('the server went away');
+          expect(cycle).toEqual(before);
+          // the next try is the same step, and it works
+          const again = await runSupplyStep(ch, xrpl, cycle);
+          expect(again.pending).toEqual(before.pending.slice(1));
+        },
+      );
+
+      it('throws when no step is left, and for a step the cycle has no use for, without a read', async () => {
+        const ch = await fresh();
+        const query = jest.spyOn(ch, 'query');
+        await expect(runSupplyStep(ch, xrpl, cycleOf())).rejects.toThrow('no step');
+        await expect(
+          runSupplyStep(ch, xahau, cycleOf({ amm: null, pending: [{ kind: 'amm', pools: [acct(1)] }] })),
+        ).rejects.toThrow('amm');
+        await expect(
+          runSupplyStep(ch, xrpl, cycleOf({ minted: null, pending: [{ kind: 'minted', from: 1, to: 2 }] })),
+        ).rejects.toThrow('minted');
+        expect(query).not.toHaveBeenCalled();
+      });
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('the snapshot row and its write', () => {
+      const full = (): SupplyCycle =>
+        cycleOf({
+          ledger: 107_747_456,
+          closeTime: 1_761_000_000,
+          startedAt: 1_760_999_900,
+          totalCoins: 99_985_312_374_716_318n,
+          escrowed: 35_212_847_105_402_318n,
+          escrowCount: 12_879,
+          reserveBase: 1_000_000n,
+          reserveInc: 200_000n,
+          amm: 9_007_199_254_740_993n,
+          ammPools: 14_594,
+          accounts: 6_410_280n,
+          ownerCount: 16_998_620n,
+          burned: 14_687_625_283_682n,
+          minted: { rewards: 41_203_318_512_207n, import: 8_102_233_104n, genesis_mint: 120_000n },
+        });
+
+      it('has the columns of network_supply in their order, the drops as decimal strings', async () => {
+        const ch = await fresh();
+        const row = supplySnapshotRow(full(), 1_761_000_100, 1_761_000_100_123);
+        expect(row).toEqual({
+          ledger_index: 107_747_456,
+          close_time: 1_761_000_000,
+          started_at: 1_760_999_900,
+          computed_at: 1_761_000_100,
+          total_coins: '99985312374716318',
+          burned: '14687625283682',
+          escrowed: '35212847105402318',
+          escrow_count: '12879',
+          amm: '9007199254740993',
+          amm_pools: 14_594,
+          reserve_base: '1000000',
+          reserve_inc: '200000',
+          accounts: '6410280',
+          owner_count: '16998620',
+          minted_rewards: '41203318512207',
+          minted_import: '8102233104',
+          minted_genesis: '120000',
+          version: '1761000100123',
+        });
+        const columns = await ch.query<{ name: string }>(
+          `SELECT name FROM system.columns WHERE database = currentDatabase() AND table = {t:String} ORDER BY position`,
+          { t: Table.NetworkSupply },
+        );
+        expect(Object.keys(row)).toEqual(columns.map((c) => c.name));
+      });
+
+      it('leaves NULL the parts the cycle does not have: no AMM, no reserve values, no minting', () => {
+        const row = supplySnapshotRow(
+          { ...full(), amm: null, ammPools: 0, reserveBase: null, reserveInc: null, minted: null },
+          1_761_000_100,
+          5,
+        );
+        expect(row).toMatchObject({
+          amm: null,
+          amm_pools: 0,
+          reserve_base: null,
+          reserve_inc: null,
+          minted_rewards: null,
+          minted_import: null,
+          minted_genesis: null,
+        });
+        // and a zero is a zero, not a NULL: an AMM with no native coin, minting that has minted nothing
+        const zeros = supplySnapshotRow(
+          {
+            ...full(),
+            amm: 0n,
+            minted: { rewards: 0n, import: 0n, genesis_mint: 0n },
+            reserveBase: 0n,
+            reserveInc: 0n,
+          },
+          1_761_000_100,
+          5,
+        );
+        expect(zeros).toMatchObject({
+          amm: '0',
+          minted_rewards: '0',
+          minted_import: '0',
+          minted_genesis: '0',
+          reserve_base: '0',
+          reserve_inc: '0',
+        });
+      });
+
+      it('stores the row as the api reads it back, NULLs included', async () => {
+        const ch = await fresh();
+        const cycle = { ...full(), amm: null, reserveBase: null, reserveInc: null, minted: null };
+        const written = await writeSupplySnapshot(ch, cycle, 1_761_000_100);
+        expect(written.computed_at).toBe(1_761_000_100);
+        expect(await newestSnapshot(ch)).toEqual(written);
+        expect(written).toMatchObject({ amm: null, reserve_base: null, reserve_inc: null, minted_import: null });
+      });
+
+      it('writes the same ledger again under a newer version, and the newest snapshot is the second', async () => {
+        const ch = await fresh();
+        await stopMerges(ch, Table.NetworkSupply);
+        const first = await writeSupplySnapshot(ch, { ...full(), accounts: 1n }, 1_761_000_100);
+        const second = await writeSupplySnapshot(ch, { ...full(), accounts: 2n }, 1_761_000_200);
+        expect(BigInt(second.version)).toBeGreaterThan(BigInt(first.version));
+        // two rows of the one key, until a merge
+        expect(await countOf(ch, `SELECT count() AS n FROM ${Table.NetworkSupply}`)).toBe(2);
+        expect(await newestSnapshot(ch)).toEqual(second);
+        expect((await newestSnapshot(ch))?.accounts).toBe('2');
+      });
+
+      it('takes a version one above the newest of its own ledger when the clock is behind it, and none from another ledger', async () => {
+        const ch = await fresh();
+        const ahead = BigInt(Date.now()) + 3_600_000n; // a snapshot written by a clock an hour fast
+        const base = supplySnapshotRow(full(), 1_761_000_100, 1);
+        await ch.insert(Table.NetworkSupply, [{ ...base, version: String(ahead) }]);
+        await ch.insert(Table.NetworkSupply, [
+          { ...base, ledger_index: base.ledger_index + 1, version: String(ahead * 2n) },
+        ]);
+
+        const again = await writeSupplySnapshot(ch, full(), 1_761_000_200);
+        expect(again.version).toBe(String(ahead + 1n)); // not the clock, and not the other ledger's
+        const other = await writeSupplySnapshot(ch, { ...full(), ledger: full().ledger + 2 }, 1_761_000_200);
+        expect(BigInt(other.version)).toBeLessThan(ahead); // a ledger of its own: the clock
+      });
+
+      it('writes nothing once aborted', async () => {
+        const ch = await fresh();
+        const aborted = new AbortController();
+        aborted.abort();
+        const read = ch.query.bind(ch);
+        const query = jest.spyOn(ch, 'query');
+        const insert = jest.spyOn(ch, 'insert');
+        await expect(writeSupplySnapshot(ch, full(), 1_761_000_100, aborted.signal)).rejects.toBeInstanceOf(
+          AggregateSetAborted,
+        );
+        expect(query).not.toHaveBeenCalled();
+        expect(insert).not.toHaveBeenCalled();
+
+        // aborted while the version is read: the insert is not made
+        const late = new AbortController();
+        query.mockImplementationOnce((async (sql: string, params?: Record<string, unknown>) => {
+          const rows = await read(sql, params);
+          late.abort();
+          return rows;
+        }) as typeof ch.query);
+        await expect(writeSupplySnapshot(ch, full(), 1_761_000_100, late.signal)).rejects.toBeInstanceOf(
+          AggregateSetAborted,
+        );
+        expect(insert).not.toHaveBeenCalled();
+        expect(await newestSnapshot(ch)).toBeUndefined();
+      });
+
+      it('writes when its signal is not aborted', async () => {
+        const ch = await fresh();
+        const written = await writeSupplySnapshot(ch, full(), 1_761_000_100, new AbortController().signal);
+        expect(await newestSnapshot(ch)).toEqual(written);
+      });
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('what the steps read', () => {
+      // Each table holds, besides the rows a step needs, bulks of rows it must skip: more than the bound of the read, in the very parts
+      // it reads (both sides of its rows) and in the other partitions. The merges are stopped, so every insert stays a part of its own.
+      // The bound is the rows the read needs and two granules for each part that holds some of them.
+      const currentDatabase = async (ch: ClickHouseService): Promise<string> =>
+        ((await ch.queryOne<{ db: string }>('SELECT currentDatabase() AS db')) as { db: string }).db;
+
+      interface Stage {
+        keys: string[];
+        condition: string;
+        granules: [number, number];
+      }
+
+      /** The primary key stage of an `EXPLAIN indexes = 1`: the columns it searches, its condition, the granules it keeps of the table's. */
+      async function primaryKeyStage(
+        ch: ClickHouseService,
+        sql: string,
+        params: Record<string, unknown>,
+      ): Promise<Stage> {
+        const lines = (await ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${sql}`, params)).map((r) =>
+          r.explain.trim(),
+        );
+        const at = lines.indexOf('PrimaryKey');
+        expect(at).toBeGreaterThan(-1);
+        const keysAt = lines.indexOf('Keys:', at);
+        const conditionAt = lines.findIndex((line, i) => i > at && line.startsWith('Condition:'));
+        const granules = lines.slice(at).find((line) => line.startsWith('Granules:')) as string;
+        const [kept, all] = granules.slice('Granules:'.length).trim().split('/').map(Number);
+        return { keys: lines.slice(keysAt + 1, conditionAt), condition: lines[conditionAt], granules: [kept, all] };
+      }
+
+      describe('an account range', () => {
+        const RANGE = supplyAccountRanges()[60];
+        const PARTS = 4; // inserts, so parts
+        const BULK = 30_000; // accounts below the range, and as many above it, in every part
+        const BASE = 2_000; // accounts of the range in every part, at ledger 10 (owner count 2)
+        const DELETED = 200; // of them, deleted at ledger 20
+        const AFTER = 200; // other ones of them, with a row after L (owner count 9)
+        const INSIDE = (BASE + DELETED + AFTER) * PARTS;
+        const INSIDE_WHERE = 'account >= {lo:String} AND account < {hi:String}';
+        const params = { lo: RANGE.lo, hi: RANGE.hi };
+        let ch: ClickHouseService;
+
+        beforeAll(async () => {
+          ch = await fresh();
+          await stopMerges(ch, Table.AccountStates);
+          for (let part = 0; part < PARTS; part++) {
+            // accounts `<prefix>p<part><n>`: a different one in every part; the columns in the table's order
+            const accounts = (
+              prefix: string,
+              count: number,
+              from: number,
+              ledger: number,
+              owner: number,
+              deleted: number,
+            ) => `
+              SELECT concat({${prefix}:String}, 'p', toString({part:UInt8}), leftPad(toString(n.number + ${from}), 8, '0')),
+                     toUInt32(${ledger}), toUInt32(0), toUInt16(0), '', toDateTime(1700000000, 'UTC'), '1', toUInt32(0),
+                     toUInt32(1), toUInt32(${owner}), '', toUInt8(${deleted})
+                FROM numbers(${count}) AS n`;
+            await ch.command(
+              `INSERT INTO ${Table.AccountStates} ${[
+                accounts('below', BULK, 0, 10, 2, 0),
+                accounts('lo', BASE, 0, 10, 2, 0),
+                accounts('lo', DELETED, 0, 20, 0, 1),
+                accounts('lo', AFTER, DELETED, L + 1, 9, 0),
+                accounts('above', BULK, 0, 10, 2, 0),
+              ].join('\nUNION ALL\n')}`,
+              { below: 'r11', lo: RANGE.lo, above: 'rzz', part },
+            );
+          }
+        });
+
+        it('has a bulk each side of the range in every part, more than the bound of the read', async () => {
+          expect(
+            await countOf(ch, `SELECT count() AS n FROM ${Table.AccountStates} WHERE ${INSIDE_WHERE}`, params),
+          ).toBe(INSIDE);
+          expect(await partsWith(ch, Table.AccountStates, INSIDE_WHERE, params)).toBe(PARTS);
+          expect(await granuleOf(ch, Table.AccountStates)).toBe(GRANULE);
+          const limit = await bound(ch, Table.AccountStates, INSIDE, INSIDE_WHERE, params);
+          expect(PARTS * BULK).toBeGreaterThan(limit);
+          expect(
+            await countOf(ch, `SELECT count() AS n FROM ${Table.AccountStates} WHERE account < {lo:String}`, params),
+          ).toBe(PARTS * BULK);
+          expect(
+            await countOf(ch, `SELECT count() AS n FROM ${Table.AccountStates} WHERE account >= {hi:String}`, params),
+          ).toBe(PARTS * BULK);
+        });
+
+        it('EXPLAIN: the primary key is searched on the account, and keeps a small part of the table', async () => {
+          const stage = await primaryKeyStage(ch, SUPPLY_ACCOUNTS_SQL, { ...params, L, pools: [] });
+          expect(stage.keys[0]).toBe('account');
+          expect(stage.condition).toContain('account');
+          expect(stage.granules[0] * 5).toBeLessThan(stage.granules[1]);
+        });
+
+        it('reads about the rows of its range and nothing of the table beyond them, and no other table', async () => {
+          let cycle: SupplyCycle | undefined;
+          const all = await logged(
+            ch,
+            async () => {
+              cycle = await runSupplyStep(ch, xrpl, cycleOf({ pending: [{ kind: 'accounts', range: RANGE }] }));
+            },
+            Table.AccountStates,
+          );
+          expect(all).toHaveLength(1);
+          const limit = await bound(ch, Table.AccountStates, INSIDE, INSIDE_WHERE, params);
+          expect(all[0].read_rows).toBeLessThanOrEqual(limit);
+          expect(all[0].read_rows).toBeGreaterThanOrEqual(INSIDE);
+          expect(all[0].tables).toEqual([`${await currentDatabase(ch)}.${Table.AccountStates}`]);
+          // the answer: 1,800 accounts of owner count 2 in every part (the deleted ones are out, and the row after L is not seen)
+          expect([cycle?.accounts, cycle?.ownerCount]).toEqual([
+            BigInt(PARTS * (BASE - DELETED)),
+            BigInt(PARTS * 2 * (BASE - DELETED)),
+          ]);
+        });
+      });
+
+      describe('a burned slice', () => {
+        // a partition of ledgers (2,000,000 to 2,059,999) in one part, the slice in the middle of it; two other partitions of 30,000
+        const FROM = 2_025_000;
+        const TO = 2_028_999;
+        const NEEDED = TO - FROM + 1;
+        const SLICE_WHERE = 'ledger_index BETWEEN {from:UInt32} AND {to:UInt32}';
+        const params = { from: FROM, to: TO };
+        let ch: ClickHouseService;
+
+        beforeAll(async () => {
+          ch = await fresh();
+          await stopMerges(ch, Table.Ledgers);
+          const ledgers = (base: number, rows: number) =>
+            ch.command(
+              `INSERT INTO ${Table.Ledgers} (ledger_index, ledger_hash, total_coins, close_time, fee_total, parser_version)
+               SELECT toUInt32({base:UInt32} + n.number), concat('H', toString(n.number)), toUInt64(1), toDateTime(1700000000, 'UTC'),
+                      toUInt64(if(toUInt32({base:UInt32} + n.number) BETWEEN {from:UInt32} AND {to:UInt32}, 3, 1000)),
+                      toUInt16(${MINT_PARSER_VERSION})
+                 FROM numbers({rows:UInt32}) AS n`,
+              { base, rows, ...params },
+            );
+          await ledgers(2_000_000, 60_000);
+          await ledgers(1_000_000, 30_000);
+          await ledgers(3_000_000, 30_000);
+        });
+
+        it('has a bulk each side of the slice in its part, and in the partitions beside it, more than the bound of the read', async () => {
+          expect(await countOf(ch, `SELECT count() AS n FROM ${Table.Ledgers} WHERE ${SLICE_WHERE}`, params)).toBe(
+            NEEDED,
+          );
+          expect(await partsWith(ch, Table.Ledgers, SLICE_WHERE, params)).toBe(1);
+          const limit = await bound(ch, Table.Ledgers, NEEDED, SLICE_WHERE, params);
+          expect(
+            await countOf(ch, `SELECT count() AS n FROM ${Table.Ledgers} WHERE ledger_index < {from:UInt32}`, params),
+          ).toBe(
+            55_000, // 25,000 below the slice in its part, 30,000 in the partition before it
+          );
+          expect(FROM - 2_000_000).toBeGreaterThan(limit); // below the slice, in its part
+          expect(2_060_000 - TO - 1).toBeGreaterThan(limit); // above it
+          expect(30_000).toBeGreaterThan(limit); // each of the other partitions
+        });
+
+        it('reads the ledgers of its slice and nothing else: no other table, no ledger beyond its ends', async () => {
+          let cycle: SupplyCycle | undefined;
+          const all = await logged(
+            ch,
+            async () => {
+              cycle = await runSupplyStep(
+                ch,
+                xahau,
+                cycleOf({ burned: 5n, pending: [{ kind: 'burned', from: FROM, to: TO }] }),
+              );
+            },
+            Table.Ledgers,
+          );
+          expect(all).toHaveLength(1);
+          const limit = await bound(ch, Table.Ledgers, NEEDED, SLICE_WHERE, params);
+          expect(all[0].read_rows).toBeLessThanOrEqual(limit);
+          expect(all[0].read_rows).toBeGreaterThanOrEqual(NEEDED);
+          expect(all[0].tables).toEqual([`${await currentDatabase(ch)}.${Table.Ledgers}`]);
+          // 3 drops of fee in each of the ledgers of the slice, on top of the 5 the cycle had
+          expect(cycle?.burned).toBe(5n + BigInt(3 * NEEDED));
+        });
+      });
+
+      describe('an amm step', () => {
+        // two pools (the base and the counter of a pair are the native side of one each), each with 30,000 rows below the window of
+        // the fill-forward, 2,000 in it, 30,000 after L; and 30,000 rows of other pools each side of them, in the same part
+        const AL = 1_000_000;
+        const FROM = AL - AMM_FILL_WINDOW_LEDGERS;
+        const BELOW = 30_000;
+        const WINDOW = 2_000;
+        const AFTER = 30_000;
+        const P = acct(100);
+        const Q = acct(200);
+        const WINDOW_WHERE = 'amm_account = {account:String} AND ledger_index BETWEEN {from:UInt32} AND {to:UInt32}';
+        let ch: ClickHouseService;
+
+        beforeAll(async () => {
+          ch = await fresh();
+          await stopMerges(ch, Table.AmmPoolStates);
+          // a state row: its pair (the native side holds the reserve under test, the other 5 or 3), its place and its reserves
+          const rows = (
+            account: string,
+            counter: boolean,
+            count: number,
+            first: number,
+            reserve: string,
+            lastRow?: string,
+          ) => {
+            const native =
+              lastRow === undefined ? `'${reserve}'` : `if(n.number = ${count - 1}, '${lastRow}', '${reserve}')`;
+            return `SELECT '${account}', toUInt32(${first} + n.number), toUInt32(0), '', toDateTime(1700000000, 'UTC'), 'AMMDeposit',
+                   '${counter ? 'USD' : 'XRP'}', '${counter ? ISSUER : ''}', '${counter ? 'XRP' : 'USD'}', '${counter ? '' : ISSUER}',
+                   ${counter ? "'3'" : native}, ${counter ? native : "'5'"}, toUInt8(0)
+              FROM numbers(${count}) AS n`;
+          };
+          const pool = (account: string, counter: boolean, windowLast: string) => [
+            rows(account, counter, BELOW, 100_000, '5'),
+            rows(account, counter, WINDOW, 900_000, '5', windowLast),
+            rows(account, counter, AFTER, AL + 1, '1000'),
+          ];
+          const other = (prefix: string, count: number) => `
+            SELECT concat('${prefix}', leftPad(toString(n.number % 50), 2, '0')), toUInt32(100000 + n.number), toUInt32(0), '',
+                   toDateTime(1700000000, 'UTC'), 'AMMDeposit', 'XRP', '', 'USD', '${ISSUER}', '5', '5', toUInt8(0)
+              FROM numbers(${count}) AS n`;
+          await ch.command(
+            `INSERT INTO ${Table.AmmPoolStates}
+               (amm_account, ledger_index, tx_index, tx_hash, close_time, tx_type, base_currency, base_issuer, counter_currency,
+                counter_issuer, reserve_base, reserve_counter, deleted)
+             ${[
+               other('rAmm0000', 15_000),
+               ...pool(P, false, '7.5'),
+               ...pool(Q, true, '2.25'),
+               other('rAmm0003', 15_000),
+             ].join('\nUNION ALL\n')}`,
+          );
+          // another part, of other pools
+          await ch.command(
+            `INSERT INTO ${Table.AmmPoolStates}
+               (amm_account, ledger_index, tx_index, tx_hash, close_time, tx_type, base_currency, base_issuer, counter_currency,
+                counter_issuer, reserve_base, reserve_counter, deleted)
+             ${other('rAmm0004', 30_000)}`,
+          );
+        });
+
+        const limit = async (): Promise<number> => {
+          let total = 0;
+          for (const account of [P, Q]) {
+            total += await bound(ch, Table.AmmPoolStates, WINDOW, WINDOW_WHERE, { account, from: FROM, to: AL });
+          }
+          return total;
+        };
+
+        it('has bulks to skip around the window of each pool, more than the bound of the read', async () => {
+          for (const account of [P, Q]) {
+            const own = { account, from: FROM, to: AL };
+            expect(
+              await countOf(ch, `SELECT count() AS n FROM ${Table.AmmPoolStates} WHERE ${WINDOW_WHERE}`, own),
+            ).toBe(WINDOW);
+            expect(await partsWith(ch, Table.AmmPoolStates, WINDOW_WHERE, own)).toBe(1);
+            expect(
+              await countOf(
+                ch,
+                `SELECT count() AS n FROM ${Table.AmmPoolStates} WHERE amm_account = {account:String} AND ledger_index < {from:UInt32}`,
+                own,
+              ),
+            ).toBe(BELOW);
+            expect(
+              await countOf(
+                ch,
+                `SELECT count() AS n FROM ${Table.AmmPoolStates} WHERE amm_account = {account:String} AND ledger_index > {to:UInt32}`,
+                own,
+              ),
+            ).toBe(AFTER);
+          }
+          // the bound of the read is that of the two pools, and each side of each pool is more than the bound of one
+          const eachPool = (await limit()) / 2;
+          expect(BELOW).toBeGreaterThan(eachPool);
+          expect(AFTER).toBeGreaterThan(eachPool);
+          expect(await granuleOf(ch, Table.AmmPoolStates)).toBe(GRANULE);
+        });
+
+        it('reads the window of its pools in the state rows and nothing else, and the pools at L are the ones it adds', async () => {
+          let cycle: SupplyCycle | undefined;
+          const all = await logged(
+            ch,
+            async () => {
+              cycle = await runSupplyStep(
+                ch,
+                xrpl,
+                cycleOf({ ledger: AL, amm: 0n, pending: [{ kind: 'amm', pools: [P, Q] }] }),
+              );
+            },
+            Table.AmmPoolStates,
+          );
+          expect(all).toHaveLength(1);
+          expect(all[0].read_rows).toBeLessThanOrEqual(await limit());
+          expect(all[0].read_rows).toBeGreaterThanOrEqual(2 * WINDOW);
+          expect(all[0].tables).toEqual([`${await currentDatabase(ch)}.${Table.AmmPoolStates}`]);
+          // P: 7.5 XRP in the last row of its window; Q: 2.25 XRP on the counter side
+          expect([cycle?.amm, cycle?.ammPools, cycle?.poolsAtZero]).toEqual([9_750_000n, 2, []]);
+        });
       });
     });
   });

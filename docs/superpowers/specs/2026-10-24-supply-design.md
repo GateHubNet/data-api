@@ -537,6 +537,8 @@ are four reads, and the test (`supply-job.e2e-spec.ts`) seeds bulks of more than
 `tx_by_type` read with the type moved last in the order: 40,960; the `transactions` read by place alone: 65,537). The Xahau burned row is one
 read of `ledgers` for each slice, within that partition (Task 7).*
 
+*Amended 2026-10-30 by the D7 Task 7 build: the three step reads are pinned in the same form (the rows the read needs and two granules for each part that holds some of them, merges stopped, a bulk of more than the bound each side of the rows in the very parts it reads). Measured against the bound: an account range of 9,600 rows in four parts, 32,768 rows read against 75,136 (without the lower bound of the range 131,072, without the upper bound 151,296, with `account` hidden from the key 249,600); a burned slice of 4,000 ledgers in a part of 60,000 rows, 8,192 against 20,384 (without the lower bound 62,768, without the upper 65,424, with `ledger_index` hidden from the key 120,000), the one table `ledgers` alone; an `amm` step of two pools with 2,000 rows each in the window, 16,384 against 36,768 (the window taken from ledger 0 81,920, taken up to a ledger past L 73,728), the bound being the sum of those of the pools, since each pool is a range of the key of its own. The account range's bound in the table above is therefore the rows of `[lo, hi)` plus two granules for each part. `SupplyCycle.steps` is the number of steps the plan had at the start, the number of the log line (4.6); a step leaves it as it is.*
+
 ## 7. XRPL, Xahau and the sandbox
 
 | | XRPL | Xahau |
