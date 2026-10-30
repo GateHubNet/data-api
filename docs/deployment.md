@@ -262,6 +262,11 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. The syncer's ClickHouse user needs `ALTER DELETE` on `token_lines` and `tokens` (the privilege that `ALTER TABLE ... DROP PARTITION` asks for) (the shipped
   full-access `data_api` user has it, [clickhouse](clickhouse.md)). The first generation of the issued tokens is built by the `tokens` job in the hours after the deploy (finish any history fill first: a fill that moves the coverage start restarts the build, [operations](operations.md#issued-tokens)): the explorer's `TOKENS` switch waits for
   `syncer_tokens_live` 1 ([operations](operations.md#issued-tokens)).
+- `015_supply.sql` (four `CREATE TABLE IF NOT EXISTS`: the ledger-derived Xahau mint tables `genesis_mints`, `imports` and `reward_claims`, and the aggregate `network_supply`) is additive but **sets an
+  order**: `migrate` first, then the syncer, then the api. A syncer of this version (parser version 9) writes the three ledger tables with the mints of a ledger (Xahau only) and deletes from them,
+  on every network, when recovery or `--reprocess` rewrites a ledger; a statement on a missing table fails, so the live runner would retry the same ledgers without end. Its `supply` job reads them and
+  writes `network_supply`, and the supply routes of the api answer 500 until the tables exist. Nothing checks for them at boot yet (a check like 014's comes with the mint parsers and the supply job of
+  this release). The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last.
 
 ## Configuration and secrets
 

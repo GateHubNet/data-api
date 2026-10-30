@@ -48,6 +48,12 @@ export enum Table {
   // The ledger-ordered index of the trust lines and issuers whose token state a transaction changed (migration 014, written by
   // ingest from parser version 8): the tokens job scans it by ledger, as the aggregator scans the other touch tables.
   StateTouches = 'state_touches',
+  // The Xahau mint tables (migration 015, written by ingest from parser version 9, MINT_PARSER_VERSION; empty on XRPL): the
+  // native entries of a successful GenesisMint, a successful Import and every ClaimReward, from which the supply job derives
+  // the minted totals.
+  GenesisMints = 'genesis_mints',
+  Imports = 'imports',
+  RewardClaims = 'reward_claims',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -92,6 +98,9 @@ export enum Table {
   TokenGenerations = 'token_generations',
   TokenLines = 'token_lines',
   Tokens = 'tokens',
+  // Written by the aggregator's `supply` job (migration 015): one row per snapshot of the native supply, the newest version of a
+  // ledger wins.
+  NetworkSupply = 'network_supply',
   // Migration 012, written by the syncer's tomls worker: one row per check of a domain's toml, the newest wins.
   DomainTomls = 'domain_tomls',
   // Written by the operator with plain SQL inserts (ADR-0014).

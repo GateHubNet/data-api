@@ -142,6 +142,15 @@ const SHAPES: Record<Table, Shape> = {
     partition: P6,
     order: 'ledger_index, tx_index, kind, account, counterparty, currency',
   },
+  // the Xahau mints (migration 015): ledger-derived, one row per entry of a successful GenesisMint, per successful Import and
+  // per ClaimReward, empty on XRPL
+  [Table.GenesisMints]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, mint_index',
+  },
+  [Table.Imports]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
+  [Table.RewardClaims]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -309,6 +318,8 @@ const SHAPES: Record<Table, Shape> = {
     partition: 'generation',
     order: 'issuer, currency',
   },
+  // the supply snapshots (migration 015): no partition, the newest version of a ledger wins
+  [Table.NetworkSupply]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'ledger_index' },
   // what the tomls worker read of a domain (migration 012): one row per check, the newest wins
   [Table.DomainTomls]: { engine: 'ReplacingMergeTree', version: 'checked_at', partition: '', order: 'domain' },
   [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
@@ -391,6 +402,10 @@ const MIGRATION_013_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectC
 const MIGRATION_014 = '014_issued_tokens.sql';
 /** The tables of migration 014. */
 const MIGRATION_014_TABLES: Table[] = [Table.StateTouches, Table.TokenGenerations, Table.TokenLines, Table.Tokens];
+/** The supply (D7): the three ledger-derived Xahau mint tables and the aggregate of the `supply` job. */
+const MIGRATION_015 = '015_supply.sql';
+/** The tables of migration 015. */
+const MIGRATION_015_TABLES: Table[] = [Table.GenesisMints, Table.Imports, Table.RewardClaims, Table.NetworkSupply];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -426,6 +441,9 @@ const DEDUP_TABLES: Table[] = [
   Table.ObjectChanges,
   Table.AccountObjectChanges,
   Table.StateTouches,
+  Table.GenesisMints,
+  Table.Imports,
+  Table.RewardClaims,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1964,6 +1982,199 @@ describe('migrations (e2e)', () => {
         { name: 'counterparty', type: 'String' },
         { name: 'currency', type: 'LowCardinality(String)' },
       ]);
+    });
+  });
+
+  describe('migration 015', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-015-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 015 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_015_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_015);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_015);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_015_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_015]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_015], skipped: before });
+      for (const table of MIGRATION_015_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('gives the four tables the columns of the spec, in order', async () => {
+      const config = { ...ch.config, database: 'ctl_015_columns' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const columnsOf = async (table: Table): Promise<Array<[string, string]>> =>
+        (
+          await admin.query<{ name: string; type: string }>(
+            `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} ORDER BY position`,
+            { db: config.database, table },
+          )
+        ).map((c) => [c.name, c.type]);
+
+      expect(await columnsOf(Table.GenesisMints)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['mint_index', 'UInt16'],
+        ['tx_hash', 'String'],
+        ['close_time', "DateTime('UTC')"],
+        ['destination', 'String'],
+        ['amount', 'UInt64'],
+        ['parent_tx_hash', 'String'],
+        ['emit_hook_hash', 'String'],
+      ]);
+      expect(await columnsOf(Table.Imports)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['tx_hash', 'String'],
+        ['close_time', "DateTime('UTC')"],
+        ['account', 'String'],
+        ['minted', 'UInt64'],
+        ['account_created', 'UInt8'],
+      ]);
+      expect(await columnsOf(Table.RewardClaims)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['tx_hash', 'String'],
+        ['close_time', "DateTime('UTC')"],
+        ['account', 'String'],
+        ['issuer', 'String'],
+        ['opt_out', 'UInt8'],
+      ]);
+      expect(await columnsOf(Table.NetworkSupply)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['close_time', "DateTime('UTC')"],
+        ['started_at', "DateTime('UTC')"],
+        ['computed_at', "DateTime('UTC')"],
+        ['total_coins', 'UInt64'],
+        ['burned', 'UInt64'],
+        ['escrowed', 'UInt64'],
+        ['escrow_count', 'UInt64'],
+        ['amm', 'Nullable(UInt64)'],
+        ['amm_pools', 'UInt32'],
+        ['reserve_base', 'Nullable(UInt64)'],
+        ['reserve_inc', 'Nullable(UInt64)'],
+        ['accounts', 'UInt64'],
+        ['owner_count', 'UInt64'],
+        ['minted_rewards', 'Nullable(UInt64)'],
+        ['minted_import', 'Nullable(UInt64)'],
+        ['minted_genesis', 'Nullable(UInt64)'],
+        ['version', 'UInt64'],
+      ]);
+    });
+
+    it('network_supply: NULL where a network has no value, and the newest snapshot by a read of the end of the key, with no FINAL', async () => {
+      const config = { ...ch.config, database: 'ctl_015_supply' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        const sample = SAMPLE_ROWS[Table.NetworkSupply];
+        const at = (ledgerOffset: number, version: number, over: Partial<typeof sample> = {}) => ({
+          ...sample,
+          ...over,
+          ledger_index: sample.ledger_index + ledgerOffset,
+          version,
+        });
+        // Merges are stopped, so it is the read and not a merge that picks the newest version.
+        await svc.command(`SYSTEM STOP MERGES ${Table.NetworkSupply}`);
+        try {
+          // an XRPL snapshot has no mints, a Xahau one no pools, and either has no reserve value before the first poll
+          await svc.insert(Table.NetworkSupply, [
+            at(-20, 100, { minted_rewards: null, minted_import: null, minted_genesis: null }),
+          ]);
+          await svc.insert(Table.NetworkSupply, [at(-10, 9_000, { amm: null })]);
+          // a cycle redone at the same ledger writes the same key under a newer version
+          await svc.insert(Table.NetworkSupply, [at(0, 1_000)]);
+          await svc.insert(Table.NetworkSupply, [at(0, 2_000, { reserve_base: null, reserve_inc: null })]);
+
+          expect(
+            await svc.queryOne(
+              `SELECT ledger_index, toString(version) AS version, toString(amm) AS amm, reserve_base, reserve_inc,
+                      toString(minted_import) AS minted_import
+                 FROM ${Table.NetworkSupply} ORDER BY ledger_index DESC, version DESC LIMIT 1`,
+            ),
+          ).toEqual({
+            ledger_index: sample.ledger_index,
+            version: '2000',
+            amm: String(sample.amm),
+            reserve_base: null,
+            reserve_inc: null,
+            minted_import: String(sample.minted_import),
+          });
+          expect(
+            await svc.queryOne(
+              `SELECT toString(amm) AS amm, toString(minted_rewards) AS minted_rewards, toString(minted_import) AS minted_import,
+                      toString(minted_genesis) AS minted_genesis
+                 FROM ${Table.NetworkSupply} WHERE ledger_index = {ledger:UInt32}`,
+              { ledger: sample.ledger_index - 10 },
+            ),
+          ).toEqual({
+            amm: null,
+            minted_rewards: String(sample.minted_rewards),
+            minted_import: String(sample.minted_import),
+            minted_genesis: String(sample.minted_genesis),
+          });
+          expect(
+            await svc.queryOne(
+              `SELECT toString(minted_rewards) AS minted_rewards, toString(minted_import) AS minted_import,
+                      toString(minted_genesis) AS minted_genesis
+                 FROM ${Table.NetworkSupply} WHERE ledger_index = {ledger:UInt32}`,
+              { ledger: sample.ledger_index - 20 },
+            ),
+          ).toEqual({ minted_rewards: null, minted_import: null, minted_genesis: null });
+        } finally {
+          await svc.command(`SYSTEM START MERGES ${Table.NetworkSupply}`);
+        }
+
+        // a merge keeps the newest version of each ledger and nothing else
+        await svc.command(`OPTIMIZE TABLE ${Table.NetworkSupply} FINAL`);
+        expect(
+          await svc.query(
+            `SELECT ledger_index, toString(version) AS version FROM ${Table.NetworkSupply} ORDER BY ledger_index`,
+          ),
+        ).toEqual([
+          { ledger_index: sample.ledger_index - 20, version: '100' },
+          { ledger_index: sample.ledger_index - 10, version: '9000' },
+          { ledger_index: sample.ledger_index, version: '2000' },
+        ]);
+      } finally {
+        await svc.close();
+      }
     });
   });
 });

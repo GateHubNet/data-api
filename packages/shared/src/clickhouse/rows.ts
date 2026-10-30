@@ -675,6 +675,54 @@ export interface StateTouchesRow {
   currency: string;
 }
 
+/**
+ * One native entry of a successful `GenesisMint` on Xahau (`genesis_mints`, migration 015): `mint_index` is the entry's position in
+ * `GenesisMints`, so an entry without a native amount leaves a gap and the key never moves. `amount` is in drops;
+ * `parent_tx_hash` is the `EmitDetails.EmitParentTxnID` and `emit_hook_hash` the `EmitDetails.EmitHookHash`, each `''` when
+ * absent. Empty on XRPL.
+ */
+export interface GenesisMintsRow {
+  ledger_index: number;
+  tx_index: number;
+  mint_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  destination: string;
+  amount: UInt64Value;
+  parent_tx_hash: string;
+  emit_hook_hash: string;
+}
+
+/**
+ * A successful `Import` on Xahau (`imports`, migration 015), the columns the supply needs. `minted` is in drops: the balance of
+ * the account after the Import, less its balance before it, plus the Fee, which the Import also burned. `account_created`
+ * is 1 when the Import created the account. Empty on XRPL.
+ */
+export interface ImportsRow {
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  account: string;
+  minted: UInt64Value;
+  account_created: number;
+}
+
+/**
+ * A `ClaimReward` on Xahau, whatever its result (`reward_claims`, migration 015): the parent of a reward mint is a claim whether or
+ * not the claim succeeded. `issuer` is `''` for a claim without one; `opt_out` is 1 for a claim that opts out of the rewards.
+ * Empty on XRPL.
+ */
+export interface RewardClaimsRow {
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  account: string;
+  issuer: string;
+  opt_out: number;
+}
+
 // -- Node-sourced tables -----------------------------------------------------------------------------------------
 
 export interface FeeStatsRow {
@@ -1420,6 +1468,41 @@ export interface TokensRow {
   name: string;
   toml: string;
   deleted: number;
+  version: UInt64Value;
+}
+
+// -- Supply (migration 015) --------------------------------------------------------------------------------------
+
+/**
+ * One snapshot of the native supply (`network_supply`), written by the aggregator's `supply` job in one insert; the newest
+ * `version` of a `ledger_index` is the snapshot, and a reader takes the newest snapshot by `ORDER BY ledger_index DESC, version DESC
+ * LIMIT 1`. All amounts are in drops. `ledger_index` and `close_time` are the snapshot ledger's; `started_at` is when the cycle began
+ * (the cadence reads it) and `computed_at` when the row was written.
+ *
+ * `burned` is 10^17 less `total_coins` on XRPL and the sum of `fee_total` up to the ledger on Xahau. `escrowed` and `escrow_count`
+ * are the open native escrows. `amm` is the drops in the pools (`null` on a network without AMM) and `amm_pools` the live pools with
+ * a native reserve above 0. `reserve_base` and `reserve_inc` are `null` when no reserve value is known at the ledger. `accounts` are
+ * the existing accounts, AMM pool accounts left out, and `owner_count` the sum of their `OwnerCount`. `minted_rewards`,
+ * `minted_import` and `minted_genesis` are every indexed mint up to the ledger, `null` on XRPL.
+ */
+export interface NetworkSupplyRow {
+  ledger_index: number;
+  close_time: UnixSeconds;
+  started_at: UnixSeconds;
+  computed_at: UnixSeconds;
+  total_coins: UInt64Value;
+  burned: UInt64Value;
+  escrowed: UInt64Value;
+  escrow_count: UInt64Value;
+  amm: UInt64Value | null;
+  amm_pools: number;
+  reserve_base: UInt64Value | null;
+  reserve_inc: UInt64Value | null;
+  accounts: UInt64Value;
+  owner_count: UInt64Value;
+  minted_rewards: UInt64Value | null;
+  minted_import: UInt64Value | null;
+  minted_genesis: UInt64Value | null;
   version: UInt64Value;
 }
 

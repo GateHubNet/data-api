@@ -95,13 +95,20 @@ const OBJECT_LEDGER_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectC
 const TOUCH_LEDGER_TABLES: Table[] = [Table.StateTouches];
 
 /**
+ * The ledger tables of the Xahau mints (migration 015): child tables like the others. No parser fills them yet, and the
+ * ripple-mock ledgers are XRPL's, which never will.
+ */
+const MINT_LEDGER_TABLES: Table[] = [Table.GenesisMints, Table.Imports, Table.RewardClaims];
+
+/**
  * The tables the ripple-mock ledgers have (almost) no activity for: the delete tests put hand-made rows into them
  * (`insertSeededRows`), to see what the deletes reach and what they leave. The recorded AMM, NFT and object ledgers give
  * real rows to these tables, but they all sit in one partition of each, and the delete tests need the rows over several.
  * `account_domains` (migration 012) is one of them: the last ripple-mock ledger gives it two rows of one account, but the
  * delete tests need a row in every ledger, and each of an account of its own (`seededDomainRow`). The two object tables
  * (migration 013) are the others: two ripple-mock ledgers give them rows, in one partition. `state_touches` (migration 014)
- * is the last: two ripple-mock ledgers give it rows too, in one partition.
+ * is another: two ripple-mock ledgers give it rows too, in one partition. The three mint tables (migration 015) are the last,
+ * and the ripple-mock ledgers give them no row at all.
  */
 const SEEDED_LEDGER_TABLES: Table[] = [
   ...AMM_LEDGER_TABLES,
@@ -109,10 +116,17 @@ const SEEDED_LEDGER_TABLES: Table[] = [
   Table.AccountDomains,
   ...OBJECT_LEDGER_TABLES,
   ...TOUCH_LEDGER_TABLES,
+  ...MINT_LEDGER_TABLES,
 ];
 
 /** The seeded tables partitioned by a million ledgers (P6); the others by ten million (P7). */
-const SEEDED_P6_TABLES: Table[] = [Table.AmmPoolTouches, Table.NftSales, Table.NftTouches, Table.StateTouches];
+const SEEDED_P6_TABLES: Table[] = [
+  Table.AmmPoolTouches,
+  Table.NftSales,
+  Table.NftTouches,
+  Table.StateTouches,
+  ...MINT_LEDGER_TABLES,
+];
 
 type Counts = Record<string, number>;
 type Json = Record<string, unknown>;
@@ -148,8 +162,8 @@ const sortedBy = (rows: Json[], keys: string[]): Json[] =>
 /**
  * What the counted tables hold when exactly the ledgers of `built` matching `keep` were written, from the rows
  * `buildLedgerRows` made (`account_domains` is not counted: `MERGED_TABLES`). `seeded` are ledgers that also got one
- * hand-made row in each AMM and NFT table, in `account_domains`, in the two object tables and in `state_touches`
- * (`insertSeededRows`).
+ * hand-made row in each AMM and NFT table, in `account_domains`, in the two object tables, in `state_touches` and in the
+ * three mint tables (`insertSeededRows`).
  */
 function countsOf(
   built: LedgerRows[],
@@ -245,7 +259,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   /**
    * The hand-made rows of a seeded table (`insertSeededRows`): in `account_domains` the ones of the `rSeeded…` accounts, in
    * the object tables the ones of the sample's object (two ripple-mock ledgers have real rows in them), in `state_touches` the
-   * ones of the sample's line.
+   * ones of the sample's line. The mint tables hold nothing else, so every row of them is one.
    */
   const countSeeded = (svc: ClickHouseService, table: Table): Promise<number> =>
     count(
@@ -346,8 +360,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   }
 
   /**
-   * One row in each AMM and NFT ledger table, in `account_domains`, in the two object tables and in `state_touches`, for every one of
-   * `rows`' ledgers. The ripple-mock ledgers (2021) have no such activity (but for two rows of `account_domains` in the
+   * One row in each AMM and NFT ledger table, in `account_domains`, in the two object tables, in `state_touches` and in the three
+   * mint tables, for every one of `rows`' ledgers. The ripple-mock ledgers (2021) have no such activity (but for two rows of `account_domains` in the
    * last one), so the delete tests put these in by hand, over several partitions, to see what the deletes reach and what
    * they leave. `expectedCounts` and `expectStored` take them as `seeded`.
    */

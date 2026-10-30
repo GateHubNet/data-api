@@ -19,10 +19,10 @@ export interface LedgerKeyedTable {
  * Every table whose rows belong to one ledger: the 19 ledger-derived tables of the baseline schema (the 14 of the
  * Ripple v2 data and the 5 AMM ledger tables), `account_states` (migration 005), `trust_line_states` (006),
  * `path_payments` (007), `account_path_payments` (008), the 5 NFT ledger tables (011), `account_domains` (012) and
- * `object_changes` and `account_object_changes` (013) and `state_touches` (014), the ones that carry a `ledger_index`
- * column and a dedup window. Fee stats, validations, manifests, aggregates (`amm_pools`, `amm_daily`, the NFT aggregates,
- * `escrows` and the token aggregates among them), `domain_tomls` and the bookkeeping tables are not in the list, because
- * a ledger's rewrite must not touch them.
+ * `object_changes` and `account_object_changes` (013), `state_touches` (014) and `genesis_mints`, `imports` and
+ * `reward_claims` (015), the ones that carry a `ledger_index` column and a dedup window. Fee stats, validations, manifests,
+ * aggregates (`amm_pools`, `amm_daily`, the NFT aggregates, `escrows`, the token aggregates and `network_supply` among
+ * them), `domain_tomls` and the bookkeeping tables are not in the list, because a ledger's rewrite must not touch them.
  *
  * The first entry is the commit marker (`ledgers`): a ledger is deleted by removing that row first, so a delete that
  * dies halfway leaves uncommitted rows behind, which recovery removes, and never a committed ledger with missing rows.
@@ -61,6 +61,9 @@ export const LEDGER_KEYED_TABLES: ReadonlyArray<LedgerKeyedTable> = [
   { table: Table.ObjectChanges, partitionSize: P7 },
   { table: Table.AccountObjectChanges, partitionSize: P7 },
   { table: Table.StateTouches, partitionSize: P6 },
+  { table: Table.GenesisMints, partitionSize: P6 },
+  { table: Table.Imports, partitionSize: P6 },
+  { table: Table.RewardClaims, partitionSize: P6 },
 ];
 
 export interface DeleteOptions {

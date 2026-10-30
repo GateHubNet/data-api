@@ -2519,6 +2519,8 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     "objectsUnclassified": 0,
   },
   "exchanges": [],
+  "genesisMints": [],
+  "imports": [],
   "ledger": {
     "account_hash": "5C4F9AA82D8570487F37C8C165894FDF7AE2C6C0B07C7F0DB8C7ACC08AD254D2",
     "accounts_created": 0,
@@ -2979,6 +2981,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
       "tx_index": 36,
     },
   ],
+  "rewardClaims": [],
   "stateTouches": [],
   "transactions": [
     {
@@ -4756,6 +4759,8 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     "objectsUnclassified": 0,
   },
   "exchanges": [],
+  "genesisMints": [],
+  "imports": [],
   "ledger": {
     "account_hash": "2DE593CCB95E5EEFE34900D6091CD8E8224E6056E9AE404008C7452DBFE125EA",
     "accounts_created": 0,
@@ -4897,6 +4902,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
       "tx_index": 3,
     },
   ],
+  "rewardClaims": [],
   "stateTouches": [],
   "transactions": [
     {
@@ -5805,6 +5811,8 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     "objectsUnclassified": 0,
   },
   "exchanges": [],
+  "genesisMints": [],
+  "imports": [],
   "ledger": {
     "account_hash": "421662B7A33787943607E0AE5E4B79560FC23F2839B03A4C688991159F9377BA",
     "accounts_created": 0,
@@ -5843,6 +5851,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
   "pathPayments": [],
   "payments": [],
   "paymentsByCurrency": [],
+  "rewardClaims": [],
   "stateTouches": [],
   "transactions": [
     {
@@ -7761,6 +7770,8 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_type": "Payment",
     },
   ],
+  "genesisMints": [],
+  "imports": [],
   "ledger": {
     "account_hash": "F7DF634D41733357A544A58591A2E6EE7451683FCA8BC0B7D324155BBBA26BFF",
     "accounts_created": 0,
@@ -7904,6 +7915,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_index": 7,
     },
   ],
+  "rewardClaims": [],
   "stateTouches": [
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
@@ -9317,6 +9329,8 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
     "objectsUnclassified": 0,
   },
   "exchanges": [],
+  "genesisMints": [],
+  "imports": [],
   "ledger": {
     "account_hash": "E6EA7D1DACE05259BF9EB3951E7F370E8AF9857298D2969C525C61703B6A29BA",
     "accounts_created": 1,
@@ -9469,6 +9483,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
       "tx_index": 4,
     },
   ],
+  "rewardClaims": [],
   "stateTouches": [
     {
       "account": "rp2PaYDxVwDvaZVLEQv7bHhoFQEyX1mEx7",

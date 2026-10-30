@@ -34,12 +34,15 @@ import {
   ExchangesRow,
   ExportJobsRow,
   FeeStatsRow,
+  GenesisMintsRow,
+  ImportsRow,
   IngestLogRow,
   LedgerByHashRow,
   LedgersRow,
   MarketsLiveRow,
   NativeRatesDailyRow,
   NetworkStateRow,
+  NetworkSupplyRow,
   NftCollectionHoldersRow,
   NftCollectionsRow,
   NftDirtyRow,
@@ -53,6 +56,7 @@ import {
   PathPaymentsRow,
   PaymentsByCurrencyRow,
   PaymentsRow,
+  RewardClaimsRow,
   StateTouchesRow,
   StatsHourlyRow,
   SyncerLeaseRow,
@@ -111,6 +115,9 @@ export interface TableRows {
   [Table.ObjectChanges]: ObjectChangesRow;
   [Table.AccountObjectChanges]: AccountObjectChangesRow;
   [Table.StateTouches]: StateTouchesRow;
+  [Table.GenesisMints]: GenesisMintsRow;
+  [Table.Imports]: ImportsRow;
+  [Table.RewardClaims]: RewardClaimsRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -146,6 +153,7 @@ export interface TableRows {
   [Table.TokenGenerations]: TokenGenerationsRow;
   [Table.TokenLines]: TokenLinesRow;
   [Table.Tokens]: TokensRow;
+  [Table.NetworkSupply]: NetworkSupplyRow;
   [Table.DomainTomls]: DomainTomlsRow;
   [Table.AccountNetworkNames]: AccountNetworkNamesRow;
   [Table.IngestLog]: IngestLogRow;
@@ -604,6 +612,38 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     account: ISSUER,
     counterparty: ALICE,
     currency: 'USD',
+  },
+  // the second entry of a GenesisMint that a hook emitted in answer to the claim below (its parent), 12.5 native coins
+  [Table.GenesisMints]: {
+    ledger_index: LEDGER,
+    tx_index: 4,
+    mint_index: 1,
+    tx_hash: hash(41),
+    close_time: CLOSE,
+    destination: ALICE,
+    amount: '12500000',
+    parent_tx_hash: hash(42),
+    emit_hook_hash: hash(43),
+  },
+  // an Import that created the account: the drops it minted are the balance of the new account, plus the fee it burned
+  [Table.Imports]: {
+    ledger_index: LEDGER,
+    tx_index: 6,
+    tx_hash: hash(44),
+    close_time: CLOSE,
+    account: ALICE,
+    minted: '25000012',
+    account_created: 1,
+  },
+  // the claim that is the parent of the mint above, which is applied in the next ledger
+  [Table.RewardClaims]: {
+    ledger_index: LEDGER - 1,
+    tx_index: 2,
+    tx_hash: hash(42),
+    close_time: CLOSE,
+    account: ALICE,
+    issuer: BOB,
+    opt_out: 0,
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
@@ -1133,6 +1173,28 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     name: 'Sample USD',
     toml: JSON.stringify({ code: 'USD', issuer: ISSUER, name: 'Sample USD' }),
     deleted: 0,
+    version: VERSION_MS,
+  },
+  // a snapshot with every nullable column set (no network has both pools and mints: the NULLs are in migrate.e2e-spec's 015 block),
+  // its totals above 2^53 drops, so the sums go as text
+  [Table.NetworkSupply]: {
+    ledger_index: LEDGER,
+    close_time: CLOSE,
+    started_at: CLOSE + 5,
+    computed_at: CLOSE + 125,
+    total_coins: '99987654321098765',
+    burned: '12345678901235',
+    escrowed: '35000000000000000',
+    escrow_count: 1_234,
+    amm: '1234567890123',
+    amm_pools: 321,
+    reserve_base: 1_000_000,
+    reserve_inc: 200_000,
+    accounts: 5_000_000,
+    owner_count: 12_345_678,
+    minted_rewards: '123456789012',
+    minted_import: '9007199254740993',
+    minted_genesis: '600000000000000',
     version: VERSION_MS,
   },
   [Table.DomainTomls]: {

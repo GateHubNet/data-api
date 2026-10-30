@@ -105,6 +105,13 @@ describe('LEDGER_KEYED_TABLES', () => {
     for (const table of [Table.TokenGenerations, Table.TokenLines, Table.Tokens]) expect(tables).not.toContain(table);
   });
 
+  it('lists the three Xahau mint tables by a million, and not network_supply: a ledger rewrite must not touch the snapshots', () => {
+    for (const table of [Table.GenesisMints, Table.Imports, Table.RewardClaims]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P6 }]);
+    }
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.NetworkSupply);
+  });
+
   it('lists every table once and keeps the commit marker first', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(new Set(tables).size).toBe(tables.length);
