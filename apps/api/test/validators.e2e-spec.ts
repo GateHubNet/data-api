@@ -2133,6 +2133,28 @@ describe('toml on the validator rows', () => {
       expect(detail.body.toml).toEqual(rowOf(list, s.unl[0].key).toml);
     });
 
+    it('lists the validators of a country and those of unknown location', async () => {
+      const keysOf = (answer: Answer): string[] =>
+        answer.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key);
+      expect(keysOf(await api.get(`${LIST}?country=de`))).toEqual([s.unl[0].key]);
+      const unknown = keysOf(await api.get(`${LIST}?country=Unknown&limit=1000`));
+      expect(unknown).toHaveLength(34);
+      expect(unknown).toContain(s.unl[1].key);
+      expect(unknown).not.toContain(s.unl[0].key);
+    });
+
+    it('lists none for a code with no validator', async () => {
+      const answer = await api.get(`${LIST}?country=uk`);
+      expect([answer.status, answer.body.count, answer.body.validators]).toEqual([200, 0, []]);
+    });
+
+    it('answers 400 invalid country', async () => {
+      for (const country of ['ZZ', 'DEU', 'Germany']) {
+        const refused = await api.get(`${LIST}?country=${country}`);
+        expect([refused.status, refused.body]).toEqual([400, { result: 'error', message: 'invalid country' }]);
+      }
+    });
+
     it('writes the toml columns into the CSV', async () => {
       const csv = await api.get(`${LIST}?format=csv`);
       const header = csv.text

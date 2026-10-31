@@ -175,8 +175,31 @@ describe('parseListQuery', () => {
     });
   });
 
-  it('checks in the order scope, publisher, amendment, q, marker, limit', () => {
-    const everything = { scope: 'x', publisher: 'x', amendment: 'x', q: 'a'.repeat(101), marker: '%%%' };
+  it.each([
+    ['DE', 'DE'],
+    ['de', 'DE'],
+    [' de ', 'DE'],
+    ['UK', 'GB'],
+    ['unknown', 'unknown'],
+    ['Unknown', 'unknown'],
+    [' UNKNOWN ', 'unknown'],
+  ])('reads country=%j as %s', (value, country) => {
+    expect(parse({ country: value }).country).toBe(country);
+  });
+
+  it('takes an empty country as none', () => {
+    expect(parse({ country: '' })).not.toHaveProperty('country');
+  });
+
+  it.each([['ZZ'], ['DEU'], ['Germany'], ['EU'], ['ß'], ['unknown2']])(
+    'refuses country=%j with 400 invalid country',
+    (country) => {
+      expectBad(() => parse({ country }), 'invalid country');
+    },
+  );
+
+  it('checks in the order scope, publisher, amendment, q, country, marker, limit', () => {
+    const everything = { scope: 'x', publisher: 'x', amendment: 'x', q: 'a'.repeat(101), country: 'ZZ', marker: '%%%' };
     expectBad(() => parse(everything), 'invalid scope');
     expectBad(() => parse({ ...everything, scope: 'all' }), 'invalid publisher');
     expectBad(() => parse({ ...everything, scope: 'all', publisher: 'vl.ripple.com' }), 'invalid amendment');
@@ -186,8 +209,48 @@ describe('parseListQuery', () => {
     );
     expectBad(
       () => parse({ ...everything, scope: 'all', publisher: 'vl.ripple.com', amendment: 'TestVoting', q: 'a' }),
+      'invalid country',
+    );
+    expectBad(
+      () =>
+        parse({
+          ...everything,
+          scope: 'all',
+          publisher: 'vl.ripple.com',
+          amendment: 'TestVoting',
+          q: 'a',
+          country: 'DE',
+        }),
       'invalid marker',
     );
+  });
+});
+
+describe('listValidators: the country filter', () => {
+  const de = entry('nHD', { domain: 'a.example', unl: true, serverCountry: 'DE' });
+  const deOff = entry('nHE', { domain: 'b.example', seen24h: true, serverCountry: 'DE' });
+  const fi = entry('nHF', { domain: 'c.example', unl: true, serverCountry: 'FI' });
+  const none = entry('nHN', { unl: true });
+  const noneOff = entry('nHO', { seen24h: true });
+  const rows = (query: Record<string, unknown>) => {
+    const directory = directoryOf([de, deOff, fi, none, noneOff]);
+    return keysOf(listValidators(directory, parse(query, directory)).rows);
+  };
+
+  it('filters by server country and by unknown, with the scope', () => {
+    expect(rows({ country: 'de' })).toEqual(['nHD']);
+    expect(rows({ country: 'DE', scope: 'all' })).toEqual(['nHD', 'nHE']);
+    expect(rows({ country: 'unknown' })).toEqual(['nHN']);
+    expect(rows({ country: 'unknown', scope: 'all' })).toEqual(['nHN', 'nHO']);
+  });
+
+  it('lists none for a code with no validator', () => {
+    expect(rows({ country: 'NO' })).toEqual([]);
+  });
+
+  it('applies with the other filters', () => {
+    expect(rows({ country: 'FI', q: 'a.example' })).toEqual([]);
+    expect(rows({ country: 'FI', q: 'c.example' })).toEqual(['nHF']);
   });
 });
 

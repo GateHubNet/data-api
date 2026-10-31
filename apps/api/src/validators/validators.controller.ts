@@ -90,6 +90,12 @@ export class ValidatorsController {
     required: false,
     description: 'A part of the domain, the master key or the signing key (at most 100 characters).',
   })
+  @ApiQuery({
+    name: 'country',
+    required: false,
+    description:
+      "An ISO 3166-1 alpha-2 code, any case (uk is GB): the validators whose toml's server_country is it. unknown, any case: those without one.",
+  })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
   @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
   @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
@@ -99,7 +105,7 @@ export class ValidatorsController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<ValidatorsBody> {
     const assembly = await this.amendments.get();
-    // the checks come in the order of the specification: scope, publisher, amendment, q, marker, limit
+    // the checks come in the order of the specification: scope, publisher, amendment, q, country, marker, limit
     const request = parseListQuery(query, assembly.directory, (name) => this.amendments.find(assembly, name)?.id);
     const page = listValidators(assembly.directory, request);
     const body = buildValidatorsBody(page.rows, page.marker, assembly);

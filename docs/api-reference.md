@@ -5466,11 +5466,12 @@ board.
 | `publisher` | | The `id` of a publisher of the [summary](#get-v2networkvalidatorssummary): only the validators on its list in use. Any other value answers 400 `invalid publisher`. |
 | `amendment` | | The name or the ID (64 hex digits, either case) of an amendment: only the validators whose vote record names it. A name is matched as `GET /v2/network/amendments/{name}` matches it; a name no amendment has, and text that is neither a name nor an ID, answers 400 `invalid amendment`. An ID nobody voted for lists no validator. |
 | `q` | | A part of the `domain`, the `validation_public_key` or the `signing_key`, in any case. More than 100 characters answers 400 `invalid search`. |
+| `country` | | An ISO 3166-1 alpha-2 code, any case (`uk` is `GB`): only the validators whose `toml.server_country` is it. `unknown`, any case: only those without one. Anything else: 400 `invalid country`. |
 | `limit` | 200 (max 1000) | The size of a page. Smaller than 1 or not a number is the default. |
 | `marker` | | From the previous page. Anything that is not a marker of this list answers 400 `invalid marker`. |
 | `format` | `json` | `csv`: the rows as a CSV file named `validators.csv`, the nested objects flattened (`agreement_24h.score`, `unl_lists[0]`, `amendment_votes.yes[0].id`), one column for each key any row has, in the order they first appear. |
 
-The parameters are checked in this order: `scope`, `publisher`, `amendment`, `q`, `marker`. An empty parameter is a missing one, a repeated one counts once (the
+The parameters are checked in this order: `scope`, `publisher`, `amendment`, `q`, `country`, `marker`. An empty parameter is a missing one, a repeated one counts once (the
 first), and parameters that are not listed are ignored. The filters and the scope apply together.
 
 **Order.** The validators with a domain come first, by domain in lower case, then by master key; then the others, by master key. A `marker` is the place of
@@ -5607,7 +5608,7 @@ A member of the UNL that was never seen is a row too, with what its lists and it
 The list is built on the assembly of the amendments (it names the amendments, and holds the directory it was built on), so an answer can be up to about 20
 seconds old; `Cache-Control: private, max-age=30`.
 
-Errors: 400 `invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid marker`; 500 `unable to retrieve validator(s)`.
+Errors: 400 `invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid country`, `invalid marker`; 500 `unable to retrieve validator(s)`.
 
 **Differences from data.ripple.com**:
 
