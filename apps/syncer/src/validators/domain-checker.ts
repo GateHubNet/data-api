@@ -283,7 +283,7 @@ function manifestRowOf(key: string, answer: unknown): ValidatorManifestsRow | un
  *
  * **Logs** name a reason, a status code, an address class and a domain (quoted: it comes from a manifest), never a body, an
  * error object or the message of a failure, a principal or an email. The result of a pair is logged when it or one of its facts
- * changes, with the values of the file it ignored (quoted and cut to 16 characters); a fetch blocked by the address
+ * changes or it is first read at a new version, with the values of the file it ignored (quoted and cut to 16 characters); a fetch blocked by the address
  * policy is logged at `warn` every time. The metric `syncer_validators_domain_checks_total{outcome}` counts every check as
  * `verified` or the reason, also a transient failure that left a domain verified; `syncer_validators_toml_fields_total` what the
  * entry of a verified check gave, and `syncer_validators_toml_store_writes_total` the write-through.
@@ -735,8 +735,8 @@ export class DomainChecker {
   }
 
   /**
-   * Logs the result of a pair when it, or a fact of the file, is not the one stored. A blocked fetch has been logged, at warn,
-   * when it was made. The values of the file come quoted and cut (`shownValue`); a principal is never logged.
+   * Logs the result of a pair when it, a fact of the file or `toml_version` is not the one stored, so that the values a file gives
+   * are said when a pair read before is first read at a new version. A blocked fetch has been logged, at warn, when it was made. The values of the file come quoted and cut (`shownValue`); a principal is never logged.
    */
   private logChange(prev: ValidatorDomainsRow | undefined, row: ValidatorDomainsRow, check: DomainCheck): void {
     if (check.reason === 'blocked_address') return;
@@ -745,6 +745,7 @@ export class DomainChecker {
       prev.status === row.status &&
       prev.reason === row.reason &&
       prev.status_code === row.status_code &&
+      prev.toml_version === row.toml_version &&
       prev.owner_country === row.owner_country &&
       prev.server_country === row.server_country &&
       prev.toml_network === row.toml_network &&

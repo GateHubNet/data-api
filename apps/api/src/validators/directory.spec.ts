@@ -291,6 +291,35 @@ describe('assembleDirectory', () => {
       expect(pending.toml).toBeUndefined();
     });
 
+    it('takes the newest row of a domain written in two cases, the older one being checked no more', () => {
+      const row = (domain: string, checked: number, serverCountry: string) => ({
+        key: 'nHM1',
+        domain,
+        status: 'verified' as const,
+        reason: '',
+        statusCode: 0,
+        tomlUrl: `https://${domain}/.well-known/xrp-ledger.toml`,
+        checked,
+        verified: checked,
+        accounts: [],
+        ...NO_FACTS,
+        serverCountry,
+        tomlVersion: 1,
+      });
+      const directory = assembleDirectory(
+        reads({
+          seen: [seenRow('nHM1')],
+          manifests: [
+            { masterKey: 'nHM1', sequence: 2, signingKey: 'n9S1', domain: 'northpeak.example', signingKeysSeen: 1 },
+          ],
+          // in the order of the read: by domain, so the old upper-case name first
+          domains: [row('Northpeak.example', 1_700_000_000, 'DE'), row('northpeak.example', 1_700_090_000, 'FI')],
+        }),
+      );
+      expect(entryOf(directory, 'nHM1').serverCountry).toBe('FI');
+      expect(entryOf(directory, 'nHM1').domainState?.checked).toBe(1_700_090_000);
+    });
+
     it('sets serverCountry from the toml', () => {
       expect(entryWith().serverCountry).toBe('DE');
       expect(entryWith({ serverCountry: '' }).serverCountry).toBeUndefined();

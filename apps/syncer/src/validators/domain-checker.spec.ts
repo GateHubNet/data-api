@@ -2005,6 +2005,35 @@ describe('DomainChecker', () => {
       expect(t.metrics.validatorsTomlFieldsTotal.inc).not.toHaveBeenCalled();
     });
 
+    it('logs the ignored values of a pair verified before D8 when it is first read, though no fact changed', async () => {
+      const { t, vals } = naming('a.example', 1);
+      const key = vals[0].master.base58;
+      t.ch.domains.push({
+        validation_public_key: key,
+        domain: 'a.example',
+        status: 'verified',
+        reason: '',
+        status_code: 0,
+        toml_url: url('a.example'),
+        checked_at: NOW - 2 * HOUR,
+        verified_at: NOW - 2 * HOUR,
+        next_check_at: NOW + 4 * HOUR,
+        accounts: [],
+        ...NO_FACTS,
+        toml_version: 0,
+      });
+      t.serve({ [url('a.example')]: `[[VALIDATORS]]\npublic_key = "${key}"\nserver_country = "Germany"\n` });
+      await t.checker.pass();
+      expect(t.logger.log.mock.calls.map((c) => c[0])).toEqual([
+        `Validator ${key}: domain "a.example" is verified; ignored server_country "Germany"`,
+      ]);
+
+      // and once: at the version, nothing changed, nothing is logged
+      t.clock.ms += RECHECK_MS;
+      await t.checker.pass();
+      expect(t.logger.log).toHaveBeenCalledTimes(1);
+    });
+
     it('logs a change of server country and the ignored values, never a principal', async () => {
       const { t, vals } = naming('northpeak.example', 1, 2);
       const [one, two] = vals.map((v) => v.master.base58);

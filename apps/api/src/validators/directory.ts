@@ -334,7 +334,12 @@ function tomlFactsOf(row: DomainRow): TomlFacts | undefined {
 }
 
 function domainStateOf(domain: string, rows: readonly DomainRow[], tomlPath: string): DomainState {
-  const row = rows.find((candidate) => candidate.domain.toLowerCase() === domain.toLowerCase());
+  // the newest: a manifest that changes the case of its domain makes a new pair, and the old one is checked no more
+  const row = rows
+    .filter((candidate) => candidate.domain.toLowerCase() === domain.toLowerCase())
+    .reduce<
+      DomainRow | undefined
+    >((newest, each) => (newest === undefined || each.checked > newest.checked ? each : newest), undefined);
   if (row === undefined) return { status: 'pending', tomlUrl: `https://${domain}${tomlPath}` };
   return compact({
     status: row.status,

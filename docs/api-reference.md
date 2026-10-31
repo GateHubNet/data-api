@@ -3589,7 +3589,7 @@ For `GET /v2/network/nft_volume` see [Network](#get-v2networknft_volume).
 
 GateHub extras: the original has neither. They serve the names the explorer shows in place of addresses. `GET /v2/account_names` gives the
 **display name** of up to 100 addresses in one call, with the account's domain and the labels the operator put on the address;
-`GET /v2/toml/{domain}` gives what a domain's toml says, as the syncer's `tomls` worker last read it (the "How we know" of the explorer's
+`GET /v2/toml/{domain}` gives what a domain's toml says, as the syncer last read it, through its `tomls` worker or the domain checker of its `validators` worker (the "How we know" of the explorer's
 account page). The design is in the [spec](superpowers/specs/2026-10-24-display-names-design.md) and
 [ADR-0017](adr/0017-display-names.md); the worker that reads the tomls is in [syncer](syncer.md#8a-the-tomls-worker), the tables in
 [data-model](data-model.md#account_domains-p7-order-by-account-migration-012).
@@ -3615,8 +3615,8 @@ objects, whose shape and key order are ours and are pinned by tests:
 - **A toml counts on a network** by its `network` keys. An `[[ACCOUNTS]]`, `[[CURRENCIES]]` or `[[VALIDATORS]]` entry counts when it has no
   `network` or one of the network's names: XRPL `main`, `mainnet`; Xahau `main`, `mainnet`, `xahau`, `21337`; XRPL Testnet `testnet`; Xahau Testnet
   `testnet`, `21338` (text, upper or lower case, or a bare integer). An entry for another network is stored and never served.
-- **Nothing is fetched on request.** Both routes read what the `tomls` worker stored: a domain is fetched only when an account's `Domain` names
-  it, once a day (a failed one on its own schedule, [syncer](syncer.md#8a-the-tomls-worker)), and a toml's text is parsed, never evaluated, and
+- **Nothing is fetched on request.** Both routes read what the syncer stored: a domain is fetched when an account's `Domain` names
+  it, once a day (a failed one on its own schedule, [syncer](syncer.md#8a-the-tomls-worker)), or when a validator's verified manifest names it, every 6 hours (hourly after a transient failure, [syncer](syncer.md#domain-verification)), and a toml's text is parsed, never evaluated, and
   nothing a toml holds (an icon, an attestation link, a `unl` URL) is ever followed. A **new** domain shows `domain`, not `verified`, until the
   worker has read its toml (minutes after the account first names it, hours when the worker has a backlog).
 - **Freshness.** The names and labels are the sets of ADR-0014, reloaded every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s). The account domain is read
@@ -3724,7 +3724,7 @@ What the fields say:
 ### `GET /v2/toml/{domain}`
 
 What the store says of one domain's toml: the explorer's account page reads it for "How we know". The api never fetches: the row is the newest one
-the `tomls` worker stored (kept 60 s in the api, a domain with no row too).
+the syncer stored, from the `tomls` worker or the validators' domain checker (kept 60 s in the api, a domain with no row too).
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -4911,8 +4911,8 @@ The row of a token:
 - `domain?` (the issuer's account domain, in lower case), `listed` (the issuer's toml lists the token, below) and `name?` (the name the toml gives it).
 
 **Listed.** A token is `listed` when the toml of the issuer's own account domain has a `[[CURRENCIES]]` entry that counts on this network, names the token's issuer and has the token's
-code: two-way, the account and its domain, and the domain's toml and the account. An entry in another domain's toml does not list the token. The tomls are those the `tomls` worker
-fetched ([Account names and tomls](#account-names-and-tomls)). A change of one shows after the worker has read it again (its own schedule) and the sweep of the `tokens` job has met the token: within
+code: two-way, the account and its domain, and the domain's toml and the account. An entry in another domain's toml does not list the token. The tomls are those the syncer
+fetched ([Account names and tomls](#account-names-and-tomls)). A change of one shows after the syncer has read it again (its own schedule) and the sweep of the `tokens` job has met the token: within
 tens of minutes on the XRP Ledger (an estimate, not a measurement), not at once ([operations](operations.md#issued-tokens)).
 
 **No generation.** `{"result":"success","coverage":{…},"kind":"issued","count":0,"tokens":[]}`, with the keys of the list that it has:
@@ -5591,7 +5591,7 @@ Keys of a yes entry, in order: `id, name`.
 | `fee_vote` | The fees the validator votes for, in whole units, in its vote record: the newest full vote within 24 hours before the newest stored voting round, whether the validator is trusted or not. A fee the validation left out is the fee in force at that round. `ledger_index` is that round's voting ledger. Absent without a record. |
 | `amendment_votes` | The amendments the record votes yes for, in the order of the record: `{id, name}`, `name` when the amendments know one. Absent without a record. |
 | `first_seen`, `last_seen` | When this deployment first and last saw the validator (a signing key's sightings are its master's). Absent for a member of a list that was never seen. |
-| `toml` | What the `[[VALIDATORS]]` entry that lists the master key says, in the file that verified the domain: `owner_country` and `server_country` (upper-case ISO 3166-1 alpha-2 codes or `XK`; `uk` in a file is `GB`), `network` (as the file says it, lower case: `main`, `testnet`, `21337`) and `unl` (an https URL). These are the file's claims: nothing checks them and nothing fetches the URL, and a `network` naming another network is shown as it is. Present when the domain is `verified` and was read by this release's checker; absent otherwise (no domain, `pending`, `unverified`, or verified before and not read again yet, which takes at most about an hour after the deploy). `{}` when the entry gives none of the four. A key is absent when the file gives no valid value. In the CSV the columns are `toml.owner_country`, `toml.server_country`, `toml.network` and `toml.unl`, and a row whose `toml` is `{}` writes `[Object]` in a column `toml`. |
+| `toml` | What the `[[VALIDATORS]]` entry that lists the master key says, in the file that verified the domain: `owner_country` and `server_country` (upper-case ISO 3166-1 alpha-2 codes or `XK`; `uk` in a file is `GB`), `network` (as the file says it, lower case: `main`, `testnet`, `21337`) and `unl` (an https URL). These are the file's claims: nothing checks them and nothing fetches the URL, and a `network` naming another network is shown as it is. Present when the domain is `verified` and was read by this release's checker; absent otherwise (no domain, `pending`, `unverified`, or verified before and not read again yet: at most about an hour after the deploy while the site answers; while it keeps failing transiently, until it recovers or the 24 h grace ends). `{}` when the entry gives none of the four. A key is absent when the file gives no valid value. In the CSV the columns are `toml.owner_country`, `toml.server_country`, `toml.network` and `toml.unl`, and a row whose `toml` is `{}` writes `[Object]` in a column `toml`. |
 
 A member of the UNL that was never seen is a row too, with what its lists and its manifest give:
 
