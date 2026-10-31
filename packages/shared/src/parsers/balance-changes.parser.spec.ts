@@ -6,9 +6,20 @@ import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { RawLedger } from '../ingest/raw-ledger';
 import { getNetworkProfile } from '../network';
 import { deepFreeze } from '../test-utils/deep-freeze';
+import {
+  editedMptCase,
+  everyMptTransaction,
+  mptCase,
+  mptCaseContext,
+  mptCaseNames,
+  mptContext,
+  mptNode,
+} from '../test-utils/mpt-cases';
 import { objectCase } from '../test-utils/object-cases';
 import { dropsToNative } from '../util/amount';
+import { mptIssuerOf } from '../util/mpt';
 import { BalanceChangesParser, ParsedBalanceChange } from './balance-changes.parser';
+import { mptDeltas } from './mpt-deltas';
 import { ParseContext, parseContextFor, ParserTx, toParserTx } from './parser.interface';
 
 const FIXTURES = join(__dirname, '..', '..', 'test', 'fixtures');
@@ -1253,6 +1264,251 @@ describe('BalanceChangesParser', () => {
       expect(t.tx.Fee).toBe('0');
       expect(rows.filter((r) => r.change_type === 'transaction_cost')).toEqual([]);
       expect(rows.some((r) => r.account === t.tx.Delegate)).toBe(false);
+    });
+  });
+
+  describe('MPTs', () => {
+    const mptRows = (name: string): ParsedBalanceChange[] => parser.parse(mptCase(name), mptCaseContext(name));
+    const MPT_ID = /^[0-9A-F]{48}$/;
+    const onlyMpt = (rows: ParsedBalanceChange[]) => rows.filter((r) => MPT_ID.test(r.currency));
+    const rowOf = (rows: ParsedBalanceChange[], account: string) => {
+      const row = rows.find((r) => r.account === account);
+      if (row === undefined) throw new Error(`no row of ${account}`);
+      return row;
+    };
+
+    it('balances payment_transfer_fee: the sender and the receiver, each with its mirror, summing to 0', () => {
+      const t = mptCase('payment_transfer_fee');
+      const id = t.tx.Amount.mpt_issuance_id as string;
+      const issuer = mptIssuerOf(id);
+      const rows = onlyMpt(mptRows('payment_transfer_fee'));
+      expect(rows).toHaveLength(4);
+      const [sender, senderMirror, receiver, receiverMirror] = rows;
+      expect(sender).toMatchObject({
+        account: t.tx.Account,
+        counterparty: issuer,
+        currency: id,
+        amount_change: '-1005890',
+        final_balance: '199999997994097',
+        change_type: 'payment_source',
+      });
+      expect(senderMirror).toMatchObject({
+        account: issuer,
+        counterparty: t.tx.Account,
+        amount_change: '1005890',
+        final_balance: '-199999997994097',
+        node_index: sender.node_index,
+      });
+      expect(receiver).toMatchObject({
+        account: t.tx.Destination,
+        counterparty: issuer,
+        amount_change: '1000000',
+        change_type: 'payment_destination',
+      });
+      expect(receiverMirror).toMatchObject({
+        account: issuer,
+        counterparty: t.tx.Destination,
+        amount_change: '-1000000',
+        node_index: receiver.node_index,
+      });
+      expect(rows.reduce((sum, r) => sum.plus(r.amount_change), new BigNumber(0)).toString()).toBe('0');
+    });
+
+    it('types a mint from the issuer to the holder, a first credit read as a rise from 0', () => {
+      const t = mptCase('payment_mint');
+      const issuer = mptIssuerOf(t.tx.Amount.mpt_issuance_id);
+      const rows = onlyMpt(mptRows('payment_mint'));
+      expect(rowOf(rows, t.tx.Destination)).toMatchObject({
+        amount_change: '1',
+        final_balance: '1',
+        change_type: 'payment_destination',
+      });
+      expect(rowOf(rows, issuer)).toMatchObject({
+        amount_change: '-1',
+        final_balance: '-1',
+        change_type: 'payment_source',
+      });
+    });
+
+    it('types a redemption from the holder to the issuer, the balance gone from FinalFields', () => {
+      const t = mptCase('payment_redeem');
+      const issuer = mptIssuerOf(t.tx.Amount.mpt_issuance_id);
+      const rows = onlyMpt(mptRows('payment_redeem'));
+      expect(rowOf(rows, t.tx.Account)).toMatchObject({
+        amount_change: '-1',
+        final_balance: '0',
+        change_type: 'payment_source',
+      });
+      expect(rowOf(rows, issuer)).toMatchObject({
+        amount_change: '1',
+        final_balance: '0',
+        change_type: 'payment_destination',
+      });
+    });
+
+    it('clawback_full: every row but the fee is clawback', () => {
+      const t = mptCase('clawback_full');
+      const rows = mptRows('clawback_full');
+      expect(onlyMpt(rows)).toHaveLength(2);
+      expect(rowOf(onlyMpt(rows), t.tx.Holder)).toMatchObject({ amount_change: '-1', final_balance: '0' });
+      for (const row of rows) {
+        expect(row.change_type).toBe(row.node_index === -1 ? 'transaction_cost' : 'clawback');
+      }
+    });
+
+    it('clawback_issued: every row of an issued token is clawback too, and the fee keeps its type', () => {
+      const rows = mptRows('clawback_issued');
+      expect(rows.filter((r) => r.change_type === 'transaction_cost')).toHaveLength(1);
+      const moved = rows.filter((r) => r.change_type !== 'transaction_cost');
+      expect(moved.length).toBeGreaterThanOrEqual(2);
+      for (const row of moved) expect(row.change_type).toBe('clawback');
+    });
+
+    it("escrow_create: the holder's row is escrow_create with the escrowed amount, and its mirror is untyped", () => {
+      const t = mptCase('escrow_create');
+      const id = t.tx.Amount.mpt_issuance_id as string;
+      const rows = onlyMpt(mptRows('escrow_create'));
+      expect(rowOf(rows, t.tx.Account)).toMatchObject({
+        amount_change: '-277073',
+        final_balance: '677146',
+        change_type: 'escrow_create',
+        escrow_counterparty: t.tx.Destination,
+        escrow_balance_change: '277073',
+      });
+      expect(rowOf(rows, mptIssuerOf(id))).toMatchObject({ amount_change: '277073', change_type: '' });
+    });
+
+    it("escrow_finish: the destination's first credit is escrow_finish, and the owner has no MPT row", () => {
+      const t = mptCase('escrow_finish');
+      const rows = onlyMpt(mptRows('escrow_finish'));
+      expect(rows).toHaveLength(2);
+      expect(rowOf(rows, t.tx.Account)).toMatchObject({
+        amount_change: '277073',
+        final_balance: '277073',
+        change_type: 'escrow_finish',
+        escrow_balance_change: '-277073',
+      });
+      expect(rows.some((r) => r.account === t.tx.Owner)).toBe(false);
+    });
+
+    it('escrow_finish_transfer_fee: the destination gets the amount less the fee', () => {
+      const t = mptCase('escrow_finish_transfer_fee');
+      expect(rowOf(onlyMpt(mptRows('escrow_finish_transfer_fee')), t.tx.Account)).toMatchObject({
+        amount_change: '9990',
+        change_type: 'escrow_finish',
+        escrow_balance_change: '-10000',
+      });
+    });
+
+    it('escrow_finish_creates_token: a created token with an amount is a change', () => {
+      const t = mptCase('escrow_finish_creates_token');
+      expect(rowOf(onlyMpt(mptRows('escrow_finish_creates_token')), t.tx.Account)).toMatchObject({
+        amount_change: '9990',
+        final_balance: '9990',
+        change_type: 'escrow_finish',
+      });
+    });
+
+    it("escrow_cancel: the owner's MPTAmount, added, is escrow_cancel", () => {
+      const t = mptCase('escrow_cancel');
+      expect(rowOf(onlyMpt(mptRows('escrow_cancel')), t.tx.Owner)).toMatchObject({
+        amount_change: '10000',
+        final_balance: '10000',
+        change_type: 'escrow_cancel',
+        escrow_balance_change: '-10000',
+      });
+    });
+
+    it('authorize_holder and unauthorize_holder: a token with nothing on it is no change', () => {
+      expect(onlyMpt(mptRows('authorize_holder'))).toEqual([]);
+      expect(onlyMpt(mptRows('unauthorize_holder'))).toEqual([]);
+    });
+
+    it('a lock changes flags only, and so no balance', () => {
+      expect(onlyMpt(mptRows('issuance_set_lock_holder'))).toEqual([]);
+      expect(onlyMpt(mptRows('issuance_set_lock_all'))).toEqual([]);
+    });
+
+    it('payment_failed: the fee rows only', () => {
+      const rows = mptRows('payment_failed');
+      expect(rows.map((r) => r.change_type)).toEqual(['transaction_cost']);
+    });
+
+    it('gives the MPT rows in the order of AffectedNodes, among the others', () => {
+      for (const { network, t } of everyMptTransaction()) {
+        const moved = parser.parse(t, mptContext(network)).filter((r) => r.node_index !== -1);
+        const indexes = moved.map((r) => r.node_index);
+        expect(indexes).toEqual([...indexes].sort((a, b) => a - b));
+      }
+    });
+
+    it('never shares a key of balance_changes between two rows of one transaction', () => {
+      for (const { network, t } of everyMptTransaction()) {
+        const rows = parser.parse(t, mptContext(network));
+        const keys = rows.map((r) => `${r.account}|${r.node_index}`);
+        expect(new Set(keys).size).toBe(keys.length);
+      }
+    });
+
+    it('sums each MPT to zero per transaction', () => {
+      let read = 0;
+      for (const { network, t } of everyMptTransaction()) {
+        const sums = new Map<string, BigNumber>();
+        for (const row of onlyMpt(parser.parse(t, mptContext(network)))) {
+          sums.set(row.currency, (sums.get(row.currency) ?? new BigNumber(0)).plus(row.amount_change));
+          read += 1;
+        }
+        for (const [currency, sum] of sums) expect([t.hash, currency, sum.toString()]).toEqual([t.hash, currency, '0']);
+      }
+      expect(read).toBeGreaterThanOrEqual(30);
+    });
+
+    it("moves each holder's row by what mptDeltas says, the fee cases included", () => {
+      for (const { network, t } of everyMptTransaction()) {
+        const rows = onlyMpt(parser.parse(t, mptContext(network)));
+        const deltas = mptDeltas(t.tx, t.meta).holders.filter((h) => h.amount_after !== h.amount_before);
+        expect(rows).toHaveLength(deltas.length * 2);
+        for (const delta of deltas) {
+          const row = rows.find((r) => r.account === delta.holder && r.node_index === delta.node_index);
+          expect(row?.amount_change).toBe(String(delta.amount_after - delta.amount_before));
+          expect(row?.final_balance).toBe(String(delta.amount_after));
+        }
+      }
+    });
+
+    it('does not write to what it reads', () => {
+      for (const name of mptCaseNames()) expect(() => mptRows(name)).not.toThrow();
+    });
+
+    // Synthetic, edited from payment_holder_to_holder: the receiver's MPTAmount is not digits.
+    it('reads an amount that is not digits as 0, and never throws', () => {
+      const t = mptCase('payment_holder_to_holder');
+      const bad = editedMptCase('payment_holder_to_holder', (_tx, meta) => {
+        mptNode(meta, 'MPToken', (f) => f.Account === t.tx.Destination).FinalFields.MPTAmount = 'x';
+      });
+      expect(rowOf(onlyMpt(parser.parse(bad, XRPL)), t.tx.Destination)).toMatchObject({
+        amount_change: '-56227452',
+        final_balance: '0',
+      });
+    });
+
+    // Synthetic, edited from payment_holder_to_holder: the node's ID is not 48 hex digits.
+    it('skips a node whose ID cannot be made, and never throws', () => {
+      const t = mptCase('payment_holder_to_holder');
+      const bad = editedMptCase('payment_holder_to_holder', (_tx, meta) => {
+        mptNode(meta, 'MPToken', (f) => f.Account === t.tx.Destination).FinalFields.MPTokenIssuanceID = '00';
+      });
+      const accounts = onlyMpt(parser.parse(bad, XRPL)).map((r) => r.account);
+      expect(accounts).not.toContain(t.tx.Destination);
+      expect(accounts).toContain(t.tx.Account);
+    });
+
+    it('reads an MPT Amount or SendMax in lower case as the upper-case currency of its rows', () => {
+      const t = mptCase('payment_holder_to_holder');
+      const lower = editedMptCase('payment_holder_to_holder', (tx) => {
+        tx.Amount.mpt_issuance_id = (tx.Amount.mpt_issuance_id as string).toLowerCase();
+      });
+      expect(rowOf(onlyMpt(parser.parse(lower, XRPL)), t.tx.Destination).change_type).toBe('payment_destination');
     });
   });
 

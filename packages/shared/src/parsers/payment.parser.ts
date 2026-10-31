@@ -1,6 +1,8 @@
 import { BigNumber } from 'bignumber.js';
 import { parseBalanceChanges } from 'ripple-lib-transactionparser';
 import { dropsToNative } from '../util/amount';
+import { mptIssuerOf } from '../util/mpt';
+import { mptAmountIssuance, mptDeltas, mptPaymentIssuance, mptUnits } from './mpt-deltas';
 import { feePayer, ParseContext, ParserTx } from './parser.interface';
 
 /** A balance change as `ripple-lib-transactionparser` reports it, but with the native currency remapped. */
@@ -14,11 +16,14 @@ export interface BalanceChangeAmount {
 export interface ParsedPayment {
   source: string;
   destination: string;
-  /** Currency of `Amount`. */
+  /** Currency of `Amount`: an MPT's is its issuance ID, 48 upper-case hex digits. */
   currency: string;
-  /** Issuer of `Amount`, resolved from the trustlines when `Amount.issuer` is a party to the payment. Native: unset. */
+  /**
+   * Issuer of `Amount`, resolved from the trustlines when `Amount.issuer` is a party to the payment; an MPT's is the one its ID
+   * holds. Native: unset.
+   */
   issuer?: string;
-  /** `Amount` in whole units. */
+  /** `Amount` in whole units; an MPT's in the ledger's integer units, never scaled. */
   amount: string;
   /** What actually arrived, in whole units. Differs from `amount` for partial payments. */
   delivered_amount: string;
@@ -41,6 +46,9 @@ type Json = Readonly<Record<string, any>>;
 function isMptAmount(amount: unknown): boolean {
   return typeof amount === 'object' && amount !== null && (amount as Json).mpt_issuance_id !== undefined;
 }
+
+/** The integer units of an MPT amount, `'0'` when they are not a `UInt64`: a ledger cannot hold that, and nothing throws here. */
+const mptValue = (amount: unknown): string => String(mptUnits((amount as Json | undefined)?.value) ?? 0n);
 
 /**
  * The amount a Payment actually delivered, as it appears on the wire (drops string or IOU object), or
@@ -69,7 +77,9 @@ export class PaymentParser {
    * - only `tesSUCCESS` Payments between two different accounts are payments (a payment to self is a conversion);
    * - source and destination tags are kept when present, including 0 (the reference dropped 0, ruling R10); an empty
    *   invoice id is left out;
-   * - `delivered_amount` falls back to `Amount` for a partial payment whose delivered amount is `'unavailable'`.
+   * - `delivered_amount` falls back to `Amount` for a partial payment whose delivered amount is `'unavailable'`;
+   * - an MPT payment (a GateHub extra) is read by `mptPayment`. A mixed one, which only MPTokensV2 can make, and one whose ID is
+   *   not 48 hex digits are left out, as the reference leaves out every MPT.
    *
    * Pure: nothing in `t` is modified, and the result shares no objects with it.
    */
@@ -77,7 +87,11 @@ export class PaymentParser {
     const { tx, meta } = t;
     if (tx.TransactionType !== 'Payment' || meta.TransactionResult !== 'tesSUCCESS') return undefined;
     if (tx.Account === tx.Destination) return undefined;
-    if ([tx.Amount, tx.SendMax, meta.DeliveredAmount, meta.delivered_amount].some(isMptAmount)) return undefined;
+    const hasMpt = [tx.Amount, tx.DeliverMax, tx.SendMax, meta.DeliveredAmount, meta.delivered_amount].some(
+      isMptAmount,
+    );
+    const mptId = hasMpt ? mptPaymentIssuance(tx, meta) : undefined;
+    if (hasMpt && mptId === undefined) return undefined;
 
     const changes = parseBalanceChanges(meta);
     const fee = dropsToNative(tx.Fee ?? '0');
@@ -118,6 +132,8 @@ export class PaymentParser {
       destinationChanges.push({ counterparty: '', currency: ctx.nativeCurrency, value: fee });
     }
 
+    if (mptId !== undefined) return this.mptPayment(t, ctx, mptId, sourceChanges, destinationChanges);
+
     const issued = typeof tx.Amount === 'object';
     const delivered = deliveredAmount(tx, meta, t.ledger_index, ctx);
 
@@ -138,15 +154,72 @@ export class PaymentParser {
       payment.max_amount = amountValue(tx.SendMax);
       payment.source_currency = typeof tx.SendMax === 'object' ? tx.SendMax.currency : ctx.nativeCurrency;
     }
-    if (tx.SourceTag !== undefined && tx.SourceTag !== null) payment.source_tag = tx.SourceTag;
-    if (tx.DestinationTag !== undefined && tx.DestinationTag !== null) payment.destination_tag = tx.DestinationTag;
-    if (tx.InvoiceID) payment.invoice_id = tx.InvoiceID;
+    this.setTags(payment, tx);
 
     if (issued) {
       const issuer = this.issuer(t, payment);
       if (issuer !== undefined) payment.issuer = issuer;
     }
     return payment;
+  }
+
+  /**
+   * An MPT payment: `currency` the issuance ID, `issuer` the one the ID holds, amounts in the ledger's integer units. The library
+   * knows no `MPToken`, so the MPT entries, after its own, come from `mptDeltas`: a holder's is the change of its `MPTAmount` with
+   * the issuer as `counterparty`, and the issuer's, when it sends or receives, the change of `OutstandingAmount` negated with the
+   * other party as `counterparty`. An entry of value 0 is left out. A transfer fee is on top of `Amount`, so the source's entry holds
+   * it.
+   */
+  private mptPayment(
+    t: ParserTx,
+    ctx: ParseContext,
+    id: string,
+    sourceChanges: BalanceChangeAmount[],
+    destinationChanges: BalanceChangeAmount[],
+  ): ParsedPayment {
+    const { tx, meta } = t;
+    const issuer = mptIssuerOf(id);
+    const asked = tx.Amount ?? tx.DeliverMax;
+    const delivered = deliveredAmount(tx, meta, t.ledger_index, ctx);
+
+    const deltas = mptDeltas(tx, meta);
+    const issuance = deltas.issuances.find((i) => i.mpt_issuance_id === id);
+    const changeOf = (account: string): bigint => {
+      if (account === issuer)
+        return issuance === undefined ? 0n : issuance.outstanding_before - issuance.outstanding_after;
+      const holder = deltas.holders.find((h) => h.holder === account && h.mpt_issuance_id === id);
+      return holder === undefined ? 0n : holder.amount_after - holder.amount_before;
+    };
+    const addEntry = (changes: BalanceChangeAmount[], account: string, other: string): void => {
+      const value = changeOf(account);
+      if (value !== 0n) {
+        changes.push({ counterparty: account === issuer ? other : issuer, currency: id, value: String(value) });
+      }
+    };
+    addEntry(sourceChanges, tx.Account, tx.Destination);
+    addEntry(destinationChanges, tx.Destination, tx.Account);
+
+    const payment: ParsedPayment = {
+      source: tx.Account,
+      destination: tx.Destination,
+      currency: id,
+      issuer,
+      amount: mptValue(asked),
+      delivered_amount: mptValue(mptAmountIssuance(delivered) === id ? delivered : asked),
+      source_currency: id,
+      fee_drops: String(tx.Fee ?? '0'),
+      source_balance_changes: sourceChanges,
+      destination_balance_changes: destinationChanges,
+    };
+    if (tx.SendMax !== undefined && tx.SendMax !== null) payment.max_amount = mptValue(tx.SendMax);
+    this.setTags(payment, tx);
+    return payment;
+  }
+
+  private setTags(payment: ParsedPayment, tx: Json): void {
+    if (tx.SourceTag !== undefined && tx.SourceTag !== null) payment.source_tag = tx.SourceTag;
+    if (tx.DestinationTag !== undefined && tx.DestinationTag !== null) payment.destination_tag = tx.DestinationTag;
+    if (tx.InvoiceID) payment.invoice_id = tx.InvoiceID;
   }
 
   /**

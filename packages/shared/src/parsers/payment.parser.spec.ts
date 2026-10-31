@@ -4,9 +4,18 @@ import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { LedgerHeader, RawLedger, RawTransaction } from '../ingest/raw-ledger';
 import { getNetworkProfile } from '../network';
 import { deepFreeze } from '../test-utils/deep-freeze';
+import {
+  editedMptCase,
+  everyMptTransaction,
+  mptCase,
+  mptCaseContext,
+  mptContext,
+  mptNode,
+} from '../test-utils/mpt-cases';
 import { dropsToNative } from '../util/amount';
+import { mptIssuerOf } from '../util/mpt';
 import { ParseContext, parseContextFor, ParserTx, toParserTx } from './parser.interface';
-import { deliveredAmount, ParsedPayment, PaymentParser } from './payment.parser';
+import { BalanceChangeAmount, deliveredAmount, ParsedPayment, PaymentParser } from './payment.parser';
 
 const FIXTURES = join(__dirname, '..', '..', 'test', 'fixtures');
 
@@ -83,6 +92,8 @@ function nativePayment(): ParserTx {
 const parser = new PaymentParser();
 
 describe('PaymentParser', () => {
+  const mptPayment = (name: string): ParsedPayment | undefined => parser.parse(mptCase(name), mptCaseContext(name));
+
   it('fee is added back to the native source change', () => {
     // The source AccountRoot drops by amount + fee (100.000012). The reported source change is the amount alone.
     const payment = parser.parse(nativePayment(), XRPL)!;
@@ -181,11 +192,152 @@ describe('PaymentParser', () => {
     expect(parser.parse(parserTx({ TransactionType: 'OfferCreate' }), XRPL)).toBeUndefined();
   });
 
-  it('MPT payments are not Ripple payments', () => {
-    const mpt = { mpt_issuance_id: '0000012FFD9EE5DA93AC614B4DB94D7E0FCE415CA51BED47', value: '10' };
-    expect(parser.parse(parserTx({ Amount: mpt }), XRPL)).toBeUndefined();
-    expect(parser.parse(parserTx({ Amount: '1000000', SendMax: mpt }), XRPL)).toBeUndefined();
-    expect(parser.parse(parserTx({ Amount: '1000000' }, { DeliveredAmount: mpt }), XRPL)).toBeUndefined();
+  describe('MPT payments', () => {
+    const ID = '0000012FFD9EE5DA93AC614B4DB94D7E0FCE415CA51BED47';
+    const ISSUANCE_ISSUER = mptIssuerOf(ID);
+    const mpt = { mpt_issuance_id: ID, value: '10' };
+
+    it('reads a bare MPT Amount, the issuer from the ID, in integer units', () => {
+      expect(parser.parse(parserTx({ Amount: mpt }), XRPL)).toMatchObject({
+        currency: ID,
+        issuer: ISSUANCE_ISSUER,
+        amount: '10',
+        delivered_amount: '10',
+        source_currency: ID,
+      });
+    });
+
+    it('stays dropped when mixed with another asset, as only MPTokensV2 can make that', () => {
+      const other = { mpt_issuance_id: '0000012BFD9EE5DA93AC614B4DB94D7E0FCE415CA51BED47', value: '10' };
+      expect(parser.parse(parserTx({ Amount: '1000000', SendMax: mpt }), XRPL)).toBeUndefined();
+      expect(parser.parse(parserTx({ Amount: '1000000' }, { DeliveredAmount: mpt }), XRPL)).toBeUndefined();
+      expect(parser.parse(parserTx({ Amount: '1000000' }, { delivered_amount: mpt }), XRPL)).toBeUndefined();
+      expect(parser.parse(parserTx({ Amount: mpt, SendMax: '1000000' }), XRPL)).toBeUndefined();
+      expect(parser.parse(parserTx({ Amount: mpt, SendMax: other }), XRPL)).toBeUndefined();
+      expect(parser.parse(parserTx({ Amount: mpt }, { DeliveredAmount: other }), XRPL)).toBeUndefined();
+    });
+
+    it('stays dropped for an ID that is not 48 hex digits, and never throws on one', () => {
+      for (const id of ['00', 'G'.repeat(48), ID + '00', 5]) {
+        expect(parser.parse(parserTx({ Amount: { mpt_issuance_id: id, value: '10' } }), XRPL)).toBeUndefined();
+      }
+    });
+
+    it('stays dropped when it failed, and when it is to self', () => {
+      expect(mptPayment('payment_failed')).toBeUndefined();
+      expect(parser.parse(parserTx({ Amount: mpt, Destination: SENDER }), XRPL)).toBeUndefined();
+    });
+
+    it('payment_holder_to_holder: the ID and its issuer, with one MPT entry on each side', () => {
+      const t = mptCase('payment_holder_to_holder');
+      const id = t.tx.Amount.mpt_issuance_id as string;
+      const issuer = mptIssuerOf(id);
+      expect(mptPayment('payment_holder_to_holder')).toMatchObject({
+        source: t.tx.Account,
+        destination: t.tx.Destination,
+        currency: id,
+        issuer,
+        amount: '100000',
+        delivered_amount: '100000',
+        source_currency: id,
+        source_balance_changes: [{ counterparty: issuer, currency: id, value: '-100000' }],
+        destination_balance_changes: [{ counterparty: issuer, currency: id, value: '100000' }],
+      });
+      expect(mptPayment('payment_holder_to_holder')?.max_amount).toBeUndefined();
+    });
+
+    it("payment_mint: the issuer's source entry is the outstanding rise negated, with the destination as counterparty", () => {
+      const t = mptCase('payment_mint');
+      const id = t.tx.Amount.mpt_issuance_id as string;
+      expect(mptPayment('payment_mint')).toMatchObject({
+        source: mptIssuerOf(id),
+        source_balance_changes: [{ counterparty: t.tx.Destination, currency: id, value: '-1' }],
+        destination_balance_changes: [{ counterparty: mptIssuerOf(id), currency: id, value: '1' }],
+      });
+    });
+
+    it("payment_redeem: the issuer's destination entry is the outstanding fall, with the source as counterparty", () => {
+      const t = mptCase('payment_redeem');
+      const id = t.tx.Amount.mpt_issuance_id as string;
+      expect(mptPayment('payment_redeem')).toMatchObject({
+        destination: mptIssuerOf(id),
+        source_balance_changes: [{ counterparty: mptIssuerOf(id), currency: id, value: '-1' }],
+        destination_balance_changes: [{ counterparty: t.tx.Account, currency: id, value: '1' }],
+      });
+    });
+
+    it("payment_transfer_fee: max_amount is SendMax, and the source's entry holds the fee", () => {
+      const t = mptCase('payment_transfer_fee');
+      const payment = mptPayment('payment_transfer_fee');
+      expect(payment).toMatchObject({ amount: '1000000', delivered_amount: '1000000', max_amount: t.tx.SendMax.value });
+      expect(payment?.source_balance_changes[0].value).toBe('-1005890');
+      expect(payment?.destination_balance_changes[0].value).toBe('1000000');
+    });
+
+    it('payment_before_delivered_fix: delivered_amount is the amount', () => {
+      const payment = mptPayment('payment_before_delivered_fix');
+      expect(payment?.delivered_amount).toBe(payment?.amount);
+      expect(payment?.delivered_amount).toBe('1');
+    });
+
+    // Synthetic, edited from payment_holder_to_holder (no partial MPT payment was read, FINDINGS): tfPartialPayment set, the nodes
+    // moved by 40000, and DeliveredAmount and delivered_amount 40000.
+    it('a partial payment delivers what the metadata stored', () => {
+      const t = mptCase('payment_holder_to_holder');
+      const partial = editedMptCase('payment_holder_to_holder', (tx, meta) => {
+        tx.Flags = PARTIAL_PAYMENT;
+        const delivered = { mpt_issuance_id: tx.Amount.mpt_issuance_id, value: '40000' };
+        meta.DeliveredAmount = delivered;
+        meta.delivered_amount = delivered;
+        mptNode(meta, 'MPToken', (f) => f.Account === t.tx.Account).PreviousFields.MPTAmount = '40000';
+        mptNode(meta, 'MPToken', (f) => f.Account === t.tx.Destination).FinalFields.MPTAmount = '56267452';
+      });
+      const payment = parser.parse(partial, XRPL);
+      expect(payment).toMatchObject({ amount: '100000', delivered_amount: '40000' });
+      expect(payment?.source_balance_changes[0].value).toBe('-40000');
+      expect(payment?.destination_balance_changes[0].value).toBe('40000');
+    });
+
+    // Synthetic, edited from payment_mint: the amounts of the transaction are not digits.
+    it('reads an amount that is not digits as 0, and never throws', () => {
+      const bad = editedMptCase('payment_mint', (tx, meta) => {
+        tx.Amount.value = 'x';
+        meta.delivered_amount.value = 'x';
+      });
+      expect(parser.parse(bad, XRPL)).toMatchObject({ amount: '0', delivered_amount: '0' });
+    });
+
+    it('reads the fee as for any payment, and leaves no native entry of it', () => {
+      const t = mptCase('payment_holder_to_holder');
+      const payment = mptPayment('payment_holder_to_holder');
+      expect(payment?.fee_drops).toBe(t.tx.Fee);
+      for (const change of [...payment!.source_balance_changes, ...payment!.destination_balance_changes]) {
+        expect(change.currency).toBe(t.tx.Amount.mpt_issuance_id);
+      }
+    });
+
+    it('leaves out an entry of value 0: a payment whose nodes moved nothing', () => {
+      const none = editedMptCase('payment_holder_to_holder', (_tx, meta) => {
+        meta.AffectedNodes = [];
+      });
+      expect(parser.parse(none, XRPL)).toMatchObject({ source_balance_changes: [], destination_balance_changes: [] });
+    });
+
+    it('reads the same from every recorded MPT payment, on both networks, with the sum of the two sides matching the fee', () => {
+      let read = 0;
+      for (const { network, t } of everyMptTransaction()) {
+        if (t.tx.TransactionType !== 'Payment' || t.meta.TransactionResult !== 'tesSUCCESS') continue;
+        const payment = parser.parse(t, mptContext(network))!;
+        read += 1;
+        expect(payment.currency).toBe(t.tx.Amount.mpt_issuance_id);
+        expect(payment.issuer).toBe(mptIssuerOf(payment.currency));
+        expect(payment.delivered_amount).toMatch(/^\d+$/);
+        const entryOf = (changes: BalanceChangeAmount[]) => changes.find((c) => c.currency === payment.currency);
+        expect(BigInt(entryOf(payment.destination_balance_changes)!.value)).toBe(BigInt(payment.delivered_amount));
+        expect(BigInt(entryOf(payment.source_balance_changes)!.value) <= -BigInt(payment.delivered_amount)).toBe(true);
+      }
+      expect(read).toBeGreaterThanOrEqual(6);
+    });
   });
 
   describe('Xahau native currency is XAH', () => {
