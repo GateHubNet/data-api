@@ -1,6 +1,7 @@
 import { loadAmendmentsConfig, NetworkProfile } from '@gatehub/data-api-shared';
 import { Module } from '@nestjs/common';
 import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
+import { NamesModule } from '../names/names.module';
 import { AmendmentsController } from './amendments.controller';
 import { AMENDMENTS_CONFIG, AmendmentsService } from './amendments.service';
 import { ValidatorDirectoryService } from './validator-directory.service';
@@ -17,6 +18,7 @@ import { ValidatorsController } from './validators.controller';
  * `GH_AMENDMENTS_CONFIG` or the file that ships for the network: an invalid file fails the boot, naming the entry.
  */
 @Module({
+  imports: [NamesModule],
   controllers: [ValidatorsController, AmendmentsController],
   providers: [
     ValidatorDirectoryService,

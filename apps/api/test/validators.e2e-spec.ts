@@ -1,4 +1,13 @@
-import { KEY_MAP_WITH, MANIFEST_MAP_SQL, mappedKey, RIPPLE_EPOCH_MS, Table } from '@gatehub/data-api-shared';
+import {
+  getNetworkProfile,
+  KEY_MAP_WITH,
+  MANIFEST_MAP_SQL,
+  mappedKey,
+  readStoredTomls,
+  RIPPLE_EPOCH_MS,
+  STORED_TOMLS_SQL,
+  Table,
+} from '@gatehub/data-api-shared';
 import { join } from 'node:path';
 import { makeManifest } from '../../../packages/shared/src/test-utils/validator-keys';
 import type { Directory } from '../src/validators/directory';
@@ -19,6 +28,8 @@ import {
 } from '../src/validators/validator-object';
 import { ApiClient, Harness, HarnessOptions, NO_RATE_LIMIT, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
+import { failToml, putToml } from './support/names-seed';
+import { explain } from './support/plans';
 import { BULK_BASES, BULK_PER_PART, insertBulk, LoggedRead, markerOf, readsOf } from './support/read-rows';
 import {
   BOARD_IDS,
@@ -2201,6 +2212,186 @@ describe('toml on the validator rows', () => {
       expect(rowOf(members[1].key).domain_verification.status).toBe('verified');
       expect(rowOf(members[1].key).domain_verification).not.toHaveProperty('verified');
     });
+  });
+});
+
+describe("the validator detail's toml: the domain's facts from the toml store (XRPL)", () => {
+  const XRPL = getNetworkProfile('xrpl');
+  const ISSUER = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+  const FETCHED_AT = Math.floor(Date.now() / 1000) - 3_600;
+  /** Hand-written test data, for no real domain. */
+  const FILE = `# Hand-written test data (D8).
+[METADATA]
+modified = 2026-10-02
+
+[[PRINCIPALS]]
+name = "Mara Lindqvist"
+email = "mara@northpeak.example"
+
+[[PRINCIPALS]]
+name = "Tomas Okafor"
+
+[[ACCOUNTS]]
+address = "${ISSUER}"
+
+[[ACCOUNTS]]
+address = "rrrrrrrrrrrrrrrrrrrrrhoLvTp"
+
+[[ACCOUNTS]]
+address = "rrrrrrrrrrrrrrrrrrrrBZbvji"
+network = "testnet"
+
+[[CURRENCIES]]
+code = "USD"
+issuer = "${ISSUER}"
+
+[[CURRENCIES]]
+code = "EUR"
+network = "main"
+
+[[CURRENCIES]]
+code = "TST"
+issuer = "${ISSUER}"
+network = "testnet"
+`;
+  let h: Harness;
+  let api: ApiClient;
+  let s: FleetScenario;
+
+  beforeAll(async () => {
+    h = (
+      await startWithDirectory({
+        seed: 'none',
+        network: 'xrpl',
+        env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xrpl },
+      })
+    ).h;
+    api = await h.api();
+    s = await seedFleet(h.ch, { activity: true });
+    const now = Date.now() / 1000;
+    const read = (key: string, domain: string, o: Record<string, unknown> = {}) => ({
+      validation_public_key: key,
+      domain,
+      checked_at: now - 10,
+      toml_version: 1,
+      ...o,
+    });
+    const named = [
+      [s.unl[2], 'kept.example'],
+      [s.unl[3], 'failing.example'],
+      [s.unl[4], 'atsign.example'],
+    ] as const;
+    await insertManifests(
+      h.ch,
+      named.map(([member, domain]) => ({
+        ephemeral_key: member.ephemeral,
+        master_key: member.key,
+        seq: 9,
+        domain,
+      })),
+    );
+    await insertDomains(h.ch, [
+      read(s.unl[0].key, 'northpeak.example', {
+        owner_country: 'NO',
+        server_country: 'DE',
+        toml_network: 'main',
+        toml_unl: 'https://vl.ripple.com',
+      }),
+      read(s.unl[1].key, 'shoreline.example'),
+      read(s.others[1].key, 'tidewater.example'),
+      ...named.map(([member, domain]) => read(member.key, domain)),
+    ]);
+    await putToml(h, XRPL, 'northpeak.example', FILE, FETCHED_AT);
+    await putToml(h, XRPL, 'kept.example', FILE, FETCHED_AT);
+    await putToml(h, XRPL, 'failing.example', FILE, FETCHED_AT);
+    // the same clock as failToml's, so that the failure is the newer row
+    await putToml(h, XRPL, 'tidewater.example', FILE);
+    await failToml(h, 'tidewater.example');
+    const stored = (await readStoredTomls(h.ch, ['northpeak.example'])).get('northpeak.example')!;
+    await h.ch.insert(Table.DomainTomls, [
+      {
+        ...stored,
+        domain: 'atsign.example',
+        principals: ['Mara Lindqvist', 'ops@northpeak.example'],
+        currencies: [{ code: 'a@b', issuer: '', network: '', fields: '{}' }],
+      },
+    ]);
+  });
+  afterAll(async () => {
+    jest.restoreAllMocks();
+    await h?.close();
+  });
+
+  it("serves the store's facts on the detail", async () => {
+    const answer = await api.get(detailOf(s.unl[0].key));
+    expect(answer.status).toBe(200);
+    expect(answer.body.toml).toEqual({
+      owner_country: 'NO',
+      server_country: 'DE',
+      network: 'main',
+      unl: 'https://vl.ripple.com',
+      principals: ['Mara Lindqvist', 'Tomas Okafor'],
+      modified: '2026-10-02T00:00:00Z',
+      accounts_listed: 3,
+      currencies: [{ code: 'USD', issuer: ISSUER }, { code: 'EUR' }],
+      currencies_listed: 2,
+      fetched: new Date(FETCHED_AT * 1000).toISOString(),
+    });
+  });
+
+  it("keeps the list to the row's toml", async () => {
+    const list = await api.get(`${LIST}?q=northpeak.example`);
+    expect(Object.keys(list.body.validators[0].toml)).toEqual(['owner_country', 'server_country', 'network', 'unl']);
+  });
+
+  it("has the row's toml alone without a store row and after a definite failure", async () => {
+    expect((await api.get(detailOf(s.unl[1].key))).body.toml).toEqual({});
+    expect((await api.get(detailOf(s.others[1].key))).body.toml).toEqual({});
+  });
+
+  it('reads no store for a row without toml', async () => {
+    const reads = await readsOf(h, Table.DomainTomls, () => api.get(detailOf(s.dormant.key)));
+    expect(reads).toEqual([]);
+  });
+
+  it('answers 500 when the store read fails', async () => {
+    const real = h.ch.query.bind(h.ch);
+    const spy = jest
+      .spyOn(h.ch, 'query')
+      .mockImplementation(((sql: string, ...rest: unknown[]) =>
+        sql.includes(Table.DomainTomls)
+          ? Promise.reject(new Error('Code: 241. Memory limit exceeded'))
+          : (real as (...args: unknown[]) => Promise<unknown>)(sql, ...rest)) as never);
+    try {
+      const failed = await api.get(detailOf(s.unl[3].key));
+      expect([failed.status, failed.body]).toEqual([
+        500,
+        { result: 'error', message: 'unable to retrieve validator(s)' },
+      ]);
+      expect(failed.headers['cache-control']).toBe('no-store');
+    } finally {
+      spy.mockRestore();
+    }
+    // the failure is not kept
+    expect((await api.get(detailOf(s.unl[3].key))).body.toml.principals).toEqual(['Mara Lindqvist', 'Tomas Okafor']);
+  });
+
+  it('reads the store once by key and keeps it 60 s', async () => {
+    const reads = await readsOf(h, Table.DomainTomls, async () => {
+      await api.get(detailOf(s.unl[2].key));
+      await api.get(detailOf(s.unl[2].key));
+    });
+    expect(reads).toHaveLength(1);
+    const plan = await explain(h, 'indexes = 1', STORED_TOMLS_SQL, { domains: ['kept.example'] });
+    expect(plan).toContain('domain');
+    expect(plan).toMatch(/PrimaryKey[\s\S]*Keys:[\s\S]*domain/);
+  });
+
+  it('serves no @ anywhere in the detail', async () => {
+    const answer = await api.get(detailOf(s.unl[4].key));
+    expect(answer.body.toml.principals).toEqual(['Mara Lindqvist']);
+    expect(answer.body.toml).not.toHaveProperty('currencies');
+    expect(JSON.stringify(answer.body)).not.toContain('@');
   });
 });
 

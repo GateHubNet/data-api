@@ -1,4 +1,5 @@
-import { Get, Param, Query, Req, Res } from '@nestjs/common';
+import { NetworkProfile } from '@gatehub/data-api-shared';
+import { Get, Inject, Param, Query, Req, Res } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // `import type`: the decorated parameters below would otherwise make Nest's metadata `require('express')`, which is not
 // a dependency of this app (only its types are)
@@ -7,7 +8,8 @@ import { Csv } from '../common/csv.interceptor';
 import { setLinkHeader } from '../common/pagination';
 import { first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
-import { ApiConfig } from '../config/api.config';
+import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
+import { DomainTomlsService } from '../names/domain-tomls.service';
 import { AmendmentsService } from './amendments.service';
 import {
   routeCacheControl,
@@ -15,6 +17,7 @@ import {
   VALIDATIONS_MARKER_CACHE_CONTROL,
   VALIDATORS_CACHE_CONTROL,
 } from './cache-control';
+import { domainTomlFactsOf } from './domain-toml-facts';
 import { buildSummary, ValidatorsSummary } from './summary-object';
 import { buildValidationsBody, ValidationsBody } from './validation-row-object';
 import { ValidatorDirectoryService } from './validator-directory.service';
@@ -41,6 +44,8 @@ export class ValidatorsController {
     private readonly amendments: AmendmentsService,
     private readonly validations: ValidatorValidationsService,
     private readonly config: ApiConfig,
+    private readonly tomls: DomainTomlsService,
+    @Inject(NETWORK_PROFILE) private readonly profile: Pick<NetworkProfile, 'tomlNetworkNames'>,
   ) {}
 
   @Get('summary')
@@ -110,7 +115,8 @@ export class ValidatorsController {
     summary: 'Get a validator of the network',
     description:
       'One validator by its master key, its signing key or 66 hex digits: the row of the list, its vote on every amendment ' +
-      'being decided, its manifest and its agreement of each of the last 30 days. JSON only.',
+      'being decided, the facts of its verified toml with those of its domain (principals, last modified, accounts, currencies), ' +
+      'its manifest and its agreement of each of the last 30 days. JSON only.',
   })
   @ApiParam({
     name: 'key',
@@ -119,7 +125,13 @@ export class ValidatorsController {
   async detail(@Param('key') raw: string, @Res({ passthrough: true }) res: Response): Promise<ValidatorDetail> {
     const key = parseValidatorKey(raw);
     const assembly = await this.amendments.get();
-    const body = validatorDetail(resolveValidator(assembly.directory, key), assembly);
+    const entry = resolveValidator(assembly.directory, key);
+    // only a row with toml has a file that verified; a store read that fails is a failure of the route
+    const facts =
+      entry.toml === undefined || entry.domain === undefined
+        ? undefined
+        : domainTomlFactsOf(await this.tomls.get(entry.domain.toLowerCase()), this.profile);
+    const body = validatorDetail(entry, assembly, facts);
     this.setCacheControl(res);
     return body;
   }

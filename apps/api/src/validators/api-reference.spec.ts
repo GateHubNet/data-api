@@ -20,6 +20,7 @@ import { VALIDATION_ROW_KEYS, VALIDATIONS_BODY_KEYS } from './validation-row-obj
 import * as validatorObject from './validator-object';
 import {
   AGREEMENT_KEYS,
+  CURRENCY_KEYS,
   DAILY_KEYS,
   DETAIL_AMENDMENT_VOTES_KEYS,
   DETAIL_TAIL_KEYS,
@@ -28,6 +29,7 @@ import {
   LIST_BODY_KEYS,
   MANIFEST_KEYS,
   ROW_AMENDMENT_VOTES_KEYS,
+  TOML_DETAIL_KEYS,
   TOML_KEYS,
   VALIDATOR_ROW_KEYS,
   VOTE_ENTRY_KEYS,
@@ -57,6 +59,8 @@ const OBJECTS: Record<string, readonly string[]> = {
   'the validators answer': LIST_BODY_KEYS,
   'a validator row': VALIDATOR_ROW_KEYS,
   'toml on a validator row': TOML_KEYS,
+  'toml on the validator answer': TOML_DETAIL_KEYS,
+  'a toml currency': CURRENCY_KEYS,
   'an agreement window': AGREEMENT_KEYS,
   domain_verification: DOMAIN_VERIFICATION_KEYS,
   fee_vote: FEE_VOTE_KEYS,

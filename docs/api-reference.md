@@ -5691,6 +5691,10 @@ Keys of the validator answer after the row, in order: `manifest, daily_agreement
 
 Keys of manifest, in order: `sequence, signing_key, signing_keys_seen, domain`.
 
+Keys of toml on the validator answer, in order: `owner_country, server_country, network, unl, principals, modified, accounts_listed, currencies, currencies_listed, fetched`.
+
+Keys of a toml currency, in order: `code, issuer`.
+
 Keys of a daily agreement, in order: `date, missed, total, score, incomplete, partial`.
 
 | Key | Meaning |
