@@ -279,6 +279,28 @@ describe('MptParser: transfers of a payment', () => {
     expect(parseAt(partial).transfers).toEqual([expect.objectContaining({ amount: '40000', fee: '0' })]);
   });
 
+  // Synthetic (FINDINGS (5)): before the fix the ledger stored no DeliveredAmount, and the node serves Amount as delivered_amount.
+  const partialBeforeFix = (name: string, asked: string): ParserTx =>
+    editedMptCase(name, (tx, meta) => {
+      tx.Flags = 0x00020000;
+      tx.Amount.value = asked;
+      delete meta.DeliveredAmount;
+      meta.delivered_amount = { mpt_issuance_id: tx.Amount.mpt_issuance_id, value: asked };
+    });
+
+  it("delivers the destination's rise on a partial payment before the fix, the fee being what was burned", () => {
+    expect(parseAt(partialBeforeFix('payment_transfer_fee', '2000000')).transfers).toEqual([
+      expect.objectContaining({ amount: '1000000', fee: '5890' }),
+    ]);
+  });
+
+  it('delivers the fall of OutstandingAmount on a partial payment to the issuer before the fix', () => {
+    const asked = mptCase('payment_redeem').tx.Amount.value as string;
+    expect(parseAt(partialBeforeFix('payment_redeem', `${asked}0`)).transfers).toEqual([
+      expect.objectContaining({ amount: asked, fee: '0' }),
+    ]);
+  });
+
   it('reads the DeliverMax of a transaction without Amount', () => {
     const t = mptCase('payment_mint');
     const deliverMax = editedMptCase('payment_mint', (tx, meta) => {

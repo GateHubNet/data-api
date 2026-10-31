@@ -64,6 +64,17 @@ const ASSET_SUBCLASSES: readonly string[] = [
 ];
 const URI_CATEGORIES: readonly string[] = ['website', 'social', 'docs', 'other'];
 
+/** The keys of the metadata's fields that hold a string, long and short. */
+const TEXT_KEYS: readonly (readonly [string, string])[] = [
+  ['ticker', 't'],
+  ['name', 'n'],
+  ['desc', 'd'],
+  ['icon', 'i'],
+  ['asset_class', 'ac'],
+  ['asset_subclass', 'as'],
+  ['issuer_name', 'in'],
+];
+
 type JsonObject = Record<string, unknown>;
 
 const isObject = (value: unknown): value is JsonObject =>
@@ -123,6 +134,12 @@ function additionalInfoOf(value: unknown): Record<string, unknown> | string | un
  * `undefined` when the hex is not at most 1024 bytes of UTF-8 holding a JSON object. Never throws: the value is the issuer's.
  */
 export function decodeMptMetadata(hex: string): MptMetadata | undefined {
+  const object = objectOf(hex);
+  return object === undefined ? undefined : fieldsOf(object);
+}
+
+/** The JSON object in the hex; `undefined` when it is not at most 1024 bytes of UTF-8 holding one. */
+function objectOf(hex: string): JsonObject | undefined {
   if (!HEX.test(hex) || hex.length > METADATA_MAX_BYTES * 2) return undefined;
   let object: unknown;
   try {
@@ -130,7 +147,10 @@ export function decodeMptMetadata(hex: string): MptMetadata | undefined {
   } catch {
     return undefined;
   }
-  if (!isObject(object)) return undefined;
+  return isObject(object) ? object : undefined;
+}
+
+function fieldsOf(object: JsonObject): MptMetadata {
   const fields: MptMetadata = {
     ticker: textOf(read(object, 'ticker', 't')),
     name: textOf(read(object, 'name', 'n')),
@@ -161,4 +181,27 @@ export function mptMetadataConforms(m: MptMetadata): boolean {
     (item) =>
       present(item.uri) && present(item.title) && item.category !== undefined && URI_CATEGORIES.includes(item.category),
   );
+}
+
+/** Whether decoding keeps all that was written under the keys of XLS-89: no field of the wrong type, no item of `uris` left out. */
+function keepsAll(object: JsonObject): boolean {
+  const dropped = (value: unknown, kept: unknown): boolean => value !== undefined && kept === undefined;
+  if (TEXT_KEYS.some(([long, short]) => dropped(read(object, long, short), textOf(read(object, long, short))))) {
+    return false;
+  }
+  const info = read(object, 'additional_info', 'ai');
+  if (dropped(info, additionalInfoOf(info))) return false;
+  const uris = read(object, 'uris', 'us');
+  const items = uris === undefined ? object.urls : uris;
+  return items === undefined || (Array.isArray(items) && items.length === (urisOf(object)?.length ?? 0));
+}
+
+/**
+ * Whether every rule of XLS-89 holds of what the issuer wrote: of the decoded object, with nothing dropped to decode it, since a
+ * `uris` item with no `uri` is gone from that object and still breaks the rule. An unknown key breaks none. `false` for hex that
+ * does not decode.
+ */
+export function mptMetadataHexConforms(hex: string): boolean {
+  const object = objectOf(hex);
+  return object !== undefined && keepsAll(object) && mptMetadataConforms(fieldsOf(object));
 }

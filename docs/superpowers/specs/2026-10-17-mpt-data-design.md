@@ -67,6 +67,8 @@ data.
 
 > **Dated note (2026-10-31, D9's Task 1).** The recorded cases correct this section; the evidence is in `packages/shared/test/fixtures/xrpl/mpt/FINDINGS.md`. `DeliveredAmount` is stored only when less than `Amount` was delivered (on none of 1,508 MPT payments read after fixMPTDeliveredAmount), and `delivered_amount` is served before the fix too, so the existing rule stands. `EscrowFinish` charges the transfer fee out of the locked amount when neither end is the issuer, as section 4.2 has it. MPT escrows exist on mainnet (59 creates, 5 finishes, no cancel). XRPL Testnet does not have `DynamicMPT`.
 
+> **Dated note (2026-10-31, D9's review).** A partial MPT payment with no `DeliveredAmount` reads what moved (the destination's rise, or the fall of `OutstandingAmount` for a payment to the issuer), not `Amount`, and section 7.4's `fee` follows. None is known, but the reprocess would write the wrong figure for good, and the true one is in the same metadata. This replaces ruling C30(e).
+
 Task 1 of the plan confirms each fact against recorded mainnet transactions and writes what differs into `FINDINGS.md`.
 
 **Enablement on XRPL mainnet** (`packages/shared/config/amendments/xrpl.json`, which agrees with xrpscan's list on 2026-10-24; Task 1
@@ -374,6 +376,8 @@ rebuilds an issuance. The explorer does not decode it: it shows what the API dec
   `uri`, a `title` and a `category` among `website, social, docs, other`.
 - **The `ticker` and `name` columns** are the decoded strings, cut to 16 and 128 characters, whether or not they conform; nothing is
   checked against the issuer's domain. URLs are served as written: the explorer decides what it links (E14).
+
+> **Dated note (2026-10-31, D9's review).** `metadata_conforms` is judged on what the issuer wrote, not only on the decoded object: a field of the wrong type or a `uris` item with no string `uri`, which the lenient decoding drops, makes it 0, because the rule "every `uris` item has a `uri`" is otherwise judged on the items that have one. An unknown key breaks no rule.
 
 ## 6. Aggregation: the `mpt_state` job
 

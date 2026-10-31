@@ -521,7 +521,7 @@ source, source_currency, source_tag?, tx_hash, transaction_cost, mpt_issuance_id
 the payment does not have are absent (a tag of `0` is a tag and is served). `transaction_cost` is the fee in whole units.
 The balance changes carry an empty `counterparty` for the native currency; the native balance change of the source does not include the fee (that is `transaction_cost`).
 
-An **MPT payment** has the issuance ID as its `currency`, the issuer the ID holds as its `issuer`, its amounts in the ledger's integer units, never scaled, and `mpt_issuance_id` as its last key; no other payment has that key, and the CSV has its column only when a row of the page has one. `delivered_amount` is the existing rule (`DeliveredAmount`, else `delivered_amount`, else `Amount`), so a partial MPT payment recorded before the amendment `fixMPTDeliveredAmount` (none is known) would report `Amount`, and the `fee` of its [transfer](#get-v2mptissuanceidtransfers) would then be 0.
+An **MPT payment** has the issuance ID as its `currency`, the issuer the ID holds as its `issuer`, its amounts in the ledger's integer units, never scaled, and `mpt_issuance_id` as its last key; no other payment has that key, and the CSV has its column only when a row of the page has one. `delivered_amount` is the existing rule (`DeliveredAmount`, else `delivered_amount`, else `Amount`), except on a partial MPT payment with no `DeliveredAmount`, as one recorded before the amendment `fixMPTDeliveredAmount` would be (none is known): the node's `delivered_amount` is then only `Amount`, so it is what moved, the destination's rise, or the fall of `OutstandingAmount` for a payment to the issuer.
 
 Errors, in the order they are checked: 400 `invalid issuer address`, `invalid start date format`, `invalid end date format`,
 then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on Xahau), `issuer is required`, `issuer does not match mpt issuance`;
@@ -5592,7 +5592,7 @@ Keys of an MPT row, in order: `rank, mpt_issuance_id, issuer, ticker?, name?, as
 
 Keys of the MPT totals, in order: `issuances, holders, transfers_24h`.
 
-`format=csv` is `tokens.csv`, the rows alone, with the same columns on every page: the keys of a row, `flags` as `flags.locked` and so on, and an empty cell where a row has no value.
+`format=csv` is `tokens.csv`, the rows alone, with the same columns on every page: the keys of a row, `flags` as `flags.locked` and so on, and an empty cell where a row has no value. `ticker` and `name` are what an issuer wrote, so in a CSV each has a leading `'` when it starts with `=`, `+`, `-`, `@`, a tab or a CR, and `'` for each `"`; the JSON answers serve them as written.
 
 Errors, in the order they are checked: D6's, 400 `invalid kind - use: issued, mpt`, `invalid min_holders`, `invalid search`, `invalid marker` (a marker of `issued` too); 500 `unable to retrieve tokens`. A 400 comes before any read.
 
@@ -5605,7 +5605,7 @@ The MPTs an account holds, at the newest committed ledger, by issuance ID. The b
 | `include_zero` | false | Boolean: also a balance of nothing. |
 | `limit` | 200 (max 1000) | |
 | `marker` | | The ID of the last row of the page before. |
-| `format` | json | `csv`: file `<address> - mpt.csv`, its columns the keys of a holding, an empty cell for what a row has not, without `coverage`. |
+| `format` | json | `csv`: file `<address> - mpt.csv`, its columns the keys of a holding, an empty cell for what a row has not, without `coverage`; `ticker` and `name` as in [the CSV of `kind=mpt`](#get-v2tokenskindmpt). |
 
 <!-- mpt-example GET /v2/accounts/rrrrrrrrrrrrrrrrrrrpWe7f1TnJ/mpt?limit=1 -->
 

@@ -4,13 +4,13 @@ import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // not a dependency of this app (only its types are)
 import type { Request, Response } from 'express';
 import { isValidClassicAddress } from 'ripple-address-codec';
-import { Csv, toCsvRow, wantsCsv } from '../common/csv.interceptor';
+import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { badRequest } from '../common/errors';
 import { fmtTime } from '../common/format';
 import { setLinkHeader } from '../common/pagination';
 import { bool, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
-import { ACCOUNT_MPT_KEYS } from '../mpt/mpt-objects';
+import { toAccountMptCsvRow } from '../mpt/mpt-objects';
 import { AccountMptService, parseHoldingsMarker } from './account-mpt.service';
 
 /** The name of the CSV file of the holdings of an account: `<address> - mpt`. `@Csv` adds the `.csv`. */
@@ -64,7 +64,7 @@ export class AccountMptController {
       ...(page.head && { ledger_index: page.head.ledger_index, close_time: fmtTime(page.head.close_time) }),
       count: page.rows.length,
       ...(page.marker !== undefined && { marker: page.marker }),
-      mpt: wantsCsv(query) ? page.rows.map((row) => toCsvRow(row, ACCOUNT_MPT_KEYS)) : page.rows,
+      mpt: wantsCsv(query) ? page.rows.map((row) => toAccountMptCsvRow(row)) : page.rows,
     };
   }
 }

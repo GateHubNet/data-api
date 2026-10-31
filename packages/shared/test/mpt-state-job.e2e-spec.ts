@@ -30,7 +30,7 @@ import {
   decodeMptMetadata,
   MPT_NAME_MAX,
   MPT_TICKER_MAX,
-  mptMetadataConforms,
+  mptMetadataHexConforms,
 } from '../src/util/mpt-metadata';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 
@@ -279,7 +279,7 @@ function oracleOf(id: string, head: number): Omit<StoredIssuance, 'version'> {
     transfer_fee: state?.transfer_fee ?? 0,
     metadata_hex: state?.metadata_hex ?? '',
     metadata: decoded ? JSON.stringify(decoded) : '',
-    metadata_conforms: decoded && mptMetadataConforms(decoded) ? 1 : 0,
+    metadata_conforms: state && mptMetadataHexConforms(state.metadata_hex) ? 1 : 0,
     ticker: cutText(decoded?.ticker, MPT_TICKER_MAX),
     name: cutText(decoded?.name, MPT_NAME_MAX),
     created_ledger: made?.ledger_index ?? null,
@@ -431,6 +431,25 @@ describe('the mpt_state job (e2e)', () => {
 
   // -------------------------------------------------------------------------------------------------------------------
   describe('state rows made by hand', () => {
+    it('keeps what it decoded of metadata with a part decoding drops, and does not call it conforming', async () => {
+      const ch = await fresh();
+      const written = {
+        t: 'HTF',
+        n: 'Hello',
+        i: 'https://example.com/i.png',
+        ac: 'defi',
+        in: 'Hello Inc',
+        us: [{ c: 'docs', t: 'no uri' }],
+      };
+      await insertCommitted(
+        ch,
+        [issuanceState(A, 10, { metadata_hex: Buffer.from(JSON.stringify(written)).toString('hex') })],
+        [],
+      );
+      await rebuildMptIssuances(ch, [{ id: A, holders: [] }], 10);
+      expect(await issuanceOf(ch, A)).toMatchObject({ metadata_conforms: 0, ticker: 'HTF', name: 'Hello' });
+    });
+
     it('sums the locked holders, and every balance when the issuance is locked', async () => {
       const ch = await fresh();
       await insertCommitted(

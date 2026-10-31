@@ -19,6 +19,7 @@ import {
   StoredMptTokenRow,
   StoredMptTransfer,
   toAccountMpt,
+  toAccountMptCsvRow,
   toMptHolder,
   toMptIssuance,
   toMptSummary,
@@ -298,6 +299,17 @@ describe('toMptTokenRow', () => {
       MPT_TOKEN_ROW_KEYS.filter((key) => !['ticker', 'name', 'maximum_amount'].includes(key)),
     );
     expect(row.transfers_24h).toBe(0);
+  });
+
+  it('keeps what an issuer wrote from running in a spreadsheet, in the CSV only', () => {
+    const row = toMptTokenRow({ ...ROW, ticker: '@SUM', name: '=HYPERLINK("http://x/","Fund")' }, 0);
+    expect(toMptTokenCsvRow(row)).toMatchObject({ ticker: "'@SUM", name: "'=HYPERLINK('http://x/','Fund')" });
+    expect(row).toMatchObject({ ticker: '@SUM', name: '=HYPERLINK("http://x/","Fund")' });
+  });
+
+  it('keeps what an issuer wrote from running in a spreadsheet in a holding too', () => {
+    const cells = toAccountMptCsvRow({ mpt_issuance_id: ID, ticker: '+1', name: 'a"b', amount: '1' });
+    expect(cells).toMatchObject({ mpt_issuance_id: ID, ticker: "'+1", name: "a'b", amount: '1' });
   });
 
   it('has the same columns in the CSV whatever a row holds, its flags flattened and an empty cell for what is absent', () => {

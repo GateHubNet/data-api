@@ -1,5 +1,5 @@
 import { LSF_MPT_LOCKED, mptIssuerOf, MptTransferKind } from '@gatehub/data-api-shared';
-import { CsvRow, toCsvRow } from '../common/csv.interceptor';
+import { CsvRow, csvSafeText, toCsvRow } from '../common/csv.interceptor';
 import { fmtTime } from '../common/format';
 
 /**
@@ -345,9 +345,24 @@ export function toMptTokenRow(row: StoredMptTokenRow, transfers24h: number): Mpt
   } as MptTokenRowObject;
 }
 
+/** A row as a row of a CSV, with `ticker` and `name`, which an issuer wrote, safe in a spreadsheet. */
+function toIssuerTextCsvRow(row: object, columns: readonly string[]): CsvRow {
+  const cells = toCsvRow(row, columns);
+  for (const column of ['ticker', 'name']) {
+    const text = cells[column];
+    if (typeof text === 'string') cells[column] = csvSafeText(text);
+  }
+  return cells;
+}
+
 /** A row of `kind=mpt` as a row of the CSV. */
 export function toMptTokenCsvRow(row: MptTokenRowObject): CsvRow {
-  return toCsvRow(row, MPT_TOKEN_CSV_COLUMNS);
+  return toIssuerTextCsvRow(row, MPT_TOKEN_CSV_COLUMNS);
+}
+
+/** A holding as a row of the CSV. */
+export function toAccountMptCsvRow(row: object): CsvRow {
+  return toIssuerTextCsvRow(row, ACCOUNT_MPT_KEYS);
 }
 
 /** `lsfMPTAuthorized` of an `MPToken`, what `authorized` says. */

@@ -298,6 +298,22 @@ describe('PaymentParser', () => {
       expect(payment?.destination_balance_changes[0].value).toBe('40000');
     });
 
+    // Synthetic (FINDINGS (5)), edited from payment_transfer_fee and payment_redeem: tfPartialPayment set and Amount above what
+    // moved, no DeliveredAmount as before the fix, and the node's delivered_amount only Amount.
+    it.each([
+      ['payment_transfer_fee', '1000000'],
+      ['payment_redeem', mptCase('payment_redeem').tx.Amount.value as string],
+    ])('%s as a partial payment before the fix delivers what moved', (name, moved) => {
+      const asked = `${moved}0`;
+      const partial = editedMptCase(name, (tx, meta) => {
+        tx.Flags = PARTIAL_PAYMENT;
+        tx.Amount.value = asked;
+        delete meta.DeliveredAmount;
+        meta.delivered_amount = { mpt_issuance_id: tx.Amount.mpt_issuance_id, value: asked };
+      });
+      expect(parser.parse(partial, XRPL)).toMatchObject({ amount: asked, delivered_amount: moved });
+    });
+
     // Synthetic, edited from payment_mint: the amounts of the transaction are not digits.
     it('reads an amount that is not digits as 0, and never throws', () => {
       const bad = editedMptCase('payment_mint', (tx, meta) => {

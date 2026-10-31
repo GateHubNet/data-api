@@ -55,6 +55,19 @@ export function toCsvRow(object: object, columns: readonly string[]): CsvRow {
   return Object.fromEntries(columns.map((column) => [column, values[column] ?? null]));
 }
 
+/** What makes a spreadsheet run a cell as a formula (OWASP, CSV Injection). */
+const FORMULA_START = /^[=+\-@\t\r]/;
+
+/**
+ * Text an outsider wrote, as a cell of a CSV of our own: a `'` before what a spreadsheet would run as a formula, and `'` for each `"`,
+ * which `convert` writes as `\"`, where an RFC 4180 reader ends the cell and moves the columns after it. The CSVs of the original's
+ * routes keep the original's cells.
+ */
+export function csvSafeText(text: string): string {
+  const cell = text.replace(/"/g, "'");
+  return FORMULA_START.test(cell) ? `'${cell}` : cell;
+}
+
 /** Whether the request asks for the CSV form: `format=csv`, in any case (the original lowercased the format). */
 export function wantsCsv(query: Record<string, unknown>): boolean {
   return first(query, 'format')?.toLowerCase() === 'csv';

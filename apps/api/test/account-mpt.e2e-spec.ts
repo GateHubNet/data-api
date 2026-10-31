@@ -1,10 +1,10 @@
-import { Table } from '@gatehub/data-api-shared';
+import { mptIssuanceId, Table } from '@gatehub/data-api-shared';
 import { COVERAGE_KEYS } from '../src/common/feature-coverage.service';
 import { ACCOUNT_MPT_BODY_KEYS, ACCOUNT_MPT_KEYS } from '../src/mpt/mpt-objects';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { accountAt } from './support/amm';
 import { csvDisposition } from './support/csv';
-import { expectNoMptRead, MPT_WORLD, mptHolderStateRow, seedMptWorld } from './support/mpt-world';
+import { expectNoMptRead, MPT_WORLD, mptHolderStateRow, mptIssuanceRow, seedMptWorld } from './support/mpt-world';
 
 /**
  * `GET /v2/accounts/{address}/mpt` (D9, spec 7.6) on a real ClickHouse, over the world of the MPT suites: `holders[0]` holds `htf`,
@@ -185,6 +185,19 @@ describe('the MPT holdings of an account over the MPT world', () => {
     expect(rows).toHaveLength(4);
     expect(rows[2]).toBe(`"${ids.unknownState}","${issuer}","","","","500","0","false","true"`);
     expect(res.text).not.toContain('from_ledger_index');
+  });
+
+  it('format=csv keeps a name an issuer wrote from running in a spreadsheet, and the JSON serves it as written', async () => {
+    const account = accountAt(0xd002);
+    const id = mptIssuanceId(0x7001, issuer);
+    const name = '=HYPERLINK("http://evil.example/","Fund")';
+    await h.ch.insert(Table.MptIssuances, [mptIssuanceRow(id, { ticker: '@SUM', name })]);
+    await h.ch.insert(Table.MptHolderStates, [mptHolderStateRow(account, id, 107_000_001, '5')]);
+
+    const res = await get(`${path(account)}?format=csv`);
+    expect(res.text.split('\n')[1]).toContain(`"'@SUM","'=HYPERLINK('http://evil.example/','Fund')"`);
+    const { body } = await api.ok(path(account), 'mpt');
+    expect(body.mpt[0]).toMatchObject({ ticker: '@SUM', name });
   });
 
   it('reads the issuance fields of the IDs of the page only', async () => {

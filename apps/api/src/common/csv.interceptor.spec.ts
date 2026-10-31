@@ -3,7 +3,7 @@ import { Test } from '@nestjs/testing';
 import { Request, Response } from 'express';
 import { convert, expressDecorator } from 'nice-json2csv';
 import request from 'supertest';
-import { Csv, csvContentDisposition, CsvInterceptor, flattenJSON, wantsCsv } from './csv.interceptor';
+import { Csv, csvContentDisposition, CsvInterceptor, csvSafeText, flattenJSON, wantsCsv } from './csv.interceptor';
 import { badRequest } from './errors';
 import { RippleController } from './ripple-controller';
 
@@ -276,6 +276,22 @@ describe('Csv', () => {
       expect(res.headers['content-disposition']).toBeUndefined();
       expect(res.body).toEqual({ result: 'error', message: 'invalid start date format' });
     });
+  });
+});
+
+describe('csvSafeText', () => {
+  it.each(['=1+1', '+1', '-1', '@SUM(A1)', '\tx', '\rx'])('keeps a spreadsheet from running %j', (text) => {
+    expect(csvSafeText(text)).toBe(`'${text}`);
+  });
+
+  it('leaves other text as it is', () => {
+    for (const text of ['Hello', 'a=b', 'a-b', 'A@B', '']) expect(csvSafeText(text)).toBe(text);
+  });
+
+  it('writes no double quote, which the writer escapes so that a reader ends the cell there', () => {
+    expect(csvSafeText('a","999')).toBe("a','999");
+    expect(csvSafeText('=HYPERLINK("http://evil.example/","Fund")')).toBe("'=HYPERLINK('http://evil.example/','Fund')");
+    expect(convert([{ name: csvSafeText('a","999'), holders: '1' }])).toBe(`"name","holders"\n"a','999","1"`);
   });
 });
 

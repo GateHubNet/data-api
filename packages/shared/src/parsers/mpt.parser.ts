@@ -10,7 +10,7 @@ import {
   mptUnits,
 } from './mpt-deltas';
 import { ParseContext, ParserTx } from './parser.interface';
-import { deliveredAmount } from './payment.parser';
+import { deliveredAmount, mptPartialDelivered } from './payment.parser';
 
 /** The state of an issuance after a transaction that changed its node, whatever the result. Amounts are integer units. */
 export interface ParsedMptIssuanceState {
@@ -154,10 +154,12 @@ export class MptParser {
         id = mptPaymentIssuance(tx, meta);
         if (id === undefined) return undefined;
         const delivered = deliveredAmount(tx, meta, t.ledger_index, ctx) as { value?: unknown } | undefined | string;
-        const amount = this.value(
-          parsed,
-          (typeof delivered === 'object' && delivered !== null ? delivered : (tx.Amount ?? tx.DeliverMax)).value,
-        );
+        const amount =
+          mptPartialDelivered(tx, meta, id, deltas) ??
+          this.value(
+            parsed,
+            (typeof delivered === 'object' && delivered !== null ? delivered : (tx.Amount ?? tx.DeliverMax)).value,
+          );
         const sender = holderOf(tx.Account, id);
         const fall = sender === undefined ? 0n : sender.amount_before - sender.amount_after;
         transfer = {

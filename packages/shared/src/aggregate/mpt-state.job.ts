@@ -4,7 +4,7 @@ import { Table } from '../clickhouse/tables';
 import { LSF_MPT_LOCKED } from '../parsers/mpt.parser';
 import { RatesService } from '../query/rates.service';
 import { decodeMptIssuanceId } from '../util/mpt';
-import { cutText, decodeMptMetadata, MPT_NAME_MAX, MPT_TICKER_MAX, mptMetadataConforms } from '../util/mpt-metadata';
+import { cutText, decodeMptMetadata, MPT_NAME_MAX, MPT_TICKER_MAX, mptMetadataHexConforms } from '../util/mpt-metadata';
 import { committedHead } from './amm-pools.job';
 
 /**
@@ -479,7 +479,7 @@ function issuanceRowOf(
     transfer_fee: state === undefined ? 0 : Number(state.transfer_fee),
     metadata_hex: hex,
     metadata: decoded === undefined ? '' : JSON.stringify(decoded),
-    metadata_conforms: decoded !== undefined && mptMetadataConforms(decoded) ? 1 : 0,
+    metadata_conforms: mptMetadataHexConforms(hex) ? 1 : 0,
     ticker: cutText(decoded?.ticker, MPT_TICKER_MAX),
     name: cutText(decoded?.name, MPT_NAME_MAX),
     created_ledger: made === undefined ? null : Number(made.ledger_index),
@@ -606,7 +606,8 @@ export async function rebuildMptIssuances(
   if (ids.length === 0) return;
   const pairs: MptPair[] = stale.flatMap((s) => s.holders.map((holder) => ({ id: s.id, holder })));
   for (const chunk of chunksOf(ids, MPT_STATE_BATCH)) {
-    pairs.push(...(await pairsAboveReflected(ch, chunk, head, signal)));
+    // One by one: spread into a call, some 125,000 pairs of one issuance overflow the stack, and so would every retry.
+    for (const pair of await pairsAboveReflected(ch, chunk, head, signal)) pairs.push(pair);
   }
   await recomputeMptHolders(ch, pairs, head, o);
   await recomputeMptIssuances(ch, ids, head, o);

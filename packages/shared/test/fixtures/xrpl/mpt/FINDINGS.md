@@ -65,7 +65,7 @@ Confirmed on every shape, and the same in the stored metadata (`tx` with `binary
 - Source-read, rippled 3.4.1, `Payment.cpp`: `if (view().rules().enabled(fixMPTDeliveredAmount) && amountDeliver != dstAmount) ctx_.deliver(amountDeliver);`. So `DeliveredAmount` is stored only when less than `Amount` was delivered, which takes a partial payment. None of the payments read has `tfPartialPayment`.
 - Before the fix: `payment_before_delivered_fix` (ledger 101491684): no `DeliveredAmount`, stored or served, but `meta.delivered_amount` `{ value: "1" }` is served, in the recorded ledger too. The node adds it to every successful payment.
 - On all 1,542 mainnet payments (34 before the fix, 1,508 after) `delivered_amount` equals `Amount`.
-- So the existing rule (`DeliveredAmount`, else `delivered_amount`, else `Amount`) gives the right amount on every payment read. C30(e) stands: a partial payment before the fix would serve `Amount`, and none was found.
+- So the existing rule (`DeliveredAmount`, else `delivered_amount`, else `Amount`) gives the right amount on every payment read. C30(e) stood when this was written: a partial payment before the fix would serve `Amount`, and none was found. (2026-10-31, D9's review: such a payment now reads what moved, since a reprocess would otherwise write the wrong figure for good. Still none was found.)
 - `DeliverMax`: all 7 MPT payments in the recorded mainnet ledgers carry it beside `Amount`.
 
 ### (6) The transfer fee is burned; MPT escrows exist

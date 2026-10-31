@@ -10,6 +10,7 @@ import {
   MPT_URI_KEYS,
   MptMetadata,
   mptMetadataConforms,
+  mptMetadataHexConforms,
 } from './mpt-metadata';
 
 /** The `MPTokenMetadata` of a case of `xrpl/mpt`, as the transaction has it. */
@@ -197,6 +198,42 @@ describe('decodeMptMetadata', () => {
       expect(decodeMptMetadata(hex)).toBeUndefined();
     }
     expect(decodeMptMetadata(padded(1024))).toEqual({});
+  });
+});
+
+describe('mptMetadataHexConforms', () => {
+  const REQUIRED = { t: 'HTF', n: 'Hello', i: 'https://example.com/i.png', ac: 'defi', in: 'Hello Inc' };
+  const LINK = { u: 'https://example.com', c: 'docs', t: 'Docs' };
+
+  it.each<[string, Record<string, unknown>]>([
+    ['the required keys alone', {}],
+    ['a full item of uris', { us: [LINK] }],
+    ['no item of uris', { us: [] }],
+    ['an unknown key, which XLS-89 does not forbid', { extra: 5 }],
+  ])('is true for %s', (_, over) => {
+    expect(mptMetadataHexConforms(hexOf({ ...REQUIRED, ...over }))).toBe(true);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['an item of uris with no uri', { us: [LINK, { c: 'docs', t: 'no uri' }] }],
+    ['an item of uris that is no object', { us: [LINK, 5] }],
+    ['uris that is no array', { us: 'http://x' }],
+    ['uris of a single item with no uri', { us: [{ c: 'docs' }] }],
+    ['a uri that is no string', { us: [{ u: 5, c: 'docs', t: 'x' }] }],
+    ['a draft urls that is no array', { urls: 5 }],
+    ['a draft urls with an item with no url', { urls: [{ type: 'docs', title: 'x' }] }],
+    ['an asset_subclass that is no string', { as: 5 }],
+    ['additional_info that is neither an object nor a string', { ai: 5 }],
+    ['a desc that is no string', { d: 5 }],
+    ['a null where a value belongs', { d: null }],
+  ])('is false for %s, which decoding drops', (_, over) => {
+    expect(mptMetadataHexConforms(hexOf({ ...REQUIRED, ...over }))).toBe(false);
+  });
+
+  it('is false for a rule of the decoded object, and for hex that does not decode', () => {
+    expect(mptMetadataHexConforms(hexOf({ ...REQUIRED, ac: 'nope' }))).toBe(false);
+    expect(mptMetadataHexConforms('6e6f74206a736f6e')).toBe(false);
+    expect(mptMetadataHexConforms('')).toBe(false);
   });
 });
 

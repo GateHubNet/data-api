@@ -2,7 +2,7 @@ import { BigNumber } from 'bignumber.js';
 import { parseBalanceChanges } from 'ripple-lib-transactionparser';
 import { dropsToNative } from '../util/amount';
 import { mptIssuerOf } from '../util/mpt';
-import { mptAmountIssuance, mptDeltas, mptPaymentIssuance, mptUnits } from './mpt-deltas';
+import { mptAmountIssuance, MptDeltas, mptDeltas, mptPaymentIssuance, mptUnits } from './mpt-deltas';
 import { feePayer, ParseContext, ParserTx } from './parser.interface';
 
 /** A balance change as `ripple-lib-transactionparser` reports it, but with the native currency remapped. */
@@ -64,6 +64,25 @@ export function deliveredAmount(tx: Json, meta: Json, ledgerIndex: number, ctx: 
 
   const partial = (Number(tx.Flags ?? 0) & TF_PARTIAL_PAYMENT) !== 0;
   return !partial || ledgerIndex > ctx.partialPaymentFixLedger ? tx.Amount : 'unavailable';
+}
+
+/**
+ * What a partial MPT payment moved when the ledger stored no `DeliveredAmount`: before fixMPTDeliveredAmount it stored none, and the
+ * node's `delivered_amount` is then only `Amount` (FINDINGS (5)). It is the destination's rise, or the fall of `OutstandingAmount` for
+ * a payment to the issuer, which holds no `MPToken`. `undefined` for every other payment, which `deliveredAmount` reads.
+ */
+export function mptPartialDelivered(tx: Json, meta: Json, id: string, deltas: MptDeltas): bigint | undefined {
+  if ((Number(tx.Flags ?? 0) & TF_PARTIAL_PAYMENT) === 0) return undefined;
+  if (meta.DeliveredAmount !== undefined && meta.DeliveredAmount !== null) return undefined;
+  let moved = 0n;
+  if (tx.Destination === mptIssuerOf(id)) {
+    const issuance = deltas.issuances.find((i) => i.mpt_issuance_id === id);
+    if (issuance !== undefined) moved = issuance.outstanding_before - issuance.outstanding_after;
+  } else {
+    const holder = deltas.holders.find((h) => h.holder === tx.Destination && h.mpt_issuance_id === id);
+    if (holder !== undefined) moved = holder.amount_after - holder.amount_before;
+  }
+  return moved > 0n ? moved : undefined;
 }
 
 /** The whole-unit value of an amount: an issued currency's `value`, or native drops converted. */
@@ -205,7 +224,9 @@ export class PaymentParser {
       currency: id,
       issuer,
       amount: mptValue(asked),
-      delivered_amount: mptValue(mptAmountIssuance(delivered) === id ? delivered : asked),
+      delivered_amount: String(
+        mptPartialDelivered(tx, meta, id, deltas) ?? mptValue(mptAmountIssuance(delivered) === id ? delivered : asked),
+      ),
       source_currency: id,
       fee_drops: String(tx.Fee ?? '0'),
       source_balance_changes: sourceChanges,

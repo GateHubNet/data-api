@@ -139,6 +139,10 @@ address.
   node timeouts for live lookups).
 - **Output hygiene:** the CSV file name is built from the request and stripped of characters a header cannot carry. A known nit: the
   payments CSV file name echoes an unvalidated currency text (the header is made safe, the name is not restricted further).
+- **What an issuer wrote, in a CSV:** anyone can create an MPT issuance, so its `ticker` and `name` are an outsider's text. In the CSVs of
+  `kind=mpt` and of an account's MPT holdings, exports too, each has a leading `'` when it starts with `=`, `+`, `-`, `@`, a tab or a CR,
+  and `'` for each `"`, so that a spreadsheet does not run it and a reader keeps the columns after it. The JSON answers serve them as
+  written, and a client treats them as untrusted. The other CSVs are unchanged.
 - **The live-node proxy** only forwards fixed commands (`account_info`, `account_lines`, `account_offers`, plus `server_info` / `server_definitions` at boot) with validated
   addresses and ledger selectors; node errors are mapped to Ripple messages, never passed through.
 
