@@ -525,7 +525,8 @@ The hourly supply snapshot ([operations](operations.md#supply-snapshots)) is rea
   issued tokens through their hook, and a window that meets a ledger of an older parser rebuilds them, more than once during a run from the oldest ledger up (above).
 - **The XRP Ledger needs no re-ingest for the supply.** `total` and `burned` come from the ledger header. `escrowed`, `amm` and `reserves` follow the coverage of the ledger objects, the AMM data and the state tables. `reserves`
   turns `complete` only with the history load from ledger 32,570, which provides the state of the first ledger.
-- **The figures follow at the next snapshot.** `coverage` changes at once, and the figures within the hour.
+- **The figures follow with the next cycle that starts after the fill** ([operations](operations.md#supply-snapshots)). `coverage` changes at once.
+- **A reward near the start of the coverage can read as `genesis_mint`.** A mint is a reward when its claim is stored, so a `GenesisMint` just above the coverage start whose `ClaimReward` is just below it counts as `genesis_mint` in every snapshot until the re-ingest. The part says `complete: false` meanwhile.
 
 Check the coverage:
 

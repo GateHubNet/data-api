@@ -1835,7 +1835,7 @@ Errors: the pair errors of the exchanges route, then 400 `invalid period - use: 
 
 ## Network
 
-`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`, and `nft_volume` the same with `coverage` after `result`. `marker` is present only when there is a next page. `markets` and `supply` have an object of their own, described with each route, and `supply/minted` is a list like `nft_volume`'s, `coverage` after `result`.
+`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`, and `nft_volume` the same with `coverage` after `result`. `marker` is present only when there is a next page. `markets` and `supply` have an object of their own, described with each route, and `supply/minted` answers `{ "result": "success", "coverage": {...}, "marker": "…", "count": n, "rows": [...] }` (the key order is `result, coverage, marker, count, rows`).
 
 ### `GET /v2/network/fees`
 
@@ -2323,7 +2323,7 @@ rate limit, `Cache-Control: private, max-age=60`, errors `{"result":"error","mes
 [spec](superpowers/specs/2026-10-24-supply-design.md).
 
 - **A snapshot, not a live figure.** The syncer's `supply` job computes every figure at one ledger, once an hour, and writes one row; the route serves the newest row, so an answer is up to
-  an hour old. `ledger_index` and `close_time` (`YYYY-MM-DDTHH:mm:ssZ`) are the ledger every figure is as of, `computed_at` when the row was written. Before the first snapshot exists the
+  about an hour old, plus the time a cycle takes. `ledger_index` and `close_time` (`YYYY-MM-DDTHH:mm:ssZ`) are the ledger every figure is as of, `computed_at` when the row was written. Before the first snapshot exists the
   answer is 404 `supply not computed yet`.
 - **Amounts** are exact decimal text in whole units of the native currency (`"64772465269.314"`: the drops divided by a million, trailing zeros dropped), summed in drops, so no float is
   in the way; the total of the XRP Ledger is past 2^53 drops. Counts (`escrows`, `pools`, `accounts`, `owner_count`) are numbers. A key without a value is left out, never `null`: `minted`
@@ -2482,9 +2482,9 @@ The native currency created on each UTC day, by source, on a network that mints 
 - **Coverage.** `coverage` stands right after `result`: the coverage of the feature `mints` (parser version 9; [Coverage](#coverage)). `from_ledger_index` is where the mints are indexed from, and `complete` says whether that is back to the network's first
   ledger, so a `false` means the currency minted before it is in no row. With no ledger stored it is `{ "complete": false }` and the list is empty.
 - **Pages.** `marker` is the start of the last row's day and is there only when there is a next page; the next page begins with the day after it (before it, when `descending`). The `Link` header carries the URL of the next page.
-- **A network that cannot mint** (the XRP Ledger and its testnet) answers `coverage` with `complete` true, `count` 0 and `rows` `[]`: there is nothing to be missing. No mint table is read.
+- **A network that cannot mint** (the XRP Ledger and its testnet) answers `coverage` with `complete` true, `count` 0 and `rows` `[]`: there is nothing to be missing. No mint table is read. With no ledger stored its `coverage` is `{ "complete": false }`, as on any network.
 - **CSV.** The columns are the keys of a row, in order: `date, amount, rewards, import, genesis_mint` (a row has every key). `coverage` and `marker` are not in the file; an empty page is an empty file.
-- **Errors**, checked in this order and before anything is read: 400 `invalid start date format`, `invalid end date format`, `invalid interval`, `invalid marker`; then 401 and 429 as everywhere, and 500 `unable to retrieve minted supply`.
+- **Errors**: 401 and 429 as everywhere come first; then, in this order and before anything is read, 400 `invalid start date format`, `invalid end date format`, `invalid interval`, `invalid marker`; and 500 `unable to retrieve minted supply`.
 
 **The examples** are answers of the end-to-end suite (`apps/api/test/supply-minted.e2e-spec.ts`, key order included; the ledgers and the mints are written by hand, `apps/api/test/support/supply-seed.ts`, with made-up figures): five days on Xahau from ledger
 1, mints on three of them, read with `limit=3`. The first page of a list has a `marker`, and its CSV is the three rows.

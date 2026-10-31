@@ -1063,9 +1063,9 @@ SELECT * FROM xrpl.network_supply ORDER BY ledger_index DESC, version DESC LIMIT
 
 **Watch** `syncer_supply_snapshot_age_seconds` (a healthy age peaks at about an hour plus the cycle; the alert is above 3 hours), `syncer_supply_cycle_seconds`, `syncer_aggregator_errors_total{job="supply"}` and, on Xahau, `syncer_parser_anomalies_total{kind="import_minted_negative"}`, which should stay 0 ([alerts](observability.md#recommended-alerts)).
 
-**Before the first snapshot** the route answers 404 `supply not computed yet`. The first cycle starts once the sentinel of the `escrows` job exists, and takes minutes today, up to an hour at full history.
+**Before the first snapshot** the route answers 404 `supply not computed yet`. The first cycle starts once the sentinel of the `escrows` job is within 1,000 ledgers of the head and, on the XRP Ledger, the `amm_pools` job has its cursor, so during a first fill of the escrows the route answers 404 for hours without a fault (the log says `supply: waiting for escrows/amm_pools to reach the head`). The cycle itself takes minutes today, up to an hour at full history.
 
-**A reprocess or a backfill shows in the figures at the next cycle, within an hour, while `coverage` changes at once**, since coverage is read at request time and the figures come from the snapshot. A part can say `complete: true` over a figure from before the fill; wait one cycle before reading it.
+**A reprocess or a backfill shows in the figures at the next cycle that starts after it, up to an hour later plus the cycle itself, while `coverage` changes at once**, since coverage is read at request time and the figures come from the snapshot. A part can say `complete: true` over a figure from before the fill, because a cycle already running keeps the start it planned. To be sure, read a row whose `started_at` is after the fill; the api does not serve `started_at`, so read it in `network_supply`.
 
 **Re-ingests.** The job keeps no incremental state, so it has no `agg_dirty` hook and nothing to repair. A `--reprocess` that rewrites ledgers at or below the snapshot ledger while a cycle runs can leave that cycle's figures off for the accounts or mints it rewrote (a range read between the delete and the rewrite); the next cycle is right again. Which re-ingest each part needs is in [backfill](backfill.md#supply).
 

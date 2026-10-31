@@ -2718,7 +2718,7 @@ describe('Xahau mint rows (parser version 9)', () => {
     const recorded = checkMintInvariant(builtOf(XAHAU_SET));
     const cases = checkMintInvariant(builtOf(MINT_XAHAU), handMade);
     const pairs = recorded.pairs + cases.pairs;
-    expect(pairs).toBeGreaterThanOrEqual(2);
+    expect(pairs).toBe(3);
     // not vacuous: both kinds of mint were part of it
     expect(recorded.genesis + cases.genesis).toBeGreaterThan(0n);
     expect(recorded.imported + cases.imported).toBeGreaterThan(0n);
