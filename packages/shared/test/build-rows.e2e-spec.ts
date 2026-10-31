@@ -76,7 +76,7 @@ interface Scenario {
   /** Test name. */
   name: string;
   database: string;
-  network: 'xrpl' | 'xahau';
+  network: 'xrpl' | 'xahau' | 'xrpl-testnet';
   dir: string;
   ledgers: number;
   /** The number of payments the Ripple Data API finds in these ledgers, when it is known. */
@@ -89,6 +89,8 @@ interface Scenario {
   touches?: boolean;
   /** The ledgers are the recorded Xahau mint cases (Imports with their parent ledgers, and two hand-made ledgers): the three mint tables get rows. */
   mint?: boolean;
+  /** The ledgers are the recorded MPT cases: the five MPT tables get rows. */
+  mpt?: boolean;
 }
 
 const SCENARIOS: Scenario[] = [
@@ -144,6 +146,16 @@ const SCENARIOS: Scenario[] = [
     ledgers: 6,
     mint: true,
   },
+  // Whole ledgers around the recorded MPT cases, the three enable ledgers among them, and the escrow cases mainnet does not have.
+  { name: 'recorded MPT cases xrpl', database: 'rows_mpt', network: 'xrpl', dir: 'xrpl/mpt', ledgers: 27, mpt: true },
+  {
+    name: 'recorded MPT cases xrpl testnet',
+    database: 'rows_mpt_testnet',
+    network: 'xrpl-testnet',
+    dir: 'xrpl-testnet/mpt',
+    ledgers: 5,
+    mpt: true,
+  },
 ];
 
 /** The five NFT tables, with the property of `LedgerRows` that holds their rows. */
@@ -160,6 +172,15 @@ const MINT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.GenesisMints, 'genesisMints'],
   [Table.Imports, 'imports'],
   [Table.RewardClaims, 'rewardClaims'],
+];
+
+/** The five MPT tables, with the property of `LedgerRows` that holds their rows. */
+const MPT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
+  [Table.MptIssuanceStates, 'mptIssuanceStates'],
+  [Table.MptHolderStates, 'mptHolderStates'],
+  [Table.MptTouches, 'mptTouches'],
+  [Table.MptTransfers, 'mptTransfers'],
+  [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
 ];
 
 /** The two object tables, with the property of `LedgerRows` that holds their rows. */
@@ -281,6 +302,22 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
           READ_SETTINGS,
         );
         expect(minted.map((r) => r.minted)).toEqual(['11', '2000000']);
+      });
+    }
+
+    if (scenario.mpt) {
+      it('the MPT fixtures land in all five tables, the enum and the amounts read back exactly', async () => {
+        for (const [table, key] of MPT_TABLES) {
+          const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
+          expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
+        }
+        const written = built.flatMap((rows) => rows.mptTransfers);
+        const stored = await svc.query<{ kind: string; amount: string; fee: string }>(
+          `SELECT kind, amount, fee FROM ${Table.MptTransfers} ORDER BY ledger_index, tx_index`,
+          {},
+          READ_SETTINGS,
+        );
+        expect(stored).toEqual(written.map(({ kind, amount, fee }) => ({ kind, amount, fee })));
       });
     }
 

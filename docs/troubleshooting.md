@@ -233,6 +233,10 @@ without end, and the `supply` job of the aggregator reads them on Xahau (it plan
 The `validators` worker is enabled and `validator_domains` does not have the five columns of the migration (`owner_country`, `server_country`, `toml_network`, `toml_unl`, `toml_version`). The domain checker reads and writes them, so without them every pass would fail, and every validators route of the api answers 500 until they exist. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer again
 ([deployment](deployment.md#schema-migrations)).
 
+### Syncer refuses to boot: `lacks the schema of 017_mpt.sql`
+The `ingest` worker is enabled and the database does not have the five MPT ledger tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers`. The schema is one on every network, so a syncer on Xahau is refused too, though its ingest never inserts into them; on XRPL and XRPL Testnet an insert into a missing table fails the batch, so the live runner would retry the same ledgers without end. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer again
+([deployment](deployment.md#schema-migrations)).
+
 ### An escrow, check, payment channel or delegation answers 404, has no `created`, or says `"complete": false`
 `coverage` says how much of the history the index holds ([api-reference](api-reference.md#coverage)): the object data start at the first ledger written by parser version 7 or
 later, and `complete` is true only when that is at or before the ledger the feature starts at (XRPL: 28,685,313 for escrows and payment channels, 56,219,905 for checks, 107,524,865

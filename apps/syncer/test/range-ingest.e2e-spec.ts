@@ -22,7 +22,15 @@ import { join } from 'node:path';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { rangeIngest, RangeIngestOptions } from '../src/cli/range-ingest';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { ammTemplate, mintTemplate, nftTemplate, objectTemplate, range, syntheticChain } from './synthetic-chain';
+import {
+  ammTemplate,
+  mintTemplate,
+  mptTemplate,
+  nftTemplate,
+  objectTemplate,
+  range,
+  syntheticChain,
+} from './synthetic-chain';
 
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 
@@ -71,6 +79,14 @@ const CLAMPED_PER_LEDGER = 2;
  * GenesisMint of 8 entries (rows in all three mint tables) and `CLAMPED_PER_LEDGER` clamped Imports.
  */
 const MINT_RAW = syntheticChain(L(1), 30, { template: mintTemplate(CLAMPED_PER_LEDGER) }).map((l) => l.raw);
+
+/** Transactions per ledger of `MPT_RAW` whose MPT amount cannot be read: it is stored as 0 and counted (see `mptTemplate`). */
+const UNREADABLE_PER_LEDGER = 2;
+/**
+ * The same 30 ledgers with MPT activity: each holds a recorded MPTokenAuthorize and a Payment with a transfer fee (rows in all five
+ * MPT tables) and `UNREADABLE_PER_LEDGER` unreadable tokens.
+ */
+const MPT_RAW = syntheticChain(L(1), 30, { template: mptTemplate(UNREADABLE_PER_LEDGER) }).map((l) => l.raw);
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 /**
@@ -1216,6 +1232,137 @@ describe('rangeIngest (e2e)', () => {
       await expectRows(svc, OBJECT_RAW.slice(0, 14), CHAIN_TABLES);
       await expectNoDuplicateObjectRows(svc);
       expect(await unclassifiedObjects(metrics)).toBe(before + 14 * UPDATES_PER_LEDGER);
+    });
+  });
+
+  describe('MPT ledgers (parser version 10)', () => {
+    const MPT_TABLES = [
+      Table.MptIssuanceStates,
+      Table.MptHolderStates,
+      Table.MptTouches,
+      Table.MptTransfers,
+      Table.MptIssuanceTransfers,
+    ];
+
+    /** The counter now, for the one kind. It is process-wide, so a test compares it with its value before. */
+    const unreadable = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.parserAnomaliesTotal.get()).values.find((v) => v.labels.kind === 'mpt_unreadable')?.value ?? 0;
+
+    /** The rows of the five MPT tables that writing `ledgers` gives, from the rows `buildLedgerRows` makes. */
+    const expectedMpt = (ledgers: RawLedger[]): Counts => {
+      const counts: Counts = {
+        mpt_issuance_states: 0,
+        mpt_holder_states: 0,
+        mpt_touches: 0,
+        mpt_transfers: 0,
+        mpt_issuance_transfers: 0,
+      };
+      for (const raw of ledgers) {
+        const rows = buildLedgerRows(raw, ctx);
+        counts.mpt_issuance_states += rows.mptIssuanceStates.length;
+        counts.mpt_holder_states += rows.mptHolderStates.length;
+        counts.mpt_touches += rows.mptTouches.length;
+        counts.mpt_transfers += rows.mptTransfers.length;
+        counts.mpt_issuance_transfers += rows.mptIssuanceTransfers.length;
+      }
+      return counts;
+    };
+
+    /** `count() == uniqExact(<sorting key>)` in each MPT table: no row is there twice, and there are rows. */
+    async function expectNoDuplicateMptRows(svc: ClickHouseService): Promise<void> {
+      for (const table of MPT_TABLES) {
+        const key = (
+          await svc.queryOne<{ sorting_key: string }>(
+            'SELECT sorting_key FROM system.tables WHERE database = currentDatabase() AND name = {t:String}',
+            { t: table },
+          )
+        )?.sorting_key;
+        const row = await svc.queryOne<{ n: string | number; u: string | number }>(
+          `SELECT count() AS n, uniqExact(${key}) AS u FROM ${table}`,
+        );
+        expect([table, Number(row?.n) > 0, Number(row?.n)]).toEqual([table, true, Number(row?.u)]);
+      }
+    }
+
+    it('writes the five MPT tables, and adds the unreadable amounts to syncer_parser_anomalies_total', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unreadable(metrics);
+
+      const result = await rangeIngest(new TestSource(MPT_RAW), svc, ctx, { from: L(1), to: L(30), ...FAST, metrics });
+
+      expect(result).toEqual({ chunksDone: 2, ledgers: 30 });
+      expect(await tableCounts(svc, MPT_TABLES)).toEqual(expectedMpt(MPT_RAW));
+      await expectNoDuplicateMptRows(svc);
+      expect(await unreadable(metrics)).toBe(before + 30 * UNREADABLE_PER_LEDGER);
+    });
+
+    it('names syncer_parser_anomalies_total in a warning at the end, and leaves its final line as it is', async () => {
+      const svc = await freshService();
+      const logger = captureLogger();
+      await rangeIngest(new TestSource(MPT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, logger });
+      const total = 14 * UNREADABLE_PER_LEDGER;
+      expect(logger.lines.filter((l) => l.level === 'warn').map((l) => l.message)).toEqual([
+        `${total} MPT amounts or nodes in the ledgers written could not be read and were stored as 0 or skipped: see syncer_parser_anomalies_total{kind="mpt_unreadable"}`,
+      ]);
+      expect(logger.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(
+        /, 0 unclassified AMM pools, 0 skipped NFT events, 0 unclassified object changes$/,
+      );
+
+      // a range without any has no warning
+      const none = captureLogger();
+      await rangeIngest(new TestSource(CHAIN_RAW), await freshService(), ctx, {
+        from: L(1),
+        to: L(5),
+        ...FAST,
+        logger: none,
+      });
+      expect(none.lines.some((l) => l.message.includes('mpt_unreadable'))).toBe(false);
+    });
+
+    it('--reprocess of MPT ledgers leaves each key once in the five tables, and counts them once', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(MPT_RAW.slice(0, 5)); // L(1)..L(5)
+      const metrics = new PrometheusService();
+      const before = await unreadable(metrics);
+
+      await rangeIngest(new TestSource(MPT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, metrics });
+      expect(await unreadable(metrics)).toBe(before + 9 * UNREADABLE_PER_LEDGER);
+      const written = await tableCounts(svc, MPT_TABLES);
+      expect(written).toEqual(expectedMpt(MPT_RAW.slice(0, 14)));
+
+      await rangeIngest(new TestSource(MPT_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+        metrics,
+      });
+      expect(await unreadable(metrics)).toBe(before + (9 + 14) * UNREADABLE_PER_LEDGER);
+      // the same rows as before: the rewrite deleted what it replaced
+      expect(await tableCounts(svc, MPT_TABLES)).toEqual(written);
+      await expectNoDuplicateMptRows(svc);
+    });
+
+    it('--reprocess gives ledgers written without MPT rows (parser version 9) their MPT rows, without duplicates', async () => {
+      const svc = await freshService();
+      await rangeIngest(new TestSource(MPT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST });
+      // What parser version 9 wrote: no rows in the MPT tables.
+      for (const table of MPT_TABLES) {
+        await svc.command(`DELETE FROM ${table} WHERE 1`, {}, { settings: { lightweight_deletes_sync: '2' } });
+        expect(await count(svc, table)).toBe(0);
+      }
+
+      const result = await rangeIngest(new TestSource(MPT_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+      });
+
+      expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
+      expect(await tableCounts(svc, MPT_TABLES)).toEqual(expectedMpt(MPT_RAW.slice(0, 14)));
+      await expectNoDuplicateMptRows(svc);
     });
   });
 

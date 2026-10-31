@@ -65,7 +65,7 @@ Everything both services need, written once:
   (`config/amendments/<family>.json`), read by the testnet of the family without its `enabled` entries.
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
-- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens, the history of escrows, checks, payment channels and delegations, the index of the trust lines and issuers a transaction changed, `state_touches`, and Xahau's mints) and
+- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens, the history of escrows, checks, payment channels and delegations, the index of the trust lines and issuers a transaction changed, `state_touches`, Xahau's mints, and MPT issuances, holders and transfers) and
   `buildLedgerRows` (a raw ledger -> rows of the 40 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).

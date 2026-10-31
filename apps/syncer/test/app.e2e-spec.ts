@@ -271,6 +271,40 @@ describe('AppModule on a real ClickHouse', () => {
     );
   });
 
+  it('fails the boot, naming 017_mpt.sql and its five ledger tables, when the ingest worker runs on a database of 001, 014 and 015', async () => {
+    const database = 'syncer_app_e2e_without_017';
+    await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql'], (schemaDir) =>
+      bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
+    );
+    await closeApp();
+    expect(await tablesOf(database)).not.toContain('mpt_touches');
+
+    // the checks of 014 and 015 pass on this database, so the refusal is 017's alone: on every network, as the schema is one
+    const refused = await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'ingest' }).catch(
+      (err: Error) => err,
+    );
+    expect(refused).toBeInstanceOf(Error);
+    expect((refused as Error).message).toMatch(
+      /lacks the schema of 017_mpt\.sql \(table mpt_issuance_states, table mpt_holder_states, table mpt_touches, table mpt_transfers, table mpt_issuance_transfers\), which the ingest worker writes/,
+    );
+    expect((refused as Error).message).not.toContain('015_supply.sql');
+    // the same database lets a syncer without the ingest start, and the migration then gives the tables
+    await bootApp({ GH_CLICKHOUSE_DATABASE: database });
+    await closeApp();
+    await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql', '017_mpt.sql'], (schemaDir) =>
+      bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
+    );
+    expect(await tablesOf(database)).toEqual(
+      expect.arrayContaining([
+        'mpt_issuance_states',
+        'mpt_holder_states',
+        'mpt_touches',
+        'mpt_transfers',
+        'mpt_issuance_transfers',
+      ]),
+    );
+  });
+
   it('fails the boot, naming 016_validator_toml_details.sql and its columns, when the validators worker runs on a database of 001 and 002', async () => {
     const database = 'syncer_app_e2e_without_016';
     await withMigrations(['001_baseline.sql', '002_validators_amendments.sql'], (schemaDir) =>

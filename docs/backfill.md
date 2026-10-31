@@ -128,11 +128,15 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   `TOKEN_PARSER_VERSION`): ledgers written by an older version have none. **The aggregate of the issued tokens needs no re-ingest of them**: its account
   pass reads `trust_line_states` as it is, and the job needs the touches only above the ledger its generation was built at. The job never applies a window that
   holds a ledger of an older version: it builds a new generation instead. A `--reprocess` of a range writes the touches of its ledgers, as for every table.
-  Parser version 9 (the current one) adds the Xahau mint rows (`genesis_mints`, `imports` and `reward_claims`; `MINT_PARSER_VERSION`): the entries of a `GenesisMint`, the
+  Parser version 9 adds the Xahau mint rows (`genesis_mints`, `imports` and `reward_claims`; `MINT_PARSER_VERSION`): the entries of a `GenesisMint`, the
   drops each `Import` brought and the `ClaimReward`s that a reward mint answers. Xahau ledgers written by an older version have none of them, and a `--reprocess` of a range
   writes them; XRPL has none of the three transaction types, so its ledgers hold no mint row of any version. Readers of the three tables gate on `MINT_PARSER_VERSION`, never on
   `PARSER_VERSION`. An `Import` whose minted drops come out below 0 (the network cannot produce one) is stored as 0 and counted in
   `syncer_parser_anomalies_total{kind="import_minted_negative"}`; the range-ingest log names the count of its run in a warning when it is not 0 (its last line does not carry it).
+  Parser version 10 (the current one) adds the MPT data (`mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers`; `MPT_PARSER_VERSION`): it writes MPT
+  payments to `payments`, `payments_by_currency` and `account_payments`, which older versions dropped, and an `MPToken`'s rows to `balance_changes`, and it types the rows of a `Clawback` as `clawback`. Ledgers written by an older
+  version have none of these, and a `--reprocess` of a range writes them; Xahau has no MPT, so its ledgers hold no MPT row of any version. Readers gate on `MPT_PARSER_VERSION`, never on `PARSER_VERSION`. An MPT amount that is not a `UInt64`
+  (the network cannot produce one) is stored as 0, and a node whose ID cannot be made is skipped, each counted in `syncer_parser_anomalies_total{kind="mpt_unreadable"}`; the range-ingest log names the count of its run in a warning when it is not 0 (its last line does not carry it).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.

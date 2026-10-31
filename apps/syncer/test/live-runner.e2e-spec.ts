@@ -31,6 +31,7 @@ import { PrometheusService } from '../src/modules/prometheus/prometheus.service'
 import {
   ammTemplate,
   mintTemplate,
+  mptTemplate,
   nftTemplate,
   objectTemplate,
   range,
@@ -946,6 +947,71 @@ describe('LiveRunner (e2e)', () => {
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
       expect(await storedMint(svc)).toEqual(expectedMint(L(12)));
       expect(await clamped(metrics)).toBe(before + 12 * CLAMPED_PER_LEDGER);
+    });
+  });
+
+  describe('MPT rows and syncer_parser_anomalies_total', () => {
+    /** Transactions per ledger whose MPT amount cannot be read (see `mptTemplate`). */
+    const UNREADABLE_PER_LEDGER = 2;
+    // Every ledger: a recorded MPTokenAuthorize and a Payment with a transfer fee (rows in all five MPT tables) and 2 unreadable tokens.
+    const MPT_CHAIN = syntheticChain(L(1), 12, { template: mptTemplate(UNREADABLE_PER_LEDGER) });
+
+    /** The counter now, for the one kind. It is process-wide, so a test compares it with its value before. */
+    const unreadable = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.parserAnomaliesTotal.get()).values.find((v) => v.labels.kind === 'mpt_unreadable')?.value ?? 0;
+
+    const MPT_TABLES: ReadonlyArray<
+      [Table, 'mptIssuanceStates' | 'mptHolderStates' | 'mptTouches' | 'mptTransfers' | 'mptIssuanceTransfers']
+    > = [
+      [Table.MptIssuanceStates, 'mptIssuanceStates'],
+      [Table.MptHolderStates, 'mptHolderStates'],
+      [Table.MptTouches, 'mptTouches'],
+      [Table.MptTransfers, 'mptTransfers'],
+      [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+    ];
+
+    /** The rows of the five MPT tables that writing the ledgers `L(1)` .. `last` of the chain gives. */
+    const expectedMpt = (last: number): Counts =>
+      Object.fromEntries(
+        MPT_TABLES.map(([table, key]) => [
+          table,
+          MPT_CHAIN.filter((l) => l.index <= last).reduce((sum, l) => sum + buildLedgerRows(l.raw, ctx)[key].length, 0),
+        ]),
+      );
+    const storedMpt = async (svc: ClickHouseService): Promise<Counts> =>
+      Object.fromEntries(
+        await Promise.all(MPT_TABLES.map(async ([table]) => [table, await count(svc, table)] as const)),
+      );
+
+    it('the chain has rows for all five MPT tables and two unreadable tokens per ledger', () => {
+      const total = MPT_CHAIN.reduce((sum, l) => sum + buildLedgerRows(l.raw, ctx).diagnostics.mptAnomalies, 0);
+      expect(total).toBe(12 * UNREADABLE_PER_LEDGER);
+      for (const value of Object.values(expectedMpt(L(12)))) expect(value).toBeGreaterThan(0);
+    });
+
+    it('writes the MPT rows with the ledgers and adds the unreadable amounts to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unreadable(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), MPT_CHAIN), { metrics });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 MPT ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await storedMpt(svc)).toEqual(expectedMpt(L(12)));
+      expect(await unreadable(metrics)).toBe(before + 12 * UNREADABLE_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without MPTs', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unreadable(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await storedMpt(svc)).toEqual(Object.fromEntries(MPT_TABLES.map(([table]) => [table, 0])));
+      expect(await unreadable(metrics)).toBe(before);
     });
   });
 

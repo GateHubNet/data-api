@@ -9,6 +9,7 @@ import { foldNftEvents } from '../aggregate/nft-state';
 import {
   DOMAIN_PARSER_VERSION,
   MINT_PARSER_VERSION,
+  MPT_PARSER_VERSION,
   NFT_PARSER_VERSION,
   OBJECT_PARSER_VERSION,
   PARSER_VERSION,
@@ -25,7 +26,9 @@ import { PaymentParser } from '../parsers/payment.parser';
 import { RewardsParser } from '../parsers/rewards.parser';
 import { StateTouchesParser } from '../parsers/state-touches.parser';
 import { deepFreeze } from '../test-utils/deep-freeze';
+import { mptCase, mptCaseNames } from '../test-utils/mpt-cases';
 import { objectCase, objectFixturesDir } from '../test-utils/object-cases';
+import { mptIssuerOf } from '../util/mpt';
 import { buildLedgerRows, CHILD_TABLES, ChildRowsKey, LedgerParseError, LedgerRows } from './build-rows';
 import { FixtureLedgerSource } from './fixture-ledger-source';
 import { normalizeLedgerResponse, RawLedger } from './raw-ledger';
@@ -41,6 +44,7 @@ const DDL = readdirSync(join(PACKAGE_ROOT, 'schema'))
 
 const XRPL: ParseContext = parseContextFor(getNetworkProfile('xrpl'));
 const XAHAU: ParseContext = parseContextFor(getNetworkProfile('xahau'));
+const XRPL_TESTNET: ParseContext = parseContextFor(getNetworkProfile('xrpl-testnet'));
 
 type Json = Record<string, any>;
 
@@ -88,11 +92,20 @@ const SETS: FixtureSet[] = [
     minNativeChecked: 150,
     minTrustlinesChecked: 50,
   },
+  // Whole mainnet ledgers around the recorded MPT cases, and the three enable ledgers (D9, Task 1).
+  {
+    name: 'recorded MPT cases (xrpl)',
+    ctx: XRPL,
+    dir: join(FIXTURES, 'xrpl', 'mpt'),
+    minNativeChecked: 500,
+    minTrustlinesChecked: 100,
+  },
 ];
 
 const RIPPLE_MOCK = SETS[0];
 const AMM_SET = SETS[2];
 const XAHAU_SET = SETS[3];
+const MPT_SET = SETS[4];
 
 /**
  * The recorded NFT cases (`test/fixtures/xrpl/nft`) and URIToken cases (`xahau/uritoken`): whole mainnet ledgers around
@@ -153,6 +166,19 @@ const MINT_XAHAU: FixtureSet = {
   name: 'recorded mint cases (xahau)',
   ctx: XAHAU,
   dir: join(FIXTURES, 'xahau', 'mint'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
+/**
+ * The MPT cases mainnet does not have, recorded on XRPL Testnet (`test/fixtures/xrpl-testnet/mpt`, D9 Task 1): small ledgers, some
+ * without any account root with a Domain. No `SETS` entry either; the MPT tests below use it, and `balance-changes.parser.spec.ts`
+ * and `mpt-deltas.spec.ts` hold its conservation.
+ */
+const MPT_TESTNET_SET: FixtureSet = {
+  name: 'recorded MPT cases (xrpl-testnet)',
+  ctx: XRPL_TESTNET,
+  dir: join(FIXTURES, 'xrpl-testnet', 'mpt'),
   minNativeChecked: 0,
   minTrustlinesChecked: 0,
 };
@@ -232,6 +258,15 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.MptTransfers, 'mptTransfers'],
   [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
 ];
+
+/** The five MPT ledger tables, with the property of `LedgerRows` that holds their rows. */
+const MPT_TABLES = [
+  [Table.MptIssuanceStates, 'mptIssuanceStates'],
+  [Table.MptHolderStates, 'mptHolderStates'],
+  [Table.MptTouches, 'mptTouches'],
+  [Table.MptTransfers, 'mptTransfers'],
+  [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+] as const;
 
 /** The columns of a table in the order of its CREATE TABLE statement. */
 function ddlColumns(table: Table): string[] {
@@ -1427,12 +1462,18 @@ describe('AMM rows (parser version 2)', () => {
       [Table.GenesisMints, 'genesisMints'],
       [Table.Imports, 'imports'],
       [Table.RewardClaims, 'rewardClaims'],
+      [Table.MptIssuanceStates, 'mptIssuanceStates'],
+      [Table.MptHolderStates, 'mptHolderStates'],
+      [Table.MptTouches, 'mptTouches'],
+      [Table.MptTransfers, 'mptTransfers'],
+      [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
     ];
 
     // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter. The Domain rows are in
     // the recorded Xahau and XRPL ledgers: the Xahau flag ledger and 26540188 hold account roots with a Domain. The object
     // rows are in the recorded escrow, check, channel and delegation ledgers. The mint rows are in the recorded Xahau ledgers
-    // 26540187 (a ClaimReward) and 26540188 (a GenesisMint); the Import rows only in the mint cases.
+    // 26540187 (a ClaimReward) and 26540188 (a GenesisMint); the Import rows only in the mint cases. The MPT rows are in the
+    // recorded MPT ledgers of both networks.
     const recorded = (): Built[] => [
       ...builtOf(AMM_SET),
       ...builtOf(NFT_SET),
@@ -1442,6 +1483,8 @@ describe('AMM rows (parser version 2)', () => {
       ...builtOf(OBJECTS_XAHAU),
       ...builtOf(STATE_TOUCHES_XRPL),
       ...builtOf(MINT_XAHAU),
+      ...builtOf(MPT_SET),
+      ...builtOf(MPT_TESTNET_SET),
     ];
 
     it.each(tables)('%s', (table, key) => {
@@ -1472,15 +1515,16 @@ describe('AMM rows (parser version 2)', () => {
           invalidDomains: 0,
           objectsUnclassified: 0,
           importMintedNegative: 0,
+          mptAnomalies: 0,
         });
         for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
       }
     });
 
-    it('stores parser_version 9 (Xahau minting, after the touch index of the token aggregate of 8)', () => {
-      expect(PARSER_VERSION).toBe(9);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(9);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(9);
+    it('stores parser_version 10 (the MPT data, after Xahau minting of 9)', () => {
+      expect(PARSER_VERSION).toBe(10);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(10);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(10);
     });
   });
 
@@ -1500,6 +1544,7 @@ describe('AMM rows (parser version 2)', () => {
           invalidDomains: 0,
           objectsUnclassified: 0,
           importMintedNegative: 0,
+          mptAnomalies: 0,
         });
         total += expected;
       }
@@ -1533,6 +1578,7 @@ describe('AMM rows (parser version 2)', () => {
         invalidDomains: 0,
         objectsUnclassified: 0,
         importMintedNegative: 0,
+        mptAnomalies: 0,
       });
       expect(rows.ammPoolStates).toEqual([]);
       expect(rows.exchanges).toEqual([]);
@@ -1887,16 +1933,17 @@ describe('NFT rows (parser version 5)', () => {
   });
 
   describe('parser_version', () => {
-    it('stamps the parser version of the build on the ledger row: 9, with the NFT parser still at 5, the domain parser at 6, the object parser at 7 and the token parser at 8', () => {
-      expect([PARSER_VERSION, MINT_PARSER_VERSION]).toEqual([9, 9]);
+    it('stamps the parser version of the build on the ledger row: 10, with the NFT parser still at 5, the domain parser at 6, the object parser at 7, the token parser at 8 and the mint parser at 9', () => {
+      expect([PARSER_VERSION, MPT_PARSER_VERSION]).toEqual([10, 10]);
+      expect(MINT_PARSER_VERSION).toBe(9);
       expect(NFT_PARSER_VERSION).toBe(5);
       expect(DOMAIN_PARSER_VERSION).toBe(6);
       expect(OBJECT_PARSER_VERSION).toBe(7);
       expect(TOKEN_PARSER_VERSION).toBe(8);
       for (const set of [NFT_SET, URITOKEN_SET, RIPPLE_MOCK]) {
-        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(9);
+        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(10);
       }
-      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(9);
+      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(10);
     });
   });
 
@@ -2378,9 +2425,9 @@ describe('ledger objects (parser version 7)', () => {
     },
   );
 
-  it('stamps parser_version 9 on the object ledgers: OBJECT_PARSER_VERSION, the first version with object rows, stays 7', () => {
+  it('stamps parser_version 10 on the object ledgers: OBJECT_PARSER_VERSION, the first version with object rows, stays 7', () => {
     expect(OBJECT_PARSER_VERSION).toBe(7);
-    expect(PARSER_VERSION).toBe(9);
+    expect(PARSER_VERSION).toBe(10);
     for (const set of [OBJECTS_XRPL, OBJECTS_XAHAU]) {
       for (const { rows } of builtOf(set)) {
         expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
@@ -2524,11 +2571,11 @@ describe('Xahau mint rows (parser version 9)', () => {
     return found[0];
   }
 
-  it('is parser version 9 for both the build and the first version that has the rows, which readers gate on', () => {
-    expect([PARSER_VERSION, MINT_PARSER_VERSION]).toEqual([9, 9]);
+  it('is parser version 9 for the first version that has the rows, which readers gate on, and the build is at or above it', () => {
+    expect(MINT_PARSER_VERSION).toBe(9);
     expect(PARSER_VERSION).toBeGreaterThanOrEqual(MINT_PARSER_VERSION);
     for (const set of [XAHAU_SET, MINT_XAHAU]) {
-      for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(MINT_PARSER_VERSION);
+      for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
     }
   });
 
@@ -2878,6 +2925,285 @@ describe('Xahau mint rows (parser version 9)', () => {
       expect(rows.imports).toEqual([]);
     });
   });
+});
+
+describe('MPT rows (parser version 10)', () => {
+  const SETS_OF_MPT = [MPT_SET, MPT_TESTNET_SET];
+  const everyBuilt = (): Built[] => SETS_OF_MPT.flatMap((set) => builtOf(set));
+
+  /** The ledger and the rows of a case's transaction. */
+  function rowsOfCase(name: string): { rows: LedgerRows; txIndex: number; hash: string } {
+    const t = mptCase(name);
+    const found = everyBuilt().find((b) => b.raw.header.ledger_index === t.ledger_index);
+    if (found === undefined) throw new Error(`${name}: ledger ${t.ledger_index} is not recorded`);
+    return { rows: found.rows, txIndex: t.tx_index, hash: t.hash };
+  }
+
+  const ofTx = <T extends { tx_index: number }>(rows: readonly T[], txIndex: number): T[] =>
+    rows.filter((r) => r.tx_index === txIndex);
+
+  it('is parser version 10 for both the build and the first version that has the rows, which readers gate on', () => {
+    expect([PARSER_VERSION, MPT_PARSER_VERSION]).toEqual([10, 10]);
+    for (const { rows } of everyBuilt()) expect(rows.ledger.parser_version).toBe(MPT_PARSER_VERSION);
+  });
+
+  // [issuance states, holder states, transfers] of each case's transaction, from FINDINGS and the cases' nodes.
+  const CASE_ROWS: Record<string, [number, number, number]> = {
+    issuance_create: [1, 0, 0],
+    issuance_create_short_keys: [1, 0, 0],
+    issuance_create_raw_metadata: [1, 0, 0],
+    issuance_create_no_max: [1, 0, 0],
+    issuance_set_lock_holder: [0, 1, 1],
+    issuance_set_unlock_holder: [0, 1, 1],
+    issuance_set_lock_all: [1, 0, 1],
+    issuance_destroy: [1, 0, 0],
+    authorize_holder: [0, 1, 0],
+    authorize_by_issuer: [0, 1, 0],
+    unauthorize_holder: [0, 1, 0],
+    payment_holder_to_holder: [0, 2, 1],
+    payment_mint: [1, 1, 1],
+    payment_redeem: [1, 1, 1],
+    payment_transfer_fee: [1, 2, 1],
+    payment_before_delivered_fix: [1, 1, 1],
+    payment_failed: [0, 0, 0],
+    clawback_full: [1, 1, 1],
+    clawback_partial: [1, 1, 1],
+    clawback_issued: [0, 0, 0],
+    escrow_create: [1, 1, 1],
+    escrow_finish: [1, 2, 1],
+    escrow_cancel: [1, 1, 1],
+    escrow_create_transfer_fee: [1, 1, 1],
+    escrow_finish_transfer_fee: [1, 2, 1],
+    escrow_finish_creates_token: [1, 2, 1],
+  };
+
+  it('names every recorded case', () => {
+    expect(Object.keys(CASE_ROWS).sort()).toEqual([...mptCaseNames()].sort());
+  });
+
+  it.each(Object.entries(CASE_ROWS))('writes the MPT rows of %s', (name, [issuances, holders, transfers]) => {
+    const { rows, txIndex } = rowsOfCase(name);
+    expect(ofTx(rows.mptIssuanceStates, txIndex)).toHaveLength(issuances);
+    expect(ofTx(rows.mptHolderStates, txIndex)).toHaveLength(holders);
+    expect(ofTx(rows.mptTouches, txIndex)).toHaveLength(issuances + holders);
+    expect(ofTx(rows.mptTransfers, txIndex)).toHaveLength(transfers);
+    expect(ofTx(rows.mptIssuanceTransfers, txIndex)).toHaveLength(transfers);
+  });
+
+  it('gives the rows the columns of the ledger and the transaction', () => {
+    const t = mptCase('payment_transfer_fee');
+    const { rows, txIndex } = rowsOfCase('payment_transfer_fee');
+    const id = t.tx.Amount.mpt_issuance_id as string;
+    const columns = {
+      ledger_index: t.ledger_index,
+      tx_index: txIndex,
+      tx_hash: t.hash,
+      tx_type: 'Payment',
+      close_time: t.close_time,
+    };
+    expect(ofTx(rows.mptIssuanceStates, txIndex)).toEqual([
+      {
+        mpt_issuance_id: id,
+        ...columns,
+        node_index: expect.any(Number),
+        issuer: 'rERShrtUSEXkrwtTpugPV4v8E787vpx1kb',
+        sequence: 93910752,
+        flags: 32,
+        asset_scale: 6,
+        maximum_amount: '1000000000000000',
+        outstanding_amount: '199999998994110',
+        escrowed_amount: '0',
+        transfer_fee: 589,
+        metadata_hex: expect.any(String),
+        deleted: 0,
+      },
+    ]);
+    expect(ofTx(rows.mptHolderStates, txIndex).map((r) => [r.holder, r.amount, r.deleted])).toEqual([
+      [t.tx.Account, '199999997994097', 0],
+      [t.tx.Destination, expect.any(String), 0],
+    ]);
+    expect(ofTx(rows.mptTransfers, txIndex)).toEqual([
+      {
+        ledger_index: t.ledger_index,
+        tx_index: txIndex,
+        mpt_issuance_id: id,
+        tx_hash: t.hash,
+        tx_type: 'Payment',
+        close_time: t.close_time,
+        kind: 'payment',
+        source: t.tx.Account,
+        destination: t.tx.Destination,
+        amount: '1000000',
+        fee: '5890',
+      },
+    ]);
+  });
+
+  it('writes deleted as 1 on what was removed', () => {
+    const destroy = rowsOfCase('issuance_destroy');
+    expect(ofTx(destroy.rows.mptIssuanceStates, destroy.txIndex)[0].deleted).toBe(1);
+    const unauthorize = rowsOfCase('unauthorize_holder');
+    expect(ofTx(unauthorize.rows.mptHolderStates, unauthorize.txIndex)[0].deleted).toBe(1);
+  });
+
+  it('touches each issuance and holder once per transaction', () => {
+    let checked = 0;
+    for (const { rows } of everyBuilt()) {
+      const expected = new Set([
+        ...rows.mptIssuanceStates.map((r) => `${r.tx_index}|${r.mpt_issuance_id}|`),
+        ...rows.mptHolderStates.map((r) => `${r.tx_index}|${r.mpt_issuance_id}|${r.holder}`),
+      ]);
+      const touches = rows.mptTouches.map((r) => `${r.tx_index}|${r.mpt_issuance_id}|${r.holder}`);
+      expect(new Set(touches)).toEqual(expected);
+      expect(touches).toHaveLength(expected.size);
+      for (const touch of rows.mptTouches) {
+        expect(Object.keys(touch)).toEqual(['ledger_index', 'tx_index', 'mpt_issuance_id', 'holder']);
+        expect(touch.ledger_index).toBe(rows.ledger.ledger_index);
+      }
+      checked += touches.length;
+    }
+    expect(checked).toBeGreaterThanOrEqual(50);
+  });
+
+  // Synthetic, edited from payment_mint: the holder's node is in the metadata twice, which no ledger writes.
+  it('touches a pair once when a transaction has two nodes of it', () => {
+    const t = mptCase('payment_mint');
+    const raw = structuredClone(everyBuilt().find((b) => b.raw.header.ledger_index === t.ledger_index)!.raw);
+    const copy = raw.transactions.find((r) => r.hash === t.hash)!;
+    const nodes = copy.meta.AffectedNodes as Json[];
+    const holder = nodes.find((n) => n.ModifiedNode?.LedgerEntryType === 'MPToken')!;
+    nodes.push(structuredClone(holder));
+    const rows = buildLedgerRows(raw, XRPL);
+    expect(ofTx(rows.mptHolderStates, t.tx_index)).toHaveLength(2);
+    expect(ofTx(rows.mptTouches, t.tx_index)).toHaveLength(2);
+  });
+
+  it('copies every transfer into mpt_issuance_transfers', () => {
+    let checked = 0;
+    for (const { rows } of everyBuilt()) {
+      expect(rows.mptIssuanceTransfers).toHaveLength(rows.mptTransfers.length);
+      const canonical = (row: Json): string => JSON.stringify(Object.entries(row).sort(([a], [b]) => (a < b ? -1 : 1)));
+      expect(rows.mptIssuanceTransfers.map(canonical)).toEqual(rows.mptTransfers.map(canonical));
+      checked += rows.mptTransfers.length;
+    }
+    expect(checked).toBeGreaterThanOrEqual(20);
+  });
+
+  it.each(MPT_TABLES)('keeps every key unique in %s', (table, key) => {
+    const columns = orderByColumns(table);
+    const rows = collect(everyBuilt(), key);
+    expect(rows.length).toBeGreaterThan(0);
+    const seen = new Set(rows.map((row) => JSON.stringify(columns.map((c) => row[c]))));
+    expect(seen.size).toBe(rows.length);
+  });
+
+  it('has the keys of the spec, the five of them', () => {
+    expect(MPT_TABLES.map(([table]) => orderByColumns(table))).toEqual([
+      ['mpt_issuance_id', 'ledger_index', 'tx_index', 'node_index'],
+      ['holder', 'mpt_issuance_id', 'ledger_index', 'tx_index', 'node_index'],
+      ['ledger_index', 'tx_index', 'mpt_issuance_id', 'holder'],
+      ['ledger_index', 'tx_index', 'mpt_issuance_id'],
+      ['mpt_issuance_id', 'ledger_index', 'tx_index'],
+    ]);
+  });
+
+  it('puts MPT payments in payments, payments_by_currency and account_payments, the ID as the currency', () => {
+    const t = mptCase('payment_transfer_fee');
+    const { rows, txIndex } = rowsOfCase('payment_transfer_fee');
+    const id = t.tx.Amount.mpt_issuance_id as string;
+    const issuer = mptIssuerOf(id);
+    expect(ofTx(rows.payments, txIndex)).toEqual([
+      expect.objectContaining({
+        source: t.tx.Account,
+        destination: t.tx.Destination,
+        currency: id,
+        issuer,
+        amount: '1000000',
+        delivered_amount: '1000000',
+        delivered_amount_f: 1000000,
+        max_amount: '1062500',
+        source_currency: id,
+      }),
+    ]);
+    expect(ofTx(rows.paymentsByCurrency, txIndex)).toEqual([
+      { currency: id, issuer, ledger_index: t.ledger_index, tx_index: txIndex },
+    ]);
+    expect(ofTx(rows.accountPayments, txIndex).map((r) => [r.account, r.direction, r.currency, r.issuer])).toEqual([
+      [t.tx.Account, 'sent', id, issuer],
+      [t.tx.Destination, 'received', id, issuer],
+    ]);
+  });
+
+  it('counts each MPT payment in payments_count and in no path payment, as it is direct', () => {
+    for (const name of ['payment_holder_to_holder', 'payment_mint', 'payment_redeem', 'payment_transfer_fee']) {
+      const { rows, txIndex } = rowsOfCase(name);
+      expect(ofTx(rows.payments, txIndex)).toHaveLength(1);
+      expect(rows.ledger.payments_count).toBe(rows.payments.length);
+      expect(ofTx(rows.pathPayments, txIndex)).toEqual([]);
+    }
+  });
+
+  it('puts the balance rows of an MPT in balance_changes, and a failed payment nowhere', () => {
+    const { rows, txIndex } = rowsOfCase('payment_transfer_fee');
+    expect(
+      ofTx(rows.balanceChanges, txIndex)
+        .filter((r) => r.counterparty !== '')
+        .map((r) => r.amount_change),
+    ).toEqual(['-1005890', '1005890', '1000000', '-1000000']);
+    const failed = rowsOfCase('payment_failed');
+    expect(ofTx(failed.rows.payments, failed.txIndex)).toEqual([]);
+    expect(ofTx(failed.rows.mptTransfers, failed.txIndex)).toEqual([]);
+  });
+
+  it('counts what the parser could not read in diagnostics, and nothing on the recorded ledgers', () => {
+    for (const { rows } of everyBuilt()) expect(rows.diagnostics.mptAnomalies).toBe(0);
+    // Synthetic, edited from payment_holder_to_holder: the receiver's MPTAmount is not digits.
+    const t = mptCase('payment_holder_to_holder');
+    const raw = structuredClone(everyBuilt().find((b) => b.raw.header.ledger_index === t.ledger_index)!.raw);
+    const copy = raw.transactions.find((r) => r.hash === t.hash)!;
+    const node = (copy.meta.AffectedNodes as Json[]).find(
+      (n) => n.ModifiedNode?.FinalFields?.Account === t.tx.Destination,
+    );
+    node!.ModifiedNode.FinalFields.MPTAmount = 'not digits';
+    const rows = buildLedgerRows(raw, XRPL);
+    expect(rows.diagnostics.mptAnomalies).toBe(1);
+    expect(ofTx(rows.mptHolderStates, t.tx_index).map((r) => r.amount)).toEqual(['0', '0']);
+  });
+
+  it('gives a recorded ledger of Xahau the five arrays empty', () => {
+    for (const set of [XAHAU_SET, MINT_XAHAU, OBJECTS_XAHAU, URITOKEN_SET]) {
+      for (const { rows } of builtOf(set)) {
+        for (const [, key] of MPT_TABLES) expect(rows[key]).toEqual([]);
+      }
+    }
+  });
+
+  it('gives a ledger with no MPT node the five arrays empty', () => {
+    for (const { rows } of builtOf(RIPPLE_MOCK)) {
+      for (const [, key] of MPT_TABLES) expect(rows[key]).toEqual([]);
+    }
+  });
+
+  /** A case's rows of the five MPT arrays, the payments and the balance changes: what the snapshots below pin. */
+  function goldenOf(name: string): Json {
+    const { rows, txIndex } = rowsOfCase(name);
+    return {
+      mptIssuanceStates: ofTx(rows.mptIssuanceStates, txIndex),
+      mptHolderStates: ofTx(rows.mptHolderStates, txIndex),
+      mptTouches: ofTx(rows.mptTouches, txIndex),
+      mptTransfers: ofTx(rows.mptTransfers, txIndex),
+      mptIssuanceTransfers: ofTx(rows.mptIssuanceTransfers, txIndex),
+      payments: ofTx(rows.payments, txIndex),
+      balanceChanges: ofTx(rows.balanceChanges, txIndex),
+    };
+  }
+
+  it.each(['payment_transfer_fee', 'escrow_finish_transfer_fee', 'clawback_full'])(
+    'matches the golden rows of %s',
+    (name) => {
+      expect(goldenOf(name)).toMatchSnapshot();
+    },
+  );
 });
 
 describe('CHILD_TABLES', () => {

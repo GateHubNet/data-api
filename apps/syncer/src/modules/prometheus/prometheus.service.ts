@@ -68,7 +68,7 @@ const metrics = {
   }),
   parserAnomaliesTotal: new Counter({
     name: 'syncer_parser_anomalies_total',
-    help: 'Things a parser found in a ledger that the network cannot produce and stored in a safe form, by kind (import_minted_negative: a Xahau Import whose minted drops came out below 0 and were stored as 0), over the ledgers written by the live ingest and by range-ingest runs of this process.',
+    help: 'Things a parser found in a ledger that the network cannot produce and stored in a safe form, by kind (import_minted_negative: a Xahau Import whose minted drops came out below 0 and were stored as 0; mpt_unreadable: an MPT amount that is not a UInt64, stored as 0, or a node skipped because its ID cannot be made), over the ledgers written by the live ingest and by range-ingest runs of this process.',
     labelNames: ['kind'],
     registers: [registry],
   }),
@@ -297,8 +297,9 @@ const metrics = {
 };
 
 // A labelled counter has no series until its first `inc`, and `increase()` of a series that first shows at its value is 0: the first
-// Import the parser clamps would raise no alert. The series of the one kind starts at 0, as the unlabelled counters above do.
+// Import the parser clamps would raise no alert. The series of each kind starts at 0, as the unlabelled counters above do.
 metrics.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, 0);
+metrics.parserAnomaliesTotal.inc({ kind: 'mpt_unreadable' }, 0);
 // the alert is an increase(), and a series that first shows at its value has none: its first failure would raise nothing
 metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'ok' }, 0);
 metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'error' }, 0);

@@ -175,7 +175,7 @@ type SchemaNeeds = ReadonlyMap<WorkerName, { tables: readonly Table[]; does: str
 /**
  * Fails the boot when a worker of `needs` is enabled and the database lacks the tables of `migration` it needs, naming the file,
  * the tables and what the workers do with them. A check that cannot be made (ClickHouse unreachable) does not fail the boot: it
- * is said, and the workers report the failures of their reads and writes as they always do. Shared by the checks of 014 and 015.
+ * is said, and the workers report the failures of their reads and writes as they always do. Shared by the checks of 014, 015 and 017.
  */
 async function assertTablesOf(
   ch: Pick<ClickHouseService, 'query'>,
@@ -288,4 +288,43 @@ export async function assertSupplySchema(
   logger: { warn(message: string): void },
 ): Promise<void> {
   await assertTablesOf(ch, enabled, database, logger, SUPPLY_MIGRATION, SUPPLY_NEEDS);
+}
+
+/** MPTokens: the five ledger tables the ingest writes, and the two aggregates of the `mpt_state` job. */
+export const MPT_MIGRATION = '017_mpt.sql';
+
+/**
+ * The tables of `MPT_MIGRATION` each worker needs, and what it does with them. The ingest writes the five ledger tables whenever a
+ * ledger has rows for one. The schema is one on every network, so the worker needs its tables wherever it runs.
+ */
+const MPT_NEEDS: SchemaNeeds = new Map([
+  [
+    'ingest',
+    {
+      tables: [
+        Table.MptIssuanceStates,
+        Table.MptHolderStates,
+        Table.MptTouches,
+        Table.MptTransfers,
+        Table.MptIssuanceTransfers,
+      ],
+      does: 'writes',
+    },
+  ],
+]);
+
+/**
+ * Fails the boot when the ingest worker is enabled and the database lacks the five ledger tables of `017_mpt.sql`. The schema is one
+ * on every network, so the check does not ask which one this is. On XRPL and XRPL Testnet the ingest inserts into them as soon as a
+ * ledger has MPT rows, and an insert into a missing table fails the batch, so that the live runner would retry the same ledgers without
+ * end. It runs after the boot-time migrations and after the check of 016. A check that cannot be made (ClickHouse unreachable) does
+ * not fail the boot: it is said, and the workers report the failures of their reads and writes as they always do.
+ */
+export async function assertMptSchema(
+  ch: Pick<ClickHouseService, 'query'>,
+  enabled: ReadonlySet<WorkerName>,
+  database: string,
+  logger: { warn(message: string): void },
+): Promise<void> {
+  await assertTablesOf(ch, enabled, database, logger, MPT_MIGRATION, MPT_NEEDS);
 }

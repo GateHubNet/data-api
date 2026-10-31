@@ -52,6 +52,7 @@ import { BalanceChangesParser } from '../parsers/balance-changes.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
 import { ImportParser } from '../parsers/import.parser';
+import { MptParser } from '../parsers/mpt.parser';
 import { NftParser, rolesOf } from '../parsers/nft.parser';
 import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
@@ -131,8 +132,8 @@ export interface LedgerRows {
   /** Every `ClaimReward`, whatever its result (migration 015). Empty on XRPL, as `genesisMints`. */
   rewardClaims: RewardClaimsRow[];
   /**
-   * The state of an issuance after each transaction that changed its `MPTokenIssuance` node (migration 017). Filled with the MPT
-   * parser; until then the five MPT arrays are empty.
+   * The state of an issuance after each transaction that changed its `MPTokenIssuance` node (migration 017, parser version 10:
+   * `MPT_PARSER_VERSION`), whatever the result. Empty on Xahau, as every MPT array.
    */
   mptIssuanceStates: MptIssuanceStatesRow[];
   /** The state of a holder's balance after each transaction that changed its `MPToken` node (migration 017). */
@@ -175,6 +176,12 @@ export interface LedgerDiagnostics {
    * summed over the ledger's transactions: `syncer_parser_anomalies_total{kind="import_minted_negative"}`.
    */
   importMintedNegative: number;
+  /**
+   * What the MPT parser could not read of a node or a transaction and a ledger cannot hold, stored in a safe form: an amount that is
+   * not a `UInt64` read as 0, and a node skipped because its ID cannot be made, summed over the ledger's transactions:
+   * `syncer_parser_anomalies_total{kind="mpt_unreadable"}`.
+   */
+  mptAnomalies: number;
 }
 
 /**
@@ -242,6 +249,7 @@ const trustLineStatesParser = new TrustLineStatesParser();
 const stateTouchesParser = new StateTouchesParser();
 const rewardsParser = new RewardsParser();
 const importParser = new ImportParser();
+const mptParser = new MptParser();
 const ammParser = new AmmParser();
 const nftParser = new NftParser();
 const objectChangesParser = new ObjectChangesParser();
@@ -377,6 +385,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
       invalidDomains: 0,
       objectsUnclassified: 0,
       importMintedNegative: 0,
+      mptAnomalies: 0,
     },
   };
 
@@ -942,6 +951,85 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         account: imported.account,
         minted: imported.minted,
         account_created: imported.account_created ? 1 : 0,
+      });
+    }
+
+    // The MPT rows (migration 017): the states of the nodes the transaction changed, whatever its result, and its transfer. The
+    // parser never throws (a throw here halts the ingest): what a ledger cannot hold reads as a default and is counted.
+    const mpt = mptParser.parse(t, ctx);
+    rows.diagnostics.mptAnomalies += mpt.anomalies;
+    const mptTouched = new Set<string>();
+    const touchMpt = (mpt_issuance_id: string, holder: string): void => {
+      const key = `${mpt_issuance_id}|${holder}`;
+      if (mptTouched.has(key)) return;
+      mptTouched.add(key);
+      rows.mptTouches.push({ ledger_index: header.ledger_index, tx_index: txIndex, mpt_issuance_id, holder });
+    };
+    for (const state of mpt.issuanceStates) {
+      rows.mptIssuanceStates.push({
+        mpt_issuance_id: state.mpt_issuance_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: state.node_index,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        issuer: state.issuer,
+        sequence: state.sequence,
+        flags: state.flags,
+        asset_scale: state.asset_scale,
+        maximum_amount: state.maximum_amount,
+        outstanding_amount: state.outstanding_amount,
+        escrowed_amount: state.escrowed_amount,
+        transfer_fee: state.transfer_fee,
+        metadata_hex: state.metadata_hex,
+        deleted: state.deleted ? 1 : 0,
+      });
+      touchMpt(state.mpt_issuance_id, '');
+    }
+    for (const state of mpt.holderStates) {
+      rows.mptHolderStates.push({
+        holder: state.holder,
+        mpt_issuance_id: state.mpt_issuance_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: state.node_index,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        amount: state.amount,
+        escrowed_amount: state.escrowed_amount,
+        flags: state.flags,
+        deleted: state.deleted ? 1 : 0,
+      });
+      touchMpt(state.mpt_issuance_id, state.holder);
+    }
+    for (const transfer of mpt.transfers) {
+      rows.mptTransfers.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        mpt_issuance_id: transfer.mpt_issuance_id,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        kind: transfer.kind,
+        source: transfer.source,
+        destination: transfer.destination,
+        amount: transfer.amount,
+        fee: transfer.fee,
+      });
+      rows.mptIssuanceTransfers.push({
+        mpt_issuance_id: transfer.mpt_issuance_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        kind: transfer.kind,
+        source: transfer.source,
+        destination: transfer.destination,
+        amount: transfer.amount,
+        fee: transfer.fee,
       });
     }
   }

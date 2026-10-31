@@ -2,11 +2,13 @@ import { ClickHouseService, Table } from '@gatehub/data-api-shared';
 import { WorkerName } from '../config/syncer.config';
 import {
   assertIssuedTokensSchema,
+  assertMptSchema,
   assertSupplySchema,
   assertTomlsSchema,
   assertValidatorsSchema,
   assertValidatorTomlSchema,
   ISSUED_TOKENS_MIGRATION,
+  MPT_MIGRATION,
   SUPPLY_MIGRATION,
   TOMLS_MIGRATION,
   VALIDATOR_TOML_MIGRATION,
@@ -412,5 +414,79 @@ describe('assertSupplySchema', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('the ingest worker starts without the check'));
     await expect(assertSupplySchema(ch, workers('aggregator'), 'xrpl', { warn })).resolves.toBe(undefined);
     expect(warn).toHaveBeenLastCalledWith(expect.stringContaining('the aggregator worker starts without the check'));
+  });
+});
+
+describe('assertMptSchema', () => {
+  const MPT_LEDGER_TABLES = [
+    Table.MptIssuanceStates,
+    Table.MptHolderStates,
+    Table.MptTouches,
+    Table.MptTransfers,
+    Table.MptIssuanceTransfers,
+  ];
+
+  it('checks nothing when the ingest worker is not enabled', async () => {
+    const db = tablesOf();
+    const warn = jest.fn();
+    await assertMptSchema(db.ch, workers('validations', 'fee_stats', 'validators', 'tomls', 'aggregator'), 'xrpl', {
+      warn,
+    });
+    await assertMptSchema(db.ch, workers(), 'xrpl', { warn });
+    expect(db.query).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('passes a database with the five ledger tables of 017 for the ingest, reading system.tables with bound values', async () => {
+    const db = tablesOf(...MPT_LEDGER_TABLES);
+    await expect(assertMptSchema(db.ch, workers('ingest'), 'xrpl', { warn: jest.fn() })).resolves.toBe(undefined);
+    expect(db.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).toContain('FROM system.tables');
+    expect(sql).toContain('database = currentDatabase()');
+    expect(params).toEqual({ tables: MPT_LEDGER_TABLES });
+  });
+
+  it('fails the boot of the ingest worker on a database without 017, naming the migration and the five tables, on every network', async () => {
+    for (const database of ['xrpl', 'xrpl_testnet', 'xahau', 'xahau_testnet']) {
+      const check = assertMptSchema(tablesOf(Table.Ledgers).ch, workers('ingest', 'fee_stats'), database, {
+        warn: jest.fn(),
+      });
+      await expect(check).rejects.toThrow(MPT_MIGRATION);
+      await expect(check).rejects.toThrow(
+        `(table ${Table.MptIssuanceStates}, table ${Table.MptHolderStates}, table ${Table.MptTouches}, ` +
+          `table ${Table.MptTransfers}, table ${Table.MptIssuanceTransfers})`,
+      );
+      await expect(check).rejects.toThrow('the ingest worker writes');
+      await expect(check).rejects.toThrow(`database "${database}"`);
+      await expect(check).rejects.toThrow('apply the migrations');
+    }
+    expect(MPT_MIGRATION).toBe('017_mpt.sql');
+  });
+
+  it('names exactly the tables that are missing', async () => {
+    const check = assertMptSchema(tablesOf(Table.MptTouches).ch, workers('ingest'), 'xrpl', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(
+      `(table ${Table.MptIssuanceStates}, table ${Table.MptHolderStates}, table ${Table.MptTransfers}, table ${Table.MptIssuanceTransfers})`,
+    );
+    await expect(check).rejects.not.toThrow(`table ${Table.MptTouches}`);
+  });
+
+  it('is a check of its own: a database with the tables of 015 and not 017 passes 015 and fails 017, each naming its own file', async () => {
+    const db = tablesOf(Table.GenesisMints, Table.Imports, Table.RewardClaims, Table.NetworkSupply);
+    await expect(assertSupplySchema(db.ch, workers('ingest'), 'xrpl', { warn: jest.fn() })).resolves.toBe(undefined);
+    const check = assertMptSchema(db.ch, workers('ingest'), 'xrpl', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(MPT_MIGRATION);
+    await expect(check).rejects.not.toThrow(SUPPLY_MIGRATION);
+  });
+
+  it('does not fail the boot when the check cannot be made, and says so', async () => {
+    const ch = {
+      query: jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:8123')),
+    } as unknown as Pick<ClickHouseService, 'query'>;
+    const warn = jest.fn();
+    await expect(assertMptSchema(ch, workers('ingest'), 'xrpl', { warn })).resolves.toBe(undefined);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(MPT_MIGRATION));
   });
 });

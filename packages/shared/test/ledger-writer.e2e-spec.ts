@@ -47,6 +47,9 @@ const index = (i: number): number => LEDGERS[i].header.ledger_index;
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 
+/** The receiver of the recorded MPT payment `payment_holder_to_holder`, of ledger 104794908. */
+const RECEIVER = 'rEPrn4DbXvHNBDJghQWUf92NzLU3MURFC3';
+
 /**
  * `account_domains` is ordered by account (spec 1.1, decision 7), so the rows of one account collapse: within one insert
  * (`optimize_on_insert`) and across inserts at the merges, whenever they run (the ripple-mock fixtures give the last ledger
@@ -958,6 +961,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         nftSkipped: 0,
         objectsUnclassified: AMM_BUILT.reduce((sum, r) => sum + r.diagnostics.objectsUnclassified, 0),
         importMintedNegative: 0,
+        mptAnomalies: 0,
       });
       for (const [table, key, orderBy] of AMM_KEYS) {
         const built = AMM_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -1018,12 +1022,14 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         nftSkipped: 0,
         objectsUnclassified: 0,
         importMintedNegative: 0,
+        mptAnomalies: 0,
       });
       expect(await new LedgerWriter(svc, ctx).write([])).toEqual({
         ammUnclassified: 0,
         nftSkipped: 0,
         objectsUnclassified: 0,
         importMintedNegative: 0,
+        mptAnomalies: 0,
       });
     });
 
@@ -1189,6 +1195,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         nftSkipped: 0,
         objectsUnclassified: NFT_BUILT.reduce((sum, r) => sum + r.diagnostics.objectsUnclassified, 0),
         importMintedNegative: 0,
+        mptAnomalies: 0,
       });
       for (const [table, key, orderBy] of NFT_KEYS) {
         const built = NFT_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -1306,6 +1313,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         nftSkipped: 0,
         objectsUnclassified: 0,
         importMintedNegative: 0,
+        mptAnomalies: 0,
       });
       for (const [table, key, orderBy] of OBJECT_KEYS) {
         const built = OBJECT_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -1489,7 +1497,13 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const result = await new LedgerWriter(svc, XAHAU_CTX).write(MINT_LEDGERS);
 
       await expectStored(svc, MINT_BUILT);
-      expect(result).toEqual({ ammUnclassified: 0, nftSkipped: 0, objectsUnclassified: 0, importMintedNegative: 0 });
+      expect(result).toEqual({
+        ammUnclassified: 0,
+        nftSkipped: 0,
+        objectsUnclassified: 0,
+        importMintedNegative: 0,
+        mptAnomalies: 0,
+      });
       for (const [table, key, orderBy] of MINT_KEYS) {
         const built = MINT_BUILT.flatMap((r) => r[key] as unknown as Json[]).map(asRead);
         expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderBy.split(', '))]);
@@ -1527,6 +1541,118 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(await count(svc, Table.Imports)).toBe(1);
       expect(await count(svc, Table.GenesisMints)).toBe(0);
       expect(await count(svc, Table.RewardClaims)).toBe(0);
+    });
+  });
+
+  describe('MPT ledgers (whole ledgers around the recorded MPT cases of mainnet, and those of XRPL Testnet)', () => {
+    const TESTNET_CTX = parseContextFor(getNetworkProfile('xrpl-testnet'));
+    const MPT_LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/mpt')).list();
+    const MPT_BUILT = MPT_LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
+    const TESTNET_LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(
+      join(__dirname, 'fixtures/xrpl-testnet/mpt'),
+    ).list();
+    const TESTNET_BUILT = TESTNET_LEDGERS.map((raw) => buildLedgerRows(raw, TESTNET_CTX));
+
+    const MPT_KEYS: Array<[Table, ChildRowsKey, string]> = [
+      [Table.MptIssuanceStates, 'mptIssuanceStates', 'mpt_issuance_id, ledger_index, tx_index, node_index'],
+      [Table.MptHolderStates, 'mptHolderStates', 'holder, mpt_issuance_id, ledger_index, tx_index, node_index'],
+      [Table.MptTouches, 'mptTouches', 'ledger_index, tx_index, mpt_issuance_id, holder'],
+      [Table.MptTransfers, 'mptTransfers', 'ledger_index, tx_index, mpt_issuance_id'],
+      [Table.MptIssuanceTransfers, 'mptIssuanceTransfers', 'mpt_issuance_id, ledger_index, tx_index'],
+    ];
+
+    /** The rows of an MPT table with every column as text, so that a UInt64 and the unix time compare with what was built. */
+    const readBack = (svc: ClickHouseService, table: Table, orderBy: string): Promise<Array<Json>> =>
+      svc.query<Json>(
+        `SELECT * FROM ${table} ORDER BY ${orderBy}`,
+        {},
+        { output_format_json_quote_64bit_integers: 1, date_time_output_format: 'unix_timestamp' },
+      );
+
+    /** A built row as `readBack` returns it: a time comes back as a quoted number, and every field compares as text. */
+    const asText = (row: Json): Json =>
+      Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value === null ? null : String(value)]));
+
+    it('the fixtures of both networks put rows into all five tables, and nothing is an anomaly', () => {
+      for (const built of [MPT_BUILT, TESTNET_BUILT]) {
+        const expected = countsOf(built);
+        for (const table of MPT_LEDGER_TABLES) expect([table, expected[table] > 0]).toEqual([table, true]);
+        expect(built.reduce((sum, r) => sum + r.diagnostics.mptAnomalies, 0)).toBe(0);
+      }
+    });
+
+    it('an MPT ledger lands in the five tables: counts and every row as built, and no anomaly is reported', async () => {
+      const svc = await freshService();
+      const result = await new LedgerWriter(svc, ctx).write(MPT_LEDGERS);
+
+      await expectStored(svc, MPT_BUILT);
+      expect(result.mptAnomalies).toBe(0);
+      for (const [table, key, orderBy] of MPT_KEYS) {
+        const built = MPT_BUILT.flatMap((r) => r[key] as unknown as Json[]);
+        const stored = (await readBack(svc, table, orderBy)).map(asText);
+        expect([table, stored]).toEqual([table, sortedBy(built, orderBy.split(', ')).map(asText)]);
+      }
+    });
+
+    it('sums what the parser could not read of the batch into mptAnomalies, and writes the amount as 0', async () => {
+      // synthetic-unreadable-amount: hand-made from the recorded payment_holder_to_holder of ledger 104794908, the receiver's
+      // MPTAmount not digits
+      const batch = structuredClone(MPT_LEDGERS);
+      const ledger = batch.find((l) => l.header.ledger_index === 104794908)!;
+      const copy = ledger.transactions.find(
+        (t) => t.tx.TransactionType === 'Payment' && t.tx.Destination === RECEIVER,
+      )!;
+      const node = (copy.meta.AffectedNodes as Array<Record<string, any>>).find(
+        (n) => n.ModifiedNode?.LedgerEntryType === 'MPToken' && n.ModifiedNode.FinalFields.Account === RECEIVER,
+      )!;
+      node.ModifiedNode.FinalFields.MPTAmount = 'not digits';
+
+      const svc = await freshService();
+      const result = await new LedgerWriter(svc, ctx).write(batch);
+
+      expect(result.mptAnomalies).toBe(1);
+      expect(
+        await svc.query(
+          `SELECT toString(amount) AS amount FROM ${Table.MptHolderStates} WHERE holder = {holder:String} AND ledger_index = {ledger:UInt32}`,
+          { holder: RECEIVER, ledger: 104794908 },
+        ),
+      ).toEqual([{ amount: '0' }]);
+    });
+
+    it('recovery of a half-written MPT ledger leaves no row of it in the five tables', async () => {
+      const svc = await freshService();
+      const committed = MPT_LEDGERS.findIndex((l) => l.header.ledger_index === 105827909);
+      expect(committed).toBeGreaterThan(0);
+      await new LedgerWriter(svc, ctx).write(MPT_LEDGERS.slice(0, committed));
+      const checkpoint = await committedCheckpoint(svc);
+      // A write that died after its child rows, before the commit marker.
+      await insertUncommitted(svc, MPT_BUILT.slice(committed));
+      for (const table of MPT_LEDGER_TABLES) {
+        expect([table, (await count(svc, table, `ledger_index > ${checkpoint}`)) > 0]).toEqual([table, true]);
+      }
+
+      await deleteLedgersAbove(svc, checkpoint!);
+
+      for (const table of MPT_LEDGER_TABLES) {
+        expect([table, await count(svc, table, `ledger_index > ${checkpoint}`)]).toEqual([table, 0]);
+      }
+      await expectStored(svc, MPT_BUILT.slice(0, committed));
+    });
+
+    it('XRPL Testnet: the escrow cases land in the five tables, on their own network', async () => {
+      const svc = await freshService();
+      const result = await new LedgerWriter(svc, TESTNET_CTX).write(TESTNET_LEDGERS);
+
+      await expectStored(svc, TESTNET_BUILT);
+      expect(result.mptAnomalies).toBe(0);
+      expect(
+        await svc.query(
+          `SELECT toString(amount) AS amount, toString(fee) AS fee FROM ${Table.MptTransfers} WHERE kind = 'escrow_finish' ORDER BY ledger_index`,
+        ),
+      ).toEqual([
+        { amount: '10000', fee: '10' },
+        { amount: '10000', fee: '10' },
+      ]);
     });
   });
 

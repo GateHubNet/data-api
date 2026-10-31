@@ -34,6 +34,11 @@ export interface LedgerWriteResult {
    * `kind="import_minted_negative"`.
    */
   importMintedNegative: number;
+  /**
+   * What the MPT parser could not read and a ledger cannot hold (`LedgerRows.diagnostics`), stored in a safe form. Counted like
+   * `ammUnclassified`: the caller adds it to `syncer_parser_anomalies_total` with `kind="mpt_unreadable"`.
+   */
+  mptAnomalies: number;
 }
 
 export interface LedgerWriterOptions {
@@ -108,7 +113,7 @@ export class LedgerWriter {
    */
   async write(ledgers: RawLedger[]): Promise<LedgerWriteResult> {
     if (ledgers.length === 0) {
-      return { ammUnclassified: 0, nftSkipped: 0, objectsUnclassified: 0, importMintedNegative: 0 };
+      return { ammUnclassified: 0, nftSkipped: 0, objectsUnclassified: 0, importMintedNegative: 0, mptAnomalies: 0 };
     }
 
     // Parsing is pure and throws before anything has been written.
@@ -142,6 +147,7 @@ export class LedgerWriter {
       nftSkipped: byIndex.reduce((sum, rows) => sum + rows.diagnostics.nftSkipped, 0),
       objectsUnclassified: byIndex.reduce((sum, rows) => sum + rows.diagnostics.objectsUnclassified, 0),
       importMintedNegative: byIndex.reduce((sum, rows) => sum + rows.diagnostics.importMintedNegative, 0),
+      mptAnomalies: byIndex.reduce((sum, rows) => sum + rows.diagnostics.mptAnomalies, 0),
     };
   }
 

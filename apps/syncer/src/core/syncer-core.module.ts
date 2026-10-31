@@ -16,6 +16,7 @@ import { migrateOnBoot } from './migrate-on-boot';
 import { createNodeClient } from './node-client.provider';
 import {
   assertIssuedTokensSchema,
+  assertMptSchema,
   assertSupplySchema,
   assertTomlsSchema,
   assertValidatorsSchema,
@@ -27,10 +28,10 @@ import {
  * `002_validators_amendments.sql` is there when a worker that writes it is enabled (`assertValidatorsSchema`), that of
  * `012_display_names.sql` when the tomls worker is (`assertTomlsSchema`), that of `014_issued_tokens.sql` when the ingest or
  * the aggregator is (`assertIssuedTokensSchema`), that of `015_supply.sql` when the ingest or the aggregator is
- * (`assertSupplySchema`) and that of `016_validator_toml_details.sql` when the validators worker is
- * (`assertValidatorTomlSchema`). Nest awaits async providers before it calls any lifecycle hook, so workers (which start in their
- * hooks) always find the migrated schema, and a database without 002, 012, 014, 015 or 016 fails the boot instead of every write of
- * the workers that need it; nothing injects this.
+ * (`assertSupplySchema`), that of `016_validator_toml_details.sql` when the validators worker is (`assertValidatorTomlSchema`) and
+ * that of `017_mpt.sql` when the ingest is (`assertMptSchema`). Nest awaits async providers before it calls any lifecycle hook, so
+ * workers (which start in their hooks) always find the migrated schema, and a database without 002, 012, 014, 015, 016 or 017 fails
+ * the boot instead of every write of the workers that need it; nothing injects this.
  */
 const SCHEMA_READY = Symbol('SCHEMA_READY');
 
@@ -101,6 +102,7 @@ export class SyncerCoreModule {
             await assertIssuedTokensSchema(ch, enabledWorkers(config), clickHouse.database, logger);
             await assertSupplySchema(ch, enabledWorkers(config), clickHouse.database, logger);
             await assertValidatorTomlSchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            await assertMptSchema(ch, enabledWorkers(config), clickHouse.database, logger);
             return migrated;
           },
           inject: [ClickHouseService],

@@ -60,7 +60,8 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^# TYPE syncer_parser_anomalies_total counter$/m);
     expect(text).toContain(
       '# HELP syncer_parser_anomalies_total Things a parser found in a ledger that the network cannot produce and stored in a ' +
-        'safe form, by kind (import_minted_negative: a Xahau Import whose minted drops came out below 0 and were stored as 0), ' +
+        'safe form, by kind (import_minted_negative: a Xahau Import whose minted drops came out below 0 and were stored as 0; ' +
+        'mpt_unreadable: an MPT amount that is not a UInt64, stored as 0, or a node skipped because its ID cannot be made), ' +
         'over the ledgers written by the live ingest and by range-ingest runs of this process.\n' +
         '# TYPE syncer_parser_anomalies_total counter\n',
     );
@@ -87,6 +88,7 @@ describe('PrometheusService', () => {
       text = await service.getMetrics();
     });
     expect(text).toMatch(/^syncer_parser_anomalies_total\{kind="import_minted_negative"\} 0$/m);
+    expect(text).toMatch(/^syncer_parser_anomalies_total\{kind="mpt_unreadable"\} 0$/m);
     // the unlabelled siblings start at 0 the same way
     expect(text).toMatch(/^syncer_objects_unclassified_total 0$/m);
     expect(text).toMatch(/^syncer_nft_skipped_total 0$/m);

@@ -233,6 +233,64 @@ export function mintTemplate(clamped = 0): Record<string, unknown> {
   return { ...ledgerOf(MINT_TEMPLATE_TRANSACTIONS[0][0]), transactions };
 }
 
+/** The recorded mainnet ledgers of the MPT cases (D9, Task 1). */
+const MPT_FIXTURES_DIR = join(__dirname, '../../../packages/shared/test/fixtures/xrpl/mpt');
+
+/**
+ * The recorded transactions `mptTemplate` copies, each `[ledger, hash]`: an MPTokenAuthorize and a holder's Payment with a
+ * transfer fee, so that a ledger made of them has rows in all five MPT tables.
+ */
+const MPT_TEMPLATE_TRANSACTIONS: ReadonlyArray<readonly [ledger: number, hash: string]> = [
+  [105827852, 'B9DEF907D9D931A316C89EAB3278EC8C55AFFF86BDBFF475188A537AE1426530'],
+  [99251687, '80C74925827B059CA14F2C7C4E01F8DE37C5502648CE20DE90B35827E73D503E'],
+];
+
+/**
+ * The template of a chain with MPT activity: the recorded transactions of `MPT_TEMPLATE_TRANSACTIONS`, plus `unreadable`
+ * transactions `synthetic-unreadable-mpt-<k>` that each change an `MPToken` whose `MPTAmount` is not digits: a ledger cannot hold
+ * that, so the MPT parser reads it as 0 and counts it (+1 on `syncer_parser_anomalies_total{kind="mpt_unreadable"}`). The recorded
+ * transactions alone count nothing. Like `ammTemplate` for the AMM pools, the synthetic ones are built here and say so; the header
+ * is the first recorded ledger's.
+ */
+export function mptTemplate(unreadable = 0): Record<string, unknown> {
+  const ledgerOf = (index: number): Json =>
+    JSON.parse(gunzipSync(readFileSync(join(MPT_FIXTURES_DIR, `${index}.json.gz`))).toString('utf8')).ledger as Json;
+  const transactions: Json[] = MPT_TEMPLATE_TRANSACTIONS.map(([index, hash], at) => {
+    const recorded = (ledgerOf(index).transactions as Json[]).find((tx) => tx.hash === hash);
+    if (!recorded) throw new Error(`transaction ${hash} is not in ledger ${index} of ${MPT_FIXTURES_DIR}`);
+    return { ...structuredClone(recorded), metaData: { ...recorded.metaData, TransactionIndex: at } };
+  });
+  for (let k = 0; k < unreadable; k++) {
+    const holder = `rUnreadableMptHolder${k}xxxxxxxxx`;
+    transactions.push({
+      Account: holder,
+      TransactionType: 'MPTokenAuthorize',
+      Fee: '10',
+      Sequence: 1 + k,
+      hash: `C${k.toString(16).toUpperCase()}`.padEnd(64, 'C'),
+      metaData: {
+        TransactionIndex: transactions.length,
+        TransactionResult: 'tesSUCCESS',
+        AffectedNodes: [
+          {
+            ModifiedNode: {
+              LedgerEntryType: 'MPToken',
+              FinalFields: {
+                Account: holder,
+                Flags: 0,
+                MPTAmount: 'not digits',
+                MPTokenIssuanceID: '0000012AB5F762798A53D543A014CAF8B297CFF8F2F937E8',
+              },
+              PreviousFields: { Flags: 2 },
+            },
+          },
+        ],
+      },
+    });
+  }
+  return { ...ledgerOf(MPT_TEMPLATE_TRANSACTIONS[0][0]), transactions };
+}
+
 /** A ledger hash (64 upper-case hex digits) that depends only on the index and the salt. */
 export function syntheticHash(index: number, salt = 'main'): string {
   return createHash('sha256').update(`synthetic-ledger:${salt}:${index}`).digest('hex').toUpperCase();

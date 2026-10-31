@@ -930,8 +930,9 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
    * `syncer_amm_unclassified_total`: the pools of AMM transactions the parser made no swap, liquidity or governance row
    * for, `syncer_nft_skipped_total`: the NFT events it dropped for an MPT amount, `syncer_objects_unclassified_total`:
    * the escrow, check, channel and delegation changes it could give no event, and `syncer_parser_anomalies_total` with
-   * `kind="import_minted_negative"`: the Xahau Imports whose minted drops it clamped to 0, in a batch that is committed. Only
-   * a batch that is, so that a write that failed and was recovered is counted once, when its rewrite commits.
+   * `kind="import_minted_negative"`: the Xahau Imports whose minted drops it clamped to 0, and with `kind="mpt_unreadable"`: what
+   * it could not read of an MPT and stored as 0 or skipped, in a batch that is committed. Only a batch that is, so that a write that
+   * failed and was recovered is counted once, when its rewrite commits.
    */
   private countDiagnostics(written: LedgerWriteResult): void {
     if (written.ammUnclassified > 0) this.metrics?.ammUnclassifiedTotal.inc(written.ammUnclassified);
@@ -940,6 +941,8 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     if (written.importMintedNegative > 0) {
       this.metrics?.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, written.importMintedNegative);
     }
+    if (written.mptAnomalies > 0)
+      this.metrics?.parserAnomaliesTotal.inc({ kind: 'mpt_unreadable' }, written.mptAnomalies);
   }
 
   /** The bookkeeping after the ledgers `first`..`last` were committed. */
