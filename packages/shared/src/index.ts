@@ -65,6 +65,7 @@ export * from './aggregate/amm-pools.job';
 export * from './aggregate/amm-reads';
 export * from './aggregate/escrows.job';
 export * from './aggregate/markets-live.job';
+export * from './aggregate/mpt-state.job';
 export * from './aggregate/nft-collections.job';
 export * from './aggregate/nft-state';
 export * from './aggregate/nft-state.job';

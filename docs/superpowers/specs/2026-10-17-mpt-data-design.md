@@ -373,6 +373,8 @@ rebuilds an issuance. The explorer does not decode it: it shows what the API dec
 
 ## 6. Aggregation: the `mpt_state` job
 
+> **Dated note (2026-10-31, rulings C10, C11).** `last_ledger` claims every pair touched below it, so `rebuildMptIssuances` first reads, for its IDs, every pair touched above each `last_ledger` up to the head (a key range of `mpt_touches` from the lowest of them) and unions it with the holders handed in. A retry after a set-aside, the hook at a newer head and the read of a tie need nothing else. ClickHouse refuses a URL parameter over 128 KiB, so pairs are read and deleted `MPT_HOLDERS_READ_CHUNK` (2,000) at a time, sorted, through `arrayZip`; `MPT_HOLDERS_CHUNK` stays 5,000 rows per insert. `agg_dirty` also finds every pair of any issuance whose newest `mpt_holders` row last saw the slice (C30(g)).
+
 `packages/shared/src/aggregate/mpt-state.job.ts` (the reads and writes) and `apps/syncer/src/aggregator/mpt-state.job-runner.ts` (the
 runner), registered in `aggregator.service.ts` as `mpt_state`: every tick, budget `AGGREGATOR_MPT_STATE_BUDGET_MS` = 3000. It follows
 the `amm_pools` runner in every rule not restated here: committed head only, a cursor in memory found again at start, stale-only
@@ -554,6 +556,8 @@ mpt holdings`.
 - Ripple parity: the recorded and ripple-mock fixtures hold no MPT, so every existing parity test stays byte-identical.
 
 ## 8. Query bounds
+
+> **Dated note (2026-10-31, ruling C12).** A read costs at least a granule, and scattered keys a granule each, so "2 × the rows" and "a granule per part" cannot pass, or cannot fail, as written. The bound of each read below is its rows plus 2 granules per part, tested against a bulk of other rows with a mutation that shows it can fail. The `mpt_state` row's 120,000 holders count inserts and holders only; a separate test reads about 50 pairs against a 4-part bulk.
 
 Pinned by `paged-reads.e2e-spec.ts` and the plan tests of `test/support/plans.ts`.
 
