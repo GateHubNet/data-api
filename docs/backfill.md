@@ -539,6 +539,31 @@ Check the coverage:
 SELECT maxOrNull(ledger_index) FROM xahau.ledgers WHERE parser_version < 9;
 ```
 
+### MPT data re-ingest
+
+Parser version 10 writes the five MPT ledger tables, MPT payments to the payment tables and an `MPToken`'s rows to `balance_changes`, so ledgers written earlier have none of them, and what happened on an MPT before the deploy is not in the index.
+
+- **What MPT needs: ledger 99,226,369 upward.** `MPTokensV1` was enabled there on the XRP Ledger (2025-10-01T13:13:10Z, `Amendment` `14853FF2D09D198B576A531C50883C59D71474BA9072C1F5C0ED1DD57882B922`, read from the recorded `EnableAmendment` in `packages/shared/test/fixtures/xrpl/mpt/FINDINGS.md`), and no MPT row can be older. That is about 8.5 million ledgers on 2026-10-24.
+- **The program's one reprocess covers it; there is no separate run.** That reprocess is the whole history, about 108 million ledgers, after the program's last parser version ([issued tokens](#issued-tokens-re-ingest)), so it writes these ledgers with the rest. Run the range below on its own only if the program's reprocess is skipped; it rewrites every table of each ledger, so it costs what the first ingest did ([Which node?](#2-which-node)):
+
+  ```bash
+  ... node dist/cli/range-ingest.js --from 99226369 --to <checkpoint> --reprocess
+  ```
+
+  From a public node such as `wss://s2.ripple.com` that is `--concurrency 1`, and 8.5 million ledgers are for your own node ([rate limits](#public-nodes-and-rate-limits)).
+- **`agg_dirty` reaches the job.** The chunks mark their hours, and `stats_dirty`'s hook of `mpt_state` rebuilds the issuances the slice names, with their holders, so nothing has to be started by hand. [Operations](operations.md#the-mpt-state-job) says what a failing hook looks like.
+- **Until then** an issuance whose own node has not changed since the deploy has no known state (`state_known = 0`): `/v2/mpt/{issuanceId}` is a 404 and the list leaves it out, while its holders and transfers are served, and `complete` is false.
+- **Xahau and Xahau Testnet need none:** they have no MPT, and they answer `complete: true`. **XRPL Testnet** is not backfilled: its index starts at its first boot, and it stays `complete: false` unless it indexed its own `EnableAmendment` (ledger 11,119,873 on the testnet of today).
+
+Check it:
+
+```sql
+-- every ledger from the enablement up should be of parser version 10 or later
+SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 99226369 GROUP BY parser_version;
+-- the issuances with no known state: 0 once the reprocess has been through the job
+SELECT countIf(state_known = 0) FROM (SELECT * FROM xrpl.mpt_issuances ORDER BY mpt_issuance_id, version DESC LIMIT 1 BY mpt_issuance_id);
+```
+
 ### Public nodes and rate limits
 
 Public nodes limit what one client may ask, and say how long to wait: `rate limit: units quota (50000 per 10s) exhausted, retry in

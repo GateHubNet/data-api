@@ -384,7 +384,7 @@ has not changed since that block, until its next change, and nothing can bring i
 whose rows of the block are dropped too. A `range-ingest` of the block later writes the same rows again (the same `version`), and `--reprocess` deletes and
 rewrites them as it does in every table.
 
-The rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and the issued token tables (`token_generations`, `token_lines`, `tokens`: [Retention of the token tables](#retention-of-the-token-tables)) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats`, `validations`, the tables of the validators and amendments data (migration 002) and the account and market aggregates (migration 003) are independent: a dropped block reaches the aggregates only through `agg_dirty` when it is ingested again. A block dropped from the AMM tables and
+The rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and the issued token tables (`token_generations`, `token_lines`, `tokens`: [Retention of the token tables](#retention-of-the-token-tables)) and the MPT aggregates (`mpt_issuances`, `mpt_holders`: [Retention of the MPT tables](#retention-of-the-mpt-tables)) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats`, `validations`, the tables of the validators and amendments data (migration 002) and the account and market aggregates (migration 003) are independent: a dropped block reaches the aggregates only through `agg_dirty` when it is ingested again. A block dropped from the AMM tables and
 brought back by `range-ingest` marks `agg_dirty`, and the aggregator rebuilds the pools and days it covers.
 
 To **bring a dropped block back**, run `range-ingest` over the same range: with no `ledgers` rows left it ingests everything. To repair a **partial** loss (some tables
@@ -1060,10 +1060,35 @@ WHERE database = 'xrpl' AND table IN ('token_lines', 'tokens') AND active GROUP 
 
 The `mpt_state` job of the aggregator ([syncer](syncer.md#the-mpt_state-job)) keeps `mpt_issuances` and `mpt_holders`, which the MPT routes serve. Every tick, eleventh in the tick (after `stats_dirty`), budget 3 s.
 
+**Roll out MPT in this order.**
+
+1. Apply `017_mpt.sql` on each network's database: `dc run --rm migrate-xrpl` and the same for each network ([Apply a schema migration](#apply-a-schema-migration)). It comes before a syncer of parser version 10, which refuses to boot without its tables.
+2. Deploy the syncer (parser version 10, job `mpt_state`) and the api together. The api's MPT routes read the tables of step 1 and answer from empty ones until the syncer has filled them.
+3. Watch `syncer_mpt_state_lag_ledgers`: 0 to a few ledgers once caught up ([alerts](observability.md#recommended-alerts)).
+4. The history comes with the program's one reprocess ([backfill](backfill.md#mpt-data-re-ingest)); Xahau needs none.
+
+**Until that reprocess** an issuance untouched since the deploy is a 404 (`state_known = 0`), the list leaves it out, and the answers say `complete: false`. To see where a network stands:
+
+```sql
+SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 99226369 GROUP BY parser_version;
+SELECT countIf(state_known = 0) FROM (SELECT * FROM xrpl.mpt_issuances ORDER BY mpt_issuance_id, version DESC LIMIT 1 BY mpt_issuance_id);
+```
+
+
 - **During a stats catch-up a new issuance waits.** The job comes after `stats_live` and `stats_dirty`, so that the jobs before `stats_live` keep to their 27 of the 30 s of a tick. While those two use the tick it gets no budget: `syncer_mpt_state_lag_ledgers` climbs at about 20 ledgers a minute, `/v2/mpt/{id}` answers 404 for an issuance made meanwhile, and an alert on the gauge fires without a fault (read `syncer_aggregator_stats_lag_seconds` beside it). It ends with the catch-up.
 - **A first run reads where it stands, and waits for the answer.** The cursor is found once per process, by a scan of `mpt_touches` joined with the newest row of each issuance, whether or not the run has budget. Measured on ClickHouse 26.8.14.3 in a container on a laptop, 2026-10-31: 14 ms at 1,000,000 touches and 5,000 issuances, 24 ms at 5,000,000, with or without the issuances' rows. Mainnet's MPT history, as far as it was read, is far below the first of those (the recorded findings count 3,796 transactions touching an MPT in the histories of 113 issuers, 14 of them capped), so `nft_state`'s read in the background is not needed here: it would take about 30 lines. Look again if `mpt_touches` passes tens of millions of rows.
 - **An issuance that fails on its own is set aside**, and does not show in the gauge, since the cursor goes on: `increase(syncer_aggregator_errors_total{job=~"mpt_state.*"}[2h]) > 0` says so ([observability](observability.md#recommended-alerts)), and the log names it (`Aggregator job mpt_state failed for issuance <id>, set aside to be tried again: ...`). Its row and its holders are stale until its retry works: 5 minutes, doubling to an hour. A restart forgets the set and finds the issuance again in the tables; what a slice of `agg_dirty` named of it is forgotten with it, and a pair the re-ingest rewrote below the issuance's `last_ledger` then waits for its next touch, or a `--reprocess` of the range again ([Backfill and repair](#backfill-and-repair)).
 - **`mpt_state_dirty` rising** with `agg_dirty` not falling is the hook of a slice failing: the read of what the slice names, or most of its issuances (the database, not an issuance). The slice stays queued and its earlier hooks run again each tick, as for every hook.
+
+### Retention of the MPT tables
+
+`mpt_touches` and `mpt_transfers` are P6 ledger tables and `mpt_issuance_states`, `mpt_holder_states` and `mpt_issuance_transfers` P7, and all five go with their block when the ledger tables are dropped ([Retention](#retention)). **`mpt_issuances` and `mpt_holders` are never dropped by retention**: they are aggregates, and nothing rebuilds them after a drop but the job. After a block was dropped:
+
+- **The holdings read the state table directly.** `/v2/accounts/{address}/mpt` reads `mpt_holder_states`, so a holder last changed in a dropped block leaves that route, although `/v2/mpt/{issuanceId}/holders` still lists it from `mpt_holders`.
+- **A rebuild is exact only for what has a state row above the oldest kept block.** A pair last changed in a dropped block has no row to rebuild it from: a rebuild that names it deletes its `mpt_holders` row, and its issuance's counts fall. An issuance whose own node last changed in a dropped block turns `state_known = 0` at its next rebuild, which any touch of a holder causes, so it answers 404 and leaves the list. Its `created_*` keys go at that rebuild too when the block of its creation is gone.
+- **The transfers of a dropped block leave `/v2/mpt/{issuanceId}/transfers`**, and the live numbers do not change for it.
+
+To bring a block back run `range-ingest` over it ([Retention](#retention)); its marks reach the job through `agg_dirty`.
 
 ## Supply snapshots
 
