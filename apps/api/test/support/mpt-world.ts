@@ -30,8 +30,8 @@ import { ledgerRow } from './validators-seed';
  * **The issuances**, one `issuer`, each with an older version in another part of `mpt_issuances`, whose numbers would show:
  *  - `htf`: metadata that conforms, a maximum, three holders (`HTF_HOLDERS`: one locked, one with an escrow), every kind of transfer;
  *  - `bare`: no metadata, no maximum, no creation in the coverage; the holders are the balances that test an order (`BARE_HOLDERS`:
- *    one above 2^53, 10 and 9, ties, one in escrow only) and one with nothing;
- *  - `unknownState`: `state_known = 0`, with two holders and two transfers;
+ *    2^53 + 1 and 2^53, which a double cannot tell apart, 10 and 9, ties, one partly in escrow) and one with nothing;
+ *  - `unknownState`: `state_known = 0`, with two holders, one of them no other issuance's (`holders[9]`), and two transfers;
  *  - `destroyed`: destroyed, and its one holder's token deleted;
  *  - `lockedAll`: `lsfMPTLocked`, two holders of which neither locked on its own, and a lock of every balance;
  *  - `escrow`: `escrowed_amount` above 0, its one holder's balance all in escrow;
@@ -49,7 +49,7 @@ const ENABLE_LEDGER = 99_226_369;
 const ISSUER = accountAt(0xa001);
 
 /** The accounts of the world, for the balances. */
-const HOLDERS = Array.from({ length: 9 }, (_, i) => accountAt(0xb001 + i));
+const HOLDERS = Array.from({ length: 10 }, (_, i) => accountAt(0xb001 + i));
 
 const IDS = {
   htf: mptIssuanceId(298, ISSUER),
@@ -249,7 +249,7 @@ export const MPT_ISSUANCES: readonly MptIssuancesRow[] = [
     created_time: closeOfMpt(99_412_004),
     created_tx_hash: hashOf(99_412_004),
   }),
-  mptIssuanceRow(IDS.bare, { outstanding_amount: '9007199254741031', holders: 5 }),
+  mptIssuanceRow(IDS.bare, { outstanding_amount: '18014398509482023', holders: 6 }),
   mptIssuanceRow(IDS.unknownState, { state_known: 0, holders: 2, last_ledger: 107_000_012 }),
   mptIssuanceRow(IDS.destroyed, { destroyed: 1, last_ledger: 107_000_009 }),
   mptIssuanceRow(IDS.lockedAll, {
@@ -271,11 +271,11 @@ export const MPT_ISSUANCES: readonly MptIssuancesRow[] = [
 /** The balances of `bare`: `[holder, amount, escrowed]`. `holders[0]` has nothing left. */
 export const BARE_HOLDERS: readonly [string, string, string][] = [
   [HOLDERS[3], '9007199254740993', '0'],
+  [HOLDERS[8], '9007199254740992', '0'],
   [HOLDERS[4], '10', '0'],
   [HOLDERS[5], '4', '6'],
   [HOLDERS[6], '9', '0'],
   [HOLDERS[7], '9', '0'],
-  [HOLDERS[8], '0', '0'],
   [HOLDERS[0], '0', '0'],
 ];
 
@@ -288,7 +288,7 @@ export const MPT_HOLDERS: readonly MptHoldersRow[] = [
     mptHolderRow(IDS.bare, holder, amount, { escrowed_amount: escrowed }),
   ),
   mptHolderRow(IDS.unknownState, HOLDERS[0], '500', { flags: HOLDER_AUTHORIZED }),
-  mptHolderRow(IDS.unknownState, HOLDERS[8], '300'),
+  mptHolderRow(IDS.unknownState, HOLDERS[9], '300'),
   mptHolderRow(IDS.destroyed, HOLDERS[0], '0', { deleted: 1 }),
   mptHolderRow(IDS.lockedAll, HOLDERS[0], '1000', { flags: HOLDER_AUTHORIZED }),
   mptHolderRow(IDS.lockedAll, HOLDERS[1], '300'),
@@ -307,8 +307,8 @@ export const MPT_TRANSFERS: readonly (MptTransfersRow & MptIssuanceTransfersRow)
   mptTransferRow(IDS.htf, 107_000_008, 0, 'escrow_cancel', HOLDERS[2], HOLDERS[2], '2000'),
   mptTransferRow(IDS.htf, 107_000_008, 5, 'payment', HOLDERS[0], ISSUER, '3000'),
   mptTransferRow(IDS.lockedAll, 107_000_010, 1, 'lock', ISSUER, '', '1300'),
-  mptTransferRow(IDS.unknownState, 107_000_011, 1, 'payment', HOLDERS[8], HOLDERS[0], '500'),
-  mptTransferRow(IDS.unknownState, 107_000_012, 1, 'payment', HOLDERS[0], HOLDERS[8], '300'),
+  mptTransferRow(IDS.unknownState, 107_000_011, 1, 'payment', HOLDERS[9], HOLDERS[0], '500'),
+  mptTransferRow(IDS.unknownState, 107_000_012, 1, 'payment', HOLDERS[0], HOLDERS[9], '300'),
   mptTransferRow(IDS.htf, HEAD - 2, 0, 'payment', HOLDERS[0], HOLDERS[1], '1'),
   mptTransferRow(IDS.htf, HEAD - 1, 0, 'payment', HOLDERS[0], HOLDERS[1], '2'),
   mptTransferRow(IDS.htf, HEAD - 1, 1, 'lock', ISSUER, HOLDERS[1], '124000000'),
@@ -375,8 +375,10 @@ export async function seedMptWorld(h: Harness): Promise<void> {
     MPT_HOLDER_STATES.filter((_, i) => i % 2 === 0),
     MPT_HOLDER_STATES.filter((_, i) => i % 2 === 1),
   );
-  await h.ch.insert(Table.MptTransfers, [...MPT_TRANSFERS]);
-  await h.ch.insert(Table.MptIssuanceTransfers, [...MPT_TRANSFERS]);
+  // the rows of `htf` are there twice, in a part of their own, as a ledger written twice leaves them until a merge
+  const again = MPT_TRANSFERS.filter((row) => row.mpt_issuance_id === IDS.htf);
+  await insertParts(h, Table.MptTransfers, [...MPT_TRANSFERS], again);
+  await insertParts(h, Table.MptIssuanceTransfers, [...MPT_TRANSFERS], again);
 }
 
 /** The seven MPT tables, which a route reads none of on a network without MPT. */

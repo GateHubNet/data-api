@@ -1,3 +1,4 @@
+import { LSF_MPT_LOCKED, MptTransferKind } from '@gatehub/data-api-shared';
 import { fmtTime } from '../common/format';
 
 /**
@@ -60,6 +61,36 @@ export const MPT_SUMMARY_KEYS = [
   'flags',
   'destroyed',
 ] as const;
+
+export const MPT_HOLDERS_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'holders'] as const;
+
+export const MPT_HOLDER_KEYS = ['holder', 'amount', 'escrowed_amount', 'locked', 'authorized'] as const;
+
+export const MPT_TRANSFERS_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'transfers'] as const;
+
+export const MPT_TRANSFER_KEYS = [
+  'ledger_index',
+  'tx_index',
+  'tx_hash',
+  'executed_time',
+  'tx_type',
+  'kind',
+  'source',
+  'destination',
+  'amount',
+  'fee',
+] as const;
+
+/** The kinds of a transfer, in the order the message of `kind` lists them. */
+export const MPT_TRANSFER_KINDS: readonly MptTransferKind[] = [
+  'payment',
+  'clawback',
+  'lock',
+  'unlock',
+  'escrow_create',
+  'escrow_finish',
+  'escrow_cancel',
+];
 
 // -- the objects ---------------------------------------------------------------------------------------------------------
 
@@ -133,6 +164,49 @@ export interface MptSummaryObject {
   destroyed: boolean;
 }
 
+/** A holder's balance as a list reads it: the newest row of `mpt_holders`, each `UInt64` as its digits. */
+export interface StoredMptHolder {
+  holder: string;
+  amount_text: string;
+  escrowed_text: string;
+  flags: number;
+}
+
+export interface MptHolderObject {
+  holder: string;
+  amount: string;
+  escrowed_amount: string;
+  locked: boolean;
+  authorized: boolean;
+}
+
+/** A row of `mpt_issuance_transfers` as the list reads it: each `UInt64` as its digits, the close time as unix seconds. */
+export interface StoredMptTransfer {
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_unix: number;
+  tx_type: string;
+  kind: MptTransferKind;
+  source: string;
+  destination: string;
+  amount_text: string;
+  fee_text: string;
+}
+
+export interface MptTransferObject {
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  executed_time: string;
+  tx_type: string;
+  kind: MptTransferKind;
+  source?: string;
+  destination?: string;
+  amount: string;
+  fee?: string;
+}
+
 /** The named bits of an issuance's flags: `0x01` locked, then in the order of `MPT_FLAGS_KEYS`, up to `0x40` can_clawback. */
 export function mptFlags(flags: number): MptFlagsObject {
   return Object.fromEntries(MPT_FLAGS_KEYS.map((key, bit) => [key, (flags & (1 << bit)) !== 0])) as MptFlagsObject;
@@ -184,5 +258,45 @@ export function toMptSummary(row: StoredMptIssuance): MptSummaryObject {
     transfer_fee: row.transfer_fee,
     flags: mptFlags(row.flags),
     destroyed: row.destroyed !== 0,
+  };
+}
+
+/** `lsfMPTAuthorized` of an `MPToken`, what `authorized` says. */
+const LSF_MPT_AUTHORIZED = 0x02;
+
+/** Whether a balance cannot move: the holder's own `lsfMPTLocked`, or the issuance's. */
+export function mptBalanceLocked(holderFlags: number, issuanceFlags: number): boolean {
+  return ((holderFlags | issuanceFlags) & LSF_MPT_LOCKED) !== 0;
+}
+
+/** Whether a holder has `lsfMPTAuthorized`, which means something when the issuance requires it. */
+export function mptBalanceAuthorized(holderFlags: number): boolean {
+  return (holderFlags & LSF_MPT_AUTHORIZED) !== 0;
+}
+
+/** A holder of an issuance (spec 7.3), with the raw flags of the issuance. */
+export function toMptHolder(row: StoredMptHolder, issuanceFlags: number): MptHolderObject {
+  return {
+    holder: row.holder,
+    amount: row.amount_text,
+    escrowed_amount: row.escrowed_text,
+    locked: mptBalanceLocked(row.flags, issuanceFlags),
+    authorized: mptBalanceAuthorized(row.flags),
+  };
+}
+
+/** A transfer of an issuance (spec 7.4): `source` and `destination` are left out when `''`, `fee` when 0. */
+export function toMptTransfer(row: StoredMptTransfer): MptTransferObject {
+  return {
+    ledger_index: row.ledger_index,
+    tx_index: row.tx_index,
+    tx_hash: row.tx_hash,
+    executed_time: fmtTime(row.close_unix),
+    tx_type: row.tx_type,
+    kind: row.kind,
+    ...(row.source !== '' && { source: row.source }),
+    ...(row.destination !== '' && { destination: row.destination }),
+    amount: row.amount_text,
+    ...(row.fee_text !== '0' && { fee: row.fee_text }),
   };
 }

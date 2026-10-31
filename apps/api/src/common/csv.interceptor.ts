@@ -42,6 +42,19 @@ export function flattenJSON(data: unknown): Json {
   return result;
 }
 
+/** An object as a CSV row: every column of its list, `null` where the object has none. */
+export type CsvRow = Record<string, string | number | boolean | null>;
+
+/**
+ * The CSV row of an object: every column of `columns`, in its order, `null` (an empty cell) where the object has none. A CSV takes its
+ * columns from the keys of its rows, so a key that is left out would move them from one page to the next; a nested object's keys are
+ * joined with a dot, as `flattenJSON` writes them (`flags.locked`).
+ */
+export function toCsvRow(object: object, columns: readonly string[]): CsvRow {
+  const values = flattenJSON(object) as Record<string, string | number | boolean | undefined>;
+  return Object.fromEntries(columns.map((column) => [column, values[column] ?? null]));
+}
+
 /** Whether the request asks for the CSV form: `format=csv`, in any case (the original lowercased the format). */
 export function wantsCsv(query: Record<string, unknown>): boolean {
   return first(query, 'format')?.toLowerCase() === 'csv';

@@ -1,5 +1,5 @@
 import { RippleHttpError } from '../common/errors';
-import { parseIdsParam, parseIssuanceIdParam } from './mpt-param';
+import { decodeMptHoldersMarker, parseIdsParam, parseIssuanceIdParam, parseKindsParam } from './mpt-param';
 
 const ID = '0000012A9AB7E5A9F3DE1D7F1E8B2C4D5F6A7B8C9D0E1F20';
 
@@ -57,5 +57,44 @@ describe('parseIdsParam', () => {
     expect(badRequestMessage(() => parseIdsParam({ ids: `${ID},` }))).toBe('invalid mpt issuance id');
     expect(badRequestMessage(() => parseIdsParam({ ids: ',' }))).toBe('invalid mpt issuance id');
     expect(badRequestMessage(() => parseIdsParam({ ids: `${ID},${ID.slice(0, 47)}` }))).toBe('invalid mpt issuance id');
+  });
+});
+
+describe('parseKindsParam', () => {
+  const MESSAGE = 'invalid kind - use: payment, clawback, lock, unlock, escrow_create, escrow_finish, escrow_cancel';
+
+  it('reads a comma list in order, without repeats; missing or empty is none', () => {
+    expect(parseKindsParam({})).toBeUndefined();
+    expect(parseKindsParam({ kind: '' })).toBeUndefined();
+    expect(parseKindsParam({ kind: 'lock,unlock,lock' })).toEqual(['lock', 'unlock']);
+    expect(parseKindsParam({ kind: 'escrow_cancel' })).toEqual(['escrow_cancel']);
+  });
+
+  it.each(['mint', 'lock,mint', 'lock,', ',lock', 'LOCK'])('refuses %j', (kind) => {
+    expect(badRequestMessage(() => parseKindsParam({ kind }))).toBe(MESSAGE);
+  });
+});
+
+describe('decodeMptHoldersMarker', () => {
+  const marker = (values: unknown[]): string => Buffer.from(JSON.stringify(values), 'utf8').toString('base64url');
+
+  it('reads the balance as text, the largest too', () => {
+    expect(decodeMptHoldersMarker(undefined)).toBeUndefined();
+    expect(decodeMptHoldersMarker('')).toBeUndefined();
+    expect(decodeMptHoldersMarker(marker(['9007199254740993', 'rA']))).toEqual(['9007199254740993', 'rA']);
+    expect(decodeMptHoldersMarker(marker(['9223372036854775807', 'rA']))).toEqual(['9223372036854775807', 'rA']);
+    expect(decodeMptHoldersMarker(marker(['0', '']))).toEqual(['0', '']);
+  });
+
+  it.each([
+    ['a number', [5, 'rA']],
+    ['not digits', ['5x', 'rA']],
+    ['a sign', ['-5', 'rA']],
+    ['20 digits', ['10000000000000000000', 'rA']],
+    ['above 2^63 - 1', ['9223372036854775808', 'rA']],
+    ['one value', ['5']],
+    ['no holder', ['5', 7]],
+  ])('refuses %s', (_name, values) => {
+    expect(badRequestMessage(() => decodeMptHoldersMarker(marker(values)))).toBe('invalid marker');
   });
 });

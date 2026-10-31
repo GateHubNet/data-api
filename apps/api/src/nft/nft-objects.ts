@@ -8,9 +8,13 @@ import {
   NftsRow,
 } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
-import { flattenJSON } from '../common/csv.interceptor';
+import type { CsvRow } from '../common/csv.interceptor';
 import { Coverage } from '../common/feature-coverage.service';
 import { fmtTime } from '../common/format';
+
+// moved to `common/csv.interceptor.ts` with D9, which needs them too; the NFT routes and D6's token list go on importing them from here
+export { toCsvRow } from '../common/csv.interceptor';
+export type { CsvRow };
 
 /**
  * The objects of the NFT routes (spec section 5.1), written down here once and pinned by the tests: each is built by a function
@@ -360,9 +364,6 @@ export interface HolderObject {
   held: number;
 }
 
-/** An object as a CSV row: every column of its list, `null` where the object has none. */
-export type CsvRow = Record<string, string | number | boolean | null>;
-
 /** The answer of the detail route. */
 export interface NftBody {
   result: 'success';
@@ -690,10 +691,4 @@ export function toCollectionDayObject(r: CollectionDayRow): CollectionDayObject 
 /** A holder from its `nft_collection_holders` row. */
 export function toHolderObject(r: { owner: string; held: number | string }): HolderObject {
   return { owner: r.owner, held: Number(r.held) };
-}
-
-/** The CSV row of an object: every column of `columns`, in its order, `null` where the object has none. */
-export function toCsvRow(object: object, columns: readonly string[]): CsvRow {
-  const values = flattenJSON(object) as Record<string, string | number | boolean | undefined>;
-  return Object.fromEntries(columns.map((column) => [column, values[column] ?? null]));
 }

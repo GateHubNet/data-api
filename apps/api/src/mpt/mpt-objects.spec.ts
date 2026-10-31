@@ -1,13 +1,21 @@
 import {
   MPT_FLAGS_KEYS,
+  MPT_HOLDER_KEYS,
+  MPT_HOLDERS_BODY_KEYS,
   MPT_ISSUANCE_BODY_KEYS,
   MPT_ISSUANCE_KEYS,
   MPT_LOOKUP_BODY_KEYS,
   MPT_SUMMARY_KEYS,
+  MPT_TRANSFER_KEYS,
+  MPT_TRANSFER_KINDS,
+  MPT_TRANSFERS_BODY_KEYS,
   mptFlags,
   StoredMptIssuance,
+  StoredMptTransfer,
+  toMptHolder,
   toMptIssuance,
   toMptSummary,
+  toMptTransfer,
 } from './mpt-objects';
 
 const ID = '0000012A9AB7E5A9F3DE1D7F1E8B2C4D5F6A7B8C9D0E1F20';
@@ -178,5 +186,71 @@ describe('toMptSummary', () => {
       MPT_SUMMARY_KEYS.filter((key) => !['ticker', 'name', 'maximum_amount'].includes(key)),
     );
     expect(bare).toMatchObject({ outstanding_amount: '1820451120', holders: 3412, destroyed: false });
+  });
+});
+
+describe('toMptHolder', () => {
+  const ROW = { holder: 'rHolder', amount_text: '9007199254740993', escrowed_text: '7', flags: 0 };
+
+  it('has the keys of MPT_HOLDER_KEYS in order, and the amounts digit for digit', () => {
+    expect(MPT_HOLDERS_BODY_KEYS).toEqual(['result', 'coverage', 'count', 'marker', 'holders']);
+    const holder = toMptHolder(ROW, 0);
+    expect(Object.keys(holder)).toEqual([...MPT_HOLDER_KEYS]);
+    expect(holder).toEqual({
+      holder: 'rHolder',
+      amount: '9007199254740993',
+      escrowed_amount: '7',
+      locked: false,
+      authorized: false,
+    });
+  });
+
+  it('is locked by its own flag or by the issuance, and authorized by its own', () => {
+    expect(toMptHolder({ ...ROW, flags: 0x01 }, 0).locked).toBe(true);
+    expect(toMptHolder(ROW, 0x01).locked).toBe(true);
+    // the issuance's other bits say nothing of a balance
+    expect(toMptHolder(ROW, 0x7e).locked).toBe(false);
+    expect(toMptHolder({ ...ROW, flags: 0x02 }, 0)).toMatchObject({ locked: false, authorized: true });
+    expect(toMptHolder(ROW, 0x7f).authorized).toBe(false);
+  });
+});
+
+describe('toMptTransfer', () => {
+  const ROW: StoredMptTransfer = {
+    ledger_index: 107795410,
+    tx_index: 31,
+    tx_hash: 'A'.repeat(64),
+    close_unix: 1_792_850_000,
+    tx_type: 'Payment',
+    kind: 'payment',
+    source: 'rSource',
+    destination: 'rDestination',
+    amount_text: '2500000',
+    fee_text: '25',
+  };
+
+  it('has the keys of MPT_TRANSFER_KEYS in order', () => {
+    expect(MPT_TRANSFERS_BODY_KEYS).toEqual(['result', 'coverage', 'count', 'marker', 'transfers']);
+    expect(Object.keys(toMptTransfer(ROW))).toEqual([...MPT_TRANSFER_KEYS]);
+    expect(toMptTransfer(ROW)).toMatchObject({ executed_time: '2026-10-24T13:53:20Z', amount: '2500000', fee: '25' });
+  });
+
+  it('leaves out an empty source or destination, and a fee of 0', () => {
+    const bare = toMptTransfer({ ...ROW, source: '', destination: '', fee_text: '0' });
+    expect(Object.keys(bare)).toEqual(
+      MPT_TRANSFER_KEYS.filter((key) => !['source', 'destination', 'fee'].includes(key)),
+    );
+  });
+
+  it('lists the kinds in the order of the message', () => {
+    expect(MPT_TRANSFER_KINDS).toEqual([
+      'payment',
+      'clawback',
+      'lock',
+      'unlock',
+      'escrow_create',
+      'escrow_finish',
+      'escrow_cancel',
+    ]);
   });
 });

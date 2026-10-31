@@ -5358,6 +5358,56 @@ Keys of an issuance summary, in order: `mpt_issuance_id, issuer, ticker?, name?,
 
 Errors, in the order they are checked: 400 `ids is required`, `too many ids` (more than 100, whatever they are), `invalid mpt issuance id` (an empty element too); 500 `unable to retrieve issuances`.
 
+### `GET /v2/mpt/{issuanceId}/holders`
+
+The balances of an issuance, as of the last run of the job, the largest first. A balance is `amount + escrowed_amount`: what the holder can move, and what it has in escrow. Equal balances go by the holder's address.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `include_zero` | false | Boolean: also the holders with nothing (an authorized, empty balance). |
+| `limit`, `marker` | 200 (max 1000) | The marker holds the balance and the holder of the last row. |
+| `format` | json | `csv`: file `<issuanceId> - holders.csv`, its columns the keys of a holder, without `coverage`. |
+
+```json
+{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true }, "count": 1, "marker": "…",
+  "holders": [{ "holder": "r…", "amount": "612040000", "escrowed_amount": "0", "locked": false, "authorized": true }] }
+```
+
+Keys of the holders answer, in order: `result, coverage, count, marker?, holders`.
+
+Keys of a holder, in order: `holder, amount, escrowed_amount, locked, authorized`.
+
+`locked` is true when the balance cannot move: the holder's own `lsfMPTLocked`, or the issuance's. `authorized` is the holder's `lsfMPTAuthorized`, which means something when the issuance requires it. A holder whose token is deleted (it opted out) is not listed. The holders of an issuance whose state is not known are served all the same, with `locked` from their own flag alone, as the explorer shows the node beside them.
+
+Errors, in the order they are checked: 400 `invalid mpt issuance id`, `invalid marker`; 404 `issuance not found` (it has no row, or the network has no MPT); 500 `unable to retrieve holders`.
+
+### `GET /v2/mpt/{issuanceId}/transfers`
+
+What the successful transactions moved, clawed back, locked or unlocked of an issuance, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `kind` | all | A comma list of `payment`, `clawback`, `lock`, `unlock`, `escrow_create`, `escrow_finish`, `escrow_cancel`. A mint is a `payment` from the issuer and a redemption a `payment` to it, as on the ledger. |
+| `account` | all | Only the rows with this account as source or destination (not validated, as the AMM lists' `account`). |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | The marker holds `ledger_index, tx_index`. |
+| `format` | json | `csv`: file `<issuanceId> - transfers.csv`, its columns the keys of a transfer, an empty cell for what a row has not, without `coverage`. |
+
+```json
+{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true }, "count": 1, "marker": "…",
+  "transfers": [{ "ledger_index": 107795410, "tx_index": 31, "tx_hash": "…", "executed_time": "2026-10-24T14:11:05Z",
+                  "tx_type": "Payment", "kind": "payment", "source": "r…", "destination": "r…", "amount": "2500000" }] }
+```
+
+Keys of the transfers answer, in order: `result, coverage, count, marker?, transfers`.
+
+Keys of a transfer, in order: `ledger_index, tx_index, tx_hash, executed_time, tx_type, kind, source?, destination?, amount, fee?`.
+
+`source` and `destination` are left out when there is none (a lock of every balance has no destination); `fee`, the transfer fee burned, only above 0. A lock's `amount` is the holder's balance after it, or the issuance's outstanding amount. The transfers of an issuance whose state is not known are served all the same.
+
+Errors, in the order they are checked: 400 `invalid mpt issuance id`, `invalid start date format`, `invalid end date format`, `invalid kind - use: payment, clawback, lock, unlock, escrow_create, escrow_finish, escrow_cancel`, `invalid marker`; 404 `issuance not found` (it has no row, or the network has no MPT); 500 `unable to retrieve transfers`.
+
+Both lists can be exported ([`POST /v2/exports`](#exports)), as every list with a CSV form can.
+
 ---
 
 ## Validations

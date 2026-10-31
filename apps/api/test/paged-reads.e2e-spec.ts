@@ -1,8 +1,9 @@
-import { Table } from '@gatehub/data-api-shared';
+import { MPT_PARSER_VERSION, mptIssuanceId, Table } from '@gatehub/data-api-shared';
 import { SAMPLE_ROWS } from '../../../packages/shared/test/sample-rows';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { accountAt, primaryKeys, served } from './support/amm';
 import { fixtureTransactions } from './support/fixtures';
+import { mptHolderRow, mptIssuanceRow, mptTransferRow } from './support/mpt-world';
 import { insertNftEvents, nftEventRow } from './support/nfts';
 import { COUNTERPARTY, insertObjects, jsonOf, objectRow, OWNER } from './support/objects';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead, tableReads } from './support/plans';
@@ -18,7 +19,7 @@ import {
   markerOf,
   readsOf,
 } from './support/read-rows';
-import { fleet, insertManifests, insertSeen, insertValidatorValidations } from './support/validators-seed';
+import { fleet, insertManifests, insertSeen, insertValidatorValidations, ledgerRow } from './support/validators-seed';
 
 /**
  * What a page of every paged list reads (Ruling R106, final review C1): about the granules the page needs, never the
@@ -2574,5 +2575,140 @@ describe("the delegations of an account read the account's prefix of account_obj
     expect(index.reads).toHaveLength(1);
     expect(index.reads[0].read_rows).toBeLessThanOrEqual(BULK_BASES.length * HELD_PER_PART + 2 * GRANULE * PARTS);
     expect(index.body.count).toBe(1);
+  });
+});
+
+/**
+ * What the MPT routes read (D9, spec 8 with its dated note, ruling C12): a read costs at least a granule, so the bound of each is its
+ * rows plus two granules a part, against a bulk of other issuances' rows on both sides of the key of the one asked for. None of
+ * the reads can pass by reading the table: the bulk is many times the bound.
+ */
+describe('the MPT routes read the rows of the issuance, not the table (read_rows over a bulk of four parts)', () => {
+  const GRANULE = 8192;
+  const ISSUER = accountAt(0xa001);
+  /** The issuance asked for, and two whose keys lie on either side of it in every part of a bulk. */
+  const ID = mptIssuanceId(500, ISSUER);
+  const BELOW = mptIssuanceId(1, ISSUER);
+  const ABOVE = mptIssuanceId(9000, ISSUER);
+  const PARTS = BULK_BASES.length;
+  const HOLDERS_PER_PART = 5_000;
+  const HOLDERS = PARTS * HOLDERS_PER_PART;
+  /** The first ledger of the bulk closes at this time, one second a ledger from there. */
+  const T0 = 1_700_000_000;
+  const HEAD = BULK_BASES[PARTS - 1] + BULK_LEDGERS;
+
+  let h: Harness;
+  let api: ApiClient;
+  const through = (table: Table, path: string) => served(h, api, table, path);
+  const parts = async (table: Table): Promise<number> => {
+    const [row] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM system.parts WHERE database = {db:String} AND table = {table:String} AND active`,
+      { db: h.database, table },
+    );
+    return Number(row.n);
+  };
+  /** What a read of a table may cost: its rows, and two granules of each part. */
+  const boundOf = async (table: Table, rows: number): Promise<number> => rows + 2 * GRANULE * (await parts(table));
+
+  beforeAll(async () => {
+    h = await startHarness({ env: NO_RATE_LIMIT });
+    api = await h.api();
+    await h.ch.insert(Table.Ledgers, [
+      { ...ledgerRow(BULK_BASES[0], T0), parser_version: MPT_PARSER_VERSION },
+      { ...ledgerRow(HEAD, T0 + (HEAD - BULK_BASES[0])), parser_version: MPT_PARSER_VERSION },
+    ]);
+    await h.ch.insert(Table.MptIssuances, [mptIssuanceRow(ID, { holders: HOLDERS })]);
+
+    // mpt_holders: the holders of ID in four parts, then the bulk of the other two
+    await h.ch.insert(Table.MptHolders, [mptHolderRow(ID, accountAt(0xc001), '1', { version: '1' })]);
+    const holder = `SELECT * FROM ${Table.MptHolders} WHERE mpt_issuance_id = {id:String} LIMIT 1`;
+    await insertBulk(
+      h,
+      Table.MptHolders,
+      holder,
+      { id: ID },
+      (base) =>
+        `concat('r', toString(${base} + n.number)) AS holder, toUInt64(1 + n.number) AS amount, toUInt64(n.number % 3) AS escrowed_amount`,
+      HOLDERS_PER_PART,
+    );
+    await insertBulk(
+      h,
+      Table.MptHolders,
+      holder,
+      { id: ID, below: BELOW, above: ABOVE },
+      (base) =>
+        `if(n.number % 2 = 0, {below:String}, {above:String}) AS mpt_issuance_id, concat('r', toString(${base} + n.number)) AS holder`,
+    );
+
+    // mpt_issuance_transfers: every fourth row of a bulk is of ID, the rest are of the other two
+    const transfer = mptTransferRow(ID, BULK_BASES[0], 0, 'payment', ISSUER, accountAt(0xc001), '1');
+    await h.ch.insert(Table.MptIssuanceTransfers, [transfer]);
+    await insertBulk(
+      h,
+      Table.MptIssuanceTransfers,
+      `SELECT * FROM ${Table.MptIssuanceTransfers} WHERE mpt_issuance_id = {id:String} LIMIT 1`,
+      { id: ID, below: BELOW, above: ABOVE },
+      (base) =>
+        `multiIf(n.number % 4 = 0, {id:String}, n.number % 4 = 1, {below:String}, {above:String}) AS mpt_issuance_id,
+         ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index`,
+    );
+  }, 300_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the seed is as assumed: the rows of the issuance among the bulk of two others', async () => {
+    const count = async (table: Table, where = '1'): Promise<number> => {
+      const [row] = await h.ch.query<{ n: string }>(`SELECT count() AS n FROM ${table} WHERE ${where}`, { id: ID });
+      return Number(row.n);
+    };
+    expect(await count(Table.MptHolders, 'mpt_issuance_id = {id:String}')).toBe(HOLDERS + 1);
+    expect(await count(Table.MptHolders)).toBe(HOLDERS + 1 + BULK_ROWS);
+    expect(await count(Table.MptIssuanceTransfers)).toBe(BULK_ROWS + 1);
+    // the bound of the holders is far below what a read of the table takes
+    expect(await boundOf(Table.MptHolders, HOLDERS + 1)).toBeLessThan(BULK_ROWS / 4);
+    expect(await parts(Table.MptHolders)).toBeGreaterThanOrEqual(PARTS * 2);
+  });
+
+  it('pages 20,000 holders over four parts', async () => {
+    const path = `/v2/mpt/${ID}/holders`;
+    const bound = await boundOf(Table.MptHolders, HOLDERS + 1);
+    const first = await through(Table.MptHolders, `${path}?limit=200`);
+    expect(first.reads).toHaveLength(1);
+    expect(first.reads[0].read_rows).toBeLessThanOrEqual(bound);
+    // it has to read the whole issuance: the order is the balance, not the key
+    expect(first.reads[0].read_rows).toBeGreaterThanOrEqual(HOLDERS);
+    expect(first.body.count).toBe(200);
+    const rows = first.body.holders as { holder: string; amount: string; escrowed_amount: string }[];
+    const balances = rows.map((row) => BigInt(row.amount) + BigInt(row.escrowed_amount));
+    expect(balances).toEqual([...balances].sort((a, b) => (a > b ? -1 : a < b ? 1 : 0)));
+
+    // deep: the marker of a balance far down the list costs the same
+    const deep = await through(Table.MptHolders, `${path}?limit=200&marker=${markerOf(['100', ''])}`);
+    expect(deep.reads).toHaveLength(1);
+    expect(deep.reads[0].read_rows).toBeLessThanOrEqual(bound);
+    expect(deep.body.count).toBe(200);
+    expect((deep.body.holders as { amount: string }[]).every((row) => BigInt(row.amount) <= 100n)).toBe(true);
+
+    const [sql, params] = first.statements[0];
+    expect(sql).not.toMatch(/\bFINAL\b/i);
+    const [byIssuance] = primaryKeys(await explain(h, 'indexes = 1', sql, params));
+    expect(byIssuance.keys[0]).toBe('mpt_issuance_id');
+    expect(byIssuance.condition).toContain('mpt_issuance_id in');
+  });
+
+  it.each([
+    ['at the start', ''],
+    ['deep, ascending', `&marker=${markerOf([BULK_BASES[1] + BULK_LEDGERS / 2, 0])}`],
+    ['deep, descending', `&descending=true&marker=${markerOf([BULK_BASES[1] + BULK_LEDGERS / 2, 0])}`],
+  ])('a page of transfers reads about a granule of each part past the marker, %s', async (_name, query) => {
+    const path = `/v2/mpt/${ID}/transfers?limit=5${query}`;
+    const { reads, statements, body } = await through(Table.MptIssuanceTransfers, path);
+    expect(body.count).toBe(5);
+    expect(reads).toHaveLength(1);
+    expect(reads[0].read_rows).toBeLessThanOrEqual(2 * GRANULE * (await parts(Table.MptIssuanceTransfers)));
+    const [sql, params] = statements[0];
+    expect(isPageRead(sql)).toBe(true);
+    await expectBoundedInOrderRead(h, sql, params, query.includes('descending'), path);
   });
 });
