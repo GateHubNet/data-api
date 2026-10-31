@@ -54,6 +54,14 @@ export enum Table {
   GenesisMints = 'genesis_mints',
   Imports = 'imports',
   RewardClaims = 'reward_claims',
+  // The MPT ledger tables (migration 017, written by ingest from parser version 10, MPT_PARSER_VERSION; empty on Xahau): the state of
+  // an issuance and of a holder's balance after each transaction that changed its node, the ledger-ordered index of what a
+  // transaction touched, and the transfers in ledger order and by issuance.
+  MptIssuanceStates = 'mpt_issuance_states',
+  MptHolderStates = 'mpt_holder_states',
+  MptTouches = 'mpt_touches',
+  MptTransfers = 'mpt_transfers',
+  MptIssuanceTransfers = 'mpt_issuance_transfers',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -101,6 +109,10 @@ export enum Table {
   // Written by the aggregator's `supply` job (migration 015): one row per snapshot of the native supply, the newest version of a
   // ledger wins.
   NetworkSupply = 'network_supply',
+  // Written by the aggregator's `mpt_state` job (migration 017): the current state of each issuance and the current balance of each
+  // holder, the newest version of a key wins.
+  MptIssuances = 'mpt_issuances',
+  MptHolders = 'mpt_holders',
   // Migration 012, written by the syncer's tomls worker: one row per check of a domain's toml, the newest wins.
   DomainTomls = 'domain_tomls',
   // Written by the operator with plain SQL inserts (ADR-0014).

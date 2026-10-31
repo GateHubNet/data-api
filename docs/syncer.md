@@ -16,7 +16,7 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
    │              │               │                │ account rollups │                  │                  │
    └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴────────┬─────────┴────────┬─────────┘
           ▼               ▼               ▼                 ▼                 ▼                  ▼
-   35 ledger      validations,    fee_stats        stats_hourly,     unl_lists,         domain_tomls
+   40 ledger      validations,    fee_stats        stats_hourly,     unl_lists,         domain_tomls
    tables         validator_      (every 5 s)      volume_live,      unl_publishers,    (reads
    (ledgers =     manifests,                       volume_daily,     validator_         account_
    commit         validator_                       amm_pools, nfts,  domains,           domains)
@@ -85,7 +85,7 @@ The single writer of the ledger tables. It follows the validated chain, one ledg
 
 ### Writing a ledger: `buildLedgerRows` and `LedgerWriter`
 
-For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 35
+For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 40
 **ledger-derived tables** (`ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`,
 `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
 `balance_changes`, `accounts_created`, and the AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`,
@@ -95,9 +95,10 @@ parser version 5: a ledger written by an older parser has no rows in them), the 
 parser version 6 and ordered by account), the history of the tracked ledger objects `object_changes` and its index by account
 `account_object_changes` (migration 013, filled from parser version 7: a ledger written by an older parser has no rows in them), the index of the trust
 lines and issuers whose token state a transaction changed `state_touches` (migration 014, filled from parser version 8: a ledger written by an older parser
-has no rows in it, and the tokens job never applies a window that holds one), and the three Xahau mint tables `genesis_mints`, `imports` and
+has no rows in it, and the tokens job never applies a window that holds one), the three Xahau mint tables `genesis_mints`, `imports` and
 `reward_claims` (migration 015, filled from parser version 9: a Xahau ledger written by an older parser has no rows in them, and XRPL has none of the three
-transaction types, so they stay empty there);
+transaction types, so they stay empty there), and the five MPT tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and
+`mpt_issuance_transfers` (migration 017, filled from parser version 10: a ledger written by an older parser has no rows in them, and Xahau has no MPT, so they stay empty there);
 see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`

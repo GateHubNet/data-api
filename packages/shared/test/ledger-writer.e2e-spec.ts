@@ -102,14 +102,26 @@ const TOUCH_LEDGER_TABLES: Table[] = [Table.StateTouches];
 const MINT_LEDGER_TABLES: Table[] = [Table.GenesisMints, Table.Imports, Table.RewardClaims];
 
 /**
+ * The ledger tables of the MPTs (migration 017): child tables like the others. The ripple-mock ledgers (2021) are older than
+ * MPTokensV1, so they give these tables no row.
+ */
+const MPT_LEDGER_TABLES: Table[] = [
+  Table.MptIssuanceStates,
+  Table.MptHolderStates,
+  Table.MptTouches,
+  Table.MptTransfers,
+  Table.MptIssuanceTransfers,
+];
+
+/**
  * The tables the ripple-mock ledgers have (almost) no activity for: the delete tests put hand-made rows into them
  * (`insertSeededRows`), to see what the deletes reach and what they leave. The recorded AMM, NFT and object ledgers give
  * real rows to these tables, but they all sit in one partition of each, and the delete tests need the rows over several.
  * `account_domains` (migration 012) is one of them: the last ripple-mock ledger gives it two rows of one account, but the
  * delete tests need a row in every ledger, and each of an account of its own (`seededDomainRow`). The two object tables
  * (migration 013) are the others: two ripple-mock ledgers give them rows, in one partition. `state_touches` (migration 014)
- * is another: two ripple-mock ledgers give it rows too, in one partition. The three mint tables (migration 015) are the last,
- * and the ripple-mock ledgers give them no row at all.
+ * is another: two ripple-mock ledgers give it rows too, in one partition. The three mint tables (migration 015) and the five
+ * MPT tables (migration 017) are the last, and the ripple-mock ledgers give them no row at all.
  */
 const SEEDED_LEDGER_TABLES: Table[] = [
   ...AMM_LEDGER_TABLES,
@@ -118,6 +130,7 @@ const SEEDED_LEDGER_TABLES: Table[] = [
   ...OBJECT_LEDGER_TABLES,
   ...TOUCH_LEDGER_TABLES,
   ...MINT_LEDGER_TABLES,
+  ...MPT_LEDGER_TABLES,
 ];
 
 /** The seeded tables partitioned by a million ledgers (P6); the others by ten million (P7). */
@@ -127,6 +140,8 @@ const SEEDED_P6_TABLES: Table[] = [
   Table.NftTouches,
   Table.StateTouches,
   ...MINT_LEDGER_TABLES,
+  Table.MptTouches,
+  Table.MptTransfers,
 ];
 
 type Counts = Record<string, number>;
@@ -163,8 +178,8 @@ const sortedBy = (rows: Json[], keys: string[]): Json[] =>
 /**
  * What the counted tables hold when exactly the ledgers of `built` matching `keep` were written, from the rows
  * `buildLedgerRows` made (`account_domains` is not counted: `MERGED_TABLES`). `seeded` are ledgers that also got one
- * hand-made row in each AMM and NFT table, in `account_domains`, in the two object tables, in `state_touches` and in the
- * three mint tables (`insertSeededRows`).
+ * hand-made row in each AMM and NFT table, in `account_domains`, in the two object tables, in `state_touches`, in the
+ * three mint tables and in the five MPT tables (`insertSeededRows`).
  */
 function countsOf(
   built: LedgerRows[],
@@ -260,7 +275,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   /**
    * The hand-made rows of a seeded table (`insertSeededRows`): in `account_domains` the ones of the `rSeeded…` accounts, in
    * the object tables the ones of the sample's object (two ripple-mock ledgers have real rows in them), in `state_touches` the
-   * ones of the sample's line. The mint tables hold nothing else, so every row of them is one.
+   * ones of the sample's line. The mint and MPT tables hold nothing else, so every row of them is one.
    */
   const countSeeded = (svc: ClickHouseService, table: Table): Promise<number> =>
     count(
@@ -344,8 +359,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
   /**
    * The hand-made row of `table` for a ledger: the table's sample row, moved to the ledger. The touches of a pool, of an
-   * NFT and of token state are the columns of their key, with no time, and `account_domains` and `account_object_changes`
-   * have none either. The key of an object row has the ledger in it, so a row of each ledger is a row of its own.
+   * NFT, of token state and of an MPT are the columns of their key, with no time, and `account_domains` and
+   * `account_object_changes` have none either. The key of an object row has the ledger in it, so a row of each ledger is a row of its own.
    */
   function seededRow(table: Table, ledger: LedgerRows['ledger']): Json {
     if (table === Table.AccountDomains) return seededDomainRow(ledger.ledger_index);
@@ -354,15 +369,16 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       table === Table.AmmPoolTouches ||
       table === Table.NftTouches ||
       table === Table.AccountObjectChanges ||
-      table === Table.StateTouches
+      table === Table.StateTouches ||
+      table === Table.MptTouches
     )
       return row;
     return { ...row, close_time: ledger.close_time };
   }
 
   /**
-   * One row in each AMM and NFT ledger table, in `account_domains`, in the two object tables, in `state_touches` and in
-   * the three mint tables, for every one of `rows`' ledgers. The ripple-mock ledgers (2021) have no such activity (but
+   * One row in each AMM and NFT ledger table, in `account_domains`, in the two object tables, in `state_touches`, in the
+   * three mint tables and in the five MPT tables, for every one of `rows`' ledgers. The ripple-mock ledgers (2021) have no such activity (but
    * for two rows of `account_domains` in the last one), so the delete tests put these in by hand, over several
    * partitions, to see what the deletes reach and what they leave. `expectedCounts` and `expectStored` take them as
    * `seeded`.
@@ -470,8 +486,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // The child tables that have rows (the 12 of the Ripple data, the 2 state tables, the path payments and their index
       // by account, account_domains, which the last ledger has two rows for, the 2 object tables, which the ledgers of
       // a recorded EscrowCreate and of two channel claims have rows for, and state_touches, which the ledgers of 11119620 and
-      // 11618225 have rows for: these ledgers have no AMM, NFT or Xahau mint activity, so the 5 AMM tables, the 5 NFT tables
-      // and the 3 mint tables get no insert) start together, before any of them has finished.
+      // 11618225 have rows for: these ledgers have no AMM, NFT, Xahau mint or MPT activity, so the 5 AMM tables, the 5 NFT
+      // tables, the 3 mint tables and the 5 MPT tables get no insert) start together, before any of them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
       );
@@ -486,7 +502,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(childTables).toContain(Table.AccountDomains);
       const firstStarts = events.slice(0, childTables.size);
       expect(new Set(firstStarts)).toEqual(new Set([...childTables].map((t) => `start:${t}`)));
-      const noInsert = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES, ...MINT_LEDGER_TABLES];
+      const noInsert = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES, ...MINT_LEDGER_TABLES, ...MPT_LEDGER_TABLES];
       expect(events.filter((e) => e.startsWith('start:') && noInsert.includes(e.slice(6) as Table))).toEqual([]);
 
       const lastChildEnd = Math.max(

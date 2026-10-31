@@ -226,6 +226,11 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.GenesisMints, 'genesisMints'],
   [Table.Imports, 'imports'],
   [Table.RewardClaims, 'rewardClaims'],
+  [Table.MptIssuanceStates, 'mptIssuanceStates'],
+  [Table.MptHolderStates, 'mptHolderStates'],
+  [Table.MptTouches, 'mptTouches'],
+  [Table.MptTransfers, 'mptTransfers'],
+  [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
 ];
 
 /** The columns of a table in the order of its CREATE TABLE statement. */
@@ -2876,7 +2881,7 @@ describe('Xahau mint rows (parser version 9)', () => {
 });
 
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones, the account domains, the object changes and their index by account, the state touches, the 3 Xahau mint tables', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones, the account domains, the object changes and their index by account, the state touches, the 3 Xahau mint tables, the 5 MPT ledger tables', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -2914,6 +2919,11 @@ describe('CHILD_TABLES', () => {
         Table.GenesisMints,
         Table.Imports,
         Table.RewardClaims,
+        Table.MptIssuanceStates,
+        Table.MptHolderStates,
+        Table.MptTouches,
+        Table.MptTransfers,
+        Table.MptIssuanceTransfers,
       ].sort(),
     );
   });

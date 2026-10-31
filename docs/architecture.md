@@ -66,7 +66,7 @@ Everything both services need, written once:
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
 - **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens, the history of escrows, checks, payment channels and delegations, the index of the trust lines and issuers a transaction changed, `state_touches`, and Xahau's mints) and
-  `buildLedgerRows` (a raw ledger -> rows of the 35 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
+  `buildLedgerRows` (a raw ledger -> rows of the 40 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
 - **`xrpl/node-client.ts`**: the resilient websocket `NodeClient` (failover, watchdog, re-subscribe), used by the syncer and the API.
@@ -229,7 +229,7 @@ next one starts. The api queues the jobs (`POST /v2/exports`) and signs the down
 
 ### ClickHouse
 
-One server, one database per network (`xrpl`, `xahau` in production; `xrpl_testnet`, `xahau_testnet` on the sandbox's own server), 78 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network (`xrpl`, `xahau` in production; `xrpl_testnet`, `xahau_testnet` on the sandbox's own server), 85 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 

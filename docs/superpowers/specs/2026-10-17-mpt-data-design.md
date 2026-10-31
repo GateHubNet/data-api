@@ -128,6 +128,8 @@ aggregates are written by the aggregator only (ADR-0008), never by ingest. `Tabl
 
 ### 3.1 Ledger tables
 
+> **Dated note (2026-10-31, ruling C2).** In `017_mpt.sql` each `Enum8(…)` is written on one line, as `011_nft_data.sql` writes its own, since the check of the column order (`ddlColumns` in `build-rows.spec.ts`) reads the first token of each line. The columns and types are those below.
+
 ```sql
 -- The state of an issuance after each transaction that changed its MPTokenIssuance node (created, modified with
 -- PreviousFields, deleted), whatever the result: the node's final fields (NewFields for a created node).

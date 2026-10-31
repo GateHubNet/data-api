@@ -734,6 +734,102 @@ export interface RewardClaimsRow {
   opt_out: number;
 }
 
+/** What an MPT transfer was: a mint and a redemption are each a `payment`, as on the ledger. */
+export type MptTransferKind =
+  | 'payment'
+  | 'clawback'
+  | 'lock'
+  | 'unlock'
+  | 'escrow_create'
+  | 'escrow_finish'
+  | 'escrow_cancel';
+
+/**
+ * The state of an issuance after a transaction that changed its `MPTokenIssuance` node, whatever the result
+ * (`mpt_issuance_states`, migration 017): the node's final fields, `NewFields` for a created node. `maximum_amount` is `null` when
+ * not set (the ledger's 2^63-1), `escrowed_amount` is the node's `LockedAmount` and `metadata_hex` is `''` when there is none.
+ * Empty on Xahau, as every MPT table.
+ */
+export interface MptIssuanceStatesRow {
+  mpt_issuance_id: string;
+  ledger_index: number;
+  tx_index: number;
+  node_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  issuer: string;
+  sequence: number;
+  flags: number;
+  asset_scale: number;
+  maximum_amount: UInt64Value | null;
+  outstanding_amount: UInt64Value;
+  escrowed_amount: UInt64Value;
+  transfer_fee: number;
+  metadata_hex: string;
+  deleted: number;
+}
+
+/**
+ * The state of a holder's balance after a transaction that changed its `MPToken` node, whatever the result (`mpt_holder_states`,
+ * migration 017). `amount` is `MPTAmount` and `escrowed_amount` the token's `LockedAmount`, each 0 when absent.
+ */
+export interface MptHolderStatesRow {
+  holder: string;
+  mpt_issuance_id: string;
+  ledger_index: number;
+  tx_index: number;
+  node_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  amount: UInt64Value;
+  escrowed_amount: UInt64Value;
+  flags: number;
+  deleted: number;
+}
+
+/** Which issuance and holder a transaction touched (`mpt_touches`, migration 017), `holder` `''` for the issuance's own node. */
+export interface MptTouchesRow {
+  ledger_index: number;
+  tx_index: number;
+  mpt_issuance_id: string;
+  holder: string;
+}
+
+/**
+ * One MPT a successful transaction moved, clawed back, locked or unlocked (`mpt_transfers`, migration 017). `source` and
+ * `destination` are `''` when there is none (a lock of every balance has no destination), `fee` the transfer fee burned.
+ */
+export interface MptTransfersRow {
+  ledger_index: number;
+  tx_index: number;
+  mpt_issuance_id: string;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  kind: MptTransferKind;
+  source: string;
+  destination: string;
+  amount: UInt64Value;
+  fee: UInt64Value;
+}
+
+/** The same rows as `mpt_transfers`, ordered by issuance (`mpt_issuance_transfers`, migration 017). */
+export interface MptIssuanceTransfersRow {
+  mpt_issuance_id: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  kind: MptTransferKind;
+  source: string;
+  destination: string;
+  amount: UInt64Value;
+  fee: UInt64Value;
+}
+
 // -- Node-sourced tables -----------------------------------------------------------------------------------------
 
 export interface FeeStatsRow {
@@ -1522,6 +1618,58 @@ export interface NetworkSupplyRow {
   minted_rewards: UInt64Value | null;
   minted_import: UInt64Value | null;
   minted_genesis: UInt64Value | null;
+  version: UInt64Value;
+}
+
+// -- MPT aggregates (migration 017) -------------------------------------------------------------------------------
+
+/**
+ * The current state of an issuance (`mpt_issuances`), rebuilt by the aggregator's `mpt_state` job: a recompute writes a whole new row
+ * under a newer `version`, and readers keep the newest `version` of each issuance. `issuer` and `sequence` come from the ID.
+ * `state_known` is 0 when `mpt_issuance_states` has no row of it in the coverage, and then the state columns are at their
+ * defaults. `escrowed_amount` is the node's `LockedAmount`; `locked_amount` and `locked_holders` are what the issuer has locked.
+ * `metadata` is the decoded object as JSON, `''` when the hex is not a JSON object. The `created_*` are `null` when the
+ * `MPTokenIssuanceCreate` is outside the coverage. `last_ledger` is the newest touch this row has seen.
+ */
+export interface MptIssuancesRow {
+  mpt_issuance_id: string;
+  issuer: string;
+  sequence: number;
+  state_known: number;
+  flags: number;
+  asset_scale: number;
+  maximum_amount: UInt64Value | null;
+  outstanding_amount: UInt64Value;
+  escrowed_amount: UInt64Value;
+  locked_amount: UInt64Value;
+  locked_holders: number;
+  holders: number;
+  transfer_fee: number;
+  metadata_hex: string;
+  metadata: string;
+  metadata_conforms: number;
+  ticker: string;
+  name: string;
+  created_ledger: number | null;
+  created_time: UnixSeconds | null;
+  created_tx_hash: string | null;
+  last_ledger: number;
+  destroyed: number;
+  version: UInt64Value;
+}
+
+/**
+ * The current balance of a holder of an issuance (`mpt_holders`), recomputed per touched pair by the aggregator's `mpt_state` job.
+ * `deleted` is 1 when the `MPToken` was deleted (the holder opted out).
+ */
+export interface MptHoldersRow {
+  mpt_issuance_id: string;
+  holder: string;
+  amount: UInt64Value;
+  escrowed_amount: UInt64Value;
+  flags: number;
+  last_ledger: number;
+  deleted: number;
   version: UInt64Value;
 }
 

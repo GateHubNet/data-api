@@ -40,6 +40,13 @@ import {
   LedgerByHashRow,
   LedgersRow,
   MarketsLiveRow,
+  MptHoldersRow,
+  MptHolderStatesRow,
+  MptIssuancesRow,
+  MptIssuanceStatesRow,
+  MptIssuanceTransfersRow,
+  MptTouchesRow,
+  MptTransfersRow,
   NativeRatesDailyRow,
   NetworkStateRow,
   NetworkSupplyRow,
@@ -118,6 +125,11 @@ export interface TableRows {
   [Table.GenesisMints]: GenesisMintsRow;
   [Table.Imports]: ImportsRow;
   [Table.RewardClaims]: RewardClaimsRow;
+  [Table.MptIssuanceStates]: MptIssuanceStatesRow;
+  [Table.MptHolderStates]: MptHolderStatesRow;
+  [Table.MptTouches]: MptTouchesRow;
+  [Table.MptTransfers]: MptTransfersRow;
+  [Table.MptIssuanceTransfers]: MptIssuanceTransfersRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -154,6 +166,8 @@ export interface TableRows {
   [Table.TokenLines]: TokenLinesRow;
   [Table.Tokens]: TokensRow;
   [Table.NetworkSupply]: NetworkSupplyRow;
+  [Table.MptIssuances]: MptIssuancesRow;
+  [Table.MptHolders]: MptHoldersRow;
   [Table.DomainTomls]: DomainTomlsRow;
   [Table.AccountNetworkNames]: AccountNetworkNamesRow;
   [Table.IngestLog]: IngestLogRow;
@@ -185,6 +199,8 @@ const VERSION_MS = 1_700_000_000_123;
 const ISSUER = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
 const ALICE = 'rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn';
 const BOB = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+/** An `MPTokenIssuanceID` of BOB's: the sequence 298, then his AccountID. */
+const MPT_ID = '0000012AB5F762798A53D543A014CAF8B297CFF8F2F937E8';
 const POOL = 'rJ8pBKtDeSyHAUhrjZGfUQJdE1MVxrZEXp';
 const CAROL = 'rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv';
 
@@ -644,6 +660,69 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     account: ALICE,
     issuer: BOB,
     opt_out: 0,
+  },
+  // an issuance of BOB, its sequence 298 and its AccountID in the ID, at the largest maximum a ledger allows
+  [Table.MptIssuanceStates]: {
+    mpt_issuance_id: MPT_ID,
+    ledger_index: LEDGER,
+    tx_index: 7,
+    node_index: 1,
+    tx_hash: hash(45),
+    tx_type: 'Payment',
+    close_time: CLOSE,
+    issuer: BOB,
+    sequence: 298,
+    flags: 0x60,
+    asset_scale: 2,
+    maximum_amount: '9223372036854775807',
+    outstanding_amount: '9007199254740993',
+    escrowed_amount: '250',
+    transfer_fee: 100,
+    metadata_hex: '7B7D',
+    deleted: 0,
+  },
+  // ALICE's balance of it, above 2^53, so the amounts go as text
+  [Table.MptHolderStates]: {
+    holder: ALICE,
+    mpt_issuance_id: MPT_ID,
+    ledger_index: LEDGER,
+    tx_index: 7,
+    node_index: 2,
+    tx_hash: hash(45),
+    tx_type: 'Payment',
+    close_time: CLOSE,
+    amount: '9007199254740743',
+    escrowed_amount: '250',
+    flags: 0,
+    deleted: 0,
+  },
+  [Table.MptTouches]: { ledger_index: LEDGER, tx_index: 7, mpt_issuance_id: MPT_ID, holder: ALICE },
+  // a mint of the issuance above: the issuer pays the holder, and no fee is burned
+  [Table.MptTransfers]: {
+    ledger_index: LEDGER,
+    tx_index: 7,
+    mpt_issuance_id: MPT_ID,
+    tx_hash: hash(45),
+    tx_type: 'Payment',
+    close_time: CLOSE,
+    kind: 'payment',
+    source: BOB,
+    destination: ALICE,
+    amount: '9007199254740993',
+    fee: '0',
+  },
+  [Table.MptIssuanceTransfers]: {
+    mpt_issuance_id: MPT_ID,
+    ledger_index: LEDGER,
+    tx_index: 7,
+    tx_hash: hash(45),
+    tx_type: 'Payment',
+    close_time: CLOSE,
+    kind: 'payment',
+    source: BOB,
+    destination: ALICE,
+    amount: '9007199254740993',
+    fee: '0',
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
@@ -1200,6 +1279,43 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     minted_rewards: '123456789012',
     minted_import: '9007199254740993',
     minted_genesis: '600000000000000',
+    version: VERSION_MS,
+  },
+  // the issuance above in the mpt_state job's table, with no maximum set
+  [Table.MptIssuances]: {
+    mpt_issuance_id: MPT_ID,
+    issuer: BOB,
+    sequence: 298,
+    state_known: 1,
+    flags: 0x60,
+    asset_scale: 2,
+    maximum_amount: null,
+    outstanding_amount: '9007199254740993',
+    escrowed_amount: '250',
+    locked_amount: '0',
+    locked_holders: 0,
+    holders: 1,
+    transfer_fee: 100,
+    metadata_hex: '7B227469636B6572223A22534D50227D',
+    metadata: '{"ticker":"SMP"}',
+    metadata_conforms: 0,
+    ticker: 'SMP',
+    name: '',
+    created_ledger: LEDGER - 1,
+    created_time: CLOSE - 4,
+    created_tx_hash: hash(46),
+    last_ledger: LEDGER,
+    destroyed: 0,
+    version: VERSION_MS,
+  },
+  [Table.MptHolders]: {
+    mpt_issuance_id: MPT_ID,
+    holder: ALICE,
+    amount: '9007199254740743',
+    escrowed_amount: '250',
+    flags: 0,
+    last_ledger: LEDGER,
+    deleted: 0,
     version: VERSION_MS,
   },
   [Table.DomainTomls]: {

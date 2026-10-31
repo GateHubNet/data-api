@@ -151,6 +151,33 @@ const SHAPES: Record<Table, Shape> = {
   },
   [Table.Imports]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
   [Table.RewardClaims]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
+  // the MPT ledger tables (migration 017): states by issuance and by holder, the touches and the transfers in ledger order, and
+  // the same transfers by issuance; empty on Xahau
+  [Table.MptIssuanceStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'mpt_issuance_id, ledger_index, tx_index, node_index',
+  },
+  [Table.MptHolderStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'holder, mpt_issuance_id, ledger_index, tx_index, node_index',
+  },
+  [Table.MptTouches]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, mpt_issuance_id, holder',
+  },
+  [Table.MptTransfers]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, mpt_issuance_id',
+  },
+  [Table.MptIssuanceTransfers]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'mpt_issuance_id, ledger_index, tx_index',
+  },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -320,6 +347,14 @@ const SHAPES: Record<Table, Shape> = {
   },
   // the supply snapshots (migration 015): no partition, the newest version of a ledger wins
   [Table.NetworkSupply]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'ledger_index' },
+  // the MPT aggregates (migration 017): no partition, the newest version of an issuance and of a holder wins
+  [Table.MptIssuances]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'mpt_issuance_id' },
+  [Table.MptHolders]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'mpt_issuance_id, holder',
+  },
   // what the tomls worker read of a domain (migration 012): one row per check, the newest wins
   [Table.DomainTomls]: { engine: 'ReplacingMergeTree', version: 'checked_at', partition: '', order: 'domain' },
   [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
@@ -415,6 +450,18 @@ const MIGRATION_016_COLUMNS = [
   { name: 'toml_unl', type: 'String' },
   { name: 'toml_version', type: 'UInt8' },
 ];
+/** MPTokens (D9): the five ledger-derived tables and the two aggregates of the `mpt_state` job. */
+const MIGRATION_017 = '017_mpt.sql';
+/** The tables of migration 017. */
+const MIGRATION_017_TABLES: Table[] = [
+  Table.MptIssuanceStates,
+  Table.MptHolderStates,
+  Table.MptTouches,
+  Table.MptTransfers,
+  Table.MptIssuanceTransfers,
+  Table.MptIssuances,
+  Table.MptHolders,
+];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -453,6 +500,11 @@ const DEDUP_TABLES: Table[] = [
   Table.GenesisMints,
   Table.Imports,
   Table.RewardClaims,
+  Table.MptIssuanceStates,
+  Table.MptHolderStates,
+  Table.MptTouches,
+  Table.MptTransfers,
+  Table.MptIssuanceTransfers,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -2280,6 +2332,243 @@ describe('migrations (e2e)', () => {
       copyReal([MIGRATION_016]);
       expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_016], skipped: before });
       expect(await columnsOf(config.database)).toEqual(MIGRATION_016_COLUMNS);
+    });
+  });
+
+  describe('migration 017', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-017-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('is seven CREATE TABLE IF NOT EXISTS and nothing else', () => {
+      const statements = statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_017), 'utf8'));
+      expect(statements).toHaveLength(MIGRATION_017_TABLES.length);
+      expect(statements.map((s) => /^CREATE TABLE IF NOT EXISTS (\w+)\s/.exec(s)?.[1])).toEqual(MIGRATION_017_TABLES);
+    });
+
+    it('applies 017 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_017_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_017);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_017);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_017_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_017]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_017], skipped: before });
+      for (const table of MIGRATION_017_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('applies 017 twice: every statement can simply be run again, and a row stays', async () => {
+      const config = { ...ch.config, database: 'ctl_017_twice' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        await svc.insert(Table.MptTouches, [SAMPLE_ROWS[Table.MptTouches]]);
+        for (const statement of statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_017), 'utf8'))) {
+          await svc.command(statement);
+        }
+        expect(await svc.query(`SELECT mpt_issuance_id FROM ${Table.MptTouches}`)).toEqual([
+          { mpt_issuance_id: SAMPLE_ROWS[Table.MptTouches].mpt_issuance_id },
+        ]);
+      } finally {
+        await svc.close();
+      }
+    });
+
+    it('gives the seven tables the columns of the spec, in order', async () => {
+      const config = { ...ch.config, database: 'ctl_017_columns' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const columnsOf = async (table: Table): Promise<Array<[string, string]>> =>
+        (
+          await admin.query<{ name: string; type: string }>(
+            `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} ORDER BY position`,
+            { db: config.database, table },
+          )
+        ).map((c) => [c.name, c.type]);
+
+      const KIND =
+        "Enum8('payment' = 1, 'clawback' = 2, 'lock' = 3, 'unlock' = 4, 'escrow_create' = 5, 'escrow_finish' = 6, 'escrow_cancel' = 7)";
+
+      expect(await columnsOf(Table.MptIssuanceStates)).toEqual([
+        ['mpt_issuance_id', 'String'],
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['node_index', 'UInt16'],
+        ['tx_hash', 'String'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+        ['issuer', 'String'],
+        ['sequence', 'UInt32'],
+        ['flags', 'UInt32'],
+        ['asset_scale', 'UInt8'],
+        ['maximum_amount', 'Nullable(UInt64)'],
+        ['outstanding_amount', 'UInt64'],
+        ['escrowed_amount', 'UInt64'],
+        ['transfer_fee', 'UInt16'],
+        ['metadata_hex', 'String'],
+        ['deleted', 'UInt8'],
+      ]);
+      expect(await columnsOf(Table.MptHolderStates)).toEqual([
+        ['holder', 'String'],
+        ['mpt_issuance_id', 'String'],
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['node_index', 'UInt16'],
+        ['tx_hash', 'String'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+        ['amount', 'UInt64'],
+        ['escrowed_amount', 'UInt64'],
+        ['flags', 'UInt32'],
+        ['deleted', 'UInt8'],
+      ]);
+      expect(await columnsOf(Table.MptTouches)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['mpt_issuance_id', 'String'],
+        ['holder', 'String'],
+      ]);
+      expect(await columnsOf(Table.MptTransfers)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['mpt_issuance_id', 'String'],
+        ['tx_hash', 'String'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+        ['kind', KIND],
+        ['source', 'String'],
+        ['destination', 'String'],
+        ['amount', 'UInt64'],
+        ['fee', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.MptIssuanceTransfers)).toEqual([
+        ['mpt_issuance_id', 'String'],
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['tx_hash', 'String'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+        ['kind', KIND],
+        ['source', 'String'],
+        ['destination', 'String'],
+        ['amount', 'UInt64'],
+        ['fee', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.MptIssuances)).toEqual([
+        ['mpt_issuance_id', 'String'],
+        ['issuer', 'String'],
+        ['sequence', 'UInt32'],
+        ['state_known', 'UInt8'],
+        ['flags', 'UInt32'],
+        ['asset_scale', 'UInt8'],
+        ['maximum_amount', 'Nullable(UInt64)'],
+        ['outstanding_amount', 'UInt64'],
+        ['escrowed_amount', 'UInt64'],
+        ['locked_amount', 'UInt64'],
+        ['locked_holders', 'UInt32'],
+        ['holders', 'UInt32'],
+        ['transfer_fee', 'UInt16'],
+        ['metadata_hex', 'String'],
+        ['metadata', 'String'],
+        ['metadata_conforms', 'UInt8'],
+        ['ticker', 'String'],
+        ['name', 'String'],
+        ['created_ledger', 'Nullable(UInt32)'],
+        ['created_time', "Nullable(DateTime('UTC'))"],
+        ['created_tx_hash', 'Nullable(String)'],
+        ['last_ledger', 'UInt32'],
+        ['destroyed', 'UInt8'],
+        ['version', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.MptHolders)).toEqual([
+        ['mpt_issuance_id', 'String'],
+        ['holder', 'String'],
+        ['amount', 'UInt64'],
+        ['escrowed_amount', 'UInt64'],
+        ['flags', 'UInt32'],
+        ['last_ledger', 'UInt32'],
+        ['deleted', 'UInt8'],
+        ['version', 'UInt64'],
+      ]);
+    });
+
+    it('holds 2^63-1 and a maximum that is not set apart, and the kinds of a transfer', async () => {
+      const config = { ...ch.config, database: 'ctl_017_values' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        const state = SAMPLE_ROWS[Table.MptIssuanceStates];
+        await svc.insert(Table.MptIssuanceStates, [
+          { ...state, tx_index: 1, maximum_amount: null },
+          { ...state, tx_index: 2, maximum_amount: '9223372036854775807' },
+        ]);
+        expect(
+          await svc.query(
+            `SELECT tx_index, toString(maximum_amount) AS maximum FROM ${Table.MptIssuanceStates} ORDER BY tx_index`,
+          ),
+        ).toEqual([
+          { tx_index: 1, maximum: null },
+          { tx_index: 2, maximum: '9223372036854775807' },
+        ]);
+
+        const kinds = [
+          'payment',
+          'clawback',
+          'lock',
+          'unlock',
+          'escrow_create',
+          'escrow_finish',
+          'escrow_cancel',
+        ] as const;
+        const transfer = SAMPLE_ROWS[Table.MptTransfers];
+        await svc.insert(
+          Table.MptTransfers,
+          kinds.map((kind, n) => ({ ...transfer, tx_index: n, kind })),
+        );
+        expect(
+          (await svc.query<{ kind: string }>(`SELECT kind FROM ${Table.MptTransfers} ORDER BY tx_index`)).map(
+            (r) => r.kind,
+          ),
+        ).toEqual(kinds);
+      } finally {
+        await svc.close();
+      }
     });
   });
 });

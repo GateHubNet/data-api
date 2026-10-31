@@ -16,14 +16,15 @@ The source of truth is the migration files of [`packages/shared/schema/`](../pac
 [`013_ledger_objects.sql`](../packages/shared/schema/013_ledger_objects.sql) and
 [`014_issued_tokens.sql`](../packages/shared/schema/014_issued_tokens.sql) and
 [`015_supply.sql`](../packages/shared/schema/015_supply.sql) and
-[`016_validator_toml_details.sql`](../packages/shared/schema/016_validator_toml_details.sql) (applied in file-name order, per network
+[`016_validator_toml_details.sql`](../packages/shared/schema/016_validator_toml_details.sql) and
+[`017_mpt.sql`](../packages/shared/schema/017_mpt.sql) (applied in file-name order, per network
 database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **78 tables** per network database, in thirteen groups:
+enum: queries use `${Table.X}`, never string literals). **85 tables** per network database, in fourteen groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
-| Ledger-derived (35) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance`, the state history `account_states` (migration 005) and `trust_line_states` (migration 006), `path_payments` (migration 007) and its index by account `account_path_payments` (migration 008), the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011), the Domain of an account `account_domains` (migration 012), the history of the tracked ledger objects `object_changes` and its index by account `account_object_changes` (migration 013), the index of the trust lines and issuers whose token state a transaction changed `state_touches` (migration 014), and the three Xahau mint tables `genesis_mints`, `imports` and `reward_claims` (migration 015, empty on XRPL) | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
+| Ledger-derived (40) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance`, the state history `account_states` (migration 005) and `trust_line_states` (migration 006), `path_payments` (migration 007) and its index by account `account_path_payments` (migration 008), the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011), the Domain of an account `account_domains` (migration 012), the history of the tracked ledger objects `object_changes` and its index by account `account_object_changes` (migration 013), the index of the trust lines and issuers whose token state a transaction changed `state_touches` (migration 014), the three Xahau mint tables `genesis_mints`, `imports` and `reward_claims` (migration 015, empty on XRPL), and the five MPT tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers` (migration 017, empty on Xahau) | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
 | Node-sourced (3) | `fee_stats`, `validations`, `validator_manifests` | the `fee_stats` and `validations` workers |
 | Validators and amendments (10, migration 002) | `validator_validations`, `validator_seen`, `unl_lists`, `unl_publishers`, `validator_domains`, `network_state`, `amendment_features`, `validator_votes`, `amendment_tallies`, `validator_agreement_hourly` | the `validations` worker (the first two) and the `validators` worker (the rest) |
 | Aggregates (5) | `stats_hourly`, `volume_daily`, `volume_live`, `amm_pools`, `amm_daily` | the `aggregator` worker |
@@ -33,6 +34,7 @@ enum: queries use `${Table.X}`, never string literals). **78 tables** per networ
 | Escrows (1, migration 013) | `escrows` | the `aggregator` worker (job `escrows`) |
 | Issued tokens (3, migration 014) | `token_generations`, `token_lines`, `tokens` | the `aggregator` worker (job `tokens`) |
 | Supply (1, migration 015) | `network_supply` | the `aggregator` worker (job `supply`) |
+| MPT aggregates (2, migration 017) | `mpt_issuances`, `mpt_holders` | the `aggregator` worker (job `mpt_state`) |
 | Operator-written (1, migration 009) | `account_network_names` | the operator, by hand, with plain SQL inserts ([operations](operations.md#name-an-account-on-one-network)) |
 | Internal (4) | `ingest_log`, `agg_dirty`, `nft_dirty` (migration 011), `syncer_lease` | the syncer |
 | Exports (1, migration 010) | `export_jobs` | the api (`queued`) and the exporter (`running`, `done`, `failed`) |
@@ -59,12 +61,13 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 
 | Kind | Engine | Partition | Why |
 | --- | --- | --- | --- |
-| Ledger-prefixed (`ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`, `state_touches`, `genesis_mints`, `imports`, `reward_claims`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
-| Prefix-keyed secondary tables, `exchanges`, the AMM tables ordered by pool or account, `account_states`, `trust_line_states`, `account_path_payments`, the three NFT event tables, `object_changes` and `account_object_changes` | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
+| Ledger-prefixed (`ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`, `state_touches`, `genesis_mints`, `imports`, `reward_claims`, `mpt_touches`, `mpt_transfers`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
+| Prefix-keyed secondary tables, `exchanges`, the AMM tables ordered by pool or account, `account_states`, `trust_line_states`, `account_path_payments`, the three NFT event tables, `object_changes`, `account_object_changes`, `mpt_issuance_states`, `mpt_holder_states` and `mpt_issuance_transfers` | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
 | `account_domains` (migration 012) | `ReplacingMergeTree(version)` | **P7**: `intDiv(ledger_index, 10000000)` | Ordered by `account`, **not** by the unique key (below); `index_granularity = 1024`, as `transactions` |
 | `accounts_created`, `volume_live`, `stats_hourly`, `amm_pools`, the four NFT aggregates, `escrows`, `token_generations`, internal | `ReplacingMergeTree` | none (`volume_daily` and `amm_daily`: `toYYYYMM(day)`) | Small tables |
 | `token_lines` and `tokens` (migration 014) | `ReplacingMergeTree(version)` | **`generation`** | A generation is built whole beside the live one and swapped in, and a retired one is dropped as a partition |
 | `network_supply` (migration 015) | `ReplacingMergeTree(version)` | none | One row per snapshot of the supply, about 24 a day and no TTL; the newest `version` of a `ledger_index` wins |
+| `mpt_issuances` and `mpt_holders` (migration 017) | `ReplacingMergeTree(version)` | none | A row per issuance and per `MPToken` ever made; the newest `version` of a key wins |
 | `fee_stats` | `MergeTree` | `toYYYYMM(ts)` | Append-only samples |
 | `account_network_names` (migration 009) | `MergeTree` | none | Append-only, the operator's history; small |
 | The nine tables of migration 003 | `ReplacingMergeTree(version)` | `toYear(day)` for the rates and the account rollups, `toDate(hour)` for `pair_hourly` (TTL 45 days, `ttl_only_drop_parts = 1`), none for the others | Recomputable aggregates written as complete sets; a year of days is a small partition, an hour table expires by whole days |
@@ -78,7 +81,7 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The one exception is `account_domains`
 (migration 012), which is ordered by `account` on purpose, so that merges keep about one row per account and partition: see
 [its section](#account_domains-p7-order-by-account-migration-012), and [ADR-0007](adr/0007-ledger-index-axis-and-secondary-tables.md)
-for the rule it departs from. The 35 ledger-derived tables carry
+for the rule it departs from. The 40 ledger-derived tables carry
 `non_replicated_deduplication_window = 1000` so that a retried insert with the same `insert_deduplication_token` is dropped; the
 two collector tables `validator_validations` and `validator_seen` (not ledger tables) carry a window of 100 for the same reason. The nine tables of
 migration 003 have no window: a set is written whole under a new `version`, so a retry is idempotent without one.
@@ -510,6 +513,32 @@ One row per `ClaimReward`, whatever its result: the parent of a reward mint is a
 `ledger_index`, `tx_index`, `tx_hash`, `close_time`, `account`, `issuer` (`''` for a claim without one) and `opt_out` (`UInt8`, 1 for a claim
 that opts out of the rewards).
 
+### MPT tables (five ledger tables, migration 017)
+The issuances and holders of the multi-purpose tokens and what moved them ([spec](superpowers/specs/2026-10-17-mpt-data-design.md)). The five are child tables like `account_states`
+(`CHILD_TABLES`, `LEDGER_KEYED_TABLES`, the deduplication window, deleted by recovery and `--reprocess`), and they are **empty on Xahau and Xahau Testnet**, which have no MPT. They are written from parser
+version 10 (`MPT_PARSER_VERSION`), whenever a ledger has MPT rows: a ledger written by an older parser has no rows in them until it is re-ingested, and readers compare with that constant, never with `PARSER_VERSION`.
+Amounts are the ledger's integer units, never scaled (`UInt64`, read as text: a balance reaches 2^63-1). The issuance ID is 48 upper-case hex digits; the existing tables keep an MPT as `currency` = the ID and `issuer` = the issuer the ID holds (`payments`, `payments_by_currency`,
+`account_payments` and `balance_changes`, with no schema change; their `*_f` shadows hold the unscaled units).
+
+#### `mpt_issuance_states` (P7, `ORDER BY (mpt_issuance_id, ledger_index, tx_index, node_index)`)
+The state of an issuance after each transaction that changed its `MPTokenIssuance` node (created, modified with a `PreviousFields`, an empty one included, or deleted), whatever the result: the node's fields after it. A modified node without `PreviousFields` was only threaded and has no row. Columns:
+`mpt_issuance_id`, `ledger_index`, `tx_index`, `node_index` (`UInt16`, the node's position in `AffectedNodes`), `tx_hash`, `tx_type`, `close_time`, `issuer`, `sequence`, `flags`, `asset_scale` (`UInt8`), `maximum_amount` (`Nullable`, `NULL` when not set, the ledger's 2^63-1), `outstanding_amount`,
+`escrowed_amount` (the node's `LockedAmount`), `transfer_fee` (`UInt16`), `metadata_hex` (`''` when none) and `deleted` (`UInt8`, 1 when `MPTokenIssuanceDestroy` removed it).
+
+#### `mpt_holder_states` (P7, `ORDER BY (holder, mpt_issuance_id, ledger_index, tx_index, node_index)`)
+The state of a holder's balance after each transaction that changed its `MPToken` node, by the same rules. Ordered by holder, so that an account's holdings and the aggregator's per-pair rebuild are prefixes. Columns: `holder`, `mpt_issuance_id`, `ledger_index`, `tx_index`, `node_index`, `tx_hash`, `tx_type`,
+`close_time`, `amount` (`MPTAmount`, 0 when absent), `escrowed_amount` (the token's `LockedAmount`, 0 when absent), `flags` and `deleted`.
+
+#### `mpt_touches` (P6, `ORDER BY (ledger_index, tx_index, mpt_issuance_id, holder)`)
+Which issuances and holders a transaction touched, in ledger order, as `amm_pool_touches`: one row per issuance state (`holder` `''`) and one per holder state, once each per transaction. The `mpt_state` job's watermark scan and the `agg_dirty` slices read it.
+
+#### `mpt_transfers` (P6, `ORDER BY (ledger_index, tx_index, mpt_issuance_id)`)
+One row per MPT a `tesSUCCESS` transaction moved, clawed back, locked or unlocked, in ledger order: what the 24 h counts of the token list read. Columns: `ledger_index`, `tx_index`, `mpt_issuance_id`, `tx_hash`, `tx_type`, `close_time`, `kind` (`Enum8`: `payment`, mints and redemptions included, `clawback`, `lock`, `unlock`,
+`escrow_create`, `escrow_finish`, `escrow_cancel`), `source` and `destination` (`''` when none: a lock of every balance has no destination), `amount` and `fee` (the transfer fee burned, 0 when none).
+
+#### `mpt_issuance_transfers` (P7, `ORDER BY (mpt_issuance_id, ledger_index, tx_index)`)
+A full copy of each `mpt_transfers` row ordered by issuance, as `account_exchanges` is of `exchanges`: what `/v2/mpt/{issuanceId}/transfers` reads.
+
 ## 3. Node-sourced, aggregate and internal tables
 
 The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM tables above.
@@ -665,6 +694,14 @@ ledger_index DESC LIMIT 1`), then every version of that ledger by its key, of wh
 `ORDER BY ledger_index DESC, version DESC LIMIT 1`, would read the whole part: `version` is not in the key. A cycle that is
 redone at the same ledger (a retry after a failed insert) writes the same key under a newer `version`.
 
+### MPT aggregates (migration 017)
+
+Two tables, both `ReplacingMergeTree(version)` with no partition, **recomputable** from the MPT ledger tables and written only by the aggregator (job `mpt_state`). They are no ledger tables: not in `CHILD_TABLES` or `LEDGER_KEYED_TABLES`, so ingest recovery never deletes from them. A recompute writes a whole new row under a newer
+`version`, and readers keep the newest `version` of each key without `FINAL`.
+
+- `mpt_issuances` (`ORDER BY mpt_issuance_id`): the current state of each issuance. Columns: `mpt_issuance_id`, `issuer` and `sequence` (from the ID), `state_known` (`UInt8`, 0 when `mpt_issuance_states` has no row of it in the coverage), `flags`, `asset_scale`, `maximum_amount` (`Nullable`), `outstanding_amount`, `escrowed_amount` (the node's `LockedAmount`), `locked_amount` (what the issuer has locked: `outstanding_amount` when `lsfMPTLocked`, else the sum of the locked holders' `amount`), `locked_holders` (`holders` when `lsfMPTLocked`, else the holders with `lsfMPTLocked`), `holders` (those with `amount + escrowed_amount > 0`), `transfer_fee`, `metadata_hex`, `metadata` (the decoded object as JSON, `''` when the hex is not a JSON object), `metadata_conforms` (`UInt8`), `ticker` and `name` (from the metadata, cut to 16 and 128 characters, `''` when none), `created_ledger`, `created_time` and `created_tx_hash` (`Nullable`, `NULL` when the `MPTokenIssuanceCreate` is outside the coverage), `last_ledger` (the newest touch this row has seen), `destroyed` and `version`.
+- `mpt_holders` (`ORDER BY (mpt_issuance_id, holder)`): the current balance of each holder of each issuance, recomputed per touched pair. Columns: `mpt_issuance_id`, `holder`, `amount`, `escrowed_amount`, `flags`, `last_ledger`, `deleted` (`UInt8`, 1 when the `MPToken` was deleted: the holder opted out) and `version`.
+
 ## 4. Relationships
 
 ```
@@ -686,6 +723,8 @@ redone at the same ledger (a retry after a failed insert) writes the same key un
  object_changes (type, then object id prefix) ──▶ account_object_changes (copy per owner and per counterparty);  object_changes (Escrow rows) ──▶ escrows (state of each escrow + a sentinel row with the escrowed total)
  trust_line_states + account_states (account prefix)  ◀── state_touches (ledger order: which lines and issuers, since when);  state_touches + trust_line_states + account_states ──▶ token_lines, tokens (per generation, token_generations holds the job's state)
  genesis_mints + imports + reward_claims (Xahau mints, by ledger slice) + ledgers (fee_total, total_coins) + escrows + amm_pools + account_states + network_state ──▶ network_supply (one row per snapshot)
+ mpt_issuance_states (issuance prefix), mpt_holder_states (holder prefix)  ◀── mpt_touches (ledger order: which issuances and holders, since when);  mpt_touches + mpt_holder_states ──▶ mpt_holders ──▶ mpt_issuances (+ mpt_issuance_states)
+ mpt_transfers (ledger order: the token list's 24 h counts)  ──▶ mpt_issuance_transfers (copy by issuance, /v2/mpt/{issuanceId}/transfers)
  exchanges ──▶ native_rates_daily, pair_hourly ──▶ markets_live;  balance_changes + account_transactions + account_exchanges ──▶
  account_lines_daily / account_tx_daily / account_trades_daily (heavy accounts only; sentinels in account_rollup_days)
 ```
@@ -722,6 +761,7 @@ The files so far:
 | `014_issued_tokens.sql` | Four `CREATE TABLE IF NOT EXISTS` statements, nothing else: the ledger-derived `state_touches` (written from parser version 8) and the three aggregates of the `tokens` job, `token_generations`, `token_lines` and `tokens` (the last two `PARTITION BY generation`). Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. Required before a syncer with parser version 8 (that syncer's writes fail without `state_touches`) and before the API serves the token routes |
 | `015_supply.sql` | Four `CREATE TABLE IF NOT EXISTS` statements, nothing else: the ledger-derived Xahau mint tables `genesis_mints`, `imports` and `reward_claims` (written from parser version 9, `MINT_PARSER_VERSION`, and empty on XRPL) and the `network_supply` aggregate of the `supply` job. Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. Required before a syncer with parser version 9 (on Xahau that syncer's inserts fail without the three ledger tables) and before the API serves the supply routes |
 | `016_validator_toml_details.sql` | One `ALTER TABLE validator_domains` that adds `owner_country`, `server_country`, `toml_network`, `toml_unl` and `toml_version`, each `IF NOT EXISTS`. Additive. The syncer's `validators` worker refuses to boot without the five columns, and the api's validators routes read them, so `migrate` runs first, then the syncer, then the api. |
+| `017_mpt.sql` | Seven `CREATE TABLE IF NOT EXISTS` statements, nothing else: the ledger-derived `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers` (written from parser version 10, `MPT_PARSER_VERSION`, and empty on Xahau) and the `mpt_issuances` and `mpt_holders` aggregates of the `mpt_state` job. Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. Required before a syncer with parser version 10 (on XRPL and XRPL Testnet an insert into a missing table fails the batch, whenever a ledger has MPT rows) and before the api (the MPT routes answer 500 until the tables exist) |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are
@@ -735,7 +775,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox run --
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 
-To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`, `011_nft_data.sql`, `012_display_names.sql`, `013_ledger_objects.sql`, `014_issued_tokens.sql`, `015_supply.sql`, `016_validator_toml_details.sql`). A database created by the
+To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`, `011_nft_data.sql`, `012_display_names.sql`, `013_ledger_objects.sql`, `014_issued_tokens.sql`, `015_supply.sql`, `016_validator_toml_details.sql`, `017_mpt.sql`). A database created by the
 earlier stack (`001_tables.sql` / `002_materialized_views.sql`) cannot be migrated: recreate it (`docker compose down -v` for
 local volumes).
 
@@ -743,7 +783,7 @@ local volumes).
 
 - `transactions.tx_json` and `meta_json` dominate (full XRPL history is roughly 1-1.5 TB compressed). Everything else together is a
   fraction of it.
-- Retention is by partition, but always the same ledger block from every ledger-derived table but `account_domains` (34 of the 35, [above](#account_domains-p7-order-by-account-migration-012)), never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
+- Retention is by partition, but always the same ledger block from every ledger-derived table but `account_domains` (39 of the 40, [above](#account_domains-p7-order-by-account-migration-012)), never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
   expires by TTL after 90 days.
 - The tables of migration 002 are not ledger tables, so no ledger retention touches them. They expire by TTL: `validator_validations`
   after 7 days of `last_datetime` (about 1 GB on XRPL; whole parts are dropped), `network_state` after 100 days of `polled_at` and
@@ -755,6 +795,7 @@ local volumes).
   generation of `token_lines` and `tokens` once the generation was replaced, and keeps `token_generations` (a row for each change of a generation).
 - `network_supply` (migration 015) is not a ledger table either, so no ledger retention touches it: it is kept (about 24 rows a day, no TTL). The three mint
   tables of migration 015 are ledger tables and go with the rest of a dropped ledger block.
+- `mpt_issuances` and `mpt_holders` (migration 017) are not ledger tables either, so no ledger retention touches them. The five MPT tables of migration 017 are ledger tables and go with the rest of a dropped ledger block.
 - Rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and `fee_stats` are small; keep them.
 - `export_jobs` expires by TTL 7 days after a job was created, as its file does (a lifecycle rule of the bucket).
 

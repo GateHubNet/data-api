@@ -59,7 +59,7 @@ docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123
 cp apps/syncer/.env.example apps/syncer/.env
 cp apps/api/.env.example    apps/api/.env  # GH_NETWORK=xrpl by default; GH_API_KEYS empty = no authentication (development only)
 
-pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline ... 016_validator_toml_details)
+pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline ... 017_mpt)
 
 pnpm start:syncer                          # ingests the XRP Ledger from the validated head  (probe on :3002)
 pnpm start:api                             # serves /v2/* on :3001, Swagger at /internal/docs

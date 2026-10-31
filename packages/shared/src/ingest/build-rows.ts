@@ -22,6 +22,11 @@ import {
   ImportsRow,
   LedgerByHashRow,
   LedgersRow,
+  MptHolderStatesRow,
+  MptIssuanceStatesRow,
+  MptIssuanceTransfersRow,
+  MptTouchesRow,
+  MptTransfersRow,
   NftEventsRow,
   NftSalesRow,
   NftTouchesRow,
@@ -125,6 +130,19 @@ export interface LedgerRows {
   imports: ImportsRow[];
   /** Every `ClaimReward`, whatever its result (migration 015). Empty on XRPL, as `genesisMints`. */
   rewardClaims: RewardClaimsRow[];
+  /**
+   * The state of an issuance after each transaction that changed its `MPTokenIssuance` node (migration 017). Filled with the MPT
+   * parser; until then the five MPT arrays are empty.
+   */
+  mptIssuanceStates: MptIssuanceStatesRow[];
+  /** The state of a holder's balance after each transaction that changed its `MPToken` node (migration 017). */
+  mptHolderStates: MptHolderStatesRow[];
+  /** Which issuances and holders a transaction touched (migration 017), once each per transaction. */
+  mptTouches: MptTouchesRow[];
+  /** What a successful transaction moved, clawed back, locked or unlocked (migration 017). */
+  mptTransfers: MptTransfersRow[];
+  /** The same rows as `mptTransfers`, for the copy ordered by issuance (migration 017). */
+  mptIssuanceTransfers: MptIssuanceTransfersRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -170,7 +188,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
  * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
  * and their index by account, the 5 NFT tables, the account domains, the object changes and their index by account, the
- * state touches, and the 3 Xahau mint tables.
+ * state touches, the 3 Xahau mint tables, and the 5 MPT ledger tables.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -206,6 +224,11 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.GenesisMints, 'genesisMints'],
   [Table.Imports, 'imports'],
   [Table.RewardClaims, 'rewardClaims'],
+  [Table.MptIssuanceStates, 'mptIssuanceStates'],
+  [Table.MptHolderStates, 'mptHolderStates'],
+  [Table.MptTouches, 'mptTouches'],
+  [Table.MptTransfers, 'mptTransfers'],
+  [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
 ];
 
 const paymentParser = new PaymentParser();
@@ -343,6 +366,11 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     genesisMints: [],
     imports: [],
     rewardClaims: [],
+    mptIssuanceStates: [],
+    mptHolderStates: [],
+    mptTouches: [],
+    mptTransfers: [],
+    mptIssuanceTransfers: [],
     diagnostics: {
       ammUnclassified: 0,
       nftSkipped: 0,

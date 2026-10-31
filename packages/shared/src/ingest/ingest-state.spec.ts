@@ -112,6 +112,17 @@ describe('LEDGER_KEYED_TABLES', () => {
     expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.NetworkSupply);
   });
 
+  it('lists the five MPT ledger tables with their partitions, and not the two aggregates: a ledger rewrite must not touch them', () => {
+    for (const table of [Table.MptIssuanceStates, Table.MptHolderStates, Table.MptIssuanceTransfers]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P7 }]);
+    }
+    for (const table of [Table.MptTouches, Table.MptTransfers]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P6 }]);
+    }
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.MptIssuances);
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.MptHolders);
+  });
+
   it('lists every table once and keeps the commit marker first', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(new Set(tables).size).toBe(tables.length);
