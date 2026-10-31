@@ -3,7 +3,7 @@ import { SAMPLE_ROWS } from '../../../packages/shared/test/sample-rows';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { accountAt, primaryKeys, served } from './support/amm';
 import { fixtureTransactions } from './support/fixtures';
-import { mptHolderRow, mptIssuanceRow, mptTransferRow } from './support/mpt-world';
+import { mptHolderRow, mptHolderStateRow, mptIssuanceRow, mptTransferRow } from './support/mpt-world';
 import { insertNftEvents, nftEventRow } from './support/nfts';
 import { COUNTERPARTY, insertObjects, jsonOf, objectRow, OWNER } from './support/objects';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead, tableReads } from './support/plans';
@@ -2603,6 +2603,10 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
   /** The ledgers of the day before the head that hold `mpt_transfers` rows: the tail of the last part of its bulk, four rows a ledger. */
   const WINDOW_LEDGERS = 1000;
   const WINDOW_ROWS = WINDOW_LEDGERS * 4;
+  /** The account of the holdings: its issuances each have a state in every part of its bulk, among the rows of two other accounts. */
+  const ACCOUNT = accountAt(0xc0a7);
+  const HELD_PER_PART = 2_500;
+  const ACCOUNT_STATES = PARTS * HELD_PER_PART + 1;
 
   let h: Harness;
   let api: ApiClient;
@@ -2681,6 +2685,29 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
         `multiIf(n.number % 4 = 0, {id:String}, n.number % 4 = 1, {below:String}, {above:String}) AS mpt_issuance_id,
          ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index`,
     );
+
+    // mpt_holder_states: the states of the account, each of its issuances in all four parts, then the bulk of two accounts on either side
+    await h.ch.insert(Table.MptHolderStates, [mptHolderStateRow(ACCOUNT, ID, BULK_BASES[0], '1')]);
+    const state = `SELECT * FROM ${Table.MptHolderStates} WHERE holder = {account:String} LIMIT 1`;
+    await insertBulk(
+      h,
+      Table.MptHolderStates,
+      state,
+      { account: ACCOUNT },
+      (base) =>
+        `concat('A', leftPad(hex(n.number), 47, '0')) AS mpt_issuance_id, ${bulkLedger(base)} AS ledger_index,
+         toUInt64(${base} + n.number) AS amount`,
+      HELD_PER_PART,
+    );
+    await insertBulk(
+      h,
+      Table.MptHolderStates,
+      state,
+      { account: ACCOUNT, before: 'r0', after: 'rz' },
+      (base) =>
+        `if(n.number % 2 = 0, {before:String}, {after:String}) AS holder, ${bulkLedger(base)} AS ledger_index,
+         ${BULK_TX_INDEX} AS tx_index`,
+    );
   }, 300_000);
   afterAll(async () => {
     await h?.close();
@@ -2697,6 +2724,7 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
     expect(await count(Table.MptIssuances)).toBe(ISSUANCES);
     expect(await count(Table.MptTransfers)).toBe(BULK_ROWS + 1);
     expect(await count(Table.MptTransfers, `ledger_index >= ${HEAD - WINDOW_LEDGERS}`)).toBe(WINDOW_ROWS);
+    expect(await count(Table.MptHolderStates)).toBe(ACCOUNT_STATES + BULK_ROWS);
     // the bound of the holders is far below what a read of the table takes
     expect(await boundOf(Table.MptHolders, HOLDERS + 1)).toBeLessThan(BULK_ROWS / 4);
     expect(await parts(Table.MptHolders)).toBeGreaterThanOrEqual(PARTS * 2);
@@ -2800,6 +2828,29 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
       expect(byLedger.keys[0]).toBe('ledger_index');
       expect(byLedger.condition).toContain('ledger_index in');
       expect(byLedger.granules[0]).toBeLessThan(byLedger.granules[1] / 8);
+    });
+  });
+
+  describe('GET /v2/accounts/{address}/mpt', () => {
+    const PATH = `/v2/accounts/${ACCOUNT}/mpt?limit=5`;
+    /** A marker halfway through the IDs of the account. */
+    const DEEP = `A${(HELD_PER_PART / 2).toString(16).toUpperCase().padStart(47, '0')}`;
+
+    it.each([
+      ['the first page', PATH],
+      ['a deep page', `${PATH}&marker=${DEEP}`],
+    ])("%s reads the account's states, not the 800,000 rows of the other two", async (_name, path) => {
+      const { reads, statements, body } = await through(Table.MptHolderStates, path);
+      expect(body.count).toBe(5);
+      expect(body.ledger_index).toBe(HEAD);
+      expect(reads).toHaveLength(1);
+      expect(reads[0].read_rows).toBeLessThanOrEqual(await boundOf(Table.MptHolderStates, ACCOUNT_STATES));
+      expect(await boundOf(Table.MptHolderStates, ACCOUNT_STATES)).toBeLessThan(BULK_ROWS / 4);
+      const [sql, params] = statements[0];
+      expect(sql).not.toMatch(/\bFINAL\b/i);
+      const [byAccount] = primaryKeys(await explain(h, 'indexes = 1', sql, params));
+      expect(byAccount.keys[0]).toBe('holder');
+      expect(byAccount.condition).toContain('holder in');
     });
   });
 });

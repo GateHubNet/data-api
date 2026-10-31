@@ -1,4 +1,6 @@
 import {
+  ACCOUNT_MPT_BODY_KEYS,
+  ACCOUNT_MPT_KEYS,
   MPT_FLAGS_KEYS,
   MPT_HOLDER_KEYS,
   MPT_HOLDERS_BODY_KEYS,
@@ -16,6 +18,7 @@ import {
   StoredMptIssuance,
   StoredMptTokenRow,
   StoredMptTransfer,
+  toAccountMpt,
   toMptHolder,
   toMptIssuance,
   toMptSummary,
@@ -327,5 +330,59 @@ describe('toMptTokenRow', () => {
       'flags.can_clawback',
       'transfers_24h',
     ]);
+  });
+});
+
+describe('toAccountMpt', () => {
+  const HOLDING = {
+    mpt_issuance_id: '0598F6E09E30A809E63A1F02DE789586D2F4FDA9EF5200E3',
+    amount_text: '9007199254740993',
+    escrowed_text: '7',
+    flags: 0x02,
+  };
+  const ISSUANCE: StoredMptIssuance = { ...FULL, flags: 0 };
+
+  it("has the keys of ACCOUNT_MPT_KEYS in order, with the issuance's fields, the amounts digit for digit", () => {
+    expect(ACCOUNT_MPT_BODY_KEYS).toEqual([
+      'result',
+      'coverage',
+      'ledger_index',
+      'close_time',
+      'count',
+      'marker',
+      'mpt',
+    ]);
+    const holding = toAccountMpt(HOLDING, ISSUANCE);
+    expect(Object.keys(holding)).toEqual([...ACCOUNT_MPT_KEYS]);
+    expect(holding).toEqual({
+      mpt_issuance_id: HOLDING.mpt_issuance_id,
+      // from the ID, whatever the row says
+      issuer: 'rERShrtUSEXkrwtTpugPV4v8E787vpx1kb',
+      ticker: 'HTF',
+      name: 'Harborline Treasury Fund',
+      asset_scale: 2,
+      amount: '9007199254740993',
+      escrowed_amount: '7',
+      locked: false,
+      authorized: true,
+    });
+  });
+
+  it('has only what the ID and the state say of an issuance with no row or no known state', () => {
+    const keys = ['mpt_issuance_id', 'issuer', 'amount', 'escrowed_amount', 'locked', 'authorized'];
+    expect(Object.keys(toAccountMpt(HOLDING, undefined))).toEqual(keys);
+    expect(Object.keys(toAccountMpt(HOLDING, { ...ISSUANCE, state_known: 0 }))).toEqual(keys);
+  });
+
+  it('leaves out an empty ticker and name, and keeps an asset_scale of 0', () => {
+    const holding = toAccountMpt(HOLDING, { ...ISSUANCE, ticker: '', name: '', asset_scale: 0 });
+    expect(Object.keys(holding)).toEqual(ACCOUNT_MPT_KEYS.filter((key) => !['ticker', 'name'].includes(key)));
+    expect(holding.asset_scale).toBe(0);
+  });
+
+  it('is locked by its own flag or by the issuance', () => {
+    expect(toAccountMpt({ ...HOLDING, flags: 0x01 }, ISSUANCE).locked).toBe(true);
+    expect(toAccountMpt(HOLDING, { ...ISSUANCE, flags: 0x01 }).locked).toBe(true);
+    expect(toAccountMpt(HOLDING, undefined).locked).toBe(false);
   });
 });

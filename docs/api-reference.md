@@ -14,7 +14,7 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
 [Path payments](#path-payments) · [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
 [Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [NFTs](#nfts) · [Account names and tomls](#account-names-and-tomls) ·
-[Ledger objects](#ledger-objects) · [Tokens](#tokens) · [Validations](#validations) · [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
+[Ledger objects](#ledger-objects) · [Tokens](#tokens) · [MPT](#mpt) · [Validations](#validations) · [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
 [Operational endpoints](#operational-endpoints)
 
 ---
@@ -837,11 +837,12 @@ address errors, `invalid date format`, `must not be a future date`; 500 `unable 
 ## Accounts
 
 The `{address}` of the account routes is **not validated** (as in the original) except where a route says otherwise
-(`/balances`, `/orders`, `/trustlines`, `/escrows/{sequence}`, `/delegations`): an address that does not exist simply has no rows. All account lists take the common window
+(`/balances`, `/orders`, `/trustlines`, `/escrows/{sequence}`, `/delegations`, `/mpt`): an address that does not exist simply has no rows. All account lists take the common window
 parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`. The path payments of an account are
 described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments), the escrow of an account by its
-sequence with the other escrow routes, under [`GET /v2/accounts/{address}/escrows/{sequence}`](#get-v2accountsaddressescrowssequence), and the
-delegations an account gave or holds under [`GET /v2/accounts/{address}/delegations`](#get-v2accountsaddressdelegations), in [Ledger objects](#ledger-objects).
+sequence with the other escrow routes, under [`GET /v2/accounts/{address}/escrows/{sequence}`](#get-v2accountsaddressescrowssequence), the
+delegations an account gave or holds under [`GET /v2/accounts/{address}/delegations`](#get-v2accountsaddressdelegations), in [Ledger objects](#ledger-objects), and
+the MPTs an account holds under [`GET /v2/accounts/{address}/mpt`](#get-v2accountsaddressmpt), in [MPT](#mpt).
 
 ### `GET /v2/accounts`
 
@@ -5341,7 +5342,7 @@ Errors, in the order they are checked: 400 `invalid mpt issuance id`; 404 `issua
 
 ### `GET /v2/mpt?ids=`
 
-A summary of each of 1 to 100 issuances, `ids` being a comma list, in the order asked, duplicates too. An ID with no row or with no known state is the ID alone, and so is every ID on a network without MPT. Nothing of it is a list of the network, so it has no `coverage`, no paging and no CSV.
+A summary of each of 1 to 100 issuances, `ids` being a comma list, in the order asked, duplicates too. An ID with no row or with no known state is the ID alone, and so is every ID on a network without MPT. It has no `coverage` (it lists nothing), no paging and no CSV.
 
 ```json
 { "result": "success", "count": 2,
@@ -5438,6 +5439,32 @@ Keys of the MPT totals, in order: `issuances, holders, transfers_24h`.
 `format=csv` is `tokens.csv`, the rows alone, with the same columns on every page: the keys of a row, `flags` as `flags.locked` and so on, and an empty cell where a row has no value.
 
 Errors, in the order they are checked: D6's, 400 `invalid kind - use: issued, mpt`, `invalid min_holders`, `invalid search`, `invalid marker` (a marker of `issued` too); 500 `unable to retrieve tokens`. A 400 comes before any read.
+
+### `GET /v2/accounts/{address}/mpt`
+
+The MPTs an account holds, at the newest committed ledger, by issuance ID. The balances are read from the ledgers, so they are as of `ledger_index` and not of the last run of the job.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `include_zero` | false | Boolean: also a balance of nothing. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | The ID of the last row of the page before. |
+| `format` | json | `csv`: file `<address> - mpt.csv`, its columns the keys of a holding, an empty cell for what a row has not, without `coverage`. |
+
+```json
+{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true },
+  "ledger_index": 107795512, "close_time": "2026-10-24T14:20:01Z", "count": 1,
+  "mpt": [{ "mpt_issuance_id": "0000012A…", "issuer": "r…", "ticker": "HTF", "name": "Harborline Treasury Fund", "asset_scale": 2,
+            "amount": "612040000", "escrowed_amount": "0", "locked": false, "authorized": true }] }
+```
+
+Keys of the MPT holdings answer, in order: `result, coverage, ledger_index?, close_time?, count, marker?, mpt`.
+
+Keys of a holding, in order: `mpt_issuance_id, issuer, ticker?, name?, asset_scale?, amount, escrowed_amount, locked, authorized`.
+
+`issuer` comes from the ID. `ticker`, `name` and `asset_scale` come from the issuance when its state is known. `locked` and `authorized` are as on [the holders](#get-v2mptissuanceidholders). A token the account deleted (it opted out) is not listed, `include_zero` or not. With no committed ledger there is no `ledger_index` to name, and the list is empty; on a network without MPT it is empty and `complete: true`. The list can be exported, as every list with a CSV form can.
+
+Errors, in the order they are checked: 400 `invalid ripple address`, `invalid marker`; 500 `unable to retrieve mpt holdings`.
 
 ---
 

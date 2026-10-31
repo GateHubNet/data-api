@@ -38,7 +38,8 @@ import { ledgerRow } from './validators-seed';
  *  - `nowhere` has no row.
  *
  * **The holdings of `holders[0]`** (`mpt_holder_states`, what `/v2/accounts/{a}/mpt` reads): `htf`, `unknownState`, `lockedAll`, `bare`
- * emptied by its newest state, `destroyed` deleted by its newest; each older state another row, in another part.
+ * emptied by its newest state, `destroyed` deleted by its newest; each older state another row, in another part. `holders[1]` holds
+ * `escrow`, all of it in escrow, and `htf`, locked on its own.
  */
 
 const at = (text: string): number => Date.parse(text) / 1000;
@@ -317,7 +318,7 @@ export const MPT_TRANSFERS: readonly (MptTransfersRow & MptIssuanceTransfersRow)
   mptTransferRow(IDS.htf, HEAD + 1, 0, 'payment', HOLDERS[0], HOLDERS[1], '5'),
 ];
 
-/** The holdings of `holders[0]`: the state of each, newest last; the last one is above the head. */
+/** The holdings of `holders[0]`, the state of each, newest last, one above the head; then those of `holders[1]`. */
 export const MPT_HOLDER_STATES: readonly MptHolderStatesRow[] = [
   mptHolderStateRow(HOLDERS[0], IDS.htf, 107_000_001, '1000000000', { flags: HOLDER_AUTHORIZED }),
   mptHolderStateRow(HOLDERS[0], IDS.htf, HEAD, '612040000', { flags: HOLDER_AUTHORIZED }),
@@ -328,6 +329,8 @@ export const MPT_HOLDER_STATES: readonly MptHolderStatesRow[] = [
   mptHolderStateRow(HOLDERS[0], IDS.destroyed, 107_000_004, '5'),
   mptHolderStateRow(HOLDERS[0], IDS.destroyed, 107_000_005, '0', { deleted: 1 }),
   mptHolderStateRow(HOLDERS[0], IDS.htf, HEAD + 1, '1', { flags: HOLDER_AUTHORIZED }),
+  mptHolderStateRow(HOLDERS[1], IDS.escrow, 107_000_006, '0', { escrowed_amount: '700' }),
+  mptHolderStateRow(HOLDERS[1], IDS.htf, 107_000_005, '124000000', { flags: HOLDER_LOCKED | HOLDER_AUTHORIZED }),
 ];
 
 /** The older rows of the aggregates: numbers a read that takes any row but the newest would serve. */

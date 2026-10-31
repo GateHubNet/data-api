@@ -598,6 +598,26 @@ describe('the MPT routes over the MPT world', () => {
       expect([res.status, res.body]).toEqual([500, { result: 'error', message: 'unable to retrieve transfers' }]);
     });
   });
+
+  it('serves every amount as an integer string of at most 19 digits, beside the issuance ID (ruling C25)', async () => {
+    const SHAPE = /^\d{1,19}$/;
+    const amounts = async (url: string, key: string, names: string[]): Promise<unknown[]> => {
+      const { body } = await api.ok(url, key);
+      return (Array.isArray(body[key]) ? body[key] : [body[key]]).flatMap((row: Obj) =>
+        names.filter((name) => name in row).map((name) => row[name]),
+      );
+    };
+    const issuance = ['maximum_amount', 'outstanding_amount', 'escrowed_amount', 'locked_amount'];
+    const served = [
+      ...(await amounts(`/v2/mpt/${ids.htf}`, 'issuance', issuance)),
+      ...(await amounts(`/v2/mpt/${ids.bare}`, 'issuance', issuance)),
+      ...(await amounts(`/v2/mpt?ids=${ids.htf},${ids.bare}`, 'issuances', issuance)),
+      ...(await amounts(`/v2/mpt/${ids.bare}/holders?include_zero=true`, 'holders', ['amount', 'escrowed_amount'])),
+      ...(await amounts(`/v2/mpt/${ids.htf}/transfers`, 'transfers', ['amount', 'fee'])),
+    ];
+    expect(served.length).toBeGreaterThan(30);
+    for (const amount of served) expect(amount).toEqual(expect.stringMatching(SHAPE));
+  });
 });
 
 describe.each(['xahau', 'xahau-testnet'] as const)('the MPT routes on %s', (network) => {

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { RatesModule } from '../exchanges/rates.module';
 import { LedgerObjectsModule } from '../ledger-objects/ledger-objects.module';
+import { MptModule } from '../mpt/mpt.module';
 import { NamesModule } from '../names/names.module';
 import { NftModule } from '../nft/nft.module';
 import { PathPaymentsModule } from '../path-payments/path-payments.module';
@@ -18,6 +19,8 @@ import { AccountEscrowController } from './account-escrow.controller';
 import { AccountExchangesController } from './account-exchanges.controller';
 import { AccountExchangesService } from './account-exchanges.service';
 import { AccountFlagsService } from './account-flags.service';
+import { AccountMptController } from './account-mpt.controller';
+import { AccountMptService } from './account-mpt.service';
 import { AccountNftsController } from './account-nfts.controller';
 import { AccountOrdersController } from './account-orders.controller';
 import { AccountOrdersService } from './account-orders.service';
@@ -50,15 +53,16 @@ import { TrustLinesService } from './trust-lines.service';
  * lines of an account at a ledger from the state history, `GET /v2/accounts/:address/trustlines` (its read,
  * `TrustLinesService`, gives `/balances` its trust lines at a historical ledger too), and the NFT routes of an account,
  * `GET /v2/accounts/:address/{nfts,nft_history}` (read by the `NftAccountsService` of `NftModule`), the escrow of an account by its
- * sequence, `GET /v2/accounts/:address/escrows/:sequence` (answered by the `ObjectAnswers` of `LedgerObjectsModule`), and the
- * delegations of an account, `GET /v2/accounts/:address/delegations` (read by the `DelegationsService` of this module).
+ * sequence, `GET /v2/accounts/:address/escrows/:sequence` (answered by the `ObjectAnswers` of `LedgerObjectsModule`), the
+ * delegations of an account, `GET /v2/accounts/:address/delegations` (read by the `DelegationsService` of this module), and its MPT
+ * holdings, `GET /v2/accounts/:address/mpt` (the issuances' fields read by the `MptService` of `MptModule`).
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added
  * to `controllers` below. `:address` matches one segment only, so these never compete with the lookup.
  */
 @Module({
-  imports: [RatesModule, PathPaymentsModule, NftModule, NamesModule, LedgerObjectsModule],
+  imports: [RatesModule, PathPaymentsModule, NftModule, NamesModule, LedgerObjectsModule, MptModule],
   controllers: [
     AccountsController,
     AccountTransactionsController,
@@ -76,6 +80,7 @@ import { TrustLinesService } from './trust-lines.service';
     AccountNftsController,
     AccountEscrowController,
     AccountDelegationsController,
+    AccountMptController,
   ],
   providers: [
     AccountsService,
@@ -88,6 +93,7 @@ import { TrustLinesService } from './trust-lines.service';
     LiveLedgerService,
     AccountBalancesService,
     AccountOrdersService,
+    AccountMptService,
     AccountReportsService,
     AccountStatsService,
     AccountDayGroupsService,

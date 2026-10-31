@@ -1,4 +1,4 @@
-import { LSF_MPT_LOCKED, MptTransferKind } from '@gatehub/data-api-shared';
+import { LSF_MPT_LOCKED, mptIssuerOf, MptTransferKind } from '@gatehub/data-api-shared';
 import { CsvRow, toCsvRow } from '../common/csv.interceptor';
 import { fmtTime } from '../common/format';
 
@@ -114,6 +114,28 @@ export const MPT_TOKENS_TOTALS_KEYS = ['issuances', 'holders', 'transfers_24h'] 
 export const MPT_TOKEN_CSV_COLUMNS = MPT_TOKEN_ROW_KEYS.flatMap((key) =>
   key === 'flags' ? MPT_FLAGS_KEYS.map((flag) => `flags.${flag}`) : [key],
 );
+
+export const ACCOUNT_MPT_BODY_KEYS = [
+  'result',
+  'coverage',
+  'ledger_index',
+  'close_time',
+  'count',
+  'marker',
+  'mpt',
+] as const;
+
+export const ACCOUNT_MPT_KEYS = [
+  'mpt_issuance_id',
+  'issuer',
+  'ticker',
+  'name',
+  'asset_scale',
+  'amount',
+  'escrowed_amount',
+  'locked',
+  'authorized',
+] as const;
 
 // -- the objects ---------------------------------------------------------------------------------------------------------
 
@@ -365,5 +387,44 @@ export function toMptTransfer(row: StoredMptTransfer): MptTransferObject {
     ...(row.destination !== '' && { destination: row.destination }),
     amount: row.amount_text,
     ...(row.fee_text !== '0' && { fee: row.fee_text }),
+  };
+}
+
+/** A holding as `/v2/accounts/{address}/mpt` reads it: the newest state of an account's token, each `UInt64` as its digits. */
+export interface StoredAccountMpt {
+  mpt_issuance_id: string;
+  amount_text: string;
+  escrowed_text: string;
+  flags: number;
+}
+
+export interface AccountMptObject {
+  mpt_issuance_id: string;
+  issuer: string;
+  ticker?: string;
+  name?: string;
+  asset_scale?: number;
+  amount: string;
+  escrowed_amount: string;
+  locked: boolean;
+  authorized: boolean;
+}
+
+/**
+ * A holding of an account (spec 7.6). The issuer is the one the ID holds; `ticker`, `name` and `asset_scale` come from the issuance's
+ * row when its state is known, and with no such row a holding has what the ledger's token said.
+ */
+export function toAccountMpt(row: StoredAccountMpt, issuance: StoredMptIssuance | undefined): AccountMptObject {
+  const known = issuance !== undefined && issuance.state_known !== 0 ? issuance : undefined;
+  return {
+    mpt_issuance_id: row.mpt_issuance_id,
+    issuer: mptIssuerOf(row.mpt_issuance_id),
+    ...(known !== undefined && known.ticker !== '' && { ticker: known.ticker }),
+    ...(known !== undefined && known.name !== '' && { name: known.name }),
+    ...(known !== undefined && { asset_scale: known.asset_scale }),
+    amount: row.amount_text,
+    escrowed_amount: row.escrowed_text,
+    locked: mptBalanceLocked(row.flags, issuance?.flags ?? 0),
+    authorized: mptBalanceAuthorized(row.flags),
   };
 }

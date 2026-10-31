@@ -282,6 +282,15 @@ describe('GET /v2/tokens?kind=mpt over the MPT world', () => {
     });
   });
 
+  it('serves every amount as an integer string of at most 19 digits (ruling C25)', async () => {
+    const { body } = await api.ok(list(), 'tokens');
+    const amounts = body.tokens.flatMap((row: Obj) =>
+      ['maximum_amount', 'outstanding_amount'].filter((name) => name in row).map((name) => row[name]),
+    );
+    expect(amounts.length).toBeGreaterThan(7);
+    for (const amount of amounts) expect(amount).toEqual(expect.stringMatching(/^\d{1,19}$/));
+  });
+
   it('kind=nft is invalid kind - use: issued, mpt', async () => {
     const res = await get('/v2/tokens?kind=nft');
     expect([res.status, res.body]).toEqual([400, { result: 'error', message: 'invalid kind - use: issued, mpt' }]);
