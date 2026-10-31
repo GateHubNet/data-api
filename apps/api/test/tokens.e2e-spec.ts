@@ -498,12 +498,12 @@ describe('GET /v2/tokens on the world of tokens-seed.ts', () => {
 
   // -- errors -----------------------------------------------------------------------------------------------------------
 
-  it('errors in order: invalid kind - use: issued, invalid min_holders, invalid search, invalid marker', async () => {
+  it('errors in order: invalid kind - use: issued, mpt, invalid min_holders, invalid search, invalid marker', async () => {
     const long = 'a'.repeat(65);
     const cases: [string, string][] = [
-      ['kind=mpt', 'invalid kind - use: issued'],
-      ['kind=ISSUED', 'invalid kind - use: issued'],
-      [`kind=x&min_holders=x&q=${long}&marker=%25%25`, 'invalid kind - use: issued'],
+      ['kind=nft', 'invalid kind - use: issued, mpt'],
+      ['kind=ISSUED', 'invalid kind - use: issued, mpt'],
+      [`kind=x&min_holders=x&q=${long}&marker=%25%25`, 'invalid kind - use: issued, mpt'],
       [`min_holders=x&q=${long}&marker=%25%25`, 'invalid min_holders'],
       ['min_holders=-1', 'invalid min_holders'],
       ['min_holders=1.5', 'invalid min_holders'],

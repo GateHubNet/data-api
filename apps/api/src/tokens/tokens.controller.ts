@@ -44,7 +44,7 @@ const TOKEN_PARAM = {
 
 /**
  * The tokens (spec 5). The list is `GET /v2/tokens`, served by the `TokenListService` of the kind asked for
- * (`TOKEN_LIST_SERVICES`): this controller knows no kind but through that map, so that D9 adds `mpt` without a change here. One
+ * (`TOKEN_LIST_SERVICES`): this controller knows no kind but through that map. One
  * token, its holders and its transfers are `GET /v2/tokens/{currency}.{issuer}`, `.../holders` and `.../transfers`, issued tokens only.
  *
  * The checks of the list come in the order of the parameters: `kind`, `min_holders`, `q`, then the marker (the service, before it
@@ -69,8 +69,10 @@ export class TokensController {
   @ApiOperation({
     summary: 'Get the tokens, ranked by holders',
     description:
-      'The tokens of a kind (`issued`: the currencies issued on trust lines) with the most holders first, then by issuer, then by ' +
-      'currency; `rank` is the place of a token in that order among the tokens the filters select. A token is a currency and its ' +
+      'The tokens of a kind with the most holders first, then by issuer, then by the token; `rank` is the place of a token in that ' +
+      'order among the tokens the filters select. `kind=mpt` lists the MPT issuances instead of the currencies issued on trust ' +
+      'lines (`issued`, the default): its row, its `totals` and its search are in the MPT section of the reference, and the rest of ' +
+      'this text is of `issued`. A token is a currency and its ' +
       'issuer, as of the last run of the tokens job (`ledger_index` and `close_time` are the ledger it is through): its holders ' +
       '(the accounts that hold a positive balance), `trust_lines` (the lines that count), `supply` (the exact sum of the balances), ' +
       'the `price` of the last day against the native currency with its `price_change` (percent) and `price_time` (the month ' +
@@ -96,7 +98,9 @@ export class TokensController {
     name: 'q',
     required: false,
     description:
-      'A search, 1 to 64 characters: an issuer address, or text in the code, name or domain, a currency in hex, an issuer prefix.',
+      'A search, 1 to 64 characters: an issuer address, or text in the code, name or domain, a currency in hex, an issuer prefix. ' +
+      'With `kind=mpt`: an issuer address, an issuance ID, or text in the ticker or name, an issuer prefix, an ID prefix of 8 hex ' +
+      'digits or more.',
   })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
   @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })

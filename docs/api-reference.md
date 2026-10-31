@@ -4679,7 +4679,7 @@ not served and answers 404 ([Compatibility](#compatibility)).
 
 ## Tokens
 
-GateHub extras: the original served no list of tokens (its `/v2/currencies` and `/v2/gateways` are not served, [Compatibility](#compatibility)). These four routes serve the **issued
+GateHub extras: the original served no list of tokens (its `/v2/currencies` and `/v2/gateways` are not served, [Compatibility](#compatibility)). The MPT issuances are in [their own section](#mpt), `kind=mpt` of the list among them. These four routes serve the **issued
 tokens** of the network, the currencies issued on trust lines: the tokens ranked by the number of their holders, one token with the settings of its issuer, its toml entry, its
 markets and its price, the holders of a token by balance, and the payments that delivered a token. The tokens, their holders and their supply are an aggregate that the syncer's
 `tokens` job keeps current from the state history ([syncer](syncer.md#the-tokens-job), [ADR-0019](adr/0019-issued-tokens-from-state-history.md), the rows in
@@ -4776,7 +4776,7 @@ The issued tokens of the network, the most held first.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `kind` | `issued` | The kind of token. Anything else answers 400 `invalid kind - use: issued`. The list is built for more than one kind: `kind` is echoed in every answer and is part of the marker (a marker of one kind is `invalid marker` for another). |
+| `kind` | `issued` | The kind of token: `issued`, what this section describes, or `mpt`, the MPT issuances ([`GET /v2/tokens?kind=mpt`](#get-v2tokenskindmpt)), with this route's envelope and parameters and a row, totals and search of their own. Anything else answers 400 `invalid kind - use: issued, mpt`. `kind` is echoed in every answer and is part of the marker (a marker of one kind is `invalid marker` for another). |
 | `min_holders` | 0 | Only the tokens with at least this many holders: plain digits, 0 to 1,000,000,000, else 400 `invalid min_holders`. |
 | `q` | | A search, trimmed, 1 to 64 characters (else 400 `invalid search`; an empty one is none). |
 | `limit` | 200 (max 1000) | |
@@ -4944,7 +4944,7 @@ file.
 "3","EUR","EUR","rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B","60","60","1860","","","","25","35","","false",""
 ```
 
-Errors, in the order they are checked: 400 `invalid kind - use: issued`, `invalid min_holders`, `invalid search`, `invalid marker`; 500 `unable to retrieve tokens`. A 400 comes before any read.
+Errors, in the order they are checked: 400 `invalid kind - use: issued, mpt`, `invalid min_holders`, `invalid search`, `invalid marker`; 500 `unable to retrieve tokens`. A 400 comes before any read.
 A generation whose newest ledger is not stored yet answers 500 as well (it can for a moment during a `--reprocess` of the newest ledgers): the answer names the ledger it is as of, and no other is
 invented in its place.
 
@@ -5407,6 +5407,37 @@ Keys of a transfer, in order: `ledger_index, tx_index, tx_hash, executed_time, t
 Errors, in the order they are checked: 400 `invalid mpt issuance id`, `invalid start date format`, `invalid end date format`, `invalid kind - use: payment, clawback, lock, unlock, escrow_create, escrow_finish, escrow_cancel`, `invalid marker`; 404 `issuance not found` (it has no row, or the network has no MPT); 500 `unable to retrieve transfers`.
 
 Both lists can be exported ([`POST /v2/exports`](#exports)), as every list with a CSV form can.
+
+### `GET /v2/tokens?kind=mpt`
+
+The route, the parameters, the envelope and the order of [`GET /v2/tokens`](#get-v2tokens), for the MPT issuances: those whose state is known and that are not destroyed, the most held first, then by issuer, then by ID. `rank` is the place of an issuance in that order among those the filters select. `ledger_index` and `close_time` are the newest committed ledger when the list is read; the aggregates trail it by at most a run of the job.
+
+**Search.** `q` a classic address: the issuances of that issuer. 48 hex digits, in any case: that issuance. Anything else matches an issuance when its `ticker` or `name` contains `q` (case-insensitive), its issuer starts with `q`, or, for 8 hex digits or more, its ID starts with `q`.
+
+**Counts.** `total` is the number of issuances the filters select, on all pages; `total_below`, when `min_holders` is above 0, the number that match `q` but have fewer holders. `totals` describe the whole kind, **whatever the filters**: `issuances` (known and live, whatever their holders), `holders` (the distinct accounts with a positive balance of at least one of them) and `transfers_24h` (every MPT payment of the day before the head, of any issuance).
+
+**The day.** `transfers_24h` of a row counts the `payment` transfers of its issuance, each once, in the ledgers that closed in the 24 hours before the newest committed ledger closed: `(close_time - 86400, close_time]`. A lock or an escrow is not a payment; a mint and a redemption are.
+
+**Nothing to list.** With no issuance, and on a network without MPT, the answer is the whole envelope at the newest committed ledger, `total: 0`, zero `totals` and no rows. With no committed ledger it is `{ "result": "success", "coverage": …, "kind": "mpt", "count": 0, "tokens": [] }`.
+
+```json
+{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true },
+  "kind": "mpt", "ledger_index": 107795512, "close_time": "2026-10-24T14:20:01Z",
+  "totals": { "issuances": 214, "holders": 9862, "transfers_24h": 2415 },
+  "total": 214, "count": 1, "marker": "…",
+  "tokens": [{ "rank": 1, "mpt_issuance_id": "0000012A…", "issuer": "r…", "ticker": "HTF", "name": "Harborline Treasury Fund",
+               "asset_scale": 2, "maximum_amount": "5000000000", "outstanding_amount": "1820451120", "holders": 3412,
+               "transfer_fee": 100, "flags": { "locked": false, "can_lock": true, "require_auth": true, "can_escrow": false,
+               "can_trade": true, "can_transfer": true, "can_clawback": true }, "transfers_24h": 412 }] }
+```
+
+Keys of an MPT row, in order: `rank, mpt_issuance_id, issuer, ticker?, name?, asset_scale, maximum_amount?, outstanding_amount, holders, transfer_fee, flags, transfers_24h`.
+
+Keys of the MPT totals, in order: `issuances, holders, transfers_24h`.
+
+`format=csv` is `tokens.csv`, the rows alone, with the same columns on every page: the keys of a row, `flags` as `flags.locked` and so on, and an empty cell where a row has no value.
+
+Errors, in the order they are checked: D6's, 400 `invalid kind - use: issued, mpt`, `invalid min_holders`, `invalid search`, `invalid marker` (a marker of `issued` too); 500 `unable to retrieve tokens`. A 400 comes before any read.
 
 ---
 

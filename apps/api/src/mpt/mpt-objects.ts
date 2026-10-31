@@ -1,4 +1,5 @@
 import { LSF_MPT_LOCKED, MptTransferKind } from '@gatehub/data-api-shared';
+import { CsvRow, toCsvRow } from '../common/csv.interceptor';
 import { fmtTime } from '../common/format';
 
 /**
@@ -91,6 +92,28 @@ export const MPT_TRANSFER_KINDS: readonly MptTransferKind[] = [
   'escrow_finish',
   'escrow_cancel',
 ];
+
+export const MPT_TOKEN_ROW_KEYS = [
+  'rank',
+  'mpt_issuance_id',
+  'issuer',
+  'ticker',
+  'name',
+  'asset_scale',
+  'maximum_amount',
+  'outstanding_amount',
+  'holders',
+  'transfer_fee',
+  'flags',
+  'transfers_24h',
+] as const;
+
+export const MPT_TOKENS_TOTALS_KEYS = ['issuances', 'holders', 'transfers_24h'] as const;
+
+/** The columns of the CSV of `kind=mpt`: the keys of a row, the flags flattened. A key with no value is an empty cell, not a moved column. */
+export const MPT_TOKEN_CSV_COLUMNS = MPT_TOKEN_ROW_KEYS.flatMap((key) =>
+  key === 'flags' ? MPT_FLAGS_KEYS.map((flag) => `flags.${flag}`) : [key],
+);
 
 // -- the objects ---------------------------------------------------------------------------------------------------------
 
@@ -259,6 +282,50 @@ export function toMptSummary(row: StoredMptIssuance): MptSummaryObject {
     flags: mptFlags(row.flags),
     destroyed: row.destroyed !== 0,
   };
+}
+
+/** A row of the list of `kind=mpt` as it is read: the newest row of an issuance with its place, each `UInt64` as its digits. */
+export interface StoredMptTokenRow {
+  rank: number;
+  mpt_issuance_id: string;
+  issuer: string;
+  ticker: string;
+  name: string;
+  asset_scale: number;
+  maximum_text: string | null;
+  outstanding_text: string;
+  holders: number;
+  transfer_fee: number;
+  flags: number;
+}
+
+/** A row of the list of `kind=mpt`, in the order of `MPT_TOKEN_ROW_KEYS`; a key with no value is left out. */
+export type MptTokenRowObject = Record<(typeof MPT_TOKEN_ROW_KEYS)[number], unknown>;
+
+/** The totals of the list of `kind=mpt`. */
+export type MptTotalsObject = Record<(typeof MPT_TOKENS_TOTALS_KEYS)[number], number>;
+
+/** A row of `kind=mpt` (spec 7.1) and how many payments its issuance had in the day before the head. */
+export function toMptTokenRow(row: StoredMptTokenRow, transfers24h: number): MptTokenRowObject {
+  return {
+    rank: row.rank,
+    mpt_issuance_id: row.mpt_issuance_id,
+    issuer: row.issuer,
+    ...(row.ticker !== '' && { ticker: row.ticker }),
+    ...(row.name !== '' && { name: row.name }),
+    asset_scale: row.asset_scale,
+    ...(row.maximum_text !== null && { maximum_amount: row.maximum_text }),
+    outstanding_amount: row.outstanding_text,
+    holders: row.holders,
+    transfer_fee: row.transfer_fee,
+    flags: mptFlags(row.flags),
+    transfers_24h: transfers24h,
+  } as MptTokenRowObject;
+}
+
+/** A row of `kind=mpt` as a row of the CSV. */
+export function toMptTokenCsvRow(row: MptTokenRowObject): CsvRow {
+  return toCsvRow(row, MPT_TOKEN_CSV_COLUMNS);
 }
 
 /** `lsfMPTAuthorized` of an `MPToken`, what `authorized` says. */

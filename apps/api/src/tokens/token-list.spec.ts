@@ -27,8 +27,8 @@ function badRequestMessage(fn: () => unknown): string {
 }
 
 describe('TOKEN_KINDS', () => {
-  it('is issued alone until D9 adds mpt', () => {
-    expect([...TOKEN_KINDS]).toEqual(['issued']);
+  it('is issued and mpt', () => {
+    expect([...TOKEN_KINDS]).toEqual(['issued', 'mpt']);
   });
 });
 
@@ -61,9 +61,16 @@ describe('parseTokenListQuery', () => {
     });
   });
 
-  it('kind other than issued is 400 `invalid kind - use: issued`', () => {
-    expect(badRequestMessage(() => parseTokenListQuery({ kind: 'mpt' }))).toBe('invalid kind - use: issued');
-    expect(badRequestMessage(() => parseTokenListQuery({ kind: 'ISSUED' }))).toBe('invalid kind - use: issued');
+  it('kind other than issued and mpt is 400 `invalid kind - use: issued, mpt`', () => {
+    expect(badRequestMessage(() => parseTokenListQuery({ kind: 'nft' }))).toBe('invalid kind - use: issued, mpt');
+    expect(badRequestMessage(() => parseTokenListQuery({ kind: 'ISSUED' }))).toBe('invalid kind - use: issued, mpt');
+    expect(badRequestMessage(() => parseTokenListQuery({ kind: 'MPT' }))).toBe('invalid kind - use: issued, mpt');
+  });
+
+  it('kind=mpt parses', () => {
+    expect(parseTokenListQuery({ kind: 'mpt' }).kind).toBe('mpt');
+    // the default stays issued
+    expect(parseTokenListQuery({}).kind).toBe('issued');
   });
 
   it.each(['-1', '1e3', '1000000001', '1.5', ' 5', 'x', '0x10', '+3'])(
@@ -102,7 +109,7 @@ describe('parseTokenListQuery', () => {
 
   it('checks kind, then min_holders, then the search', () => {
     expect(badRequestMessage(() => parseTokenListQuery({ kind: 'x', min_holders: '-1', q: 'a'.repeat(65) }))).toBe(
-      'invalid kind - use: issued',
+      'invalid kind - use: issued, mpt',
     );
     expect(badRequestMessage(() => parseTokenListQuery({ min_holders: '-1', q: 'a'.repeat(65) }))).toBe(
       'invalid min_holders',
@@ -115,6 +122,14 @@ describe('the marker of the list', () => {
   it('codes (holders, issuer, key) and decodes it for its kind', () => {
     const marker = encodeTokenListMarker('issued', 48920, ISSUER, USD);
     expect(decodeTokenListMarker(marker, 'issued')).toEqual([48920, ISSUER, USD]);
+  });
+
+  it('a marker of mpt decodes for mpt and is invalid marker for issued, and the other way round', () => {
+    const mpt = encodeTokenListMarker('mpt', 3, ISSUER, 'A'.repeat(48));
+    expect(decodeTokenListMarker(mpt, 'mpt')).toEqual([3, ISSUER, 'A'.repeat(48)]);
+    expect(badRequestMessage(() => decodeTokenListMarker(mpt, 'issued'))).toBe('invalid marker');
+    const issued = encodeTokenListMarker('issued', 3, ISSUER, USD);
+    expect(badRequestMessage(() => decodeTokenListMarker(issued, 'mpt'))).toBe('invalid marker');
   });
 
   it('is the base64url JSON of the kind and the three values', () => {

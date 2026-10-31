@@ -6,15 +6,21 @@ import {
   MPT_ISSUANCE_KEYS,
   MPT_LOOKUP_BODY_KEYS,
   MPT_SUMMARY_KEYS,
+  MPT_TOKEN_CSV_COLUMNS,
+  MPT_TOKEN_ROW_KEYS,
+  MPT_TOKENS_TOTALS_KEYS,
   MPT_TRANSFER_KEYS,
   MPT_TRANSFER_KINDS,
   MPT_TRANSFERS_BODY_KEYS,
   mptFlags,
   StoredMptIssuance,
+  StoredMptTokenRow,
   StoredMptTransfer,
   toMptHolder,
   toMptIssuance,
   toMptSummary,
+  toMptTokenCsvRow,
+  toMptTokenRow,
   toMptTransfer,
 } from './mpt-objects';
 
@@ -251,6 +257,75 @@ describe('toMptTransfer', () => {
       'escrow_create',
       'escrow_finish',
       'escrow_cancel',
+    ]);
+  });
+});
+
+describe('toMptTokenRow', () => {
+  const ROW: StoredMptTokenRow = {
+    rank: 3,
+    mpt_issuance_id: ID,
+    issuer: 'rIssuer',
+    ticker: 'HTF',
+    name: 'Harborline Treasury Fund',
+    asset_scale: 2,
+    maximum_text: '9223372036854775807',
+    outstanding_text: '1820451120',
+    holders: 3412,
+    transfer_fee: 100,
+    flags: 0x22,
+  };
+
+  it('has the keys of MPT_TOKEN_ROW_KEYS in order', () => {
+    expect(MPT_TOKENS_TOTALS_KEYS).toEqual(['issuances', 'holders', 'transfers_24h']);
+    const row = toMptTokenRow(ROW, 412);
+    expect(Object.keys(row)).toEqual([...MPT_TOKEN_ROW_KEYS]);
+    expect(row).toMatchObject({
+      rank: 3,
+      maximum_amount: '9223372036854775807',
+      outstanding_amount: '1820451120',
+      flags: { can_lock: true, can_transfer: true, locked: false },
+      transfers_24h: 412,
+    });
+  });
+
+  it('leaves out a key with no value', () => {
+    const row = toMptTokenRow({ ...ROW, ticker: '', name: '', maximum_text: null }, 0);
+    expect(Object.keys(row)).toEqual(
+      MPT_TOKEN_ROW_KEYS.filter((key) => !['ticker', 'name', 'maximum_amount'].includes(key)),
+    );
+    expect(row.transfers_24h).toBe(0);
+  });
+
+  it('has the same columns in the CSV whatever a row holds, its flags flattened and an empty cell for what is absent', () => {
+    const bare = toMptTokenCsvRow(toMptTokenRow({ ...ROW, ticker: '', name: '', maximum_text: null }, 0));
+    expect(Object.keys(bare)).toEqual([...MPT_TOKEN_CSV_COLUMNS]);
+    expect(bare).toMatchObject({
+      ticker: null,
+      name: null,
+      maximum_amount: null,
+      'flags.can_lock': true,
+      transfers_24h: 0,
+    });
+    expect(MPT_TOKEN_CSV_COLUMNS).toEqual([
+      'rank',
+      'mpt_issuance_id',
+      'issuer',
+      'ticker',
+      'name',
+      'asset_scale',
+      'maximum_amount',
+      'outstanding_amount',
+      'holders',
+      'transfer_fee',
+      'flags.locked',
+      'flags.can_lock',
+      'flags.require_auth',
+      'flags.can_escrow',
+      'flags.can_trade',
+      'flags.can_transfer',
+      'flags.can_clawback',
+      'transfers_24h',
     ]);
   });
 });

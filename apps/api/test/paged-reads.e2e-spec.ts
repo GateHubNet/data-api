@@ -2596,6 +2596,13 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
   /** The first ledger of the bulk closes at this time, one second a ledger from there. */
   const T0 = 1_700_000_000;
   const HEAD = BULK_BASES[PARTS - 1] + BULK_LEDGERS;
+  const HEAD_CLOSE = T0 + (HEAD - BULK_BASES[0]);
+  /** The other issuances of `mpt_issuances`: what the list and its counts read, each of them once. */
+  const ISSUANCES_PER_PART = 25_000;
+  const ISSUANCES = PARTS * ISSUANCES_PER_PART + 1;
+  /** The ledgers of the day before the head that hold `mpt_transfers` rows: the tail of the last part of its bulk, four rows a ledger. */
+  const WINDOW_LEDGERS = 1000;
+  const WINDOW_ROWS = WINDOW_LEDGERS * 4;
 
   let h: Harness;
   let api: ApiClient;
@@ -2615,9 +2622,19 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
     api = await h.api();
     await h.ch.insert(Table.Ledgers, [
       { ...ledgerRow(BULK_BASES[0], T0), parser_version: MPT_PARSER_VERSION },
-      { ...ledgerRow(HEAD, T0 + (HEAD - BULK_BASES[0])), parser_version: MPT_PARSER_VERSION },
+      { ...ledgerRow(HEAD - WINDOW_LEDGERS, HEAD_CLOSE - WINDOW_LEDGERS), parser_version: MPT_PARSER_VERSION },
+      { ...ledgerRow(HEAD, HEAD_CLOSE), parser_version: MPT_PARSER_VERSION },
     ]);
     await h.ch.insert(Table.MptIssuances, [mptIssuanceRow(ID, { holders: HOLDERS })]);
+    await insertBulk(
+      h,
+      Table.MptIssuances,
+      `SELECT * FROM ${Table.MptIssuances} WHERE mpt_issuance_id = {id:String} LIMIT 1`,
+      { id: ID },
+      (base) =>
+        `concat('F', leftPad(hex(toUInt64(${base} + n.number)), 47, '0')) AS mpt_issuance_id, toUInt32(n.number % 1000) AS holders`,
+      ISSUANCES_PER_PART,
+    );
 
     // mpt_holders: the holders of ID in four parts, then the bulk of the other two
     await h.ch.insert(Table.MptHolders, [mptHolderRow(ID, accountAt(0xc001), '1', { version: '1' })]);
@@ -2652,6 +2669,18 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
         `multiIf(n.number % 4 = 0, {id:String}, n.number % 4 = 1, {below:String}, {above:String}) AS mpt_issuance_id,
          ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index`,
     );
+
+    // mpt_transfers: the same bulk by ledger, its last ledgers in the day before the head, and nothing of it above the head
+    await h.ch.insert(Table.MptTransfers, [transfer]);
+    await insertBulk(
+      h,
+      Table.MptTransfers,
+      `SELECT * FROM ${Table.MptTransfers} WHERE mpt_issuance_id = {id:String} LIMIT 1`,
+      { id: ID, below: BELOW, above: ABOVE },
+      (base) =>
+        `multiIf(n.number % 4 = 0, {id:String}, n.number % 4 = 1, {below:String}, {above:String}) AS mpt_issuance_id,
+         ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index`,
+    );
   }, 300_000);
   afterAll(async () => {
     await h?.close();
@@ -2665,6 +2694,9 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
     expect(await count(Table.MptHolders, 'mpt_issuance_id = {id:String}')).toBe(HOLDERS + 1);
     expect(await count(Table.MptHolders)).toBe(HOLDERS + 1 + BULK_ROWS);
     expect(await count(Table.MptIssuanceTransfers)).toBe(BULK_ROWS + 1);
+    expect(await count(Table.MptIssuances)).toBe(ISSUANCES);
+    expect(await count(Table.MptTransfers)).toBe(BULK_ROWS + 1);
+    expect(await count(Table.MptTransfers, `ledger_index >= ${HEAD - WINDOW_LEDGERS}`)).toBe(WINDOW_ROWS);
     // the bound of the holders is far below what a read of the table takes
     expect(await boundOf(Table.MptHolders, HOLDERS + 1)).toBeLessThan(BULK_ROWS / 4);
     expect(await parts(Table.MptHolders)).toBeGreaterThanOrEqual(PARTS * 2);
@@ -2710,5 +2742,64 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
     const [sql, params] = statements[0];
     expect(isPageRead(sql)).toBe(true);
     await expectBoundedInOrderRead(h, sql, params, query.includes('descending'), path);
+  });
+
+  describe('GET /v2/tokens?kind=mpt', () => {
+    const PATH = '/v2/tokens?kind=mpt&limit=5';
+
+    /** The rows the holders of the kind are counted over: those of `ID`, the one issuance of the bulks with a holder; the bulk's others have no row of `mpt_issuances`. */
+    const HOLDER_ROWS = HOLDERS + 1;
+
+    it('reads the issuances three times, the rows of the window and the holders of the issuances, and no more', async () => {
+      const [{ t }] = await h.ch.query<{ t: string }>('SELECT now64(6) AS t');
+      const res = await api.ok(PATH, 'tokens');
+      await h.ch.command('SYSTEM FLUSH LOGS');
+      const qualified = [Table.MptIssuances, Table.MptTransfers, Table.MptHolders].map(
+        (table) => `${h.database}.${table}`,
+      );
+      const [read] = await h.ch.query<{ n: string }>(
+        `SELECT sum(read_rows) AS n FROM system.query_log
+          WHERE current_database = {db:String} AND type = 'QueryFinish' AND query_kind = 'Select'
+            AND query_start_time_microseconds >= {t:DateTime64(6)} AND hasAny(tables, {tables:Array(String)})`,
+        { db: h.database, t, tables: qualified },
+      );
+      const granules =
+        2 *
+        GRANULE *
+        ((await parts(Table.MptIssuances)) + (await parts(Table.MptTransfers)) + (await parts(Table.MptHolders)));
+      expect(Number(read.n)).toBeLessThanOrEqual(3 * ISSUANCES + WINDOW_ROWS + HOLDER_ROWS + granules);
+      expect(Number(read.n)).toBeGreaterThanOrEqual(3 * ISSUANCES + WINDOW_ROWS + HOLDER_ROWS);
+      expect(res.body.count).toBe(5);
+      expect(res.body.totals).toEqual({ issuances: ISSUANCES, holders: HOLDER_ROWS, transfers_24h: WINDOW_ROWS });
+    });
+
+    it('reads mpt_issuances once a statement, each of them its rows: the list, the counts and the IDs of the holders', async () => {
+      const issuances = await through(Table.MptIssuances, PATH);
+      expect(issuances.reads).toHaveLength(3);
+      for (const read of issuances.reads) expect(read.read_rows).toBeGreaterThanOrEqual(ISSUANCES);
+      for (const [sql] of issuances.statements) expect(sql).not.toMatch(/\bFINAL\b/i);
+    });
+
+    it('reads the holders of the issuances of the kind, not the 800,000 rows of the other two', async () => {
+      const { reads, statements } = await through(Table.MptHolders, PATH);
+      expect(reads).toHaveLength(1);
+      const bound =
+        ISSUANCES + HOLDER_ROWS + 2 * GRANULE * ((await parts(Table.MptHolders)) + (await parts(Table.MptIssuances)));
+      expect(reads[0].read_rows).toBeLessThanOrEqual(bound);
+      expect(BULK_ROWS).toBeGreaterThan(bound);
+      expect(statements[0][0]).not.toMatch(/\bFINAL\b/i);
+    });
+
+    it('reads the window of mpt_transfers by a primary-key range on ledger_index, not the 800,000 rows', async () => {
+      const { reads, statements } = await through(Table.MptTransfers, PATH);
+      expect(reads).toHaveLength(1);
+      expect(reads[0].read_rows).toBeLessThanOrEqual(WINDOW_ROWS + 2 * GRANULE * (await parts(Table.MptTransfers)));
+      expect(reads[0].read_rows).toBeGreaterThanOrEqual(WINDOW_ROWS);
+      const [sql, params] = statements[0];
+      const [byLedger] = primaryKeys(await explain(h, 'indexes = 1', sql, params));
+      expect(byLedger.keys[0]).toBe('ledger_index');
+      expect(byLedger.condition).toContain('ledger_index in');
+      expect(byLedger.granules[0]).toBeLessThan(byLedger.granules[1] / 8);
+    });
   });
 });

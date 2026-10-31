@@ -8,12 +8,11 @@ import type { CsvRow } from '../nft/nft-objects';
 
 /**
  * The list of every kind of token, `GET /v2/tokens` (spec 5.1 and 8): the query and its checks, the marker, and the envelope
- * of the answer. A kind is a `TokenListService` registered under `TOKEN_LIST_SERVICES`; D9 adds `'mpt'` to `TOKEN_KINDS` and its
- * service to the map and changes nothing else here.
+ * of the answer. A kind is a `TokenListService` registered under `TOKEN_LIST_SERVICES`: `issued` (D6) and `mpt` (D9).
  */
 
 /** The kinds of token the list takes. */
-export const TOKEN_KINDS = ['issued'] as const;
+export const TOKEN_KINDS = ['issued', 'mpt'] as const;
 export type TokenKind = (typeof TOKEN_KINDS)[number];
 
 /** The parameters of the list, checked. `q` is trimmed and left out when empty; `marker` is the text the client sent. */
@@ -32,7 +31,7 @@ const MAX_MIN_HOLDERS = 1_000_000_000;
 const MAX_SEARCH_LENGTH = 64;
 
 /**
- * The query of the list. Checks, in order: `kind` (`issued` when missing or empty, else 400 `invalid kind - use: issued`),
+ * The query of the list. Checks, in order: `kind` (`issued` when missing or empty, else 400 `invalid kind - use: issued, mpt`),
  * `min_holders` (0 when missing or empty, else plain digits from 0 to 1,000,000,000, else `invalid min_holders`), `q` (trimmed,
  * 1 to 64 characters, else `invalid search`; empty is none) and `limit` (200, at most 1000). The marker is checked by
  * `decodeTokenListMarker`, where the service reads it.
