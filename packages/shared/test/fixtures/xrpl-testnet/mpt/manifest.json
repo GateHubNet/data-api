@@ -1,0 +1,94 @@
+{
+  "network": "xrpl-testnet",
+  "endpoint": "wss://clio.altnet.rippletest.net:51233",
+  "recorded_at": "2026-10-31T16:19:06.917Z",
+  "validated_head": 21966420,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "4245906360EA53103ADCC3CD8992244F37D5BF5961113AFD3C92CF2774CB0EDA": {
+      "ledger": 19500962,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "23DC3FC19583A603E197270E12B732A77488B54AD9C99F69596DB70F747734B5": {
+      "ledger": 19500967,
+      "type": "EscrowFinish",
+      "result": "tesSUCCESS"
+    },
+    "55B4703F0EFC57A8A2E0B762CD03E6BEF65012D83F116A30B8DECC0E1A64DAE4": {
+      "ledger": 19636048,
+      "type": "EscrowCancel",
+      "result": "tesSUCCESS"
+    },
+    "E4C5B9949E1883FB5DF1264F798F1D832B024884C82ABEA31557F1C9628100A2": {
+      "ledger": 19636036,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "765CA5103C059312A300F2D25EC81F3DB83E4F156203F4C4DE0473C2B5BD3656": {
+      "ledger": 15923872,
+      "type": "EscrowFinish",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "escrow_cancel": {
+      "ledger": 19636048,
+      "hash": "55B4703F0EFC57A8A2E0B762CD03E6BEF65012D83F116A30B8DECC0E1A64DAE4",
+      "type": "EscrowCancel",
+      "note": "XRPL Testnet: not found on mainnet. The destination rEPjvJTn9i3S5rKRueJAFVydUh1yEEvkQm cancels an MPT escrow of rJwGT5SySdaf3KRjxgZdZ6VqWc8cwiV4r7, who had put in all it held: its MPToken PreviousFields {LockedAmount: \"10000\"} alone, MPTAmount \"10000\" only in FinalFields (an added field); the issuance's LockedAmount listed and gone from FinalFields, OutstandingAmount unchanged. Its create is the supporting E4C5B994..."
+    },
+    "escrow_create_transfer_fee": {
+      "ledger": 19500962,
+      "hash": "4245906360EA53103ADCC3CD8992244F37D5BF5961113AFD3C92CF2774CB0EDA",
+      "type": "EscrowCreate",
+      "note": "XRPL Testnet: an MPT escrow of an issuance with TransferFee 100: Amount 10000, the Escrow node has TransferRate 1001000000. A first escrow: MPToken PreviousFields {MPTAmount: \"100000\"} alone, MPTokenIssuance PreviousFields {}"
+    },
+    "escrow_finish_transfer_fee": {
+      "ledger": 19500967,
+      "hash": "23DC3FC19583A603E197270E12B732A77488B54AD9C99F69596DB70F747734B5",
+      "type": "EscrowFinish",
+      "note": "XRPL Testnet: the finish of escrow_create_transfer_fee charges the fee out of the locked amount: the destination gets 9990 of 10000 (first credit, PreviousFields {}), the owner's and the issuance's LockedAmount fall by 10000 and leave FinalFields, OutstandingAmount falls by 10 (100000 to 99990)"
+    },
+    "escrow_finish_creates_token": {
+      "ledger": 15923872,
+      "hash": "765CA5103C059312A300F2D25EC81F3DB83E4F156203F4C4DE0473C2B5BD3656",
+      "type": "EscrowFinish",
+      "note": "XRPL Testnet: the destination rfoTRBR67tKfDm4TbqBikAbTkzkK4t4qjk finishes it and has no MPToken yet: CreatedNode MPToken with MPTAmount \"9990\" in NewFields, 9990 of 10000 (TransferFee 100); OutstandingAmount 100000 to 99990"
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 15923872,
+      "bytes": 12500,
+      "gzipBytes": 3616
+    },
+    {
+      "ledger": 19500962,
+      "bytes": 5843,
+      "gzipBytes": 2168
+    },
+    {
+      "ledger": 19500967,
+      "bytes": 6282,
+      "gzipBytes": 2149
+    },
+    {
+      "ledger": 19636036,
+      "bytes": 25260,
+      "gzipBytes": 7478
+    },
+    {
+      "ledger": 19636048,
+      "bytes": 21014,
+      "gzipBytes": 6727
+    }
+  ]
+}

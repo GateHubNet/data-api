@@ -636,12 +636,14 @@ describe('StateTouchesParser over the recorded cases', () => {
       ['xrpl/objects', XRPL],
       ['xrpl/path-payments', XRPL],
       ['xrpl/state-touches', XRPL],
+      ['xrpl/mpt', XRPL],
       ['xahau/recorded', XAHAU],
       ['xahau/flag', XAHAU],
       ['xahau/uritoken', XAHAU],
       ['xahau/objects', XAHAU],
       ['xahau/mint', XAHAU],
       ['xrpl-testnet/recorded', XRPL_TESTNET],
+      ['xrpl-testnet/mpt', XRPL_TESTNET],
       ['xahau-testnet/recorded', XAHAU_TESTNET],
     ];
 

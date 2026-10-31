@@ -1,0 +1,412 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://s2.ripple.com",
+  "recorded_at": "2026-10-31T15:51:37.413Z",
+  "validated_head": 108026259,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "68D137B937AE7C6EF558DBDDC307B3BC6FADEB3C2F038DDAA3D36BF93C1FDF9E": {
+      "ledger": 99337721,
+      "type": "MPTokenIssuanceCreate",
+      "result": "tesSUCCESS"
+    },
+    "B95BDC99AF0F038B7B60FC60BE5C70BCD87F5182C68E6BF97F996739E6CEAEA1": {
+      "ledger": 106427568,
+      "type": "MPTokenIssuanceCreate",
+      "result": "tesSUCCESS"
+    },
+    "542F24F494DF60DA2A5929897FE852221045C0FB6CB028B9D15CCE01BB6AA1FC": {
+      "ledger": 103864099,
+      "type": "MPTokenIssuanceCreate",
+      "result": "tesSUCCESS"
+    },
+    "3CE646A68D56F2CC959D0207815E368FA7E122A5E61B3810703ADAD8A058AC68": {
+      "ledger": 100825095,
+      "type": "MPTokenIssuanceCreate",
+      "result": "tesSUCCESS"
+    },
+    "C166A16A2188E5BBD9EE2D73BEE9798515027FF894F5FBA91FA01BE5819F8EC3": {
+      "ledger": 107211753,
+      "type": "MPTokenIssuanceSet",
+      "result": "tesSUCCESS"
+    },
+    "90094A7658143819679C7D81FC282F4BD47C2F64FDDAA6D03B40A02002E36EB5": {
+      "ledger": 107211755,
+      "type": "MPTokenIssuanceSet",
+      "result": "tesSUCCESS"
+    },
+    "5DB41F975E3AC04DD4AE9E93764AFBBABB0E4C7322B2D6F2E84B253FAA170BF3": {
+      "ledger": 99557866,
+      "type": "MPTokenIssuanceSet",
+      "result": "tesSUCCESS"
+    },
+    "9E8E4942CB82D3BAF55E3873D297C5B2241ED251AFE8B186DB9FDA42279D4A8B": {
+      "ledger": 105916049,
+      "type": "MPTokenIssuanceDestroy",
+      "result": "tesSUCCESS"
+    },
+    "B9DEF907D9D931A316C89EAB3278EC8C55AFFF86BDBFF475188A537AE1426530": {
+      "ledger": 105827852,
+      "type": "MPTokenAuthorize",
+      "result": "tesSUCCESS"
+    },
+    "D3DD0FD6F6CB18411950864C79BD3EA6EBE976D2A303C206F9D45A84862B15EF": {
+      "ledger": 105827859,
+      "type": "MPTokenAuthorize",
+      "result": "tesSUCCESS"
+    },
+    "7ED410EEF5D92F11831E41A464203F78945EF632B687928129E74FCA24F155EE": {
+      "ledger": 105916049,
+      "type": "MPTokenAuthorize",
+      "result": "tesSUCCESS"
+    },
+    "B0180041927546FF6673C8A678289647CD461557F7B956848F33FEED0F799D0F": {
+      "ledger": 104794908,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "4D9BB2A0B0289D36A995B10AB17D5BE9B19E961B777AFDE29D84CC59384E74F6": {
+      "ledger": 105827909,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "21B46565FD7B5D609EF6C1B36598608C4F3809E5F9774C2F34C403E305A8295A": {
+      "ledger": 104261693,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "80C74925827B059CA14F2C7C4E01F8DE37C5502648CE20DE90B35827E73D503E": {
+      "ledger": 99251687,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "9219729CC7AF29AB5BC67EF94BAA9A818A4F0D60711E50BC06E11919C0DE7C58": {
+      "ledger": 101491684,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "F7B0BE5AA088F02BCC6F15BF3B58D37153FB041D8C5E5A29F126BBB1738DD87D": {
+      "ledger": 105827538,
+      "type": "Payment",
+      "result": "tecNO_AUTH"
+    },
+    "01D099632560B0D854D1843A064E61148AD5A131A4866279D0AB8CF9ACF71D6B": {
+      "ledger": 105916048,
+      "type": "Clawback",
+      "result": "tesSUCCESS"
+    },
+    "5F279C8E57CEA1A0F3E017155E7C4EBFDBC8B458F68E35BE93CAD122FF82035E": {
+      "ledger": 107541378,
+      "type": "Clawback",
+      "result": "tesSUCCESS"
+    },
+    "4DFC30E6EE88AF6CE5718368A5F599158809E05584AF86C2E8E8101229A50523": {
+      "ledger": 107211745,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "40D8B7B72377D423DFB41756AD619C15CEC2B61CE7F56A7FD6405F7F8BE080E1": {
+      "ledger": 107211749,
+      "type": "EscrowFinish",
+      "result": "tesSUCCESS"
+    },
+    "B406BE4AB3CABF8C76FD2653D4C83311FEB2F950D02906A95D2B3F3A818AFE50": {
+      "ledger": 99558158,
+      "type": "MPTokenIssuanceSet",
+      "result": "tesSUCCESS"
+    },
+    "56133344D8A327F2602CF9A86EEB327B10FA16F7EFBD7805B6F759EE74E78FB4": {
+      "ledger": 107211747,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "CDA244FDA8F78E6EAB40EA6E6879DB0DA0E0C22208F6791D10D5AA4FFD74A118": {
+      "ledger": 107211751,
+      "type": "EscrowFinish",
+      "result": "tesSUCCESS"
+    },
+    "C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8": {
+      "ledger": 85885429,
+      "type": "Clawback",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "issuance_create": {
+      "ledger": 99337721,
+      "hash": "68D137B937AE7C6EF558DBDDC307B3BC6FADEB3C2F038DDAA3D36BF93C1FDF9E",
+      "type": "MPTokenIssuanceCreate",
+      "note": "rBEERdzDHqDyYmfw2jqzyMNBZu31yzfg6q creates an issuance with every field: TransferFee 192, AssetScale 4, MaximumAmount 1000000000000, flags 126, XLS-89 long-key metadata. meta.mpt_issuance_id 03F907F2... is Sequence 66652146 and the issuer"
+    },
+    "issuance_create_short_keys": {
+      "ledger": 106427568,
+      "hash": "B95BDC99AF0F038B7B60FC60BE5C70BCD87F5182C68E6BF97F996739E6CEAEA1",
+      "type": "MPTokenIssuanceCreate",
+      "note": "rLFUzo23kPsxeMfJ8FPixizEREUhNVf66g: XLS-89 short-key metadata (t, n, d, i, ac, in, us), TransferFee 5000, AssetScale 1, flags 56"
+    },
+    "issuance_create_raw_metadata": {
+      "ledger": 103864099,
+      "hash": "542F24F494DF60DA2A5929897FE852221045C0FB6CB028B9D15CCE01BB6AA1FC",
+      "type": "MPTokenIssuanceCreate",
+      "note": "rNX4faQ35SdtE4rDoEg8YeVLQKQ57AYyCt: MPTokenMetadata is a URL as text, not JSON"
+    },
+    "issuance_create_no_max": {
+      "ledger": 100825095,
+      "hash": "3CE646A68D56F2CC959D0207815E368FA7E122A5E61B3810703ADAD8A058AC68",
+      "type": "MPTokenIssuanceCreate",
+      "note": "rLKfWwLeimLe69mrTr3MygNavDxL8tjuUX: no MaximumAmount, and none in NewFields"
+    },
+    "issuance_set_lock_holder": {
+      "ledger": 107211753,
+      "hash": "C166A16A2188E5BBD9EE2D73BEE9798515027FF894F5FBA91FA01BE5819F8EC3",
+      "type": "MPTokenIssuanceSet",
+      "note": "rJgwiVNzEEgtXngyi4bhSVkVLhWWu7UqfS locks rBoJ7MWPXiejVbqCRhiVgGcaXAHXVstCD4: MPToken Flags 2 to 3, PreviousFields only {Flags}; MPTAmount 45000000 stays"
+    },
+    "issuance_set_unlock_holder": {
+      "ledger": 107211755,
+      "hash": "90094A7658143819679C7D81FC282F4BD47C2F64FDDAA6D03B40A02002E36EB5",
+      "type": "MPTokenIssuanceSet",
+      "note": "The same issuer unlocks the same holder two ledgers later: MPToken Flags 3 to 2"
+    },
+    "issuance_set_lock_all": {
+      "ledger": 99557866,
+      "hash": "5DB41F975E3AC04DD4AE9E93764AFBBABB0E4C7322B2D6F2E84B253FAA170BF3",
+      "type": "MPTokenIssuanceSet",
+      "note": "rNFta7UKwcoiCpxEYbhH2v92numE3cceB6 locks every balance: no Holder, the MPTokenIssuance's Flags 122 to 123 is the only MPT node"
+    },
+    "issuance_destroy": {
+      "ledger": 105916049,
+      "hash": "9E8E4942CB82D3BAF55E3873D297C5B2241ED251AFE8B186DB9FDA42279D4A8B",
+      "type": "MPTokenIssuanceDestroy",
+      "note": "rwA8orrVtNPuBykRvQdDJzRDQbe7CuxCiR destroys its issuance with a ticket (Sequence 0): DeletedNode with FinalFields, OutstandingAmount \"0\", no PreviousFields. The holder's MPToken still exists"
+    },
+    "authorize_holder": {
+      "ledger": 105827852,
+      "hash": "B9DEF907D9D931A316C89EAB3278EC8C55AFFF86BDBFF475188A537AE1426530",
+      "type": "MPTokenAuthorize",
+      "note": "rMNysCkYEX9L3SrSPqavVVXYFT2v5CEVpo opts in: CreatedNode MPToken whose NewFields are only Account and MPTokenIssuanceID (no Flags, no MPTAmount)"
+    },
+    "authorize_by_issuer": {
+      "ledger": 105827859,
+      "hash": "D3DD0FD6F6CB18411950864C79BD3EA6EBE976D2A303C206F9D45A84862B15EF",
+      "type": "MPTokenAuthorize",
+      "note": "rwA8orr... authorizes rMNysCk...: MPToken Flags 0 to 2, PreviousFields {Flags: 0}. Same issuance as authorize_holder, unauthorize_holder, payment_mint, payment_failed, clawback_full and issuance_destroy"
+    },
+    "unauthorize_holder": {
+      "ledger": 105916049,
+      "hash": "7ED410EEF5D92F11831E41A464203F78945EF632B687928129E74FCA24F155EE",
+      "type": "MPTokenAuthorize",
+      "note": "rMNysCk... opts out: DeletedNode MPToken with FinalFields (Account, Flags 2, MPTokenIssuanceID, OwnerNode), no MPTAmount and no PreviousFields"
+    },
+    "payment_holder_to_holder": {
+      "ledger": 104794908,
+      "hash": "B0180041927546FF6673C8A678289647CD461557F7B956848F33FEED0F799D0F",
+      "type": "Payment",
+      "note": "No fee: two MPToken nodes, no MPTokenIssuance node. The sender's balance goes to absent: FinalFields without MPTAmount, PreviousFields MPTAmount \"100000\""
+    },
+    "payment_mint": {
+      "ledger": 105827909,
+      "hash": "4D9BB2A0B0289D36A995B10AB17D5BE9B19E961B777AFDE29D84CC59384E74F6",
+      "type": "Payment",
+      "note": "A holder's first credit: ModifiedNode MPToken with PreviousFields {} (present and empty), FinalFields MPTAmount \"1\"; the issuance's OutstandingAmount \"0\" to \"1\""
+    },
+    "payment_redeem": {
+      "ledger": 104261693,
+      "hash": "21B46565FD7B5D609EF6C1B36598608C4F3809E5F9774C2F34C403E305A8295A",
+      "type": "Payment",
+      "note": "To the issuer: OutstandingAmount \"1\" to \"0\", the holder's MPTAmount listed \"1\" and absent from FinalFields"
+    },
+    "payment_transfer_fee": {
+      "ledger": 99251687,
+      "hash": "80C74925827B059CA14F2C7C4E01F8DE37C5502648CE20DE90B35827E73D503E",
+      "type": "Payment",
+      "note": "TransferFee 589: Amount 1000000, SendMax 1062500. The sender falls by 1005890, the destination rises by 1000000, OutstandingAmount falls by 5890 (the fee is burned). Delivered is Amount, so no DeliveredAmount; before fixMPTDeliveredAmount too"
+    },
+    "payment_before_delivered_fix": {
+      "ledger": 101491684,
+      "hash": "9219729CC7AF29AB5BC67EF94BAA9A818A4F0D60711E50BC06E11919C0DE7C58",
+      "type": "Payment",
+      "note": "Before fixMPTDeliveredAmount (ledger 101852417): no DeliveredAmount; the node serves delivered_amount {value: \"1\"} all the same. Also a first credit (PreviousFields {})"
+    },
+    "payment_failed": {
+      "ledger": 105827538,
+      "hash": "F7B0BE5AA088F02BCC6F15BF3B58D37153FB041D8C5E5A29F126BBB1738DD87D",
+      "type": "Payment",
+      "note": "tecNO_AUTH: the holder has no MPToken yet. No MPT node in the metadata, no delivered_amount"
+    },
+    "clawback_full": {
+      "ledger": 105916048,
+      "hash": "01D099632560B0D854D1843A064E61148AD5A131A4866279D0AB8CF9ACF71D6B",
+      "type": "Clawback",
+      "note": "rwA8orr... takes 1 of 1 from rMNysCk... with a ticket: MPTAmount listed \"1\", absent from FinalFields; OutstandingAmount \"1\" to \"0\""
+    },
+    "clawback_partial": {
+      "ledger": 107541378,
+      "hash": "5F279C8E57CEA1A0F3E017155E7C4EBFDBC8B458F68E35BE93CAD122FF82035E",
+      "type": "Clawback",
+      "note": "rNd7q6Wn8hV8Wm6GBhbgSxiibHU2VVFxDF takes 1000000 of 4000000: MPTAmount \"4000000\" to \"3000000\"; OutstandingAmount falls alike. A Batch inner transaction (tfInnerBatchTxn in Flags, Fee 0)"
+    },
+    "clawback_issued": {
+      "ledger": 85885429,
+      "hash": "C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8",
+      "type": "Clawback",
+      "note": "An issued-token Clawback, as in xrpl/state-touches, recorded again for decision 8: RippleState Balance -1 to 0, no MPT node"
+    },
+    "escrow_create": {
+      "ledger": 107211745,
+      "hash": "4DFC30E6EE88AF6CE5718368A5F599158809E05584AF86C2E8E8101229A50523",
+      "type": "EscrowCreate",
+      "note": "A holder's first escrow: MPToken PreviousFields {MPTAmount: \"954219\"} alone, LockedAmount \"277073\" only in FinalFields; MPTokenIssuance PreviousFields {} and LockedAmount \"277073\" only in FinalFields; OutstandingAmount unchanged"
+    },
+    "escrow_finish": {
+      "ledger": 107211749,
+      "hash": "40D8B7B72377D423DFB41756AD619C15CEC2B61CE7F56A7FD6405F7F8BE080E1",
+      "type": "EscrowFinish",
+      "note": "Of escrow_create: the owner's and the issuance's LockedAmount both 318073 to 41000, the destination's first credit (PreviousFields {}), OutstandingAmount unchanged, no fee (no TransferFee on this issuance)"
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 85885429,
+      "bytes": 281340,
+      "gzipBytes": 61066
+    },
+    {
+      "ledger": 99226369,
+      "bytes": 505034,
+      "gzipBytes": 56700
+    },
+    {
+      "ledger": 99251687,
+      "bytes": 456549,
+      "gzipBytes": 78393
+    },
+    {
+      "ledger": 99337721,
+      "bytes": 263092,
+      "gzipBytes": 46499
+    },
+    {
+      "ledger": 99557866,
+      "bytes": 276202,
+      "gzipBytes": 54128
+    },
+    {
+      "ledger": 99558158,
+      "bytes": 220459,
+      "gzipBytes": 43626
+    },
+    {
+      "ledger": 100825095,
+      "bytes": 198447,
+      "gzipBytes": 39952
+    },
+    {
+      "ledger": 101491684,
+      "bytes": 278894,
+      "gzipBytes": 58717
+    },
+    {
+      "ledger": 101852417,
+      "bytes": 344779,
+      "gzipBytes": 70627
+    },
+    {
+      "ledger": 102204929,
+      "bytes": 286675,
+      "gzipBytes": 60245
+    },
+    {
+      "ledger": 103864099,
+      "bytes": 340559,
+      "gzipBytes": 72545
+    },
+    {
+      "ledger": 104261693,
+      "bytes": 225688,
+      "gzipBytes": 45120
+    },
+    {
+      "ledger": 104794908,
+      "bytes": 91885,
+      "gzipBytes": 21402
+    },
+    {
+      "ledger": 105827538,
+      "bytes": 121426,
+      "gzipBytes": 28663
+    },
+    {
+      "ledger": 105827852,
+      "bytes": 81851,
+      "gzipBytes": 20167
+    },
+    {
+      "ledger": 105827859,
+      "bytes": 192679,
+      "gzipBytes": 37428
+    },
+    {
+      "ledger": 105827909,
+      "bytes": 114638,
+      "gzipBytes": 27403
+    },
+    {
+      "ledger": 105916048,
+      "bytes": 98750,
+      "gzipBytes": 21060
+    },
+    {
+      "ledger": 105916049,
+      "bytes": 180940,
+      "gzipBytes": 38442
+    },
+    {
+      "ledger": 106427568,
+      "bytes": 416701,
+      "gzipBytes": 90176
+    },
+    {
+      "ledger": 107211745,
+      "bytes": 248419,
+      "gzipBytes": 50620
+    },
+    {
+      "ledger": 107211747,
+      "bytes": 154386,
+      "gzipBytes": 30753
+    },
+    {
+      "ledger": 107211749,
+      "bytes": 254159,
+      "gzipBytes": 47152
+    },
+    {
+      "ledger": 107211751,
+      "bytes": 297982,
+      "gzipBytes": 57417
+    },
+    {
+      "ledger": 107211753,
+      "bytes": 191929,
+      "gzipBytes": 41138
+    },
+    {
+      "ledger": 107211755,
+      "bytes": 113166,
+      "gzipBytes": 23637
+    },
+    {
+      "ledger": 107541378,
+      "bytes": 119096,
+      "gzipBytes": 23761
+    }
+  ]
+}

@@ -61,6 +61,8 @@ data.
 
 ## 1. How it looks on the ledger
 
+> **Dated note (2026-10-31, D9's Task 1).** The recorded cases correct this section; the evidence is in `packages/shared/test/fixtures/xrpl/mpt/FINDINGS.md`. `DeliveredAmount` is stored only when less than `Amount` was delivered (on none of 1,508 MPT payments read after fixMPTDeliveredAmount), and `delivered_amount` is served before the fix too, so the existing rule stands. `EscrowFinish` charges the transfer fee out of the locked amount when neither end is the issuer, as section 4.2 has it. MPT escrows exist on mainnet (59 creates, 5 finishes, no cancel). XRPL Testnet does not have `DynamicMPT`.
+
 Task 1 of the plan confirms each fact against recorded mainnet transactions and writes what differs into `FINDINGS.md`.
 
 **Enablement on XRPL mainnet** (`packages/shared/config/amendments/xrpl.json`, which agrees with xrpscan's list on 2026-10-24; Task 1
@@ -307,6 +309,8 @@ issuer }`, which throws on anything but 48 hex digits; `isMptIssuanceId(text)`),
 parser stays pure on deep-frozen input. `PARSER_VERSION` moves to the new version.
 
 ### 4.1 `MptParser.parse(t, ctx): { issuanceStates, holderStates, transfers }`
+
+> **Dated note (2026-10-31, ruling C3).** "Modified with `PreviousFields`" tests for the key, not for a listed field: a first credit and an issuance's first escrow are modified nodes with `PreviousFields: {}`, and an added field is never listed. So the "before" of `MPTAmount` is the listed value, else 0 when the transaction is a success crediting this holder (Payment destination, EscrowFinish destination, EscrowCancel owner), else the final value; of `LockedAmount`, on token and issuance, the listed value, else 0 on a successful EscrowCreate by this holder of this issuance, else the final value. Conservation is the arbiter. A flag test masks `tfInnerBatchTxn` (0x40000000).
 
 - **States**, whatever the transaction's result: one `ParsedMptIssuanceState` per created, modified (with `PreviousFields`) or deleted
   `MPTokenIssuance` node, its ID built from its `Issuer` and `Sequence`; one `ParsedMptHolderState` per such `MPToken` node, its ID

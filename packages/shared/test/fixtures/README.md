@@ -13,12 +13,14 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xrpl/account-domains/`        | Mainnet AccountSets that set and change a Domain (see "Account domains").                        |
 | `xrpl/state-touches/`          | Mainnet AccountSets (TransferRate, AllowTrustLineClawback) and a Clawback (see "State touches"). |
 | `xrpl/nft/`                    | Mainnet NFToken transactions, one ledger per named case (see below).                             |
+| `xrpl/mpt/`                    | Mainnet MPT transactions, one ledger per named case, and the enable ledgers (see below).         |
 | `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).                    |
 | `xrpl/objects/`                | Mainnet escrow, check, payment channel and delegation cases (see below).                         |
 | `xahau/objects/`               | Xahau escrow, check and payment channel cases (see below).                                       |
 | `xahau/mint/`                  | Xahau Imports with their parent ledgers, and two hand-made mint ledgers (see "Xahau minting").   |
 | `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                                   |
 | `xrpl-testnet/recorded/`       | XRPL Testnet ledgers recorded from a public testnet node (see below).                            |
+| `xrpl-testnet/mpt/`            | XRPL Testnet: MPT escrow cases mainnet does not have: a cancel, a fee (see "XRPL MPT cases").    |
 | `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                           |
 | `xrpl/unl/`                    | Validator lists of the XRPL default publishers, as served (see "UNL lists").                     |
 | `xahau/unl/`                   | The validator list of the Xahau default publisher, as served (see "UNL lists").                  |
@@ -49,7 +51,7 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
-  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/`, `xrpl/account-domains/`, `xrpl/objects/`, `xahau/objects/`, `xahau/mint/` and `xrpl/state-touches/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
+  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/`, `xrpl/account-domains/`, `xrpl/objects/`, `xahau/objects/`, `xahau/mint/`, `xrpl/state-touches/`, `xrpl/mpt/` and `xrpl-testnet/mpt/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
@@ -565,6 +567,71 @@ Every case of the plan was found. Facts the ledgers show:
 - The AMM pool's own account root (`ammdeposit_lp_line`) changes `Balance` only, and the `AMM` node is not an account root: neither is a touch.
 - `meta.TransactionIndex` is the `tx_index` of a touch, not the position of the transaction in the expanded list (the Clawback is the 123rd of the 157 transactions of its
   ledger's list and has `TransactionIndex` 80).
+
+### XRPL MPT cases (`xrpl/mpt/`, `xrpl-testnet/mpt/`)
+
+Recorded 2026-10-31 from `wss://s2.ripple.com` (rippled mainnet, Clio 2.8.0, network id 0; validated head 108026259) with `--ledgers`, then `--txs`, and `--delay-ms 3000`, one request in flight:
+27 ledgers, 1.25 MB gzipped (largest 90 KB, ledger 106427568). `manifest.json` has the 22 cases found under `cases.<name>` as `{ledger, hash, type, note}` (the note says what the metadata shows) and the 25
+transactions under `txs`. Three of them are supporting, not cases: `B406BE4A…` (ledger 99558158, unlocks what `issuance_set_lock_all` locked), `56133344…` (107211747, a second escrow) and `CDA244FD…` (107211751, the last finish, where
+`LockedAmount` leaves `FinalFields`). `xrpl/mpt/FINDINGS.md` answers the facts of spec §1, each with its case, field and value. `src/parsers/mpt-fixtures.spec.ts` pins what every case is for and the shape of an added field.
+
+MPT is rare, so `--want` was not used and nothing of mainnet's state was walked. The issuers came from a public listing (`api.xrpscan.com`, 113 issuers), used for addresses only; the hashes from `account_tx` of those issuers (a throwaway script, not in the repository), 3,796 MPT transactions in all. The node answered `slowDown` three times during that search; each run stopped there and resumed minutes later, 8 s apart at the end. Recorded with (in batches of eight or nine, about 90 s apart):
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint wss://s2.ripple.com \
+  --out test/fixtures/xrpl/mpt --delay-ms 3000 --ledgers 99226369,101852417,102204929
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint wss://s2.ripple.com \
+  --out test/fixtures/xrpl/mpt --delay-ms 3000 --txs 68D137B937AE7C6EF558DBDDC307B3BC6FADEB3C2F038DDAA3D36BF93C1FDF9E,B95BDC99AF0F038B7B60FC60BE5C70BCD87F5182C68E6BF97F996739E6CEAEA1,542F24F494DF60DA2A5929897FE852221045C0FB6CB028B9D15CCE01BB6AA1FC,3CE646A68D56F2CC959D0207815E368FA7E122A5E61B3810703ADAD8A058AC68,C166A16A2188E5BBD9EE2D73BEE9798515027FF894F5FBA91FA01BE5819F8EC3,90094A7658143819679C7D81FC282F4BD47C2F64FDDAA6D03B40A02002E36EB5,5DB41F975E3AC04DD4AE9E93764AFBBABB0E4C7322B2D6F2E84B253FAA170BF3,9E8E4942CB82D3BAF55E3873D297C5B2241ED251AFE8B186DB9FDA42279D4A8B,B9DEF907D9D931A316C89EAB3278EC8C55AFFF86BDBFF475188A537AE1426530,D3DD0FD6F6CB18411950864C79BD3EA6EBE976D2A303C206F9D45A84862B15EF,7ED410EEF5D92F11831E41A464203F78945EF632B687928129E74FCA24F155EE,B0180041927546FF6673C8A678289647CD461557F7B956848F33FEED0F799D0F,4D9BB2A0B0289D36A995B10AB17D5BE9B19E961B777AFDE29D84CC59384E74F6,21B46565FD7B5D609EF6C1B36598608C4F3809E5F9774C2F34C403E305A8295A,80C74925827B059CA14F2C7C4E01F8DE37C5502648CE20DE90B35827E73D503E,9219729CC7AF29AB5BC67EF94BAA9A818A4F0D60711E50BC06E11919C0DE7C58,F7B0BE5AA088F02BCC6F15BF3B58D37153FB041D8C5E5A29F126BBB1738DD87D,01D099632560B0D854D1843A064E61148AD5A131A4866279D0AB8CF9ACF71D6B,5F279C8E57CEA1A0F3E017155E7C4EBFDBC8B458F68E35BE93CAD122FF82035E,4DFC30E6EE88AF6CE5718368A5F599158809E05584AF86C2E8E8101229A50523,40D8B7B72377D423DFB41756AD619C15CEC2B61CE7F56A7FD6405F7F8BE080E1,B406BE4AB3CABF8C76FD2653D4C83311FEB2F950D02906A95D2B3F3A818AFE50,56133344D8A327F2602CF9A86EEB327B10FA16F7EFBD7805B6F759EE74E78FB4,CDA244FDA8F78E6EAB40EA6E6879DB0DA0E0C22208F6791D10D5AA4FFD74A118,C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8
+```
+
+| Case                           | Ledger    | Transaction                                                        | What it shows                                                                                                       |
+| ------------------------------ | --------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `issuance_create`              | 99337721  | `68D137B937AE7C6EF558DBDDC307B3BC6FADEB3C2F038DDAA3D36BF93C1FDF9E` | Every field: `TransferFee` 192, `AssetScale` 4, `MaximumAmount`, flags 126; XLS-89 long keys in the metadata        |
+| `issuance_create_short_keys`   | 106427568 | `B95BDC99AF0F038B7B60FC60BE5C70BCD87F5182C68E6BF97F996739E6CEAEA1` | XLS-89 short keys (`t`, `n`, `d`, `i`, `ac`, `in`, `us`); `TransferFee` 5000                                        |
+| `issuance_create_raw_metadata` | 103864099 | `542F24F494DF60DA2A5929897FE852221045C0FB6CB028B9D15CCE01BB6AA1FC` | `MPTokenMetadata` is a URL as text, not JSON                                                                        |
+| `issuance_create_no_max`       | 100825095 | `3CE646A68D56F2CC959D0207815E368FA7E122A5E61B3810703ADAD8A058AC68` | No `MaximumAmount`, in the transaction or in `NewFields`                                                            |
+| `issuance_set_lock_holder`     | 107211753 | `C166A16A2188E5BBD9EE2D73BEE9798515027FF894F5FBA91FA01BE5819F8EC3` | One holder: `MPToken` `Flags` 2 to 3, nothing else listed                                                           |
+| `issuance_set_unlock_holder`   | 107211755 | `90094A7658143819679C7D81FC282F4BD47C2F64FDDAA6D03B40A02002E36EB5` | The same holder, `Flags` 3 to 2                                                                                     |
+| `issuance_set_lock_all`        | 99557866  | `5DB41F975E3AC04DD4AE9E93764AFBBABB0E4C7322B2D6F2E84B253FAA170BF3` | No `Holder`: `MPTokenIssuance` `Flags` 122 to 123 is the only MPT node                                              |
+| `issuance_destroy`             | 105916049 | `9E8E4942CB82D3BAF55E3873D297C5B2241ED251AFE8B186DB9FDA42279D4A8B` | `DeletedNode` with `FinalFields`, `OutstandingAmount` "0"; sent with a ticket                                       |
+| `authorize_holder`             | 105827852 | `B9DEF907D9D931A316C89EAB3278EC8C55AFFF86BDBFF475188A537AE1426530` | `CreatedNode` `MPToken` with `Account` and `MPTokenIssuanceID` alone                                                |
+| `authorize_by_issuer`          | 105827859 | `D3DD0FD6F6CB18411950864C79BD3EA6EBE976D2A303C206F9D45A84862B15EF` | `Holder` set: `MPToken` `Flags` 0 to 2                                                                              |
+| `unauthorize_holder`           | 105916049 | `7ED410EEF5D92F11831E41A464203F78945EF632B687928129E74FCA24F155EE` | `tfMPTUnauthorize`: `DeletedNode` `MPToken` with `FinalFields`, no `MPTAmount`                                      |
+| `payment_holder_to_holder`     | 104794908 | `B0180041927546FF6673C8A678289647CD461557F7B956848F33FEED0F799D0F` | No fee: two `MPToken` nodes, no `MPTokenIssuance` node                                                              |
+| `payment_mint`                 | 105827909 | `4D9BB2A0B0289D36A995B10AB17D5BE9B19E961B777AFDE29D84CC59384E74F6` | First credit: `MPToken` `PreviousFields` `{}`, `FinalFields.MPTAmount` "1"; `OutstandingAmount` "0" to "1"          |
+| `payment_redeem`               | 104261693 | `21B46565FD7B5D609EF6C1B36598608C4F3809E5F9774C2F34C403E305A8295A` | To the issuer: `OutstandingAmount` "1" to "0"; `MPTAmount` listed, absent after                                     |
+| `payment_transfer_fee`         | 99251687  | `80C74925827B059CA14F2C7C4E01F8DE37C5502648CE20DE90B35827E73D503E` | `TransferFee` 589, `SendMax` 1062500: sender -1005890, destination +1000000, `OutstandingAmount` -5890              |
+| `payment_before_delivered_fix` | 101491684 | `9219729CC7AF29AB5BC67EF94BAA9A818A4F0D60711E50BC06E11919C0DE7C58` | Below 101852417: no `DeliveredAmount`; the node serves `delivered_amount` all the same                              |
+| `payment_failed`               | 105827538 | `F7B0BE5AA088F02BCC6F15BF3B58D37153FB041D8C5E5A29F126BBB1738DD87D` | `tecNO_AUTH`: no MPT node, no `delivered_amount`                                                                    |
+| `clawback_full`                | 105916048 | `01D099632560B0D854D1843A064E61148AD5A131A4866279D0AB8CF9ACF71D6B` | Takes 1 of 1: `MPTAmount` listed, absent after; `OutstandingAmount` "1" to "0"                                      |
+| `clawback_partial`             | 107541378 | `5F279C8E57CEA1A0F3E017155E7C4EBFDBC8B458F68E35BE93CAD122FF82035E` | Takes 1000000 of 4000000; a Batch inner transaction                                                                 |
+| `clawback_issued`              | 85885429  | `C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8` | An issued-token `Clawback` (recorded again from `xrpl/state-touches`)                                               |
+| `escrow_create`                | 107211745 | `4DFC30E6EE88AF6CE5718368A5F599158809E05584AF86C2E8E8101229A50523` | First escrow: `MPToken` lists `MPTAmount` alone, `MPTokenIssuance` lists `{}`; `LockedAmount` only in `FinalFields` |
+| `escrow_finish`                | 107211749 | `40D8B7B72377D423DFB41756AD619C15CEC2B61CE7F56A7FD6405F7F8BE080E1` | Of `escrow_create`: both `LockedAmount`s 318073 to 41000, the destination's first credit (`{}`), no fee             |
+
+| Enable ledger | Closed               | Size  | Amendments of this plan                                        |
+| ------------- | -------------------- | ----- | -------------------------------------------------------------- |
+| 99226369      | 2025-10-01T13:13:10Z | 57 KB | `MPTokensV1`                                                   |
+| 101852417     | 2026-01-27T22:20:10Z | 71 KB | `fixMPTDeliveredAmount`, `fixTokenEscrowV1` (and three others) |
+| 102204929     | 2026-02-12T21:24:40Z | 60 KB | `TokenEscrow`                                                  |
+
+**XRPL Testnet** (`xrpl-testnet/mpt/`): no mainnet escrow read has a `TransferRate`, so the fee of `EscrowFinish` and `escrow_cancel` were searched there. Recorded 2026-10-31 from `wss://clio.altnet.rippletest.net:51233` (Clio 2.8.0, network id 1; validated head 21966420): 5 ledgers, 22 KB gzipped. The accounts came from a bounded sample of `ledger_data` on the testnet (453 pages, a small part of its state), then `account_tx`, 1,978 MPT transactions in all. Its `manifest.json` has `escrow_cancel`, three cases the plan did not name, and one supporting transaction, the create of `escrow_cancel` (`E4C5B994…`, ledger 19636036).
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl-testnet --endpoint wss://clio.altnet.rippletest.net:51233 \
+  --out test/fixtures/xrpl-testnet/mpt --delay-ms 3000 --txs 4245906360EA53103ADCC3CD8992244F37D5BF5961113AFD3C92CF2774CB0EDA,23DC3FC19583A603E197270E12B732A77488B54AD9C99F69596DB70F747734B5,55B4703F0EFC57A8A2E0B762CD03E6BEF65012D83F116A30B8DECC0E1A64DAE4,E4C5B9949E1883FB5DF1264F798F1D832B024884C82ABEA31557F1C9628100A2,765CA5103C059312A300F2D25EC81F3DB83E4F156203F4C4DE0473C2B5BD3656
+```
+
+| Case                          | Ledger   | Transaction                                                        | What it shows                                                                                                                  |
+| ----------------------------- | -------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `escrow_cancel`               | 19636048 | `55B4703F0EFC57A8A2E0B762CD03E6BEF65012D83F116A30B8DECC0E1A64DAE4` | Not on mainnet. The owner had put in all it held: `PreviousFields` `{ LockedAmount }` alone, `MPTAmount` only in `FinalFields` |
+| `escrow_create_transfer_fee`  | 19500962 | `4245906360EA53103ADCC3CD8992244F37D5BF5961113AFD3C92CF2774CB0EDA` | Of an issuance with `TransferFee` 100: `Amount` 10000, the `Escrow` has `TransferRate` 1001000000                              |
+| `escrow_finish_transfer_fee`  | 19500967 | `23DC3FC19583A603E197270E12B732A77488B54AD9C99F69596DB70F747734B5` | The destination gets 9990 of 10000; both `LockedAmount`s fall by 10000; `OutstandingAmount` 100000 to 99990                    |
+| `escrow_finish_creates_token` | 15923872 | `765CA5103C059312A300F2D25EC81F3DB83E4F156203F4C4DE0473C2B5BD3656` | The destination has no `MPToken` yet: `CreatedNode` with `MPTAmount` "9990" in `NewFields`                                     |
+
+Every case of the plan was found: 22 on mainnet and `escrow_cancel` on XRPL Testnet only. On mainnet no MPT escrow read was cancelled: of the 59, 5 are finished and 54 alive, and 38 of those cannot be cancelled before 2027. Nothing read shows a stored `DeliveredAmount` on an MPT payment, a fee payment after fixMPTDeliveredAmount, or a clawback that took less than it asked (see `FINDINGS.md`, section "Not found").
+
+Both directories join every test that walks a network's directories at this commit: `balance-changes.parser.spec.ts` and `object-changes.parser.spec.ts` read them by themselves (none of their ledgers holds a delegated transaction, so that count stays 8), and `state-touches.parser.spec.ts` has them in `SETS`.
 
 ### XRPL Testnet (`xrpl-testnet/recorded/`)
 
