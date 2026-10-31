@@ -78,6 +78,11 @@ export interface NetworkProfile {
    * mints nothing, its supply only falls. The supply reads the mints only where this is true. The key is in every profile.
    */
   readonly hasMinting: boolean;
+  /**
+   * Whether the network has multi-purpose tokens (`MPTokenIssuance`, `MPToken` and their transactions): the XRP Ledger and its
+   * testnet do; xahaud has no such amendment. Where this is false the MPT routes read no MPT table. The key is in every profile.
+   */
+  readonly hasMpt: boolean;
   /** The node software of the network: it decides how `server_version` is decoded. */
   software: 'rippled' | 'xahaud';
   /** Where a validator's domain publishes its TOML file. */
@@ -136,6 +141,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     hasDelegation: true,
     hasAmm: true,
     hasMinting: false,
+    hasMpt: true,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
     tomlNetworkNames: ['main', 'mainnet'],
@@ -163,6 +169,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     hasDelegation: false,
     hasAmm: false,
     hasMinting: true,
+    hasMpt: false,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
     tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
@@ -190,6 +197,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     hasDelegation: true,
     hasAmm: true,
     hasMinting: false,
+    hasMpt: true,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
     tomlNetworkNames: ['testnet'],
@@ -227,6 +235,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     hasDelegation: false,
     hasAmm: false,
     hasMinting: true,
+    hasMpt: false,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
     tomlNetworkNames: ['testnet', '21338'],

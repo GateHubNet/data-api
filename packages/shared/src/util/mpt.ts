@@ -1,4 +1,4 @@
-import { encodeAccountID } from 'ripple-address-codec';
+import { decodeAccountID, encodeAccountID } from 'ripple-address-codec';
 
 /** An `MPTokenIssuanceID` is 24 bytes: 48 hex digits (the case does not matter). */
 const MPT_ISSUANCE_ID = /^[0-9a-fA-F]{48}$/;
@@ -26,6 +26,24 @@ export function mptIssuerOf(issuanceId: string): string {
     throw new RangeError(`an MPTokenIssuanceID must be 48 hex digits: '${String(issuanceId)}'`);
   }
   return encodeAccountID(Buffer.from(issuanceId.slice(8, 48), 'hex'));
+}
+
+/**
+ * The `MPTokenIssuanceID` of an issuance, in upper case: its `Sequence` as a big-endian UInt32, then the issuer's AccountID.
+ * `sequence` is the node's, never `tx.Sequence`: a create sent with a ticket has `tx.Sequence` 0. Throws on a sequence that is
+ * not a UInt32 or an address that does not decode, so a parser guards what it reads from a ledger.
+ */
+export function mptIssuanceId(sequence: number, issuer: string): string {
+  const id = Buffer.alloc(24);
+  id.writeUInt32BE(sequence, 0);
+  Buffer.from(decodeAccountID(issuer)).copy(id, 4);
+  return id.toString('hex').toUpperCase();
+}
+
+/** The sequence and the issuer an ID holds. Throws `invalid mpt issuance id` unless `id` is 48 hex digits. */
+export function decodeMptIssuanceId(id: string): { sequence: number; issuer: string } {
+  if (!isMptIssuanceId(id)) throw new Error('invalid mpt issuance id');
+  return { sequence: Number.parseInt(id.slice(0, 8), 16), issuer: mptIssuerOf(id) };
 }
 
 /** The MPT amount object of `value` units of an issuance, the ID in upper case. Throws like `mptIssuerOf`. */

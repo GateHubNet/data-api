@@ -43,6 +43,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       hasDelegation: true,
       hasAmm: true,
       hasMinting: false,
+      hasMpt: true,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
       tomlNetworkNames: ['main', 'mainnet'],
@@ -70,6 +71,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       hasDelegation: false,
       hasAmm: false,
       hasMinting: true,
+      hasMpt: false,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
       tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
@@ -97,6 +99,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       hasDelegation: true,
       hasAmm: true,
       hasMinting: false,
+      hasMpt: true,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
       tomlNetworkNames: ['testnet'],
@@ -124,6 +127,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       hasDelegation: false,
       hasAmm: false,
       hasMinting: true,
+      hasMpt: false,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
       tomlNetworkNames: ['testnet', '21338'],
@@ -251,6 +255,17 @@ describe('network profiles', () => {
         for (const key of ['hasAmm', 'hasMinting']) {
           expect(Object.prototype.hasOwnProperty.call(getNetworkProfile(name), key)).toBe(true);
         }
+      }
+    });
+
+    it('hasMpt is true on xrpl and its testnet and false on Xahau and its testnet', () => {
+      // NETWORK_NAMES order: xrpl, xahau, xrpl-testnet, xahau-testnet
+      expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasMpt)).toEqual([true, false, true, false]);
+    });
+
+    it('has the hasMpt key on all four profiles', () => {
+      for (const name of NETWORK_NAMES) {
+        expect(Object.prototype.hasOwnProperty.call(getNetworkProfile(name), 'hasMpt')).toBe(true);
       }
     });
 

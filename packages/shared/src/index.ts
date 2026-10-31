@@ -96,6 +96,7 @@ export * from './util/currency-code';
 export * from './util/helpers';
 export * from './util/keylets';
 export * from './util/mpt';
+export * from './util/mpt-metadata';
 export * from './util/nftoken-id';
 export * from './util/quality';
 export * from './util/set-fee';
