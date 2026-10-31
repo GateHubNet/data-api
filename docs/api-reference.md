@@ -5293,6 +5293,73 @@ the hash, the ledger and time, the two parties, the delivered amount and the tag
 
 ---
 
+## MPT
+
+GateHub extras: the original knew no MPTokens (XLS-33). These routes serve the **MPT issuances** of the network: one issuance with its metadata, a lookup of several, the holders of an issuance by balance and its transfers, the issuances ranked by holders ([`GET /v2/tokens?kind=mpt`](#get-v2tokenskindmpt)) and the holdings of an account ([`GET /v2/accounts/{address}/mpt`](#get-v2accountsaddressmpt)). The issuances and their holders are aggregates that the syncer's `mpt_state` job keeps current from the state rows of the ledgers ([syncer](syncer.md)); the transfers are read from the ledgers. The design is in the [spec](superpowers/specs/2026-10-17-mpt-data-design.md).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these rules, whose shapes and key orders are ours and are pinned by tests:
+
+- **An MPT is its issuance ID**: 48 hex digits, in either case on a route and in upper case in an answer. It is `Sequence (4 bytes) | Issuer (20 bytes)`, so the ID names its issuer. A route that names an issuance checks the ID first: 400 `invalid mpt issuance id`. In every `(currency, issuer)` column and answer of the other routes an MPT is `currency` = the ID and `issuer` = the issuer the ID holds ([`/v2/payments`](#payments), [balance changes](#get-v2accountsaddressbalance_changes)), and such an asset is written `<48hex>` or `<48hex>+<issuer>`.
+- **Amounts are the ledger's integer units, never scaled**, as strings of digits beside the ID (an amount reaches 2^63 − 1, past what a JSON number holds). `asset_scale` says how to show them; the scale and the ticker of an ID are what [`GET /v2/mpt?ids=`](#get-v2mptids) is for. Counts are numbers.
+- **Flags are named booleans**, the bits of the ledger's `UInt32`; a new flag is a new key.
+- **`coverage`** is the key right after `result` on every answer that lists or describes an issuance, never in a CSV: `from_ledger_index` is where the rows of the parser that writes MPT data start, one above the newest stored ledger an older parser wrote, else the oldest stored ledger, and `complete` says that is at or below the ledger `MPTokensV1` was enabled in (99226369 on the XRP Ledger; on XRPL Testnet only an indexed `EnableAmendment` counts, so the sandbox answers `complete: false` unless it indexed that ledger). Until a reprocess reaches that ledger (`--reprocess` from 99226369, [backfill](backfill.md)) an issuance whose node has not changed since the deploy has no known state: `/v2/mpt/{issuanceId}` is a 404 and the list leaves it out, while its holders and transfers are still served.
+- **Xahau and Xahau Testnet have no MPT**, and no route reads an MPT table there: `/v2/mpt/{issuanceId}`, its holders and its transfers answer 404 `issuance not found`, `/v2/mpt?ids=` the bare IDs, and `kind=mpt` and `/v2/accounts/{address}/mpt` an empty list with `complete: true`.
+
+### `GET /v2/mpt/{issuanceId}`
+
+One issuance, as of the last run of the job.
+
+```json
+{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true },
+  "issuance": {
+    "mpt_issuance_id": "0000012A…", "issuer": "r…", "sequence": 298, "ticker": "HTF", "name": "Harborline Treasury Fund",
+    "asset_scale": 2, "maximum_amount": "5000000000", "outstanding_amount": "1820451120", "escrowed_amount": "84411120",
+    "locked_amount": "124000000", "locked_holders": 1, "holders": 3, "transfer_fee": 100,
+    "flags": { "locked": false, "can_lock": true, "require_auth": true, "can_escrow": false, "can_trade": true,
+               "can_transfer": true, "can_clawback": true },
+    "metadata": { "ticker": "HTF", "name": "Harborline Treasury Fund", "desc": "…", "icon": "harborline.example/htf/icon.png",
+                  "asset_class": "rwa", "asset_subclass": "treasury", "issuer_name": "Harborline Capital",
+                  "uris": [{ "uri": "harborline.example/htf", "category": "website", "title": "Fund page" }] },
+    "metadata_hex": "7B227469636B6572…", "metadata_conforms": true,
+    "created_ledger": 99412004, "created_time": "2025-10-09T11:20:31Z", "created_tx_hash": "…",
+    "last_ledger": 107795512, "destroyed": false } }
+```
+
+Keys of the issuance answer, in order: `result, coverage, issuance`.
+
+Keys of an issuance, in order: `mpt_issuance_id, issuer, sequence, ticker?, name?, asset_scale, maximum_amount?, outstanding_amount, escrowed_amount, locked_amount, locked_holders, holders, transfer_fee, flags, metadata?, metadata_hex?, metadata_conforms?, created_ledger?, created_time?, created_tx_hash?, last_ledger, destroyed`.
+
+Keys of flags, in order: `locked, can_lock, require_auth, can_escrow, can_trade, can_transfer, can_clawback`.
+
+Keys of metadata, in order: `ticker?, name?, desc?, icon?, asset_class?, asset_subclass?, issuer_name?, uris?, additional_info?`.
+
+Keys of an item of uris, in order: `uri, category?, title?`.
+
+`ticker` and `name` come from the metadata, cut to 16 and 128 characters, and are left out when there are none. `maximum_amount` is left out when the issuance sets none (the ledger's limit is 2^63 − 1). `escrowed_amount` is the node's `LockedAmount`. `locked_amount` and `locked_holders` count what cannot move: everything when the issuance is locked, else the holders locked on their own, and in either case only balances above 0. `metadata` is the decoded object, read leniently because an issuer may write what it likes: the long and the short keys of XLS-89 and an early draft's `urls` all read as these keys, and a field of the wrong type or an unknown key is dropped. It is left out when the hex is not at most 1024 bytes of UTF-8 holding a JSON object, while `metadata_hex` is served whenever the issuance has metadata, and `metadata_conforms` says whether every rule of XLS-89 holds of the decoded object. The `created_*` keys are there when the creation is in the coverage. A destroyed issuance is served, with `destroyed: true`. No CSV.
+
+Errors, in the order they are checked: 400 `invalid mpt issuance id`; 404 `issuance not found` (there is none, its state is outside the coverage or newer than the last run of the job, or the network has no MPT); 500 `unable to retrieve issuance`.
+
+### `GET /v2/mpt?ids=`
+
+A summary of each of 1 to 100 issuances, `ids` being a comma list, in the order asked, duplicates too. An ID with no row or with no known state is the ID alone, and so is every ID on a network without MPT. Nothing of it is a list of the network, so it has no `coverage`, no paging and no CSV.
+
+```json
+{ "result": "success", "count": 2,
+  "issuances": [{ "mpt_issuance_id": "0000012A…", "issuer": "r…", "ticker": "HTF", "name": "Harborline Treasury Fund", "asset_scale": 2,
+                  "maximum_amount": "5000000000", "outstanding_amount": "1820451120", "holders": 3, "transfer_fee": 100,
+                  "flags": { "locked": false, "can_lock": true, "require_auth": true, "can_escrow": false, "can_trade": true,
+                             "can_transfer": true, "can_clawback": true }, "destroyed": false },
+                { "mpt_issuance_id": "00000130…" }] }
+```
+
+Keys of the lookup answer, in order: `result, count, issuances`.
+
+Keys of an issuance summary, in order: `mpt_issuance_id, issuer, ticker?, name?, asset_scale, maximum_amount?, outstanding_amount, holders, transfer_fee, flags, destroyed`.
+
+Errors, in the order they are checked: 400 `ids is required`, `too many ids` (more than 100, whatever they are), `invalid mpt issuance id` (an empty element too); 500 `unable to retrieve issuances`.
+
+---
+
 ## Validations
 
 ### `GET /v2/ledgers/{ledger_hash}/validations` and `GET /v2/ledger/{ledger_hash}/validations`

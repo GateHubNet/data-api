@@ -45,6 +45,7 @@ import { ExportsModule } from './exports/exports.module';
 import { LedgerObjectsModule } from './ledger-objects/ledger-objects.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
+import { MptModule } from './mpt/mpt.module';
 import { NamesModule } from './names/names.module';
 import { NetworkModule } from './network/network.module';
 import { NftModule } from './nft/nft.module';
@@ -103,6 +104,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   NamesModule,
   LedgerObjectsModule,
   TokensModule,
+  MptModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */

@@ -429,6 +429,15 @@ describe('FeatureCoverageService', () => {
       expect(setup({ network }).svc.isAvailable('nfts')).toBe(true);
     });
 
+    it.each([
+      ['xrpl', true],
+      ['xahau', false],
+      ['xrpl-testnet', true],
+      ['xahau-testnet', false],
+    ] as const)('mpt on %s: %s', (network, available) => {
+      expect(setup({ network }).svc.isAvailable('mpt')).toBe(available);
+    });
+
     it('has no feature whose start is unavailable on the network', () => {
       const unavailable = { parserVersion: 3, startOf: () => ({ kind: 'unavailable' }) };
       jest.replaceProperty(COVERAGE_FEATURES, 'nfts', unavailable as unknown as typeof COVERAGE_FEATURES.nfts);

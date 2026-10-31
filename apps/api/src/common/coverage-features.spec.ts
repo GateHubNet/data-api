@@ -2,6 +2,7 @@ import {
   AMM_PARSER_VERSION,
   getNetworkProfile,
   MINT_PARSER_VERSION,
+  MPT_PARSER_VERSION,
   NETWORK_NAMES,
   OBJECT_PARSER_VERSION,
   STATE_PARSER_VERSION,
@@ -135,5 +136,19 @@ describe('the coverage features of D7', () => {
       { kind: 'first_ledger' },
     ]);
     expect(NETWORK_NAMES.map((name) => getNetworkProfile(name).hasMinting)).toEqual([false, true, false, true]);
+  });
+});
+
+describe('the coverage feature of D9', () => {
+  it('mpt: MPTokensV1 on the XRPL family, unavailable on Xahau and Xahau Testnet', () => {
+    expect(COVERAGE_FEATURES.mpt.parserVersion).toBe(MPT_PARSER_VERSION);
+    expect(MPT_PARSER_VERSION).toBe(10);
+    expect(startsOf('mpt')).toEqual([
+      { kind: 'amendment', amendment: 'MPTokensV1' },
+      { kind: 'unavailable' },
+      { kind: 'amendment', amendment: 'MPTokensV1' },
+      { kind: 'unavailable' },
+    ]);
+    expect(NETWORK_NAMES.map((name) => getNetworkProfile(name).hasMpt)).toEqual([true, false, true, false]);
   });
 });

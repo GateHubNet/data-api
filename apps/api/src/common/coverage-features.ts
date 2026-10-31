@@ -1,6 +1,7 @@
 import {
   AMM_PARSER_VERSION,
   MINT_PARSER_VERSION,
+  MPT_PARSER_VERSION,
   NetworkProfile,
   NFT_PARSER_VERSION,
   OBJECT_PARSER_VERSION,
@@ -26,8 +27,8 @@ export interface CoverageFeature {
 
 /**
  * The features of program 2 whose coverage an answer states, by name. D3 registers `nfts`, D5 `escrows`, `payment_channels`,
- * `checks` and `delegations`, D6 `issued_tokens` and `token_transfers`, D7 `fees`, `amm`, `account_states` and `mints`; D9 adds its
- * entries here and uses `FeatureCoverageService`, and defines no rule of its own.
+ * `checks` and `delegations`, D6 `issued_tokens` and `token_transfers`, D7 `fees`, `amm`, `account_states` and `mints`, D9 `mpt`; each
+ * uses `FeatureCoverageService` and defines no rule of its own.
  */
 export const COVERAGE_FEATURES = {
   // NFTs are an amendment on both families, by the family and not the network, so a testnet takes its mainnet's
@@ -80,6 +81,12 @@ export const COVERAGE_FEATURES = {
   mints: {
     parserVersion: MINT_PARSER_VERSION,
     startOf: (p) => (p.hasMinting ? { kind: 'first_ledger' } : { kind: 'unavailable' }),
+  },
+  // MPTokens (D9, spec 7) are an amendment of the XRP Ledger family only: Xahau cannot have them, so its lists are complete and no
+  // route reads an MPT table.
+  mpt: {
+    parserVersion: MPT_PARSER_VERSION,
+    startOf: (p) => (p.hasMpt ? { kind: 'amendment', amendment: 'MPTokensV1' } : { kind: 'unavailable' }),
   },
 } satisfies Record<string, CoverageFeature>;
 
