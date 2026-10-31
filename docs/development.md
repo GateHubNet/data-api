@@ -143,6 +143,8 @@ From the repo root; `pnpm -r <script>` fans out in dependency order.
 
 There is no root `test:e2e`: each package spins its own throwaway ClickHouse and runs `--runInBand`.
 
+The api's `test:e2e` sets `NODE_OPTIONS=--max-old-space-size=6144` (Linux and macOS). `--runInBand` holds about 40 to 80 MB per suite, and one full run crashed at Node's 4 GB default. The limit only caps growth, so a machine that needs less uses less; a runner with less than about 6 GB free would swap on a full run.
+
 ## 5. Conventions
 
 - **TypeScript strict** (`tsconfig.base.json`); each package extends it. **Prettier** (`.prettierrc`): 120 columns, single quotes, trailing

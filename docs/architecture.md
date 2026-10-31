@@ -15,7 +15,7 @@ exporter and a shared library. This page explains the moving parts; the reasons 
  │   ingest ─ LiveRunner (live + catch-up)   range-ingest CLI        │
  │   validations ─ collector      fee_stats ─ poller                 │
  │   aggregator ─ stats, volumes, AMM, rates, markets, rollups,      │
- │                escrows, issued tokens                             │
+ │                escrows, issued tokens, supply                     │
  │   validators ─ UNL lists, domains (HTTPS), votes, agreement       │
  │   tomls ─ the toml of every domain accounts name (HTTPS)          │
  └──────────────────────────────┬────────────────────────────────────┘
@@ -65,7 +65,7 @@ Everything both services need, written once:
   (`config/amendments/<family>.json`), read by the testnet of the family without its `enabled` entries.
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
-- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens, the history of escrows, checks, payment channels and delegations, and the index of the trust lines and issuers a transaction changed, `state_touches`) and
+- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens, the history of escrows, checks, payment channels and delegations, the index of the trust lines and issuers a transaction changed, `state_touches`, and Xahau's mints) and
   `buildLedgerRows` (a raw ledger -> rows of the 35 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
@@ -81,7 +81,7 @@ Everything both services need, written once:
   (`amm-reads.ts`, the windowed fill-forward of pool state in `amm-pools.job.ts`), the jobs of the account and market aggregates
   (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`), the NFT jobs (`nft_state`, `nft_collections`, with `foldNftEvents`, the one
   fold of an NFT's events that the job and the API's detail route share, and the prices of sales in `query/nft-prices.ts`) and the `escrows` job (the
-  current state of every escrow and the sentinel that holds the escrowed total for D7) and the `tokens` job (the generations of the issued tokens built from the state history and the touch index: `tokens.job.ts`, with the pure rules of a token in `token-rules.ts`).
+  current state of every escrow and the sentinel that holds the escrowed total for D7) and the `tokens` job (the generations of the issued tokens built from the state history and the touch index: `tokens.job.ts`, with the pure rules of a token in `token-rules.ts`), and the `supply` job (the hourly snapshot of the native supply: `supply.job.ts`, its reads in `query/supply.ts`).
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
@@ -105,7 +105,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   the Ripple object, binary codec with the node's definitions, an LRU of serialized forms), `XrplService` (the shared `NodeClient` with
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
-- **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `amm`,
+- **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets and supply routes, `amm`,
   `nft`, `names`, `ledger-objects`, `tokens`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
@@ -192,6 +192,11 @@ The four routes of the issued tokens are GateHub extras ([ADR-0019](adr/0019-iss
   `token-param.ts` the path, `token-list.ts` the query, the marker and the envelope of the list.
 - **Reads** are bounded by `read_rows` tests (`tokens.e2e-spec.ts`, over a bulk of other tokens' rows and the retired generation's; `paged-reads.e2e-spec.ts` for the transfers).
 
+#### The supply routes (`apps/api/src/network`)
+
+`GET /v2/network/supply` and `/minted` are GateHub extras (ADR-0010, Amendment 9) in the existing `NetworkModule`. `SupplyService` reads the newest `network_supply` row and the coverage of each part; `/minted` reads the mint tables by day, and
+no mint table on a network without minting. `supply-object.ts` holds every object and its key order (the `*_KEYS` constants that the tests and `network/api-reference.spec.ts` pin).
+
 #### The names module (`apps/api/src/names`)
 
 `GET /v2/account_names` and `GET /v2/toml/{domain}` are GateHub extras ([ADR-0017](adr/0017-display-names.md)). `NamesModule` is in `ENDPOINT_MODULES`
@@ -243,7 +248,7 @@ views. See [clickhouse](clickhouse.md).
    `nft_collection_holders`) from the append-only NFT ledger tables, and keeps the account and market
    aggregates (daily native rates, `pair_hourly` and `markets_live` from `exchanges`, rollups of heavy accounts from `balance_changes`,
    `account_transactions` and `account_exchanges`), the escrowed total from `object_changes`, and the issued tokens (`token_generations`, `token_lines`, `tokens`: generations built from `trust_line_states`, `account_states` and the
-   `state_touches` index, swapped whole); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
+   `state_touches` index, swapped whole) and the hourly supply snapshot (`network_supply`); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
    rounds and the hourly agreement from `validations` and `ledgers`.
 5. Crashes recover from the database alone: re-read the checkpoint, delete the uncommitted tail, carry on
    ([syncer](syncer.md#checkpoint-boot-and-recovery)).

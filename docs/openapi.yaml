@@ -4358,6 +4358,98 @@ paths:
           description: ''
       tags:
       - network
+  "/v2/network/supply":
+    get:
+      operationId: SupplyController_snapshot
+      summary: Get the supply of the native currency
+      description: 'The newest hourly snapshot of the native supply: every figure
+        is as of one ledger (`ledger_index`, `close_time`), computed at `computed_at`,
+        and an exact decimal text in whole units. `total` is the currency in existence.
+        `burned` is what was destroyed: on the XRP Ledger 100 billion XRP less the
+        total, exact from the ledger header, and on Xahau the fees of the indexed
+        ledgers (no cap). `minted` (Xahau) is what was created by the indexed ledgers,
+        `amount` being the sum of `rewards` (the rewards claimed), `import` (what
+        an Import credited) and `genesis_mint` (every other GenesisMint). `escrowed`
+        is the native currency in open escrows, `circulating` the total less the escrowed,
+        which counts what is in payment channels, in AMM pools and held as reserves.
+        `amm` (the XRP Ledger) is the native currency in the pools of automated market
+        makers, and `reserves` the least the accounts must keep: the accounts times
+        the base reserve plus their owned objects times the owner reserve (`base`,
+        `increment`), at the snapshot ledger. `minted`, `amm` and `reserves` are left
+        out where the network or the snapshot has none. A part read from the indexed
+        history ends with its `coverage`: the first ledger the history is whole from,
+        and whether it is whole back to where the feature starts. Before the first
+        snapshot the answer is 404 `supply not computed yet`.'
+      parameters: []
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/supply/minted":
+    get:
+      operationId: SupplyController_minted
+      summary: Get the native currency minted per day
+      description: 'The native currency created on each UTC day, by source, on a network
+        that mints (Xahau): `amount` is the sum of `rewards` (the rewards claimed),
+        `import` (what an Import credited) and `genesis_mint` (every other GenesisMint),
+        in whole units. Every day from the first one the indexed history covers whole
+        to the day of the newest ledger is a row, the days with no mint with zeros,
+        and the newest day is the running one, summed so far. The answer states the
+        `coverage` of the mints: the first ledger the history is whole from, and whether
+        it is whole back to the network''s first ledger. On a network that cannot
+        mint (the XRP Ledger) the list is empty. `format=csv` gives the rows as a
+        CSV file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the first day the mints are covered for.'
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day (the only one).'
+        schema:
+          enum:
+          - day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
   "/v2/ledgers/{ledger_hash}/validations":
     get:
       operationId: ValidationsController_list

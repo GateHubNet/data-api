@@ -35,6 +35,7 @@ no `GH_CLICKHOUSE_DATABASE`, so each network's database is the name its profile 
 | NFT data | `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending`, `syncer_nft_skipped_total`, the `nft_state` / `nft_state_dirty` / `nft_collections` error labels, [the NFT data](#the-nft-data) |
 | Ledger objects | `syncer_escrows_lag_ledgers`, `syncer_escrows_open`, `syncer_objects_unclassified_total`, the `escrows` / `escrows_dirty` error labels; the rollout and the re-ingest: [Ledger objects and delegation](#ledger-objects-and-delegation) |
 | Issued tokens | `syncer_tokens_live`, `syncer_tokens_lag_ledgers`, `syncer_tokens_building`, `syncer_tokens_repair_ledgers`, the `tokens` / `tokens_dirty` error labels; the rollout, the first build and the runbook: [Issued tokens](#issued-tokens) |
+| Supply | `syncer_supply_snapshot_age_seconds`, `syncer_supply_cycle_seconds`, `syncer_parser_anomalies_total{kind}`, the `supply` error label; reading the newest row and the re-ingests: [Supply snapshots](#supply-snapshots) |
 | Display names | `syncer_tomls_due`, `syncer_tomls_domains{status}`, `syncer_tomls_checks_total{outcome}`, `syncer_tomls_discovery_seconds`; the rollout and the seed: [The display names](#the-display-names) |
 | Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
 | Exports | `exporter-xrpl` / `exporter-xahau` (profile `exports`, one each): `GET /liveliness/healthz` on 3005, `exporter_jobs_total{status}`; the jobs are rows of `export_jobs` ([deployment](deployment.md#topology)) |
@@ -405,6 +406,8 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_tokens_live` | 1 once the first generation of the issued tokens is promoted (hours after the deploy of a new database) | 0 for longer than the first build: see [Issued tokens](#issued-tokens). It gates the explorer's `TOKENS` switch |
 | `syncer_tokens_lag_ledgers` | 0 to a few ledgers (0 also while no generation is live) | Above 300 for 15 minutes (alert, paired with `rate(syncer_aggregator_errors_total{job=~"tokens.*"}[15m])`): the live generation is not following the head, see [Issued tokens](#issued-tokens) |
 | `syncer_tokens_building` / `syncer_tokens_repair_ledgers` | 0 / 0 outside a build and a re-ingest | `building` 1 for days with the log's cursor not moving, or a log line every ten minutes saying the generation `was stale while it built`: a coverage start that keeps moving, finish the fill; `repair_ledgers` above 0 and not falling: a repair waiting for the replacement generation |
+| `syncer_supply_snapshot_age_seconds` | up to about an hour plus the cycle (no series until the job has seen a snapshot) | Above 3 hours for 5 minutes outside a catch-up: see [Supply snapshots](#supply-snapshots) |
+| `syncer_parser_anomalies_total{kind="import_minted_negative"}` | 0 | Any rise: a Xahau `Import` came out below 0 minted drops, which the network cannot produce, and was stored as 0 |
 | `syncer_objects_unclassified_total` | flat | Rising: a transaction changed an escrow, check, channel or delegation in a way the history has no event for (stored as event `update`), a shape the parser does not know; see [Ledger objects and delegation](#ledger-objects-and-delegation) |
 | `syncer_markets_live_age_seconds{period="day"}` | under 120 s (a set a minute) | Above 600 s for 10 minutes: the Markets table is stale, see [below](#account-and-market-aggregates) |
 | `syncer_markets_live_age_seconds{period=~"7day\|30day"}` | under about 300 s (a set every fifth run, about every 5 minutes); about 900 s for a few minutes after one failed set | Above 600 s for 10 minutes: that period of the Markets table is stale (the `MARKETS` switch needs all three periods under 600 s) |
@@ -1046,6 +1049,25 @@ SELECT count() FROM (SELECT issuer, currency, argMax(deleted, version) AS gone F
 SELECT table, partition, sum(rows) AS rows, formatReadableSize(sum(bytes_on_disk)) AS size FROM system.parts
 WHERE database = 'xrpl' AND table IN ('token_lines', 'tokens') AND active GROUP BY table, partition ORDER BY table, partition;
 ```
+
+## Supply snapshots
+
+The `supply` job of the aggregator ([syncer](syncer.md#the-supply-job)) writes one row of `network_supply` an hour, every figure as of one ledger, and `GET /v2/network/supply` serves the newest. Rows are kept and have no TTL.
+
+**Read the newest row:**
+
+```sql
+-- `version` tells the rows apart when a cycle was redone at the same ledger
+SELECT * FROM xrpl.network_supply ORDER BY ledger_index DESC, version DESC LIMIT 1;
+```
+
+**Watch** `syncer_supply_snapshot_age_seconds` (a healthy age peaks at about an hour plus the cycle; the alert is above 3 hours), `syncer_supply_cycle_seconds`, `syncer_aggregator_errors_total{job="supply"}` and, on Xahau, `syncer_parser_anomalies_total{kind="import_minted_negative"}`, which should stay 0 ([alerts](observability.md#recommended-alerts)).
+
+**Before the first snapshot** the route answers 404 `supply not computed yet`. The first cycle starts once the sentinel of the `escrows` job exists, and takes minutes today, up to an hour at full history.
+
+**A reprocess or a backfill shows in the figures at the next cycle, within an hour, while `coverage` changes at once**, since coverage is read at request time and the figures come from the snapshot. A part can say `complete: true` over a figure from before the fill; wait one cycle before reading it.
+
+**Re-ingests.** The job keeps no incremental state, so it has no `agg_dirty` hook and nothing to repair. A `--reprocess` that rewrites ledgers at or below the snapshot ledger while a cycle runs can leave that cycle's figures off for the accounts or mints it rewrote (a range read between the delete and the rewrite); the next cycle is right again. Which re-ingest each part needs is in [backfill](backfill.md#supply).
 
 ## Backfill and repair
 

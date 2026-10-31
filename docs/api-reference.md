@@ -248,7 +248,7 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
   carry none.
 
 Coverage turns `complete` once no ledger at or above the start ledger was written by an older parser, which is what re-ingesting the history
-does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of (and the reserves of the supply) come with version 3 and the payments their transfers are read from (and Xahau's burned supply, from the fee totals) with version 1; the AMM data of the supply come with version 2 and the mint tables of Xahau's minted supply with version 9.
+does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of (and the reserves of the supply, feature `account_states`) come with version 3 and the payments their transfers are read from (and Xahau's burned supply, from the fee totals, feature `fees`) with version 1; the AMM data of the supply (feature `amm`) come with version 2 and the mint tables of Xahau's minted supply (feature `mints`) with version 9.
 
 ### Compatibility
 
@@ -307,6 +307,10 @@ From the issued tokens ([ADR-0019](adr/0019-issued-tokens-from-state-history.md)
 [Tokens](#tokens), [`GET /v2/tokens`](#get-v2tokens) (the issued tokens ranked by holders, with `kind`, `min_holders` and a search),
 [`GET /v2/tokens/{currency}.{issuer}`](#get-v2tokenscurrencyissuer) with its [`/holders`](#get-v2tokenscurrencyissuerholders) and
 [`/transfers`](#get-v2tokenscurrencyissuertransfers), and the `coverage` field that their answers carry. The original's `/v2/currencies` and `/v2/gateways` are still out of scope (below).
+
+From the supply ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 9, items 103 to 104): [`GET /v2/network/supply`](#get-v2networksupply) (the native supply at one
+ledger, an hourly snapshot, with the `coverage` of each part read from history) and [`GET /v2/network/supply/minted`](#get-v2networksupplyminted) (Xahau's minting per day and
+source, with its `coverage`; empty on the XRP Ledger). The original's `/v2/network/xrp_distribution` is still out of scope (below).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -2489,7 +2493,7 @@ The native currency created on each UTC day, by source, on a network that mints 
 
 Keys of the minted answer, in order: `result, coverage, marker?, count, rows`.
 
-Keys of a day row, in order: `date, amount, rewards, import, genesis_mint`.
+Keys of a minted day, in order: `date, amount, rewards, import, genesis_mint`.
 
 On Xahau, `GET /v2/network/supply/minted?limit=3`:
 

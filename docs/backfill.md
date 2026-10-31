@@ -515,6 +515,25 @@ SELECT generation, argMax(state, version) AS state, argMax(through_ledger, versi
 FROM xrpl.token_generations GROUP BY generation ORDER BY generation;
 ```
 
+### Supply
+
+The hourly supply snapshot ([operations](operations.md#supply-snapshots)) is read from what the ledgers already hold, and only one of its parts needs a re-ingest.
+
+- **Xahau: the minted part.** The mint tables (`genesis_mints`, `imports`, `reward_claims`) come with parser version 9, so ledgers written earlier have none. Until they are re-ingested, `minted` and the rows of
+  `/v2/network/supply/minted` start at the deploy ledger, with `complete: false`. The repair is `range-ingest --from <firstLedger> --to <deploy ledger> --reprocess` on Xahau, about 27 million ledgers. **Share one run:** it is
+  the same command as the [ledger object](#ledger-objects-and-delegation-re-ingest) and [issued token](#issued-tokens-re-ingest) re-ingests, so run it once, after the program's last parser version. A reprocess also reaches the
+  issued tokens through their hook, and a window that meets a ledger of an older parser rebuilds them, more than once during a run from the oldest ledger up (above).
+- **The XRP Ledger needs no re-ingest for the supply.** `total` and `burned` come from the ledger header. `escrowed`, `amm` and `reserves` follow the coverage of the ledger objects, the AMM data and the state tables. `reserves`
+  turns `complete` only with the history load from ledger 32,570, which provides the state of the first ledger.
+- **The figures follow at the next snapshot.** `coverage` changes at once, and the figures within the hour.
+
+Check the coverage:
+
+```sql
+-- the mints are indexed above this ledger (NULL: every stored ledger)
+SELECT maxOrNull(ledger_index) FROM xahau.ledgers WHERE parser_version < 9;
+```
+
 ### Public nodes and rate limits
 
 Public nodes limit what one client may ask, and say how long to wait: `rate limit: units quota (50000 per 10s) exhausted, retry in

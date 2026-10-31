@@ -13,7 +13,8 @@ it holds in `coverage` ([ADR-0016](docs/adr/0016-nft-and-uritoken-data.md)); and
 (a verified name from the toml of the account's domain, else the name the operator gave the address, else its unverified domain), with the labels, and what a domain's
 toml says ([ADR-0017](docs/adr/0017-display-names.md)); and **ledger objects** on both networks: an escrow, a check, a payment channel by its object ID with the
 history of the transactions that changed it, the permission delegations of an account (XRP Ledger), and which kind of object an ID is, each stating its `coverage`
-([ADR-0018](docs/adr/0018-ledger-object-history.md)).
+([ADR-0018](docs/adr/0018-ledger-object-history.md)); and the **native supply**: an hourly snapshot of the total, burned, escrowed and circulating figures, the AMM pools (XRP Ledger), the reserves, and Xahau's minting by source and day,
+each part read from history stating its `coverage` ([api reference](docs/api-reference.md#get-v2networksupply)).
 
 One deployment serves one network; the same images run all four. The API answers the same `/v2/...` paths on a host per network:
 
@@ -128,7 +129,7 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Rates | `/v2/exchange_rates/{base}/{counter}`, `/v2/normalize` |
 | Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]` (`interval`), `.../stats/{transactions\|value}` (`interval`), `.../analytics/{balances\|balance_changes\|counterparties\|exchanges}` (extra), `.../amm_liquidity`, `.../amm_positions` (AMM, extras) |
 | Markets | `/v2/active_accounts/{base}/{counter}` |
-| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/markets` (extra), `/v2/network/amm_volume` (AMM, extra), `/v2/network/nft_volume` (NFTs, extra) |
+| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/markets` (extra), `/v2/network/amm_volume` (AMM, extra), `/v2/network/nft_volume` (NFTs, extra), `/v2/network/supply` (extra), `/v2/network/supply/minted` (Xahau's minting, extra) |
 | AMM (extras) | `/v2/amm/pools`, `/v2/amm/pools/{pool}`, `/v2/amm/pools/{base}/{counter}`, `/v2/amm/pools/{pool}/{history,swaps,liquidity,governance}` |
 | NFTs (extras, both networks) | `/v2/nfts/{nft_id}`, `/v2/nfts/{nft_id}/{history,offers}`, `/v2/accounts/{address}/{nfts,nft_history}`, `/v2/nft_collections`, `/v2/nft_collections/{issuer}/{taxon}` (XRPL) or `/{issuer}` (Xahau) with `/{nfts,holders,sales,stats}`, `/v2/nft_sales`; each answer has `coverage` |
 | Names (extras) | `/v2/account_names?addresses=` (the display names, domains and labels of up to 100 addresses), `/v2/toml/{domain}` (what a domain's toml says, as the syncer last read it) |

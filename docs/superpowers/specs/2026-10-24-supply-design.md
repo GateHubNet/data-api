@@ -489,6 +489,8 @@ Xahau:
 - **Cache**: the default `Cache-Control: private, max-age=60`. **Query bound**: one granule of `network_supply` (the read of the end of
   the key). *Amended 2026-10-30 by the D7 Task 5 build: two such reads, one after the other (sections 3 and 6).*
 
+**Note (2026-10-31).** The example coverages of this section cannot occur together: `from_ledger_index` does not decrease as the parser version rises, so `reserves` (version 3) cannot start above `escrowed` (version 7). They show the shape only; the built examples are in [api-reference](../../api-reference.md#get-v2networksupply).
+
 ### 5.2 `GET /v2/network/supply/minted`
 
 The native currency minted per UTC day, by source (Xahau). Parameters in the style of `network/fees`:
@@ -655,7 +657,7 @@ mints (F5 says it does: the key imports only depend on it).
   escrows coverage feature. D7 is built after D5.
 - **PR #20**: `account_states` (migration 005, `STATE_PARSER_VERSION`); reserves are complete only after the history spec's ledger 32,570.
 - **D1**: `network_state` (reserves; the `SetFee` fallback covers its absence).
-- **The AMM data**: `amm_pools`, `ammPoolsWatermark`, `fillForward`.
+- **The AMM data**: `amm_pools`, `fillForward`. (2026-10-31: `ammPoolsWatermark` is no longer a dependency; the cycle does not wait for it, section 4.1 (b).)
 - **Family 5** (Xahau-native, not built): D7 builds `genesis_mints`, `imports` (subset), `reward_claims` (ledger-ordered) and the two
   parsers with family 5's names; family 5 extends them and must read this spec's decision 7.
 - **E12** reads both routes; it reads burned per day from the existing `/v2/network/fees?interval=day`.
