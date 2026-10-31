@@ -34,6 +34,10 @@ export function mptIssuerOf(issuanceId: string): string {
  * not a UInt32 or an address that does not decode, so a parser guards what it reads from a ledger.
  */
 export function mptIssuanceId(sequence: number, issuer: string): string {
+  // `writeUInt32BE` takes `undefined` for 0, so a sequence is checked here.
+  if (!Number.isInteger(sequence) || sequence < 0 || sequence > 0xffffffff) {
+    throw new RangeError(`an issuance's sequence must be a UInt32: '${String(sequence)}'`);
+  }
   const id = Buffer.alloc(24);
   id.writeUInt32BE(sequence, 0);
   Buffer.from(decodeAccountID(issuer)).copy(id, 4);

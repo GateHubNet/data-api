@@ -17,6 +17,8 @@ export * from './parsers/balance-changes.parser';
 export * from './parsers/exchanges.parser';
 export * from './parsers/from-client.parser';
 export * from './parsers/import.parser';
+export * from './parsers/mpt-deltas';
+export * from './parsers/mpt.parser';
 export * from './parsers/nft.parser';
 export * from './parsers/object-changes.parser';
 export * from './parsers/parser.interface';

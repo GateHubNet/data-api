@@ -62,6 +62,15 @@ describe('mptIssuanceId', () => {
     expect(mptIssuanceId(0xffffffff, 'rrrrrrrrrrrrrrrrrrrrrhoLvTp')).toBe('FFFFFFFF' + '0'.repeat(40));
   });
 
+  it('throws on a sequence that is not a UInt32 and on an address that does not decode', () => {
+    for (const sequence of [undefined, null, -1, 1.5, 2 ** 32, '1', Number.NaN]) {
+      expect(() => mptIssuanceId(sequence as number, ISSUER)).toThrow();
+    }
+    for (const issuer of [undefined, '', 'not an address', ISSUER + 'x']) {
+      expect(() => mptIssuanceId(1, issuer as string)).toThrow();
+    }
+  });
+
   it('builds the ID of every recorded issuance from the sequence of its node', () => {
     // A create sent with a ticket has `tx.Sequence` 0 and the ticket in the node (FINDINGS (2)), so the node is what counts.
     const fixtures = join(__dirname, '..', '..', 'test', 'fixtures');
