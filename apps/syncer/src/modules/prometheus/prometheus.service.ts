@@ -227,6 +227,18 @@ const metrics = {
     labelNames: ['outcome'],
     registers: [registry],
   }),
+  validatorsTomlFieldsTotal: new Counter({
+    name: 'syncer_validators_toml_fields_total',
+    help: "Per verified domain check, what the validator's toml entry gave, by field (owner_country, server_country, network, unl) and outcome (read, absent, invalid).",
+    labelNames: ['field', 'outcome'],
+    registers: [registry],
+  }),
+  validatorsTomlStoreWritesTotal: new Counter({
+    name: 'syncer_validators_toml_store_writes_total',
+    help: 'Writes of the domain checker to the per-domain toml store, by outcome (ok, error). A failed write does not fail the pass.',
+    labelNames: ['outcome'],
+    registers: [registry],
+  }),
   validatorsNodePollsTotal: new Counter({
     name: 'syncer_validators_node_polls_total',
     help: 'Polls of the node by the validators worker, by request (amendments, negative_unl, fee_settings, server_info, feature) and outcome (ok, error).',
@@ -287,6 +299,9 @@ const metrics = {
 // A labelled counter has no series until its first `inc`, and `increase()` of a series that first shows at its value is 0: the first
 // Import the parser clamps would raise no alert. The series of the one kind starts at 0, as the unlabelled counters above do.
 metrics.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, 0);
+// the alert is an increase(), and a series that first shows at its value has none: its first failure would raise nothing
+metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'ok' }, 0);
+metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'error' }, 0);
 
 // prom-client gives a gauge without labels a sample of 0 when it is registered. These two are not known until the supply job has seen
 // a snapshot, or written a row: a 0 would read as a snapshot that has just been written, and no alert could fire on a job that
@@ -348,6 +363,8 @@ export class PrometheusService implements OnModuleInit {
   readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
   readonly validatorsUnlSize = metrics.validatorsUnlSize;
   readonly validatorsDomainChecksTotal = metrics.validatorsDomainChecksTotal;
+  readonly validatorsTomlFieldsTotal = metrics.validatorsTomlFieldsTotal;
+  readonly validatorsTomlStoreWritesTotal = metrics.validatorsTomlStoreWritesTotal;
   readonly validatorsNodePollsTotal = metrics.validatorsNodePollsTotal;
   readonly validatorsJobsTotal = metrics.validatorsJobsTotal;
   readonly validatorsAgreementLagSeconds = metrics.validatorsAgreementLagSeconds;

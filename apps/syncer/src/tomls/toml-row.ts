@@ -1,5 +1,5 @@
 import { DomainTomlsRow, EMPTY_TOML_CONTENT, okTomlRow, TomlContent } from '@gatehub/data-api-shared';
-import { DOMAIN_VERIFIED_GRACE_S, isTransientReason } from '../validators/domain-checker';
+import { DOMAIN_VERIFIED_GRACE_S, isTransientReason } from '../validators/domain-reason';
 import { FetchFailure } from '../validators/safe-fetch';
 
 /** A transient failure that carries the content is checked again after an hour. */

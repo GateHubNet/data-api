@@ -4,28 +4,39 @@ Raw ledgers used by parser, ledger-writer and API tests. Load a directory with `
 (`src/ingest/fixture-ledger-source.ts`); it reads `<index>.json`, `<index>-<label>.json` and `<index>.json.gz` files and
 ignores everything else in the directory (`manifest.json`, `server_info.json`, `README.md`, ...).
 
-| Directory                      | Contents                                                                                |
-| ------------------------------ | --------------------------------------------------------------------------------------- |
-| `xrpl/ripple-mock/`            | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.     |
-| `xrpl/recorded/`               | Mainnet ledgers recorded from a public node (see below).                                |
-| `xrpl/amm/`                    | Mainnet AMM transactions, one ledger per named case (see below).                        |
-| `xrpl/account-state/`          | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
-| `xrpl/account-domains/`        | Mainnet AccountSets that set and change a Domain (see "Account domains").               |
+| Directory                      | Contents                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `xrpl/ripple-mock/`            | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.              |
+| `xrpl/recorded/`               | Mainnet ledgers recorded from a public node (see below).                                         |
+| `xrpl/amm/`                    | Mainnet AMM transactions, one ledger per named case (see below).                                 |
+| `xrpl/account-state/`          | Mainnet changes of account flags, trust line settings and an AccountDelete.                      |
+| `xrpl/account-domains/`        | Mainnet AccountSets that set and change a Domain (see "Account domains").                        |
 | `xrpl/state-touches/`          | Mainnet AccountSets (TransferRate, AllowTrustLineClawback) and a Clawback (see "State touches"). |
-| `xrpl/nft/`                    | Mainnet NFToken transactions, one ledger per named case (see below).                    |
-| `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).           |
-| `xrpl/objects/`                | Mainnet escrow, check, payment channel and delegation cases (see below).                |
-| `xahau/objects/`               | Xahau escrow, check and payment channel cases (see below).                              |
-| `xahau/mint/`                  | Xahau Imports with their parent ledgers, and two hand-made mint ledgers (see "Xahau minting"). |
-| `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                          |
-| `xrpl-testnet/recorded/`       | XRPL Testnet ledgers recorded from a public testnet node (see below).                   |
-| `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                  |
-| `xrpl/unl/`                    | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
-| `xahau/unl/`                   | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
-| `xrpl-testnet/unl/`            | The validator list of the XRPL Testnet default publisher, as served (see "UNL lists").  |
-| `xrpl/network-state/`          | Answers of an XRPL node for the validators worker's ledger state (see "Network state"). |
-| `xahau/network-state/`         | The same from a Xahau node (see "Network state").                                       |
-| `xahau-testnet/network-state/` | The same from a Xahau Testnet node (see "Network state").                               |
+| `xrpl/nft/`                    | Mainnet NFToken transactions, one ledger per named case (see below).                             |
+| `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).                    |
+| `xrpl/objects/`                | Mainnet escrow, check, payment channel and delegation cases (see below).                         |
+| `xahau/objects/`               | Xahau escrow, check and payment channel cases (see below).                                       |
+| `xahau/mint/`                  | Xahau Imports with their parent ledgers, and two hand-made mint ledgers (see "Xahau minting").   |
+| `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                                   |
+| `xrpl-testnet/recorded/`       | XRPL Testnet ledgers recorded from a public testnet node (see below).                            |
+| `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                           |
+| `xrpl/unl/`                    | Validator lists of the XRPL default publishers, as served (see "UNL lists").                     |
+| `xahau/unl/`                   | The validator list of the Xahau default publisher, as served (see "UNL lists").                  |
+| `xrpl-testnet/unl/`            | The validator list of the XRPL Testnet default publisher, as served (see "UNL lists").           |
+| `xrpl/network-state/`          | Answers of an XRPL node for the validators worker's ledger state (see "Network state").          |
+| `xahau/network-state/`         | The same from a Xahau node (see "Network state").                                                |
+| `xahau-testnet/network-state/` | The same from a Xahau Testnet node (see "Network state").                                        |
+| `tomls/`                       | Hand-written validator tomls, for no real domain (see "Toml files").                             |
+
+## Toml files
+
+Written by hand for D8, not recorded: a real domain's file changes. Domains are `*.example`. The syncer's e2e suite puts its master keys in
+place of `__KEY_1__` and `__KEY_2__`.
+
+| File                                      | Holds                                                                                                                                                                                                                                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tomls/validator-details.xrp-ledger.toml` | `modified` as a local date; a principal with an email, one whose name holds `@`, and one plain; key 1 with a lower-case code, a code with spaces, a `unl` and a `server_location`; key 2 with `network`, `UK`, `Germany` and an `http:` `unl`; an account and a currency. |
+| `tomls/validator-details.xahau.toml`      | Key 1 with a bare `network = 21337`, a lower-case code and `EE`.                                                                                                                                                                                                          |
 
 ## Recorded fixtures
 
@@ -182,15 +193,15 @@ gzipped, largest 305 KB). The API's account state history tests (`apps/api/test/
 `xrpl-account-state`) read them: each change comes with a ledger in which the same account changed before, so a test sees the
 flags before and after it. The hashes were found with `account_tx` on each account; the `cases` of `manifest.json` name them.
 
-| Case | Ledger | Transaction | What the account root does |
-| --- | --- | --- | --- |
-| `account_created` | 93663329 | `4DCBF02D75CF484B385F667B75A8871B843E6C9E8C8D483248693A5A6E75F0A2` | A Payment creates `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV`, no flags |
-| `accountset_sets_flag` | 93663330 | `25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10` | AccountSet `SetFlag` 8: DefaultRipple (0 to 0x800000) |
-| `setregularkey_then_disable_master` | 93663334 | `DD0B4FC1AA4D8A4E0FBEDFD591828A932FE6111F87FD5DA71CC25214075FCF42` | SetRegularKey sets PasswordSpent, then AccountSet `387FDEDC…` sets DisableMaster (0x910000) |
-| `password_spent_before` | 107872956 | `F96ADF5D4D59B6BA82E9FA85EF266948FBE461A5220B2CB1C889A36F4837DBB4` | A Batch of `rheEvN3wAWbnPwnnsisiJzUqqKqoUC14tw`, which has PasswordSpent (0x10000) |
-| `payment_clears_password_spent` | 107872958 | `53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D` | A Payment of XRP to it clears PasswordSpent (0x10000 to 0): a flag changed by another type |
-| `before_account_delete` | 107670694 | `EE8547C7070DFB9C2249EAF693B77C1253858317F5132F058EEE267199F8828C` | The last change of `r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC` before it is deleted |
-| `account_delete` | 107671593 | `8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D` | AccountDelete: the account root is a `DeletedNode` (the ledger is also in `xrpl/recorded/`) |
+| Case                                | Ledger    | Transaction                                                        | What the account root does                                                                  |
+| ----------------------------------- | --------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `account_created`                   | 93663329  | `4DCBF02D75CF484B385F667B75A8871B843E6C9E8C8D483248693A5A6E75F0A2` | A Payment creates `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV`, no flags                            |
+| `accountset_sets_flag`              | 93663330  | `25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10` | AccountSet `SetFlag` 8: DefaultRipple (0 to 0x800000)                                       |
+| `setregularkey_then_disable_master` | 93663334  | `DD0B4FC1AA4D8A4E0FBEDFD591828A932FE6111F87FD5DA71CC25214075FCF42` | SetRegularKey sets PasswordSpent, then AccountSet `387FDEDC…` sets DisableMaster (0x910000) |
+| `password_spent_before`             | 107872956 | `F96ADF5D4D59B6BA82E9FA85EF266948FBE461A5220B2CB1C889A36F4837DBB4` | A Batch of `rheEvN3wAWbnPwnnsisiJzUqqKqoUC14tw`, which has PasswordSpent (0x10000)          |
+| `payment_clears_password_spent`     | 107872958 | `53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D` | A Payment of XRP to it clears PasswordSpent (0x10000 to 0): a flag changed by another type  |
+| `before_account_delete`             | 107670694 | `EE8547C7070DFB9C2249EAF693B77C1253858317F5132F058EEE267199F8828C` | The last change of `r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC` before it is deleted                |
+| `account_delete`                    | 107671593 | `8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D` | AccountDelete: the account root is a `DeletedNode` (the ledger is also in `xrpl/recorded/`) |
 
 Flag changes are rare: of the 1500 ledgers before the head (107871708 to 107873207), five Payments cleared PasswordSpent and one
 account made the only four AccountSets that changed flags. The AccountSet case comes instead from the history of `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV`, an
@@ -208,16 +219,16 @@ with the TUJ lines of `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV` that its holders and 
 Freezes and authorizations were found with `account_lines` on issuers (`freeze`, `freeze_peer`, `authorized` set) and then
 `account_tx` with `tx_type: TrustSet` on the holders; no recorded set had a quality, a freeze or an authorization before.
 
-| Case | Ledger | Transaction | What the trust line does |
-| --- | --- | --- | --- |
-| `trustset_qualities` | 26922216 | `7AC4B79B90CDC9510BEC38B451ABAF877577731D55C0E0BFDA488BEAD42F2914` | `rKQxxMQxm6jHV82bq4BCwyfcxcGG9GPWiU` raises its LBR limit to 10000000; its side has QualityIn and QualityOut 1 |
-| `trustset_freeze` | 26926380 | `40574C8990CD1EAD6D9831D6A32CBE16E3412CE0BDE48F5B86750A8BD8156CAD` | The same holder freezes the line (HighFreeze) and clears its qualities |
-| `trustset_unfreeze` | 26926383 | `5F852D7E42E707A0F142EE525F4A427B3DDA8775BB724D6B9FA7E12A15CF25EC` | It clears the freeze again |
-| `trustset_preauthorizes` | 104477592 | `7CD6BB1BEAFB159C576910B8A442FCD86FA92B2E8454CF8BE6190299AC9609EA` | The USDV issuer `rfffsukWALJB1PXYk7H8xkR6UJUDT8nMJE` creates a holder's line, authorized, at zero |
-| `ammcreate_unauthorized_line` | 104478769 | `93605E3991FED4AED241A9A0274975394332E552BD38C15D7050F262F49DC9C9` | AMMCreate gives the pool `rPZZja3wKFEmAGGteziXYLT9Ne6SnT7H66` a USDV line of 700000, not authorized |
-| `trustset_authorizes` | 104479125 | `C36AC10B9FA6AD15E2254477DFEF057D08589E39CA0102871D93622191D03D96` | The USDV issuer authorizes the pool's line |
-| `trustline_created_at_zero` | 104566877 | `19B5C0FB6295872FCECCE7491806E3CE4A54067F4C43BC898BD1387EBC0D9DAB` | `rsMeJ5p6qzVARADTYhvZbHqwkfyN18U2XH` creates a USDV line with a zero balance |
-| `trustline_deleted` | 104566926 | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | It sets the limit back to 0: the line is a `DeletedNode` |
+| Case                          | Ledger    | Transaction                                                        | What the trust line does                                                                                       |
+| ----------------------------- | --------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `trustset_qualities`          | 26922216  | `7AC4B79B90CDC9510BEC38B451ABAF877577731D55C0E0BFDA488BEAD42F2914` | `rKQxxMQxm6jHV82bq4BCwyfcxcGG9GPWiU` raises its LBR limit to 10000000; its side has QualityIn and QualityOut 1 |
+| `trustset_freeze`             | 26926380  | `40574C8990CD1EAD6D9831D6A32CBE16E3412CE0BDE48F5B86750A8BD8156CAD` | The same holder freezes the line (HighFreeze) and clears its qualities                                         |
+| `trustset_unfreeze`           | 26926383  | `5F852D7E42E707A0F142EE525F4A427B3DDA8775BB724D6B9FA7E12A15CF25EC` | It clears the freeze again                                                                                     |
+| `trustset_preauthorizes`      | 104477592 | `7CD6BB1BEAFB159C576910B8A442FCD86FA92B2E8454CF8BE6190299AC9609EA` | The USDV issuer `rfffsukWALJB1PXYk7H8xkR6UJUDT8nMJE` creates a holder's line, authorized, at zero              |
+| `ammcreate_unauthorized_line` | 104478769 | `93605E3991FED4AED241A9A0274975394332E552BD38C15D7050F262F49DC9C9` | AMMCreate gives the pool `rPZZja3wKFEmAGGteziXYLT9Ne6SnT7H66` a USDV line of 700000, not authorized            |
+| `trustset_authorizes`         | 104479125 | `C36AC10B9FA6AD15E2254477DFEF057D08589E39CA0102871D93622191D03D96` | The USDV issuer authorizes the pool's line                                                                     |
+| `trustline_created_at_zero`   | 104566877 | `19B5C0FB6295872FCECCE7491806E3CE4A54067F4C43BC898BD1387EBC0D9DAB` | `rsMeJ5p6qzVARADTYhvZbHqwkfyN18U2XH` creates a USDV line with a zero balance                                   |
+| `trustline_deleted`           | 104566926 | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | It sets the limit back to 0: the line is a `DeletedNode`                                                       |
 
 ### XRPL path payments (`xrpl/path-payments/`)
 
@@ -270,23 +281,23 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpo
   --out test/fixtures/xrpl/nft --delay-ms 75 --txs 32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D,350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1,C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92,12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1,9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427,910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D,BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9,AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034,D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3,BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56,695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9,0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C,2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7,4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A,33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2
 ```
 
-| Case | Ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `mint` | 107878781 | `32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D` | Own mint, no `Issuer`, no `Amount`; one id added to an existing page |
-| `mint_with_offer` | 107886233 | `350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1` | Mint with `Amount` "0" and `Destination`: a created sell `NFTokenOffer` |
-| `mint_on_behalf` | 107883082 | `C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92` | `Issuer` is not the sender; the id lands on the minter's page |
-| `burn` | 107883610 | `12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1` | Burn with no `NFTokenOffer` deleted |
-| `burn_removes_offers` | 107879890 | `9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427` | Burn that deletes the NFT's sell offer |
-| `modify` | 107886001 | `910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D` | `URI` of one NFT changed; same ids, same page |
-| `sell_offer_create` | 107886233 | `BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9` | `Flags` 1: a sell offer of 19.98 XRP with `Destination` |
-| `buy_offer_create` | 107886233 | `AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034` | No `Flags`: a buy offer of 8.11 XRP with `Destination` and `Expiration` |
-| `offer_cancel` | 107886163 | `D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3` | Cancels one buy offer (146.25 XRP) |
-| `sale_by_sell_offer` | 107874617 | `BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56` | One sell offer accepted, 10 XRP, fee 5%: the issuer, neither party, is paid 0.5 XRP |
-| `sale_by_buy_offer` | 107878775 | `695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9` | One buy offer accepted, 1 drop; the seller is the issuer |
-| `brokered_sale_royalty` | 107879497 | `0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C` | Both offers, broker fee 2.3835 XRP, fee 3%, issuer paid 4.428495 XRP |
-| `sale_issued_currency` | 107881530 | `2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7` | Sell offer priced 100 of a 40-hex currency (XRPlay) |
-| `transfer_zero_amount` | 107886163 | `4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A` | Accepted sell offer of `Amount` "0": the NFT moves, no payment |
-| `page_split_with_mint` | 107886233 | `33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2` | Mint on a full page: a created and a modified page of one owner, and a neighbour whose `NFTokens` did not change; the mint also creates a gift sell `NFTokenOffer` (`Amount` "0", `Destination`) and deletes the Ticket it was sent with |
+| Case                    | Ledger    | Transaction                                                        | What it shows                                                                                                                                                                                                                            |
+| ----------------------- | --------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mint`                  | 107878781 | `32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D` | Own mint, no `Issuer`, no `Amount`; one id added to an existing page                                                                                                                                                                     |
+| `mint_with_offer`       | 107886233 | `350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1` | Mint with `Amount` "0" and `Destination`: a created sell `NFTokenOffer`                                                                                                                                                                  |
+| `mint_on_behalf`        | 107883082 | `C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92` | `Issuer` is not the sender; the id lands on the minter's page                                                                                                                                                                            |
+| `burn`                  | 107883610 | `12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1` | Burn with no `NFTokenOffer` deleted                                                                                                                                                                                                      |
+| `burn_removes_offers`   | 107879890 | `9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427` | Burn that deletes the NFT's sell offer                                                                                                                                                                                                   |
+| `modify`                | 107886001 | `910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D` | `URI` of one NFT changed; same ids, same page                                                                                                                                                                                            |
+| `sell_offer_create`     | 107886233 | `BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9` | `Flags` 1: a sell offer of 19.98 XRP with `Destination`                                                                                                                                                                                  |
+| `buy_offer_create`      | 107886233 | `AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034` | No `Flags`: a buy offer of 8.11 XRP with `Destination` and `Expiration`                                                                                                                                                                  |
+| `offer_cancel`          | 107886163 | `D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3` | Cancels one buy offer (146.25 XRP)                                                                                                                                                                                                       |
+| `sale_by_sell_offer`    | 107874617 | `BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56` | One sell offer accepted, 10 XRP, fee 5%: the issuer, neither party, is paid 0.5 XRP                                                                                                                                                      |
+| `sale_by_buy_offer`     | 107878775 | `695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9` | One buy offer accepted, 1 drop; the seller is the issuer                                                                                                                                                                                 |
+| `brokered_sale_royalty` | 107879497 | `0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C` | Both offers, broker fee 2.3835 XRP, fee 3%, issuer paid 4.428495 XRP                                                                                                                                                                     |
+| `sale_issued_currency`  | 107881530 | `2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7` | Sell offer priced 100 of a 40-hex currency (XRPlay)                                                                                                                                                                                      |
+| `transfer_zero_amount`  | 107886163 | `4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A` | Accepted sell offer of `Amount` "0": the NFT moves, no payment                                                                                                                                                                           |
+| `page_split_with_mint`  | 107886233 | `33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2` | Mint on a full page: a created and a modified page of one owner, and a neighbour whose `NFTokens` did not change; the mint also creates a gift sell `NFTokenOffer` (`Amount` "0", `Destination`) and deletes the Ticket it was sent with |
 
 **Not found** (within the 19,955 ledgers scanned, fewer than the 50,000 the plan names): `offer_removed_other`. No transaction of a type other than NFTokenAcceptOffer, NFTokenBurn and NFTokenCancelOffer deleted an `NFTokenOffer` in them (an AccountDelete of an offer's owner is the only other type expected to), and the 290 accounts that owned offers in the first part of the scan all still existed when checked with `account_info`. The scan was stopped there because the node answered "You are placing too much load on the server" to it. Task 4 needs a `synthetic-…` transaction for `offer_removed_other`.
 
@@ -313,27 +324,27 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpo
   --out test/fixtures/xrpl/objects --delay-ms 150 --txs BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53,7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954,92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046,852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198,3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C,375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA,DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E,CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326,A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE,3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330,A075E757D0E6E283ABB6CD7ED751A412D4B1DC14C6F5DE616819C7D6579EC63C,BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77,04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7,E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127,0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE,886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790,29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB,42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75,FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8,9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9,4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66,8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8
 ```
 
-| Case | Ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `escrow_create_timed` | 107897249 | `BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53` | XRP escrow with `FinishAfter` and `CancelAfter`, no `Condition` |
-| `escrow_create_conditional` | 106268539 | `7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954` | `Condition`, `FinishAfter`, `CancelAfter`; 4258 of an issued token (a token-escrow test) |
-| `escrow_finish_timed` | 107670360 | `92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046` | No `Fulfillment`; a 50 XRP escrow created in ledger 59388170 |
-| `escrow_cancel` | 106179366 | `852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198` | Cancel by a third party (`Account` is not `Owner`) after `CancelAfter`; token escrow |
-| `escrow_create_token` | 107945438 | `3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C` | 75000 XRB, `FinishAfter` only: the sender's trust line moves |
-| `escrow_finish_token` | 107967068 | `375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA` | Finish of that escrow, sent by a bot with a ticket: the destination's trust line moves |
-| `check_create_xrp` | 107972102 | `DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E` | `SendMax` 1000 XRP, no `Expiration` |
-| `check_create_token` | 107698980 | `CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326` | 1 RLUSD with `InvoiceID` and `Expiration` |
-| `check_cash_amount` | 107671568 | `A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE` | `Amount` 933.622827 XRP; a Batch inner; no `DeliveredAmount` |
-| `check_cancel_source` | 107968411 | `BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77` | Cancel by the check's own source |
-| `channel_create` | 106970128 | `04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7` | 10000 drops with `CancelAfter` and `SettleDelay` 1209600; no `Balance` in `NewFields` |
-| `channel_fund_expiration` | 107220098 | `0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE` | Fund of 1 drop with `Expiration` |
-| `channel_claim` | 107641123 | `886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790` | The first claim of a channel: `PreviousFields.Balance` "0" |
-| `channel_close_request` | 107107437 | `29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB` | `tfClose` by the source with the balance below the amount: the channel stays and gains `Expiration` |
-| `channel_close_destination` | 107296498 | `42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75` | `tfClose` by the destination: the channel is deleted at once |
-| `channel_renew` | 107218583 | `FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8` | `tfRenew`: the `Expiration` of the close request is removed |
-| `channel_close_expired` | 102145584 | `9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9` | A claim on a channel whose `Expiration` has passed deletes it |
-| `delegate_set_create` | 107558036 | `4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66` | `OfferCreate` and `OfferCancel` permissions: a created `Delegate` |
-| `delegated_batch_inner` | 107699656 | `8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8` | `Delegate` set, `Fee` "0", `tfInnerBatchTxn`: an inner transaction of a Batch |
+| Case                        | Ledger    | Transaction                                                        | What it shows                                                                                       |
+| --------------------------- | --------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `escrow_create_timed`       | 107897249 | `BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53` | XRP escrow with `FinishAfter` and `CancelAfter`, no `Condition`                                     |
+| `escrow_create_conditional` | 106268539 | `7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954` | `Condition`, `FinishAfter`, `CancelAfter`; 4258 of an issued token (a token-escrow test)            |
+| `escrow_finish_timed`       | 107670360 | `92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046` | No `Fulfillment`; a 50 XRP escrow created in ledger 59388170                                        |
+| `escrow_cancel`             | 106179366 | `852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198` | Cancel by a third party (`Account` is not `Owner`) after `CancelAfter`; token escrow                |
+| `escrow_create_token`       | 107945438 | `3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C` | 75000 XRB, `FinishAfter` only: the sender's trust line moves                                        |
+| `escrow_finish_token`       | 107967068 | `375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA` | Finish of that escrow, sent by a bot with a ticket: the destination's trust line moves              |
+| `check_create_xrp`          | 107972102 | `DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E` | `SendMax` 1000 XRP, no `Expiration`                                                                 |
+| `check_create_token`        | 107698980 | `CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326` | 1 RLUSD with `InvoiceID` and `Expiration`                                                           |
+| `check_cash_amount`         | 107671568 | `A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE` | `Amount` 933.622827 XRP; a Batch inner; no `DeliveredAmount`                                        |
+| `check_cancel_source`       | 107968411 | `BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77` | Cancel by the check's own source                                                                    |
+| `channel_create`            | 106970128 | `04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7` | 10000 drops with `CancelAfter` and `SettleDelay` 1209600; no `Balance` in `NewFields`               |
+| `channel_fund_expiration`   | 107220098 | `0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE` | Fund of 1 drop with `Expiration`                                                                    |
+| `channel_claim`             | 107641123 | `886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790` | The first claim of a channel: `PreviousFields.Balance` "0"                                          |
+| `channel_close_request`     | 107107437 | `29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB` | `tfClose` by the source with the balance below the amount: the channel stays and gains `Expiration` |
+| `channel_close_destination` | 107296498 | `42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75` | `tfClose` by the destination: the channel is deleted at once                                        |
+| `channel_renew`             | 107218583 | `FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8` | `tfRenew`: the `Expiration` of the close request is removed                                         |
+| `channel_close_expired`     | 102145584 | `9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9` | A claim on a channel whose `Expiration` has passed deletes it                                       |
+| `delegate_set_create`       | 107558036 | `4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66` | `OfferCreate` and `OfferCancel` permissions: a created `Delegate`                                   |
+| `delegated_batch_inner`     | 107699656 | `8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8` | `Delegate` set, `Fee` "0", `tfInnerBatchTxn`: an inner transaction of a Batch                       |
 
 **Not found** (within the ledgers scanned and the histories read; each is built synthetically in the test that needs it): `escrow_create_ticket`,
 `escrow_finish_fulfillment` (every conditional escrow seen is a token escrow that its testers cancelled), `escrow_create_mpt` (no MPT amount in any of the
@@ -378,17 +389,17 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endp
   --out test/fixtures/xahau/uritoken --delay-ms 75 --txs 8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B,CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169,1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D,01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C,9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E,B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01,3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426,4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B,A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B
 ```
 
-| Case | Ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `uritoken_mint` | 26774724 | `8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B` | Mint without `Amount` (an Evernode lease token), Flags 1 |
-| `uritoken_sell_offer_create` | 26765431 | `CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169` | Sell offer of 2200 XAH; the entry gains `Amount` |
-| `uritoken_sell_offer_cancel` | 26533927 | `1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D` | Cancel: the entry loses `Amount` (1800 XAH) |
-| `uritoken_buy_above_ask` | 26763778 | `01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C` | A buy at exactly the ask (4200 XAH); the seller gains the `Amount` |
-| `uritoken_burn_with_offer` | 26768773 | `9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E` | Burn of a token with a standing 0.0001 EVR sell offer |
-| `remit_transfer` | 26771798 | `B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01` | `Remit` with one `URITokenIDs`: the owner changes, the sell offer is cleared |
-| `remit_mint` | 26689211 | `3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426` | `Remit` with `MintURIToken`: a token for the destination |
-| `uritoken_remint` | 26763629 | `4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B` | Mint of an id that an earlier burn deleted (the burn is in `burn`) |
-| (its burn) | 26763618 | `A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B` | The `URITokenBurn` that deleted the id |
+| Case                         | Ledger   | Transaction                                                        | What it shows                                                                |
+| ---------------------------- | -------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| `uritoken_mint`              | 26774724 | `8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B` | Mint without `Amount` (an Evernode lease token), Flags 1                     |
+| `uritoken_sell_offer_create` | 26765431 | `CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169` | Sell offer of 2200 XAH; the entry gains `Amount`                             |
+| `uritoken_sell_offer_cancel` | 26533927 | `1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D` | Cancel: the entry loses `Amount` (1800 XAH)                                  |
+| `uritoken_buy_above_ask`     | 26763778 | `01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C` | A buy at exactly the ask (4200 XAH); the seller gains the `Amount`           |
+| `uritoken_burn_with_offer`   | 26768773 | `9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E` | Burn of a token with a standing 0.0001 EVR sell offer                        |
+| `remit_transfer`             | 26771798 | `B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01` | `Remit` with one `URITokenIDs`: the owner changes, the sell offer is cleared |
+| `remit_mint`                 | 26689211 | `3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426` | `Remit` with `MintURIToken`: a token for the destination                     |
+| `uritoken_remint`            | 26763629 | `4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B` | Mint of an id that an earlier burn deleted (the burn is in `burn`)           |
+| (its burn)                   | 26763618 | `A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B` | The `URITokenBurn` that deleted the id                                       |
 
 **Not found** (within those ledgers and the account histories): `uritoken_mint_with_offer`. No `URITokenMint` carries an `Amount` (or a `Destination`) among the 14,211 mints seen in the 32,927 ledgers read, nor among the mints in the `account_tx` of the marketplace accounts looked at. Task 5 needs a `synthetic-…` transaction for `uritoken_mint_with_offer`.
 **`uritoken_buy_above_ask` is the fallback the plan allows**: no `URITokenBuy` paid more than the ask in any buy met, so the case is a buy at exactly the ask (its note says so).
@@ -411,19 +422,19 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endp
   --out test/fixtures/xahau/objects --delay-ms 1000 --txs 3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676,E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF,D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA,868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A,D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086,2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916,11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C,2615DA09A9FB5E0F919EE108066407A518771B63541BCA51DEB10B96D9FFA026,7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6,D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA,658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC,8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037
 ```
 
-| Case | Ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `escrow_create` | 14634228 | `3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676` | 200 XAH to itself, `FinishAfter` only; `TransferRate` in `NewFields` |
-| `escrow_finish` | 20555633 | `E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF` | `Owner` and `OfferSequence`; carries `PreviousTxnID` |
-| `escrow_finish_escrow_id` | 10090323 | `D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA` | `EscrowID`, no `OfferSequence`; `Owner` is the escrow's destination |
-| `escrow_cancel` | 20449602 | `868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A` | Cancel by a third party (`Account` is not `Owner`) |
-| `escrow_create_token` | 25229443 | `D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086` | 80875 CLV: the trust line gains `LockCount` and `LockedBalance`, its `Balance` does not move |
-| `check_create` | 12064511 | `2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916` | `SendMax` 1 XAH |
-| `check_cash` | 12064524 | `11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C` | `DeliverMin` "1000000", no `Amount`; `DeliveredAmount` in the metadata |
-| `channel_create` | 8852809 | `7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6` | 300000 drops; `Balance` "0" and `TransferRate` in `NewFields` |
-| `channel_claim` | 8863640 | `D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA` | The first claim of that channel: `PreviousFields.Balance` "0" |
-| `channel_create_token` | 11056548 | `658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC` | 1 DHA: `Amount` and `Balance` are token amounts; the creator's line is locked |
-| `channel_claim_token` | 11083603 | `8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037` | The first claim of that channel: two trust lines move |
+| Case                      | Ledger   | Transaction                                                        | What it shows                                                                                |
+| ------------------------- | -------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `escrow_create`           | 14634228 | `3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676` | 200 XAH to itself, `FinishAfter` only; `TransferRate` in `NewFields`                         |
+| `escrow_finish`           | 20555633 | `E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF` | `Owner` and `OfferSequence`; carries `PreviousTxnID`                                         |
+| `escrow_finish_escrow_id` | 10090323 | `D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA` | `EscrowID`, no `OfferSequence`; `Owner` is the escrow's destination                          |
+| `escrow_cancel`           | 20449602 | `868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A` | Cancel by a third party (`Account` is not `Owner`)                                           |
+| `escrow_create_token`     | 25229443 | `D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086` | 80875 CLV: the trust line gains `LockCount` and `LockedBalance`, its `Balance` does not move |
+| `check_create`            | 12064511 | `2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916` | `SendMax` 1 XAH                                                                              |
+| `check_cash`              | 12064524 | `11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C` | `DeliverMin` "1000000", no `Amount`; `DeliveredAmount` in the metadata                       |
+| `channel_create`          | 8852809  | `7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6` | 300000 drops; `Balance` "0" and `TransferRate` in `NewFields`                                |
+| `channel_claim`           | 8863640  | `D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA` | The first claim of that channel: `PreviousFields.Balance` "0"                                |
+| `channel_create_token`    | 11056548 | `658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC` | 1 DHA: `Amount` and `Balance` are token amounts; the creator's line is locked                |
+| `channel_claim_token`     | 11083603 | `8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037` | The first claim of that channel: two trust lines move                                        |
 
 Every case of the set was found. Xahau has no conditional escrow among its 198 live ones (none has a `Condition`), no MPT and no `Delegate`, so the set has none.
 
@@ -448,13 +459,13 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endp
   --ledgers 24508586,2609052
 ```
 
-| Case | Ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `import-creates-account` | 24508587 | `A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843` | The first `Import` of `rBPKXGERk7KrzZDGXscchv4eQoS2k6nV6M`: `Fee` 0, a `CreatedNode` `AccountRoot` with `Balance` 2000000 (the starting bonus) |
-| (its parent) | 24508586 | | For the invariant: 127 transactions in the child, one of them the `Import` |
-| `import-existing-account` | 2609053 | `3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE` | An `Import` of `rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`, which exists: `Fee` 100, `Balance` 1000000 to 999911 (minted 11) |
-| (its parent) | 2609052 | | For the invariant |
-| `claim-opt-out` (hand-made) | 26540187 | `3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C` | `26540187-opt-out.json`: the recorded ledger of `xahau/recorded` with the `ClaimReward`'s `Flags` set from 0 to 1 and its `Issuer` removed (an opt-out has none, xahaud `ClaimReward.cpp:124-129`) |
+| Case                                  | Ledger   | Transaction                                                        | What it shows                                                                                                                                                                                                                                                   |
+| ------------------------------------- | -------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `import-creates-account`              | 24508587 | `A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843` | The first `Import` of `rBPKXGERk7KrzZDGXscchv4eQoS2k6nV6M`: `Fee` 0, a `CreatedNode` `AccountRoot` with `Balance` 2000000 (the starting bonus)                                                                                                                  |
+| (its parent)                          | 24508586 |                                                                    | For the invariant: 127 transactions in the child, one of them the `Import`                                                                                                                                                                                      |
+| `import-existing-account`             | 2609053  | `3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE` | An `Import` of `rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`, which exists: `Fee` 100, `Balance` 1000000 to 999911 (minted 11)                                                                                                                                            |
+| (its parent)                          | 2609052  |                                                                    | For the invariant                                                                                                                                                                                                                                               |
+| `claim-opt-out` (hand-made)           | 26540187 | `3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C` | `26540187-opt-out.json`: the recorded ledger of `xahau/recorded` with the `ClaimReward`'s `Flags` set from 0 to 1 and its `Issuer` removed (an opt-out has none, xahaud `ClaimReward.cpp:124-129`)                                                              |
 | `genesis-mint-governance` (hand-made) | 26540188 | `E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D` | `26540188-governance.json`: the recorded ledger with the `GenesisMint`'s `EmitDetails.EmitParentTxnID` set to the recorded `Invoke` `DE1FEAEA69ABF97EA8D95341A6C9B79094746CD8F35C0557583BB986867BB48D` (ledger 26540711 of `xahau/recorded`), which is no claim |
 
 The hand-made files are copies of ledgers that `xahau/recorded` holds for real, with the edits named above (one for the governance mint, two for the opt-out claim) and nothing else changed (the ledger hash and the transaction hashes are those of the real
@@ -476,20 +487,20 @@ The hashes came from a throwaway scan (not in the repository). It walked back fr
 (one request in flight, 75 ms between requests, a throttle answer waited out), at most 5,000 ledgers per network, and kept the first transaction
 that fitted each case. `failed_tx_with_domain` was not searched: it and the two Payments below are read in place.
 
-| Case | Ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `accountset_sets_domain` | 107939675 | `7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F` | `rM8kmmnz5qPMg7V3r7SHYXgDGvm8PhzLvM` sets `lumitrades.io` (none before) |
+| Case                        | Ledger    | Transaction                                                        | What it shows                                                                                |
+| --------------------------- | --------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `accountset_sets_domain`    | 107939675 | `7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F` | `rM8kmmnz5qPMg7V3r7SHYXgDGvm8PhzLvM` sets `lumitrades.io` (none before)                      |
 | `accountset_changes_domain` | 107938710 | `894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98` | `rPo76joT4HVuvyomAqnapVcX3tYvmAxhHT` changes a Domain of 32 bytes to another one of 32 bytes |
 
 **Read in place** (the ledgers are in other directories and not copied; the test loads them by index):
 
-| Case | Ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `payment_to_account_with_domain` (`xrpl/recorded/`) | 107671317 | `B244AF0904E22964D1AF89FD213AA8502ADF65FEED95185C6B62961DB9DC2571` | A `Payment` to `rf82s1CDagppvM6ATqc1nSrL6GackzHJrm`, Domain `test.com` (its root is node 0, only `Balance` changes) |
-| `failed_tx_with_domain` (`xrpl/amm/`) | 106084525 | `1531CDE5DA5E231C54B7A697FD7C1C51151E8AB2AD3D1FB5174A571E63C2E280` | `Payment` `tecPATH_PARTIAL` by `r428GGG2F1vgn9BUtuiCiEmzrh5oAnhyj7`, Domain `https://www.smartplaystudio.com/`: the fee and `Sequence` change the root |
-| `failed_tx_with_domain` (`xrpl/path-payments/`) | 37999837 | `B28614B78D1D90B34081F74B6EC5A76C6898800A51B69ED19280F918B743A50E` | `OfferCreate` `tecUNFUNDED_OFFER` by `r9Gps6fB9YLuZ87rWx7M9TgLAGK2zsz5s6`, Domain `mduo13.com`; the last of three transactions of the ledger that change its root |
-| `payment_by_account_with_domain` (`xahau/recorded/`) | 26540187 | `00F5098EB67BB5E4E177D02F5B492DD5BF215DFF1677EFBD8542394387EBC866` | A `Payment` **sent by** `rGsbGtyrXoPSocAWcngrQZqm6AaQmocw5B` (the sender's root: `Sequence` is in its `PreviousFields`), Domain `n1737.bisdaknode1701-1750.ovh`; the recipient `rHktfGUbjqzU4GsYCMc1pDjdHXb5CJamto` has no Domain |
-| (14 AccountSets) (`xahau/recorded/`) | 26540711 | | 14 successful `AccountSet`s (Evernode hosts) whose sender's root has a Domain before and another one after; each of the 14 accounts has one root node with a Domain in the ledger |
+| Case                                                 | Ledger    | Transaction                                                        | What it shows                                                                                                                                                                                                                     |
+| ---------------------------------------------------- | --------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `payment_to_account_with_domain` (`xrpl/recorded/`)  | 107671317 | `B244AF0904E22964D1AF89FD213AA8502ADF65FEED95185C6B62961DB9DC2571` | A `Payment` to `rf82s1CDagppvM6ATqc1nSrL6GackzHJrm`, Domain `test.com` (its root is node 0, only `Balance` changes)                                                                                                               |
+| `failed_tx_with_domain` (`xrpl/amm/`)                | 106084525 | `1531CDE5DA5E231C54B7A697FD7C1C51151E8AB2AD3D1FB5174A571E63C2E280` | `Payment` `tecPATH_PARTIAL` by `r428GGG2F1vgn9BUtuiCiEmzrh5oAnhyj7`, Domain `https://www.smartplaystudio.com/`: the fee and `Sequence` change the root                                                                            |
+| `failed_tx_with_domain` (`xrpl/path-payments/`)      | 37999837  | `B28614B78D1D90B34081F74B6EC5A76C6898800A51B69ED19280F918B743A50E` | `OfferCreate` `tecUNFUNDED_OFFER` by `r9Gps6fB9YLuZ87rWx7M9TgLAGK2zsz5s6`, Domain `mduo13.com`; the last of three transactions of the ledger that change its root                                                                 |
+| `payment_by_account_with_domain` (`xahau/recorded/`) | 26540187  | `00F5098EB67BB5E4E177D02F5B492DD5BF215DFF1677EFBD8542394387EBC866` | A `Payment` **sent by** `rGsbGtyrXoPSocAWcngrQZqm6AaQmocw5B` (the sender's root: `Sequence` is in its `PreviousFields`), Domain `n1737.bisdaknode1701-1750.ovh`; the recipient `rHktfGUbjqzU4GsYCMc1pDjdHXb5CJamto` has no Domain |
+| (14 AccountSets) (`xahau/recorded/`)                 | 26540711  |                                                                    | 14 successful `AccountSet`s (Evernode hosts) whose sender's root has a Domain before and another one after; each of the 14 accounts has one root node with a Domain in the ledger                                                 |
 
 **Not found** within the 5,000 ledgers of the scan, so not recorded (the hand-made unit cases of `account-domains.parser.spec.ts` stay their only test):
 
@@ -525,27 +536,27 @@ The hashes came from `account_tx` of known issuers, one request at a time (a thr
 `rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq` (the AccountSets of its first rows) and the RLUSD issuer `rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De` (the same). The
 Clawback came from a page of a third-party explorer that lists it, and was then checked with `tx` on the node: validated, `tesSUCCESS`, in the ledger below.
 
-| Case | Ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `accountset_transfer_rate` | 11738848 | `E9CFA70630C46E4E6E539C5FA840487974A241A9A9E75EE6FB3555711144D746` | The GateHub issuer sets `TransferRate` 1002000000 for the first time. Its account root is the only node and its `PreviousFields` hold `Balance` and `Sequence` alone: the touch comes from the rule for the sender of an `AccountSet` |
-| `accountset_allow_clawback` | 89925780 | `9B1042DD30188C9BAE7F81C5B3DB91F9C121669A359F4124FBB88531F8BAADA2` | The RLUSD issuer sets `SetFlag` 16 (`asfAllowTrustLineClawback`). Its account root is the only node and its `PreviousFields` hold `Balance`, `Flags` and `Sequence` |
-| `clawback` | 85885429 | `C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8` | `rYNKrtQaf3vUVWVK5sw9rJdPGDLbxZu89` claws back 1 unit of `594F494E4B000000000000000000000000000000` from `rYNK7JFGbJhkX8HhT4zw1LJ1Yiu3aa9Mp`. Two nodes: the issuer's root (`Balance` and `Sequence`: no touch) and the trust line (`Balance`: one `line` touch) |
+| Case                        | Ledger   | Transaction                                                        | What it shows                                                                                                                                                                                                                                                    |
+| --------------------------- | -------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accountset_transfer_rate`  | 11738848 | `E9CFA70630C46E4E6E539C5FA840487974A241A9A9E75EE6FB3555711144D746` | The GateHub issuer sets `TransferRate` 1002000000 for the first time. Its account root is the only node and its `PreviousFields` hold `Balance` and `Sequence` alone: the touch comes from the rule for the sender of an `AccountSet`                            |
+| `accountset_allow_clawback` | 89925780 | `9B1042DD30188C9BAE7F81C5B3DB91F9C121669A359F4124FBB88531F8BAADA2` | The RLUSD issuer sets `SetFlag` 16 (`asfAllowTrustLineClawback`). Its account root is the only node and its `PreviousFields` hold `Balance`, `Flags` and `Sequence`                                                                                              |
+| `clawback`                  | 85885429 | `C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8` | `rYNKrtQaf3vUVWVK5sw9rJdPGDLbxZu89` claws back 1 unit of `594F494E4B000000000000000000000000000000` from `rYNK7JFGbJhkX8HhT4zw1LJ1Yiu3aa9Mp`. Two nodes: the issuer's root (`Balance` and `Sequence`: no touch) and the trust line (`Balance`: one `line` touch) |
 
 **Read in place** (the ledgers are in other directories and not copied; the test loads them by their hash, and names each case as below):
 
-| Case | Directory, ledger | Transaction | What it shows |
-| --- | --- | --- | --- |
-| `accountset_domain` (changed) | `xrpl/account-domains/` 107938710 | `894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98` | `Domain` is among the `PreviousFields` of the sender's root |
-| `accountset_domain` (set first) | `xrpl/account-domains/` 107939675 | `7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F` | `Domain` is in `FinalFields` alone; only `Balance` and `Sequence` are in the `PreviousFields`: the sender rule is the only way to the touch |
-| `payment_ripples_through_issuer` | `xrpl/account-state/` 104477592 | `33B40BE22F00E669023312A6F7192EC20748CA5111DA180B81E5D6458DCDA06B` | A Payment through the issuer `rBitcoiNXev8VoVxV7pwoQx1sSfonVP9i3`: four trust lines move, no account root changes more than `Balance` and `Sequence` |
-| `offercreate_two_issued_lines` | `xrpl/account-state/` 104477592 | `E75F47B22075C3554C321E125F127F71E2C440B03770A350886C943995690FA5` | An OfferCreate that crosses two offers: four trust lines, two of the currency `XAH` and two of RLUSD (`524C5553…`) |
-| `ammdeposit_lp_line` | `xrpl/account-state/` 107872956 | `45E37A13EEEA300014BEBBD81F915ECBE338481732B6E409579D7422B5BC684D` | An AMMDeposit: the depositor's LP line (`03D2DE40…`), written like any other line |
-| `trustset_preauthorizes` | `xrpl/account-state/` 104477592 | `7CD6BB1BEAFB159C576910B8A442FCD86FA92B2E8454CF8BE6190299AC9609EA` | `tfSetfAuth`: the USDV issuer creates the line; its own root changes `Balance`, `OwnerCount` and `Sequence`: no touch |
-| `trustline_deleted` | `xrpl/account-state/` 104566926 | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | The line is a `DeletedNode` |
-| `trustset_freeze` | `xrpl/account-state/` 26926380 | `40574C8990CD1EAD6D9831D6A32CBE16E3412CE0BDE48F5B86750A8BD8156CAD` | The line is modified (HighFreeze) |
-| `trustset` (Xahau) | `xahau/objects/` 11056548 | `2A1E6EADE207AB90023A2F050ED1766A7932C53776AF0A2287C90FF7B2A0F6FB` | A TrustSet that changes the limit of a USD line |
-| `payment_issued` (Xahau, EVR) | `xahau/objects/` 11056548 | `1A8BE06C9600311F0A908AC263C4643BA4F90A904F01AE374B1F7F3018C28EBE` | A Payment of EVR: two trust lines of the issuer `rEvernodee8dJLaFsujS6q1EiXvZYmHXr8` |
-| `remit_issued` (Xahau) | `xahau/recorded/` 26540613 | `8C50C44787A12B785AA62377D0AFA6C4711E8E07EF68BA6E83DC286F7EE79AAF` | A Remit of issued tokens: six trust lines, and five account roots that change `Balance`, `TouchCount` and the like (no touch) |
+| Case                             | Directory, ledger                 | Transaction                                                        | What it shows                                                                                                                                        |
+| -------------------------------- | --------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accountset_domain` (changed)    | `xrpl/account-domains/` 107938710 | `894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98` | `Domain` is among the `PreviousFields` of the sender's root                                                                                          |
+| `accountset_domain` (set first)  | `xrpl/account-domains/` 107939675 | `7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F` | `Domain` is in `FinalFields` alone; only `Balance` and `Sequence` are in the `PreviousFields`: the sender rule is the only way to the touch          |
+| `payment_ripples_through_issuer` | `xrpl/account-state/` 104477592   | `33B40BE22F00E669023312A6F7192EC20748CA5111DA180B81E5D6458DCDA06B` | A Payment through the issuer `rBitcoiNXev8VoVxV7pwoQx1sSfonVP9i3`: four trust lines move, no account root changes more than `Balance` and `Sequence` |
+| `offercreate_two_issued_lines`   | `xrpl/account-state/` 104477592   | `E75F47B22075C3554C321E125F127F71E2C440B03770A350886C943995690FA5` | An OfferCreate that crosses two offers: four trust lines, two of the currency `XAH` and two of RLUSD (`524C5553…`)                                   |
+| `ammdeposit_lp_line`             | `xrpl/account-state/` 107872956   | `45E37A13EEEA300014BEBBD81F915ECBE338481732B6E409579D7422B5BC684D` | An AMMDeposit: the depositor's LP line (`03D2DE40…`), written like any other line                                                                    |
+| `trustset_preauthorizes`         | `xrpl/account-state/` 104477592   | `7CD6BB1BEAFB159C576910B8A442FCD86FA92B2E8454CF8BE6190299AC9609EA` | `tfSetfAuth`: the USDV issuer creates the line; its own root changes `Balance`, `OwnerCount` and `Sequence`: no touch                                |
+| `trustline_deleted`              | `xrpl/account-state/` 104566926   | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | The line is a `DeletedNode`                                                                                                                          |
+| `trustset_freeze`                | `xrpl/account-state/` 26926380    | `40574C8990CD1EAD6D9831D6A32CBE16E3412CE0BDE48F5B86750A8BD8156CAD` | The line is modified (HighFreeze)                                                                                                                    |
+| `trustset` (Xahau)               | `xahau/objects/` 11056548         | `2A1E6EADE207AB90023A2F050ED1766A7932C53776AF0A2287C90FF7B2A0F6FB` | A TrustSet that changes the limit of a USD line                                                                                                      |
+| `payment_issued` (Xahau, EVR)    | `xahau/objects/` 11056548         | `1A8BE06C9600311F0A908AC263C4643BA4F90A904F01AE374B1F7F3018C28EBE` | A Payment of EVR: two trust lines of the issuer `rEvernodee8dJLaFsujS6q1EiXvZYmHXr8`                                                                 |
+| `remit_issued` (Xahau)           | `xahau/recorded/` 26540613        | `8C50C44787A12B785AA62377D0AFA6C4711E8E07EF68BA6E83DC286F7EE79AAF` | A Remit of issued tokens: six trust lines, and five account roots that change `Balance`, `TouchCount` and the like (no touch)                        |
 
 Every case of the plan was found. Facts the ledgers show:
 

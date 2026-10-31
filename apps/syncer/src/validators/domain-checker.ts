@@ -8,9 +8,15 @@ import {
   NetworkProfile,
   NEWEST_MANIFEST_ORDER,
   NodeClient,
+  readStoredTomls,
+  recordToml,
   Table,
   TOML_DETAILS_VERSION,
+  TOML_FIELDS,
+  TomlField,
+  tomlUrlOf,
   UnixSeconds,
+  UnixSecondsMs,
   ValidatorDomainsRow,
   ValidatorManifestsRow,
   ValidatorTomlEntry,
@@ -19,11 +25,16 @@ import {
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { NETWORK_PROFILE, NODE_CLIENT, SyncerConfig, unlPublishersOf, unlValidatorsOf } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { nextTomlRow, TomlFailure } from '../tomls/toml-row';
 import { describeError, isRippledError, rippledCodeOf, SIMPLE_NAME } from './describe-error';
-import { SAFE_FETCHER, SafeFetcher, SafeFetchError, tomlFetchLimits } from './safe-fetch';
+import { DOMAIN_VERIFIED_GRACE_S, DomainReason, isTransientReason } from './domain-reason';
+import { FetchFailure, SAFE_FETCHER, SafeFetcher, SafeFetchError, tomlFetchLimits } from './safe-fetch';
 import { readStoredLists } from './stored-lists';
 import { matchToml, TomlInvalidError } from './toml-match';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from './validators.options';
+
+export { DOMAIN_VERIFIED_GRACE_S, isTransientReason };
+export type { DomainReason };
 
 /** Checks (rows written) in one pass, and node lookups in one pass. */
 export const DOMAIN_PASS_LIMIT = 100;
@@ -34,31 +45,14 @@ export const DOMAIN_SEEN_WITHIN_S = 30 * 86_400;
 /** A key without raw manifest bytes is asked of the node at most this often, and the node gets this long to answer. */
 export const MANIFEST_LOOKUP_INTERVAL_MS = 600_000;
 export const MANIFEST_LOOKUP_TIMEOUT_MS = 5_000;
-/** A transient failure is checked again after an hour; it keeps `verified` for this long after the last success. */
+/** A transient failure is checked again after an hour. */
 export const DOMAIN_TRANSIENT_RECHECK_S = 3_600;
-export const DOMAIN_VERIFIED_GRACE_S = 86_400;
 
 /** The manifests verified between two turns of the event loop: a verification costs about 2 ms. */
 export const DOMAIN_VERIFICATIONS_PER_TURN = 50;
 
 const ACCEPT = 'application/toml, text/plain, */*';
 const MAX_UINT32 = 0xffff_ffff;
-
-/** Why a domain is not verified (`''` when it is). The fetch failures are those of the safe fetcher. */
-export type DomainReason =
-  | ''
-  | 'not_listed'
-  | 'toml_invalid'
-  | 'too_large'
-  | 'redirect_rejected'
-  | 'blocked_address'
-  | 'domain_invalid'
-  | 'manifest_unverified'
-  | 'http_status'
-  | 'dns_error'
-  | 'connect_error'
-  | 'tls_error'
-  | 'timeout';
 
 /** What one check of a (validator, domain) pair came to. */
 export interface DomainCheck {
@@ -73,17 +67,6 @@ export interface DomainCheck {
   accounts?: string[];
   /** The facts of the `[[VALIDATORS]]` entry of a verified domain. */
   entry?: ValidatorTomlEntry;
-}
-
-/**
- * Whether a failure may pass by itself (a website that blips) and so is checked again soon and does not take the badge from
- * a domain that was verified a moment ago: the network failures, a 5xx and a 429. A 4xx, a file that is not what it should
- * be, and every other reason are definite.
- */
-export function isTransientReason(reason: DomainReason, statusCode?: number): boolean {
-  if (reason === 'dns_error' || reason === 'connect_error' || reason === 'tls_error' || reason === 'timeout')
-    return true;
-  return reason === 'http_status' && statusCode !== undefined && (statusCode >= 500 || statusCode === 429);
 }
 
 /**
@@ -165,9 +148,34 @@ export function nextDomainRow(
   return unverified(DOMAIN_TRANSIENT_RECHECK_S);
 }
 
+/** A verified pair whose row was written before the checker read what it reads now. */
+const isBelowVersion = (stored: ValidatorDomainsRow): boolean =>
+  stored.status === 'verified' && stored.toml_version < TOML_DETAILS_VERSION;
+
+/**
+ * Whether a pair is checked in this pass: no row; or its next check has passed; or it is verified, was read before the checker
+ * read what it reads now, and was checked at least an hour ago (D8 3.3). The hour keeps a pair whose re-check met a transient
+ * failure, which keeps its version through the grace, from being fetched every minute while its website is down.
+ */
+export function isDomainDue(stored: ValidatorDomainsRow | undefined, now: number): boolean {
+  if (stored === undefined || stored.next_check_at <= now) return true;
+  return isBelowVersion(stored) && stored.checked_at <= now - DOMAIN_TRANSIENT_RECHECK_S;
+}
+
+/** The value of each of the fields of an entry that are read. */
+const FACT_OF: Record<TomlField, 'ownerCountry' | 'serverCountry' | 'network' | 'unl'> = {
+  owner_country: 'ownerCountry',
+  server_country: 'serverCountry',
+  network: 'network',
+  unl: 'unl',
+};
+
 // -- the checker --------------------------------------------------------------------------------------------------------
 
-type CheckerConfig = Pick<SyncerConfig, 'unlPublishers' | 'unlValidators' | 'domainRecheckMs' | 'domainFetchTimeoutMs'>;
+type CheckerConfig = Pick<
+  SyncerConfig,
+  'unlPublishers' | 'unlValidators' | 'domainRecheckMs' | 'domainFetchTimeoutMs' | 'tomlRecheckMs'
+>;
 type CheckerStore = Pick<ClickHouseService, 'query' | 'insert'>;
 
 /** The newest manifest of a master key, as stored: the highest `seq`, preferring a row with raw bytes among equals. */
@@ -207,7 +215,7 @@ interface Candidate {
 type Verdict = { verified: true; domain: string } | { verified: false };
 
 /** A fetch that did not give a file. */
-type FetchFailed = Pick<DomainCheck, 'reason' | 'statusCode'>;
+type FetchFailed = { reason: FetchFailure; statusCode?: number };
 
 /** A `manifest` answer of the node: `details` of the manifest it knows, and the manifest itself in base64. */
 interface ManifestAnswer {
@@ -261,17 +269,24 @@ function manifestRowOf(key: string, answer: unknown): ValidatorManifestsRow | un
  *    manifest; a validator that has none is not checked and has no row. A row without raw bytes (from before migration 002)
  *    is asked of the node at the end of the pass, `manifest` with the master key, at most once in 10 minutes per key, 5 s,
  *    no retry, and the answer is stored with `source = 'rpc'`; it is checked in a later pass, like any manifest;
- * 3. **the pairs due**: no stored row for (key, domain), or `next_check_at` passed (a changed domain is a new pair). Never
- *    checked first, then the oldest `next_check_at`, at most 100 a pass;
+ * 3. **the pairs due** (`isDomainDue`): no stored row for (key, domain), or `next_check_at` passed (a changed domain is a new
+ *    pair), or verified, read before the checker read what it reads now, and checked at least an hour ago. Never checked and
+ *    below the version first, then the oldest `next_check_at`, at most 100 a pass;
  * 4. **the checks**. A domain whose syntax is not that of rippled's `isProperlyFormedTomlDomain` is `domain_invalid` before
  *    any DNS query. Of the others, one fetch per domain (shared by the validators that name it), at most 4 in flight, of
  *    `https://{domain}{tomlPath}` through the safe fetcher, with no fall-back to the other name. The file is matched with
- *    `matchToml` and the row follows from `nextDomainRow`. The rows of a domain are written as soon as it is done.
+ *    `matchToml` and the row follows from `nextDomainRow`. The rows of a domain are written as soon as it is done;
+ * 5. **the write-through**. After those rows, every file fetched is written to the per-domain store once: `recordToml` for a file
+ *    read as TOML, whatever its verdicts, and `nextTomlRow` over the stored row for a fetch failure or a file that is not TOML. So a
+ *    domain only a validator names is in the store, and its content goes when its file goes. A failed store write is counted and
+ *    logged, and does not fail the pass: the verdicts are written, and the next check writes the store again.
  *
  * **Logs** name a reason, a status code, an address class and a domain (quoted: it comes from a manifest), never a body, an
- * error object or the message of a failure. The result of a pair is logged when it changes; a fetch blocked by the address
+ * error object or the message of a failure, a principal or an email. The result of a pair is logged when it or one of its facts
+ * changes, with the values of the file it ignored (quoted and cut to 16 characters); a fetch blocked by the address
  * policy is logged at `warn` every time. The metric `syncer_validators_domain_checks_total{outcome}` counts every check as
- * `verified` or the reason, also a transient failure that left a domain verified.
+ * `verified` or the reason, also a transient failure that left a domain verified; `syncer_validators_toml_fields_total` what the
+ * entry of a verified check gave, and `syncer_validators_toml_store_writes_total` the write-through.
  *
  * `stop()` starts nothing more, writes nothing for what is on its way, and waits for it.
  */
@@ -292,7 +307,11 @@ export class DomainChecker {
     @Inject(SyncerConfig) private readonly cfg: CheckerConfig,
     @Inject(NETWORK_PROFILE) private readonly profile: Pick<NetworkProfile, 'tomlPath' | 'name'>,
     @Inject(ClickHouseService) private readonly ch: CheckerStore,
-    @Inject(PrometheusService) private readonly metrics: Pick<PrometheusService, 'validatorsDomainChecksTotal'>,
+    @Inject(PrometheusService)
+    private readonly metrics: Pick<
+      PrometheusService,
+      'validatorsDomainChecksTotal' | 'validatorsTomlFieldsTotal' | 'validatorsTomlStoreWritesTotal'
+    >,
     @Inject(SAFE_FETCHER) private readonly fetcher: Pick<SafeFetcher, 'get'>,
     @Inject(NODE_CLIENT) private readonly node: Pick<NodeClient, 'request'>,
     @Optional() @Inject(VALIDATORS_WORKER_OPTIONS) options: ValidatorsWorkerOptions = {},
@@ -541,13 +560,18 @@ export class DomainChecker {
     );
   }
 
-  /** The pairs due at `now`: never checked first, then the oldest `next_check_at`. */
+  /** The pairs due at `now`: never checked and below the version first, by key and domain; then the oldest `next_check_at`. */
   private dueFirst(candidates: Candidate[], stored: Map<string, ValidatorDomainsRow>, now: number): Candidate[] {
-    const nextCheck = (c: Candidate) => stored.get(pairOf(c.key, c.domain))?.next_check_at;
+    const storedOf = (c: Candidate) => stored.get(pairOf(c.key, c.domain));
+    /** The next check of a pair of the later group; a pair of the first group has none. */
+    const laterAt = (c: Candidate): number | undefined => {
+      const row = storedOf(c);
+      return row === undefined || isBelowVersion(row) ? undefined : row.next_check_at;
+    };
     return candidates
-      .filter((c) => (nextCheck(c) ?? -Infinity) <= now)
+      .filter((c) => isDomainDue(storedOf(c), now))
       .sort((a, b) => {
-        const [na, nb] = [nextCheck(a), nextCheck(b)];
+        const [na, nb] = [laterAt(a), laterAt(b)];
         if ((na === undefined) !== (nb === undefined)) return na === undefined ? -1 : 1;
         return (
           (na ?? 0) - (nb ?? 0) ||
@@ -589,7 +613,7 @@ export class DomainChecker {
     return checked;
   }
 
-  /** Fetches the file of a domain once and judges the file for each validator that names the domain. */
+  /** Fetches the file of a domain once, judges it for each validator that names the domain, and writes it to the store. */
   private async checkDomain(group: Candidate[], stored: Map<string, ValidatorDomainsRow>): Promise<number> {
     const file = await this.fetchFile(group[0].tomlUrl, group[0].domain);
     if (this.stopped) return 0;
@@ -603,7 +627,60 @@ export class DomainChecker {
         ...('text' in file ? judge(file.text, c.key, this.profile, Math.floor(fetchedAt)) : file),
       }),
     );
-    return this.record(checks, stored);
+    const written = await this.record(checks, stored);
+    await this.writeThrough(group[0].domain.toLowerCase(), file, fetchedAt);
+    return written;
+  }
+
+  /** Writes the check of a domain to the per-domain store. Never throws: a failure is counted and logged, by the name of the error. */
+  private async writeThrough(
+    domain: string,
+    file: { text: string } | FetchFailed,
+    fetchedAt: UnixSecondsMs,
+  ): Promise<void> {
+    if (this.stopped) return;
+    const tomlUrl = tomlUrlOf(domain, this.profile);
+    try {
+      if ('text' in file) {
+        await this.writeFile(domain, tomlUrl, file.text, fetchedAt);
+      } else {
+        await this.writeFailure(domain, tomlUrl, file.reason, file.statusCode, fetchedAt);
+      }
+      this.metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'ok' });
+    } catch (err) {
+      this.metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'error' });
+      this.logger.warn(`Domain ${quoted(domain)}: the write to the toml store failed (${errorNameOf(err)})`);
+    }
+  }
+
+  /** The `ok` row of a file read as TOML, or the failed row of one that is not. */
+  private async writeFile(domain: string, tomlUrl: string, text: string, fetchedAt: UnixSecondsMs): Promise<void> {
+    try {
+      await recordToml(this.ch, {
+        domain,
+        tomlUrl,
+        text,
+        fetchedAt,
+        recheckMs: this.cfg.tomlRecheckMs,
+        profile: this.profile,
+      });
+    } catch (err) {
+      if (!(err instanceof TomlInvalidError)) throw err;
+      await this.writeFailure(domain, tomlUrl, 'toml_invalid', undefined, fetchedAt);
+    }
+  }
+
+  /** The failed row of a domain, over its stored row. */
+  private async writeFailure(
+    domain: string,
+    tomlUrl: string,
+    reason: TomlFailure,
+    statusCode: number | undefined,
+    now: UnixSecondsMs,
+  ): Promise<void> {
+    const prev = (await readStoredTomls(this.ch, [domain])).get(domain);
+    const row = nextTomlRow(prev, { domain, tomlUrl, reason, statusCode }, now, this.cfg.tomlRecheckMs);
+    await this.ch.insert(Table.DomainTomls, [row]);
   }
 
   /** The text of the file at `url`, or why it could not be had. Never throws. */
@@ -637,24 +714,52 @@ export class DomainChecker {
     await this.ch.insert(Table.ValidatorDomains, rows);
     checks.forEach((check, i) => {
       this.metrics.validatorsDomainChecksTotal.inc({ outcome: check.reason === '' ? 'verified' : check.reason });
+      this.countFields(check);
       this.logChange(stored.get(pairOf(check.key, check.domain)), rows[i], check);
     });
     return rows.length;
   }
 
-  /** Logs the result of a pair when it is not the one stored. A blocked fetch has been logged, at warn, when it was made. */
+  /** What the entry of a verified check gave, field by field. */
+  private countFields(check: DomainCheck): void {
+    if (check.reason !== '' || check.entry === undefined) return;
+    const { entry } = check;
+    for (const field of TOML_FIELDS) {
+      const outcome = entry.invalid.some((each) => each.field === field)
+        ? 'invalid'
+        : entry[FACT_OF[field]] !== ''
+          ? 'read'
+          : 'absent';
+      this.metrics.validatorsTomlFieldsTotal.inc({ field, outcome });
+    }
+  }
+
+  /**
+   * Logs the result of a pair when it, or a fact of the file, is not the one stored. A blocked fetch has been logged, at warn,
+   * when it was made. The values of the file come quoted and cut (`shownValue`); a principal is never logged.
+   */
   private logChange(prev: ValidatorDomainsRow | undefined, row: ValidatorDomainsRow, check: DomainCheck): void {
     if (check.reason === 'blocked_address') return;
     if (
       prev !== undefined &&
       prev.status === row.status &&
       prev.reason === row.reason &&
-      prev.status_code === row.status_code
+      prev.status_code === row.status_code &&
+      prev.owner_country === row.owner_country &&
+      prev.server_country === row.server_country &&
+      prev.toml_network === row.toml_network &&
+      prev.toml_unl === row.toml_unl
     ) {
       return;
     }
     const why = row.reason === '' ? '' : ` (${row.reason}${row.status_code === 0 ? '' : ` ${row.status_code}`})`;
-    this.logger.log(`Validator ${row.validation_public_key}: domain ${quoted(row.domain)} is ${row.status}${why}`);
+    const country =
+      row.status === 'verified' && row.server_country !== '' ? `, server country ${row.server_country}` : '';
+    const ignored = (check.entry?.invalid ?? []).map(({ field, shown }) => `${field} ${shown}`).join(', ');
+    this.logger.log(
+      `Validator ${row.validation_public_key}: domain ${quoted(row.domain)} is ${row.status}${why}${country}` +
+        (ignored === '' ? '' : `; ignored ${ignored}`),
+    );
   }
 }
 

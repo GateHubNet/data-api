@@ -380,6 +380,8 @@ export const VALIDATORS_METRICS = [
   'validatorsUnlExpirySeconds',
   'validatorsUnlSize',
   'validatorsDomainChecksTotal',
+  'validatorsTomlFieldsTotal',
+  'validatorsTomlStoreWritesTotal',
   'validatorsNodePollsTotal',
   'validatorsJobsTotal',
   'validatorsRoundsLagLedgers',

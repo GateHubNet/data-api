@@ -231,6 +231,20 @@ describe('PrometheusService', () => {
     }
   });
 
+  it('registers the two counters of the toml details, with both outcomes of the store writes at 0 from the start', async () => {
+    const service = new PrometheusService();
+    const text = await service.getMetrics();
+    // the alert is an increase(): a series that first shows at its value would not raise it at the first failure
+    expect(text).toMatch(/^# TYPE syncer_validators_toml_store_writes_total counter$/m);
+    expect(text).toMatch(/^syncer_validators_toml_store_writes_total\{outcome="ok"\} \d+$/m);
+    expect(text).toMatch(/^syncer_validators_toml_store_writes_total\{outcome="error"\} \d+$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_toml_fields_total counter$/m);
+    service.validatorsTomlFieldsTotal.inc({ field: 'unl', outcome: 'read' });
+    expect(await service.getMetrics()).toMatch(
+      /^syncer_validators_toml_fields_total\{field="unl",outcome="read"\} \d+$/m,
+    );
+  });
+
   it('registers the two gauges of the supply job with their names, types, label sets and help texts (spec section 4.6)', async () => {
     const service = new PrometheusService();
     service.onModuleInit();
