@@ -15,7 +15,7 @@ exporter and a shared library. This page explains the moving parts; the reasons 
  │   ingest ─ LiveRunner (live + catch-up)   range-ingest CLI        │
  │   validations ─ collector      fee_stats ─ poller                 │
  │   aggregator ─ stats, volumes, AMM, rates, markets, rollups,      │
- │                escrows, issued tokens, supply                     │
+ │                escrows, issued tokens, MPT, supply                │
  │   validators ─ UNL lists, domains (HTTPS), votes, agreement       │
  │   tomls ─ the toml of every domain accounts name (HTTPS)          │
  └──────────────────────────────┬────────────────────────────────────┘
@@ -81,7 +81,7 @@ Everything both services need, written once:
   (`amm-reads.ts`, the windowed fill-forward of pool state in `amm-pools.job.ts`), the jobs of the account and market aggregates
   (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`), the NFT jobs (`nft_state`, `nft_collections`, with `foldNftEvents`, the one
   fold of an NFT's events that the job and the API's detail route share, and the prices of sales in `query/nft-prices.ts`) and the `escrows` job (the
-  current state of every escrow and the sentinel that holds the escrowed total for D7) and the `tokens` job (the generations of the issued tokens built from the state history and the touch index: `tokens.job.ts`, with the pure rules of a token in `token-rules.ts`), and the `supply` job (the hourly snapshot of the native supply: `supply.job.ts`, its reads in `query/supply.ts`).
+  current state of every escrow and the sentinel that holds the escrowed total for D7) and the `tokens` job (the generations of the issued tokens built from the state history and the touch index: `tokens.job.ts`, with the pure rules of a token in `token-rules.ts`), and the `supply` job (the hourly snapshot of the native supply: `supply.job.ts`, its reads in `query/supply.ts`), and the `mpt_state` job (the current holders and issuances of MPTs, rebuilt per touched issuance: `mpt-state.job.ts`, with the lenient decoding of the metadata in `util/mpt-metadata.ts`).
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
@@ -106,7 +106,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets and supply routes, `amm`,
-  `nft`, `names`, `ledger-objects`, `tokens`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+  `nft`, `names`, `ledger-objects`, `tokens`, `mpt`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
@@ -192,6 +192,16 @@ The four routes of the issued tokens are GateHub extras ([ADR-0019](adr/0019-iss
   `token-param.ts` the path, `token-list.ts` the query, the marker and the envelope of the list.
 - **Reads** are bounded by `read_rows` tests (`tokens.e2e-spec.ts`, over a bulk of other tokens' rows and the retired generation's; `paged-reads.e2e-spec.ts` for the transfers).
 
+#### The MPT module (`apps/api/src/mpt`)
+
+The routes of the MPT issuances are GateHub extras ([ADR-0020](adr/0020-mpt-data.md)). `MptModule` is in `ENDPOINT_MODULES` before `NotFoundModule` (`app.module.spec.ts` pins its place); `TokensModule` and `AccountsModule` import it, for `kind=mpt` and `/v2/accounts/{address}/mpt`, and it imports neither.
+
+- **One controller for the issuances:** `MptController` has the lookup, the issuance, `/holders` and `/transfers`, and every route that names an issuance checks the ID first (`mpt-param.ts`). `MptTokensService` is the `TokenListService` of the kind `mpt`, so `kind=mpt` is D6's route and envelope through the `TOKEN_LIST_SERVICES` map. The holdings have their controller in `accounts`, which reads `mpt_holder_states` directly, so that a balance is as of the newest committed ledger.
+- **The aggregates.** `mpt_issuances` and `mpt_holders` are read newest version per key (`LIMIT 1 BY`, never `FINAL`). The holders are ordered at read time, by the balance and then the address; their marker holds the balance as text, since it can pass 2^53. The transfers are a `readDistinctPage` over `mpt_issuance_transfers`, capped at the head by `LedgerRangeResolver`.
+- **Coverage and Xahau.** Every answer but `?ids=` states the feature `mpt` (`common/coverage-features.ts`). While `isAvailable('mpt')` is false no service reads an MPT table.
+- **Objects in one file.** `mpt-objects.ts` holds every object, its key order (the `*_KEYS` constants that the tests and `mpt/api-reference.spec.ts` pin), its CSV columns and the builders; amounts are integer strings beside the ID, never scaled.
+- **Reads** are bounded by `read_rows` tests (`paged-reads.e2e-spec.ts`, over a bulk of other rows): their rows and two granules a part.
+
 #### The supply routes (`apps/api/src/network`)
 
 `GET /v2/network/supply` and `/minted` are GateHub extras (ADR-0010, Amendment 9) in the existing `NetworkModule`. `SupplyService` reads the newest `network_supply` row and the coverage of each part; `/minted` reads the mint tables by day, and
@@ -248,7 +258,7 @@ views. See [clickhouse](clickhouse.md).
    `nft_collection_holders`) from the append-only NFT ledger tables, and keeps the account and market
    aggregates (daily native rates, `pair_hourly` and `markets_live` from `exchanges`, rollups of heavy accounts from `balance_changes`,
    `account_transactions` and `account_exchanges`), the escrowed total from `object_changes`, and the issued tokens (`token_generations`, `token_lines`, `tokens`: generations built from `trust_line_states`, `account_states` and the
-   `state_touches` index, swapped whole) and the hourly supply snapshot (`network_supply`); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
+   `state_touches` index, swapped whole), the MPT state (`mpt_holders`, `mpt_issuances`: rebuilt per touched issuance from the state tables and the `mpt_touches` index) and the hourly supply snapshot (`network_supply`); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
    rounds and the hourly agreement from `validations` and `ledgers`.
 5. Crashes recover from the database alone: re-read the checkpoint, delete the uncommitted tail, carry on
    ([syncer](syncer.md#checkpoint-boot-and-recovery)).

@@ -43,6 +43,8 @@ deviation from the boards. Each is built as written unless the owner says otherw
 
 > **Dated note (2026-10-31, ruling C30(k)).** Decision 15's "about 30 s" is about a minute: the aggregator's tick is 60 s, so a new issuance waits for the next tick. And during a stats catch-up it waits longer: see the dated note of section 6 (ruling C13, to confirm).
 
+> **Dated note (2026-10-31, ruling C25).** Decision 17's "D9 serves every MPT amount in it" and section 2's Amounts row read against section 7's examples and the plan's Global Constraints, which serve integer strings beside the issuance ID. The integer strings stand: D9's own answers carry amounts as strings of digits, checked against E14's own plan (x-explorer `docs/superpowers/plans/2026-10-24-mpt-page.md`: its issuance and `MptHolder` types read amount fields as strings, with the shape rule `/^\d{1,19}$/`). D5's amount object stays what D5's routes serve, unchanged, and scale and ticker still come from `?ids=`. ADR-0010's item 85 is corrected through Amendment 11, item 109. A client that expected D5's object on these routes reads another shape. Decision 17's placement of `coverage` is unchanged.
+
 ## Goal
 
 Serve every figure of the Mpt board and of the token list's MPT tab from the index: issuances with their state, flags, decoded
@@ -423,6 +425,8 @@ is nothing to miss). Nothing is added to D3's service.
 
 ### 7.1 `GET /v2/tokens?kind=mpt` (additive to D6)
 
+> **Dated note (2026-10-31, Task 12's ruling).** `transfers_24h` is one read of `mpt_transfers` by the ledger range for both the rows and the total, `GROUP BY mpt_issuance_id` over every issuance of the window, not a read "for the page's IDs" beside a read for the total: one read of the window's rows is the bound section 8 names, and it costs an issuance's worth of small rows returned per request. A database with no issuance row answers the zero page even when `mpt_transfers` holds payments of the window, as the plan's decision says zero totals, so `transfers_24h` reads 0 until the job's first run. `total_below` is 0 on the zero page with `min_holders` above 0, so the key is there whenever `min_holders` is.
+
 D6's route and envelope (D6 §5.1 and §8): `result, coverage, kind, ledger_index, close_time, totals, total, total_below?, count,
 marker?, tokens`; its `min_holders`, `q`, `limit` (200, max 1000), `marker` (which holds the kind) and `format` (`csv`: `tokens.csv`);
 its order by holders. D9 adds `mpt` to `kind` (the message becomes `invalid kind - use: issued, mpt`), the MPT row, the MPT `totals`
@@ -562,6 +566,8 @@ mpt holdings`.
 ## 8. Query bounds
 
 > **Dated note (2026-10-31, ruling C12).** A read costs at least a granule, and scattered keys a granule each, so "2 × the rows" and "a granule per part" cannot pass, or cannot fail, as written. The bound of each read below is its rows plus 2 granules per part, tested against a bulk of other rows with a mutation that shows it can fail. The `mpt_state` row's 120,000 holders count inserts and holders only; a separate test reads about 50 pairs against a 4-part bulk.
+
+> **Dated note (2026-10-31, Task 12's ruling).** The `/v2/tokens?kind=mpt` row below reads, as built and as `paged-reads.e2e-spec.ts` pins it: 3 × the `mpt_issuances` rows (the list, its counts and the IDs of the distinct holders), plus the rows of the window in `mpt_transfers`, plus the `mpt_holders` rows of the known and live issuances, plus 2 granules a part. `mpt_holders` does not say whether its issuance is known and live, so the IDs must come from `mpt_issuances`. The one form that keeps 2 ×, a scalar array of the IDs in one statement with the counts, was measured: 100 ms at 100,000 IDs with one holder, and no answer in 30 s (the client's timeout) at 100,000 IDs and 800,000 holders, where the subquery takes 14 ms. The subquery narrows `mpt_holders` by its primary key, so its part of the bound is tighter than the row's "the `mpt_holders` rows".
 
 Pinned by `paged-reads.e2e-spec.ts` and the plan tests of `test/support/plans.ts`.
 

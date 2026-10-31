@@ -207,7 +207,7 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 ### Coverage
 
 A feature whose data are read from ledger history says how much of that history the index holds. The routes of such a feature (the
-[NFTs](#nfts), the [ledger objects](#ledger-objects), the [tokens](#tokens) and the [supply](#get-v2networksupply); later features of the same program register with the same service and add no rule of their own) put
+[NFTs](#nfts), the [ledger objects](#ledger-objects), the [tokens](#tokens), the [MPT issuances](#mpt) and the [supply](#get-v2networksupply); later features of the same program register with the same service and add no rule of their own) put
 
 ```json
 "coverage": { "from_ledger_index": 107874617, "complete": false }
@@ -225,8 +225,8 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
     the index holds, and on a mainnet the amendment metadata file when it holds none. The API reports an enabling ledger only for an amendment that the
     node's ledger state lists as enabled, which the syncer's `validators` worker polls. The ledger is never a constant of the code. NFTs are
     `NonFungibleTokensV1_1` on the XRP Ledger (ledger 75,443,457) and `URIToken` on Xahau (ledger 1, its genesis). Escrows, payment channels and
-    checks are `Escrow`, `PayChan` and `Checks` on the XRP Ledger (ledger 28,685,313 for the first two, 56,219,905 for the checks) and delegations
-    are `PermissionDelegationV1_1` (ledger 107,524,865); `Escrow` and `PayChan` are retired amendments, so the API knows their enabling ledger only
+    checks are `Escrow`, `PayChan` and `Checks` on the XRP Ledger (ledger 28,685,313 for the first two, 56,219,905 for the checks), delegations
+    are `PermissionDelegationV1_1` (ledger 107,524,865) and the MPT issuances `MPTokensV1` (ledger 99,226,369); `Escrow` and `PayChan` are retired amendments, so the API knows their enabling ledger only
     while the node's ledger state lists them. Where no enabling ledger is known, `complete` is false.
   - A feature **as old as the network**, with no amendment, starts at the network's first ledger: **32,570** on the XRP
     Ledger and **1** on Xahau, its genesis, so complete coverage on Xahau needs ledger 1 indexed (`range-ingest --from 1`). The escrows, payment
@@ -238,7 +238,7 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
     `complete: false` there, and a feature of an amendment only when the index holds the amendment's `EnableAmendment`. They are not
     backfilled.
   - A feature **a network cannot have** is `complete: true` (nothing can be missing) and its routes read no table: the delegations of Xahau and
-    Xahau Testnet, which have no permission delegation.
+    Xahau Testnet, which have no permission delegation, and the MPT issuances of Xahau and Xahau Testnet, which have no MPT.
 - **One item.** The detail of one item (an NFT, with its history and offers; an escrow, a check or a payment channel, each with its history) states its own
   coverage: the feature's, and complete also when the item's creation is indexed (its mint, or the transaction that created it, is at or above
   `from_ledger_index`), whatever came before it. The detail of a token is the exception: it states the feature's `issued_tokens`, with no coverage of its own.
@@ -250,7 +250,7 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
   carry none.
 
 Coverage turns `complete` once no ledger at or above the start ledger was written by an older parser, which is what re-ingesting the history
-does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of (and the reserves of the supply, feature `account_states`) come with version 3 and the payments their transfers are read from (and Xahau's burned supply, from the fee totals, feature `fees`) with version 1; the AMM data of the supply (feature `amm`) come with version 2 and the mint tables of Xahau's minted supply (feature `mints`) with version 9.
+does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of (and the reserves of the supply, feature `account_states`) come with version 3 and the payments their transfers are read from (and Xahau's burned supply, from the fee totals, feature `fees`) with version 1; the AMM data of the supply (feature `amm`) come with version 2 and the mint tables of Xahau's minted supply (feature `mints`) with version 9; the MPT data with version 10 (feature `mpt`).
 
 ### Compatibility
 
@@ -315,6 +315,11 @@ ledger, an hourly snapshot, with the `coverage` of each part read from history) 
 source, with its `coverage`; empty on the XRP Ledger). The original's `/v2/network/xrp_distribution` is still out of scope (below).
 
 From the validator toml details ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 10, items 105 to 107): `toml` on the [validator rows](#get-v2networkvalidators) and on [the answer for one validator](#get-v2networkvalidatorskey), the `country` filter of the list, and [`GET /v2/network/validators/countries`](#get-v2networkvalidatorscountries).
+
+From the MPT data ([ADR-0020](adr/0020-mpt-data.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 11, items 108 to 117): the routes of [MPT](#mpt), [`GET /v2/mpt/{issuanceId}`](#get-v2mptissuanceid) with its [`/holders`](#get-v2mptissuanceidholders) and
+[`/transfers`](#get-v2mptissuanceidtransfers), [`GET /v2/mpt?ids=`](#get-v2mptids) and [`GET /v2/accounts/{address}/mpt`](#get-v2accountsaddressmpt), `kind=mpt` on [`GET /v2/tokens`](#get-v2tokenskindmpt), and the `coverage` field that their answers carry (all but the lookup `?ids=`). Routes of the original gain what they used to drop, with no change for a history without MPT:
+an MPT payment is a payment, with `mpt_issuance_id` as the last key of its row in [`/v2/payments`](#payments) and of its [balance change](#get-v2accountsaddressbalance_changes), and a CSV column only when a row of the page has one; a balance change of an MPT is two rows, the holder's and the issuer's mirror, as on a trust line;
+`change_type` gains `clawback`, for every balance row of a `Clawback`, of an issued token too; and an asset can be written `<48hex>` or `<48hex>+<issuer>`, with the 400 `issuer does not match mpt issuance`.
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -3883,7 +3888,7 @@ rules for the objects, whose shape and key order are ours and are pinned by test
   units (drops divided by 1,000,000, exact decimal text); an issued token as on the ledger (the currency code as written there, 3 letters or 40
   hex digits, its issuer, and the `value` text of the ledger); a multi-purpose token as `{ "currency": "<issuance ID>", "issuer", "value",
   "mpt_issuance_id" }`, the 48 upper-case hex digits of the issuance ID in `currency` and again as the last key, the issuer read from the ID and
-  the `value` the raw integer units, never scaled. **This is the data API's MPT amount object**; the scale and the ticker of a token are not
+  the `value` the raw integer units, never scaled. **This is the data API's MPT amount object**, in the ledger objects' answers; the [MPT routes](#mpt) serve an amount as its integer string beside the issuance ID. The scale and the ticker of a token are not
   in an amount. A key an object has no value for is left out, never `null`.
 - **History** is the transactions that changed the object (a failed attempt that touched nothing is not in it), each an **event**: what
   happened (`event`), the ledger and time, the transaction (`tx_hash`, `tx_type`, `result`), the `account` that sent it, the `delegate` that
@@ -5310,20 +5315,54 @@ Everything below follows the usual contract (the [conventions](#conventions) abo
 
 One issuance, as of the last run of the job.
 
+<!-- mpt-example GET /v2/mpt/0000012A000000000000000000000000000000000000A001 -->
+
 ```json
-{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true },
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
   "issuance": {
-    "mpt_issuance_id": "0000012A…", "issuer": "r…", "sequence": 298, "ticker": "HTF", "name": "Harborline Treasury Fund",
-    "asset_scale": 2, "maximum_amount": "5000000000", "outstanding_amount": "1820451120", "escrowed_amount": "84411120",
-    "locked_amount": "124000000", "locked_holders": 1, "holders": 3, "transfer_fee": 100,
-    "flags": { "locked": false, "can_lock": true, "require_auth": true, "can_escrow": false, "can_trade": true,
-               "can_transfer": true, "can_clawback": true },
-    "metadata": { "ticker": "HTF", "name": "Harborline Treasury Fund", "desc": "…", "icon": "harborline.example/htf/icon.png",
-                  "asset_class": "rwa", "asset_subclass": "treasury", "issuer_name": "Harborline Capital",
-                  "uris": [{ "uri": "harborline.example/htf", "category": "website", "title": "Fund page" }] },
-    "metadata_hex": "7B227469636B6572…", "metadata_conforms": true,
-    "created_ledger": 99412004, "created_time": "2025-10-09T11:20:31Z", "created_tx_hash": "…",
-    "last_ledger": 107795512, "destroyed": false } }
+    "mpt_issuance_id": "0000012A000000000000000000000000000000000000A001",
+    "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+    "sequence": 298,
+    "ticker": "HTF",
+    "name": "Harborline Treasury Fund",
+    "asset_scale": 2,
+    "maximum_amount": "5000000000",
+    "outstanding_amount": "1820451120",
+    "escrowed_amount": "84411120",
+    "locked_amount": "124000000",
+    "locked_holders": 1,
+    "holders": 3,
+    "transfer_fee": 100,
+    "flags": {
+      "locked": false,
+      "can_lock": true,
+      "require_auth": true,
+      "can_escrow": false,
+      "can_trade": true,
+      "can_transfer": true,
+      "can_clawback": true
+    },
+    "metadata": {
+      "ticker": "HTF",
+      "name": "Harborline Treasury Fund",
+      "desc": "A tokenized treasury fund.",
+      "icon": "harborline.example/htf/icon.png",
+      "asset_class": "rwa",
+      "asset_subclass": "treasury",
+      "issuer_name": "Harborline Capital",
+      "uris": [{"uri": "harborline.example/htf", "category": "website", "title": "Fund page"}]
+    },
+    "metadata_hex": "7B227469636B6572223A22485446222C226E616D65223A22486172626F726C696E652054726561737572792046756E64222C2264657363223A224120746F6B656E697A65642074726561737572792066756E642E222C2269636F6E223A22686172626F726C696E652E6578616D706C652F6874662F69636F6E2E706E67222C2261737365745F636C617373223A22727761222C2261737365745F737562636C617373223A227472656173757279222C226973737565725F6E616D65223A22486172626F726C696E65204361706974616C222C2275726973223A5B7B22757269223A22686172626F726C696E652E6578616D706C652F687466222C2263617465676F7279223A2277656273697465222C227469746C65223A2246756E642070616765227D5D7D",
+    "metadata_conforms": true,
+    "created_ledger": 99412004,
+    "created_time": "2025-10-09T11:20:31Z",
+    "created_tx_hash": "0000000000000000000000000000000000000000000000000000000005ECE824",
+    "last_ledger": 107795512,
+    "destroyed": false
+  }
+}
 ```
 
 Keys of the issuance answer, in order: `result, coverage, issuance`.
@@ -5344,13 +5383,37 @@ Errors, in the order they are checked: 400 `invalid mpt issuance id`; 404 `issua
 
 A summary of each of 1 to 100 issuances, `ids` being a comma list, in the order asked, duplicates too. An ID with no row or with no known state is the ID alone, and so is every ID on a network without MPT. It has no `coverage` (it lists nothing), no paging and no CSV.
 
+<!-- mpt-example GET /v2/mpt?ids=0000012A000000000000000000000000000000000000A001,00000130000000000000000000000000000000000000A001 -->
+
 ```json
-{ "result": "success", "count": 2,
-  "issuances": [{ "mpt_issuance_id": "0000012A…", "issuer": "r…", "ticker": "HTF", "name": "Harborline Treasury Fund", "asset_scale": 2,
-                  "maximum_amount": "5000000000", "outstanding_amount": "1820451120", "holders": 3, "transfer_fee": 100,
-                  "flags": { "locked": false, "can_lock": true, "require_auth": true, "can_escrow": false, "can_trade": true,
-                             "can_transfer": true, "can_clawback": true }, "destroyed": false },
-                { "mpt_issuance_id": "00000130…" }] }
+{
+  "result": "success",
+  "count": 2,
+  "issuances": [
+    {
+      "mpt_issuance_id": "0000012A000000000000000000000000000000000000A001",
+      "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "ticker": "HTF",
+      "name": "Harborline Treasury Fund",
+      "asset_scale": 2,
+      "maximum_amount": "5000000000",
+      "outstanding_amount": "1820451120",
+      "holders": 3,
+      "transfer_fee": 100,
+      "flags": {
+        "locked": false,
+        "can_lock": true,
+        "require_auth": true,
+        "can_escrow": false,
+        "can_trade": true,
+        "can_transfer": true,
+        "can_clawback": true
+      },
+      "destroyed": false
+    },
+    {"mpt_issuance_id": "00000130000000000000000000000000000000000000A001"}
+  ]
+}
 ```
 
 Keys of the lookup answer, in order: `result, count, issuances`.
@@ -5369,9 +5432,24 @@ The balances of an issuance, as of the last run of the job, the largest first. A
 | `limit`, `marker` | 200 (max 1000) | The marker holds the balance and the holder of the last row. |
 | `format` | json | `csv`: file `<issuanceId> - holders.csv`, its columns the keys of a holder, without `coverage`. |
 
+<!-- mpt-example GET /v2/mpt/0000012A000000000000000000000000000000000000A001/holders?limit=1 -->
+
 ```json
-{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true }, "count": 1, "marker": "…",
-  "holders": [{ "holder": "r…", "amount": "612040000", "escrowed_amount": "0", "locked": false, "authorized": true }] }
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "count": 1,
+  "marker": "WyIxMDg0NDExMTIwIiwicnJycnJycnJycnJycnJycnJycnBXZWpCY2V3SyJd",
+  "holders": [
+    {
+      "holder": "rrrrrrrrrrrrrrrrrrrpWejBcewK",
+      "amount": "1000000000",
+      "escrowed_amount": "84411120",
+      "locked": false,
+      "authorized": true
+    }
+  ]
+}
 ```
 
 Keys of the holders answer, in order: `result, coverage, count, marker?, holders`.
@@ -5393,10 +5471,40 @@ What the successful transactions moved, clawed back, locked or unlocked of an is
 | `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | The marker holds `ledger_index, tx_index`. |
 | `format` | json | `csv`: file `<issuanceId> - transfers.csv`, its columns the keys of a transfer, an empty cell for what a row has not, without `coverage`. |
 
+<!-- mpt-example GET /v2/mpt/0000012A000000000000000000000000000000000000A001/transfers?kind=payment&limit=2 -->
+
 ```json
-{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true }, "count": 1, "marker": "…",
-  "transfers": [{ "ledger_index": 107795410, "tx_index": 31, "tx_hash": "…", "executed_time": "2026-10-24T14:11:05Z",
-                  "tx_type": "Payment", "kind": "payment", "source": "r…", "destination": "r…", "amount": "2500000" }] }
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "count": 2,
+  "marker": "WzEwNzAwMDAwMiwxXQ",
+  "transfers": [
+    {
+      "ledger_index": 107000001,
+      "tx_index": 3,
+      "tx_hash": "00000000000000000000000000000000000000000000000000000018E9B271EB",
+      "executed_time": "2026-09-01T00:00:00Z",
+      "tx_type": "Payment",
+      "kind": "payment",
+      "source": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "destination": "rrrrrrrrrrrrrrrrrrrpWe7f1TnJ",
+      "amount": "1000000000"
+    },
+    {
+      "ledger_index": 107000002,
+      "tx_index": 1,
+      "tx_hash": "00000000000000000000000000000000000000000000000000000018E9B275D1",
+      "executed_time": "2026-09-02T00:00:00Z",
+      "tx_type": "Payment",
+      "kind": "payment",
+      "source": "rrrrrrrrrrrrrrrrrrrpWeX6wxTJ",
+      "destination": "rrrrrrrrrrrrrrrrrrrpWejBcewK",
+      "amount": "2500000",
+      "fee": "2500"
+    }
+  ]
+}
 ```
 
 Keys of the transfers answer, in order: `result, coverage, count, marker?, transfers`.
@@ -5421,15 +5529,63 @@ The route, the parameters, the envelope and the order of [`GET /v2/tokens`](#get
 
 **Nothing to list.** With no issuance, and on a network without MPT, the answer is the whole envelope at the newest committed ledger, `total: 0`, zero `totals` and no rows. With no committed ledger it is `{ "result": "success", "coverage": …, "kind": "mpt", "count": 0, "tokens": [] }`.
 
+<!-- mpt-example GET /v2/tokens?kind=mpt&limit=2 -->
+
 ```json
-{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true },
-  "kind": "mpt", "ledger_index": 107795512, "close_time": "2026-10-24T14:20:01Z",
-  "totals": { "issuances": 214, "holders": 9862, "transfers_24h": 2415 },
-  "total": 214, "count": 1, "marker": "…",
-  "tokens": [{ "rank": 1, "mpt_issuance_id": "0000012A…", "issuer": "r…", "ticker": "HTF", "name": "Harborline Treasury Fund",
-               "asset_scale": 2, "maximum_amount": "5000000000", "outstanding_amount": "1820451120", "holders": 3412,
-               "transfer_fee": 100, "flags": { "locked": false, "can_lock": true, "require_auth": true, "can_escrow": false,
-               "can_trade": true, "can_transfer": true, "can_clawback": true }, "transfers_24h": 412 }] }
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "kind": "mpt",
+  "ledger_index": 107795512,
+  "close_time": "2026-10-24T14:20:01Z",
+  "totals": {"issuances": 4, "holders": 9, "transfers_24h": 3},
+  "total": 4,
+  "count": 2,
+  "marker": "WyJtcHQiLDMsInJycnJycnJycnJycnJycnJycnJwNGdKemQ0ZjIiLCIwMDAwMDEyQTAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMEEwMDEiXQ",
+  "tokens": [
+    {
+      "rank": 1,
+      "mpt_issuance_id": "0000012B000000000000000000000000000000000000A001",
+      "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "asset_scale": 0,
+      "outstanding_amount": "18014398509482023",
+      "holders": 6,
+      "transfer_fee": 0,
+      "flags": {
+        "locked": false,
+        "can_lock": false,
+        "require_auth": false,
+        "can_escrow": false,
+        "can_trade": false,
+        "can_transfer": false,
+        "can_clawback": false
+      },
+      "transfers_24h": 1
+    },
+    {
+      "rank": 2,
+      "mpt_issuance_id": "0000012A000000000000000000000000000000000000A001",
+      "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "ticker": "HTF",
+      "name": "Harborline Treasury Fund",
+      "asset_scale": 2,
+      "maximum_amount": "5000000000",
+      "outstanding_amount": "1820451120",
+      "holders": 3,
+      "transfer_fee": 100,
+      "flags": {
+        "locked": false,
+        "can_lock": true,
+        "require_auth": true,
+        "can_escrow": false,
+        "can_trade": true,
+        "can_transfer": true,
+        "can_clawback": true
+      },
+      "transfers_24h": 2
+    }
+  ]
+}
 ```
 
 Keys of an MPT row, in order: `rank, mpt_issuance_id, issuer, ticker?, name?, asset_scale, maximum_amount?, outstanding_amount, holders, transfer_fee, flags, transfers_24h`.
@@ -5451,11 +5607,30 @@ The MPTs an account holds, at the newest committed ledger, by issuance ID. The b
 | `marker` | | The ID of the last row of the page before. |
 | `format` | json | `csv`: file `<address> - mpt.csv`, its columns the keys of a holding, an empty cell for what a row has not, without `coverage`. |
 
+<!-- mpt-example GET /v2/accounts/rrrrrrrrrrrrrrrrrrrpWe7f1TnJ/mpt?limit=1 -->
+
 ```json
-{ "result": "success", "coverage": { "from_ledger_index": 99226369, "complete": true },
-  "ledger_index": 107795512, "close_time": "2026-10-24T14:20:01Z", "count": 1,
-  "mpt": [{ "mpt_issuance_id": "0000012A…", "issuer": "r…", "ticker": "HTF", "name": "Harborline Treasury Fund", "asset_scale": 2,
-            "amount": "612040000", "escrowed_amount": "0", "locked": false, "authorized": true }] }
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "ledger_index": 107795512,
+  "close_time": "2026-10-24T14:20:01Z",
+  "count": 1,
+  "marker": "0000012A000000000000000000000000000000000000A001",
+  "mpt": [
+    {
+      "mpt_issuance_id": "0000012A000000000000000000000000000000000000A001",
+      "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "ticker": "HTF",
+      "name": "Harborline Treasury Fund",
+      "asset_scale": 2,
+      "amount": "612040000",
+      "escrowed_amount": "0",
+      "locked": false,
+      "authorized": true
+    }
+  ]
+}
 ```
 
 Keys of the MPT holdings answer, in order: `result, coverage, ledger_index?, close_time?, count, marker?, mpt`.

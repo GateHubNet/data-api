@@ -14,7 +14,8 @@ it holds in `coverage` ([ADR-0016](docs/adr/0016-nft-and-uritoken-data.md)); and
 toml says ([ADR-0017](docs/adr/0017-display-names.md)); and **ledger objects** on both networks: an escrow, a check, a payment channel by its object ID with the
 history of the transactions that changed it, the permission delegations of an account (XRP Ledger), and which kind of object an ID is, each stating its `coverage`
 ([ADR-0018](docs/adr/0018-ledger-object-history.md)); and the **native supply**: an hourly snapshot of the total, burned, escrowed and circulating figures, the AMM pools (XRP Ledger), the reserves, and Xahau's minting by source and day,
-each part read from history stating its `coverage` ([api reference](docs/api-reference.md#get-v2networksupply)).
+each part read from history stating its `coverage` ([api reference](docs/api-reference.md#get-v2networksupply)); and **MPT data** on the XRP Ledger (XLS-33): an issuance with its flags and decoded metadata, its holders and transfers, the issuances ranked by holders, an account's holdings, and MPT payments and balance changes on the routes of the original,
+each answer stating its `coverage` ([ADR-0020](docs/adr/0020-mpt-data.md)).
 
 One deployment serves one network; the same images run all four. The API answers the same `/v2/...` paths on a host per network:
 
@@ -135,6 +136,7 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Names (extras) | `/v2/account_names?addresses=` (the display names, domains and labels of up to 100 addresses), `/v2/toml/{domain}` (what a domain's toml says, as the syncer last read it) |
 | Ledger objects (extras, both networks) | `/v2/escrows/{id}`, `/v2/checks/{id}`, `/v2/payment_channels/{id}`, each with `/history` (an object's state and the transactions that changed it, with `status` and `coverage`), `/v2/accounts/{address}/escrows/{sequence}` (an escrow by owner and sequence), `/v2/accounts/{address}/delegations` (`direction=given\|held`; empty on Xahau), `/v2/ledger_objects/{id}` (which kind of object an ID is) |
 | Tokens (extras, both networks) | `/v2/tokens` (the issued tokens ranked by holders; `kind`, `min_holders`, `q`), `/v2/tokens/{currency}.{issuer}` (one token: supply, price, the issuer's settings, its toml entry, its markets), `.../holders` and `.../transfers`; each answer has `coverage` |
+| MPT (extras, XRPL; empty or 404 on Xahau) | `/v2/mpt/{issuanceId}` with `/holders` and `/transfers`, `/v2/mpt?ids=` (a summary of up to 100 issuances), `/v2/tokens?kind=mpt` (the issuances ranked by holders), `/v2/accounts/{address}/mpt` (an account's holdings); amounts are integer strings beside the issuance ID, and each answer but `?ids=` has `coverage` |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
 | Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/countries`, `/v2/network/validators/{key}/validations` |
 | Amendments | `/v2/network/amendments[/{name}]` |

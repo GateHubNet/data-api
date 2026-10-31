@@ -133,7 +133,7 @@ address.
   column lists and sort keys, all hard-coded; interval expressions come from a fixed whitelist.
 - **Search and the tokens.** The search `q` of `GET /v2/tokens` (1 to 64 characters) is a bound parameter used with `positionCaseInsensitiveUTF8` and `startsWith`, never a `LIKE` pattern, so `%` and `_` match
   themselves; the path of a token is parsed into a currency and a classic address before any read. What the toml of an issuer says of a token (`toml` of the detail: names, descriptions, a URL) is the text
-  an issuer chose, served as data in a fixed set of keys and never fetched; the job and the api never request a toml ([ADR-0019](adr/0019-issued-tokens-from-state-history.md)).
+  an issuer chose, served as data in a fixed set of keys and never fetched; the job and the api never request a toml ([ADR-0019](adr/0019-issued-tokens-from-state-history.md)). The search of `kind=mpt` is bound in the same way, and the ID on a route is checked for 48 hex digits before any read. The metadata of an MPT issuance is what its issuer wrote on the ledger: at most 1024 bytes, decoded by the job into a fixed set of keys and served as data, its URLs as written and never fetched ([ADR-0020](adr/0020-mpt-data.md)).
 - **Resource guards:** every SELECT carries `max_execution_time` and `max_memory_usage` (`GH_CLICKHOUSE_MAX_EXECUTION_TIME`,
   `GH_CLICKHOUSE_MAX_QUERY_MEMORY`), and endpoints bound their own work (`limit` maxima, the 200-day report window, capped candle pages,
   node timeouts for live lookups).
@@ -190,7 +190,7 @@ Production compose (`docker-compose.prod.yaml`):
 - **Dev compose:** everything is published on `127.0.0.1` only, and the dev API key is `dev-api-key`.
 - **ClickHouse users:** a dedicated `data_api` user (access management enabled), not `default`. The api and the syncers share it
   (full access); a read-only user for the api would be better. **A narrower user for the syncer still needs `ALTER DELETE` on `token_lines` and `tokens`** (the privilege that `ALTER TABLE ... DROP PARTITION` asks for): the `tokens` job drops the
-  partitions of a retired generation (the number is made by the job and checked as an integer, the one statement that takes no bound parameter; [clickhouse](clickhouse.md), [syncer](syncer.md#the-tokens-job)).
+  partitions of a retired generation (the number is made by the job and checked as an integer, the one statement that takes no bound parameter; [clickhouse](clickhouse.md), [syncer](syncer.md#the-tokens-job)), and on `mpt_holders` and `mpt_issuances` for the `DELETE` of the `mpt_state` job, whose values are bound.
 
 ### Outbound HTTPS to arbitrary public hosts (syncer)
 

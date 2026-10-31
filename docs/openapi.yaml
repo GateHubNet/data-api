@@ -608,8 +608,9 @@ paths:
       summary: Get payments
       description: The `Payment` transactions between two different accounts of the
         ledgers that closed between `start` and `end`, oldest first; with a currency
-        in the path, only the payments of that currency. `format=csv` gives the payments
-        as a flat CSV file.
+        in the path, only the payments of that currency. An MPT payment has the issuance
+        ID as its `currency`, its amounts in integer units, and `mpt_issuance_id`
+        as its last key. `format=csv` gives the payments as a flat CSV file.
       parameters:
       - name: format
         required: false
@@ -651,7 +652,8 @@ paths:
         required: false
         in: path
         description: 'A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
-          or the native currency alone. Omitted: all currencies.'
+          the native currency alone, or an MPT: its 48 hex digits, with or without
+          its issuer. Omitted: all currencies.'
         schema: {}
       responses:
         '200':
@@ -664,8 +666,9 @@ paths:
       summary: Get payments
       description: The `Payment` transactions between two different accounts of the
         ledgers that closed between `start` and `end`, oldest first; with a currency
-        in the path, only the payments of that currency. `format=csv` gives the payments
-        as a flat CSV file.
+        in the path, only the payments of that currency. An MPT payment has the issuance
+        ID as its `currency`, its amounts in integer units, and `mpt_issuance_id`
+        as its last key. `format=csv` gives the payments as a flat CSV file.
       parameters:
       - name: format
         required: false
@@ -707,7 +710,8 @@ paths:
         required: false
         in: path
         description: 'A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
-          or the native currency alone. Omitted: all currencies.'
+          the native currency alone, or an MPT: its 48 hex digits, with or without
+          its issuer. Omitted: all currencies.'
         schema: {}
       responses:
         '200':
@@ -1623,13 +1627,14 @@ paths:
     get:
       operationId: AccountBalanceChangesController_list
       summary: Get the balance changes of an account
-      description: Every change of a balance of the account (the native currency and
-        its trust lines) made by the transactions of the ledgers that closed between
-        `start` and `end`, oldest first; the fee of a transaction comes first, as
-        a `transaction_cost` without a `node_index`. `currency`, `counterparty` (alias
-        `issuer`) and `change_type` (alias `type`) keep the changes of that currency,
-        against that counterparty, of that kind. `format=csv` gives the changes as
-        a CSV file.
+      description: Every change of a balance of the account (the native currency,
+        its trust lines and its MPTs) made by the transactions of the ledgers that
+        closed between `start` and `end`, oldest first; the fee of a transaction comes
+        first, as a `transaction_cost` without a `node_index`. `currency`, `counterparty`
+        (alias `issuer`) and `change_type` (alias `type`) keep the changes of that
+        currency, against that counterparty, of that kind. The change of an MPT has
+        the issuance ID as its `currency`, its amounts in integer units, and `mpt_issuance_id`
+        as its last key. `format=csv` gives the changes as a CSV file.
       parameters:
       - name: address
         required: true
@@ -1679,6 +1684,7 @@ paths:
           - escrow_finish
           - paychannel_fund
           - paychannel_payout
+          - clawback
           type: string
       - name: counterparty
         required: false
@@ -2182,24 +2188,24 @@ paths:
       description: Every balance change of the window counts once, the fees (`transaction_cost`)
         too. A change type is one of transaction_cost, payment_destination, payment_source,
         exchange, intermediary, escrow_create, escrow_finish, escrow_cancel, paychannel_fund,
-        paychannel_payout; the changes of transaction types that have none are grouped
-        without a `change_type`. `in` is the sum of the positive changes and `out`
-        the sum of the negative ones as a positive amount; `in_value` and `out_value`
-        are their values in the native currency (the native currency is worth itself,
-        an issued amount its amount over the rate of its day, cut to 17 significant
-        digits per change type, asset and day, and 0 without a rate; a change on a
-        line the account owes on is a change of its own currency), and `net_value`
-        is `in_value` minus `out_value`. `totals` has an entry for each change type
-        that has a change, in that order. Without `interval` `rows` are per change
-        type and asset (`issuer` is left out for the native currency), the largest
-        `in_value + out_value` first; with one they are per bucket and change type,
-        with `date` the start of the bucket. The window is whole UTC days, from the
-        day of `start` to the day of `end` (both included, whatever the time of day),
-        widened to whole buckets when there is an `interval`; the answer's `start`
-        is the start of the first day or bucket and `end` the start of the one after
-        the last, so it is exclusive. An `end` before `start` is an empty answer.
-        With an interval, at most 1000 buckets. `format=csv` gives the rows as a CSV
-        file.
+        paychannel_payout, clawback; the changes of transaction types that have none
+        are grouped without a `change_type`. `in` is the sum of the positive changes
+        and `out` the sum of the negative ones as a positive amount; `in_value` and
+        `out_value` are their values in the native currency (the native currency is
+        worth itself, an issued amount its amount over the rate of its day, cut to
+        17 significant digits per change type, asset and day, and 0 without a rate;
+        a change on a line the account owes on is a change of its own currency), and
+        `net_value` is `in_value` minus `out_value`. `totals` has an entry for each
+        change type that has a change, in that order. Without `interval` `rows` are
+        per change type and asset (`issuer` is left out for the native currency),
+        the largest `in_value + out_value` first; with one they are per bucket and
+        change type, with `date` the start of the bucket. The window is whole UTC
+        days, from the day of `start` to the day of `end` (both included, whatever
+        the time of day), widened to whole buckets when there is an `interval`; the
+        answer's `start` is the start of the first day or bucket and `end` the start
+        of the one after the last, so it is exclusive. An `end` before `start` is
+        an empty answer. With an interval, at most 1000 buckets. `format=csv` gives
+        the rows as a CSV file.
       parameters:
       - name: address
         required: true
@@ -2806,6 +2812,57 @@ paths:
           - given
           - held
           type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/mpt":
+    get:
+      operationId: AccountMptController_list
+      summary: Get the MPT holdings of an account
+      description: 'The account''s balances of MPTs at the newest committed ledger
+        (`ledger_index`, `close_time`), by issuance ID: the integer units it can move
+        (`amount`) and has in escrow (`escrowed_amount`), `locked` when the balance
+        cannot move (its own flag or the issuance''s), and its `authorized` flag.
+        `issuer` comes from the ID; `ticker`, `name` and `asset_scale` from the issuance,
+        when its state is known. `include_zero` adds a balance of nothing; a deleted
+        token is never listed. The marker is the ID of the last row. `format=csv`
+        gives the holdings as a CSV file `<address> - mpt.csv` (without `coverage`).
+        A network without MPT has an empty list, complete.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account (a classic address).
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: 'From the previous page: the ID of its last row.'
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: include_zero
+        required: false
+        in: query
+        description: Also a balance of nothing.
+        schema:
+          type: boolean
       responses:
         '200':
           description: ''
@@ -3776,6 +3833,174 @@ paths:
           description: ''
       tags:
       - ledger_objects
+  "/v2/mpt":
+    get:
+      operationId: MptController_lookup
+      summary: Look up several MPT issuances
+      description: A summary of each of 1 to 100 issuances, in the order asked, duplicates
+        too. An ID with no row, or whose state is not known, is the ID alone, as is
+        every ID on a network without MPT. No coverage, no paging, no CSV.
+      parameters:
+      - name: ids
+        required: true
+        in: query
+        description: A comma list of 1 to 100 issuance IDs.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - mpt
+  "/v2/mpt/{issuanceId}":
+    get:
+      operationId: MptController_issuance
+      summary: Get an MPT issuance
+      description: 'One issuance as of the last run of the `mpt_state` job: its issuer
+        and sequence, the ticker and name of its metadata, the ledger''s integer units
+        of its maximum, outstanding, escrowed and locked amounts (`asset_scale` says
+        how to show them), its holders, transfer fee and flags, its metadata (`metadata`
+        only when it was decoded; `metadata_hex` and `metadata_conforms` when it has
+        any), its creation when that is in the coverage, and `destroyed`. No row,
+        a state outside the coverage or newer than the last tick, and every ID on
+        a network without MPT are a 404 `issuance not found`. No CSV.'
+      parameters:
+      - name: issuanceId
+        required: true
+        in: path
+        description: 'The ID of the issuance: 48 hex digits in either case, answered
+          in upper case.'
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - mpt
+  "/v2/mpt/{issuanceId}/holders":
+    get:
+      operationId: MptController_holders
+      summary: Get the holders of an MPT issuance
+      description: The balances of an issuance as of the last run of the `mpt_state`
+        job, the largest first (`amount`, the integer units the holder can move, and
+        `escrowed_amount`, those it has in escrow, count together), then by address.
+        `locked` says the balance cannot move, by the holder's own flag or the issuance's;
+        `authorized` is the holder's flag, which means something when the issuance
+        requires it. `include_zero` adds the holders with nothing. An issuance whose
+        state is not known is served; no row is a 404 `issuance not found`, as is
+        every ID on a network without MPT. `format=csv` gives the holders as a CSV
+        file `<issuanceId> - holders.csv` (without `coverage`).
+      parameters:
+      - name: issuanceId
+        required: true
+        in: path
+        description: 'The ID of the issuance: 48 hex digits in either case, answered
+          in upper case.'
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: include_zero
+        required: false
+        in: query
+        description: Also the holders with nothing.
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+      tags:
+      - mpt
+  "/v2/mpt/{issuanceId}/transfers":
+    get:
+      operationId: MptController_transfers
+      summary: Get the transfers of an MPT issuance
+      description: What the successful transactions of the ledgers that closed between
+        `start` and `end` moved, clawed back, locked or unlocked of an issuance, oldest
+        first. `amount` is integer units; `source` and `destination` are left out
+        where there is none (a lock of every balance has no destination) and `fee`,
+        the transfer fee burned, unless it is above 0. `kind` and `account` (on either
+        side, not validated) keep those rows. An issuance whose state is not known
+        is served; no row is a 404 `issuance not found`, as is every ID on a network
+        without MPT. `format=csv` gives the transfers as a CSV file `<issuanceId>
+        - transfers.csv` (without `coverage`).
+      parameters:
+      - name: issuanceId
+        required: true
+        in: path
+        description: 'The ID of the issuance: 48 hex digits in either case, answered
+          in upper case.'
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
+        schema: {}
+      - name: account
+        required: false
+        in: query
+        description: Only the rows with this account as source or destination.
+        schema: {}
+      - name: kind
+        required: false
+        in: query
+        description: 'A comma list of payment, clawback, lock, unlock, escrow_create,
+          escrow_finish, escrow_cancel. Default: all.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - mpt
   "/v2/active_accounts/{base}/{counter}":
     get:
       operationId: ActiveAccountsController_activeAccounts
@@ -5331,29 +5556,31 @@ paths:
     get:
       operationId: TokensController_list
       summary: Get the tokens, ranked by holders
-      description: 'The tokens of a kind (`issued`: the currencies issued on trust
-        lines) with the most holders first, then by issuer, then by currency; `rank`
-        is the place of a token in that order among the tokens the filters select.
-        A token is a currency and its issuer, as of the last run of the tokens job
-        (`ledger_index` and `close_time` are the ledger it is through): its holders
-        (the accounts that hold a positive balance), `trust_lines` (the lines that
-        count), `supply` (the exact sum of the balances), the `price` of the last
-        day against the native currency with its `price_change` (percent) and `price_time`
-        (the month when the day has none, without a change), the `native_volume` and
-        `trades` of the day, and the issuer''s `domain`, whether its toml `listed`
-        the token, and the `name` it gives it. `min_holders` keeps the tokens with
-        at least that many holders; `q` (1 to 64 characters) keeps the tokens of an
-        issuer (a classic address), or those whose code, name or domain contains it
-        (any case), whose currency it is (40 hex digits) or whose issuer starts with
-        it. `total` is the number of tokens the filters select, on all pages; `total_below`,
-        with `min_holders`, the number that match `q` but have fewer holders. `totals`
-        describe the whole kind, whatever the filters: `tokens`, `tokens_with_10_holders`,
-        `holders` (distinct holders of all tokens; left out while the job has not
-        counted them) and the `native_volume` of the day on the markets (left out
-        without a day set). Before the job has built a generation the answer has no
-        tokens. The ranking is rebuilt each minute, so a token can move between pages
-        from one minute to the next. `format=csv` gives the tokens as a CSV file (without
-        `coverage`).'
+      description: 'The tokens of a kind with the most holders first, then by issuer,
+        then by the token; `rank` is the place of a token in that order among the
+        tokens the filters select. `kind=mpt` lists the MPT issuances instead of the
+        currencies issued on trust lines (`issued`, the default): its row, its `totals`
+        and its search are in the MPT section of the reference, and the rest of this
+        text is of `issued`. A token is a currency and its issuer, as of the last
+        run of the tokens job (`ledger_index` and `close_time` are the ledger it is
+        through): its holders (the accounts that hold a positive balance), `trust_lines`
+        (the lines that count), `supply` (the exact sum of the balances), the `price`
+        of the last day against the native currency with its `price_change` (percent)
+        and `price_time` (the month when the day has none, without a change), the
+        `native_volume` and `trades` of the day, and the issuer''s `domain`, whether
+        its toml `listed` the token, and the `name` it gives it. `min_holders` keeps
+        the tokens with at least that many holders; `q` (1 to 64 characters) keeps
+        the tokens of an issuer (a classic address), or those whose code, name or
+        domain contains it (any case), whose currency it is (40 hex digits) or whose
+        issuer starts with it. `total` is the number of tokens the filters select,
+        on all pages; `total_below`, with `min_holders`, the number that match `q`
+        but have fewer holders. `totals` describe the whole kind, whatever the filters:
+        `tokens`, `tokens_with_10_holders`, `holders` (distinct holders of all tokens;
+        left out while the job has not counted them) and the `native_volume` of the
+        day on the markets (left out without a day set). Before the job has built
+        a generation the answer has no tokens. The ranking is rebuilt each minute,
+        so a token can move between pages from one minute to the next. `format=csv`
+        gives the tokens as a CSV file (without `coverage`).'
       parameters:
       - name: format
         required: false
@@ -5379,7 +5606,9 @@ paths:
         required: false
         in: query
         description: 'A search, 1 to 64 characters: an issuer address, or text in
-          the code, name or domain, a currency in hex, an issuer prefix.'
+          the code, name or domain, a currency in hex, an issuer prefix. With `kind=mpt`:
+          an issuer address, an issuance ID, or text in the ticker or name, an issuer
+          prefix, an ID prefix of 8 hex digits or more.'
         schema: {}
       - name: min_holders
         required: false
@@ -5395,6 +5624,7 @@ paths:
         schema:
           enum:
           - issued
+          - mpt
           type: string
       responses:
         '200':

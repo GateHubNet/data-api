@@ -4,7 +4,7 @@
 [ADR-0015](0015-historical-account-state-from-clickhouse.md)'s approach (state from the ClickHouse history, never from a node) to the issued tokens, [ADR-0016](0016-nft-and-uritoken-data.md)'s
 coverage rule (`FeatureCoverageService`, with [ADR-0018](0018-ledger-object-history.md)'s case of a feature without an amendment) to two more features, and
 [ADR-0017](0017-display-names.md)'s toml store to the listing of a token. The design is in [the issued tokens spec](../superpowers/specs/2026-10-24-issued-tokens-design.md), program 2
-sub-project D6.
+sub-project D6. Amended on 2026-10-31 (at the end of this record): its hook is no longer the last of a slice.
 
 ## Context
 The explorer has a list of the tokens of the network ranked by holders, and a page for a token: its holders and supply, its price and volume, the settings of its issuer, what the
@@ -67,3 +67,7 @@ issuer's toml says of it, its biggest holders and its recent transfers. The inde
   fail, so `agg_dirty` does not drain. A missing migration 014 cannot cause it: the syncer refuses to boot without the tables (the ingest needs `state_touches`, the aggregator all four), as it does
   without 002 or 012 for their workers ([operations](../operations.md#apply-a-schema-migration)). What is left is ClickHouse failing the job's opening reads ([operations](../operations.md#a-persistent-tokens_dirty)).
 - **An issuer with millions of lines is one statement** of the pass (seconds, hundreds of megabytes: measured in [operations](../operations.md#issued-tokens)); the pass does not split it.
+
+## Amendment (2026-10-31): the hook of `tokens` is no longer the last
+
+Decision 4 and the consequence on a job that cannot read its tables call the hook of `tokens` the last of `hooksOfSlice`. Since D9 ([ADR-0020](0020-mpt-data.md)) the hook of `mpt_state` runs after it, so that is no longer so. Nothing else of those two passages changes: a hook that fails still fails the slice, the slice stays in `agg_dirty` and its hooks run again, so a `tokens` hook that throws holds back `mpt_state`'s hook of that slice as well.
