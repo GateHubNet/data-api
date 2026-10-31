@@ -5,6 +5,7 @@ import {
   TomlAccount,
   TomlCurrency,
   TomlValidator,
+  validatorTomlEntryOf,
 } from '@gatehub/data-api-shared';
 import { fmtMillis, fmtTime } from '../common/format';
 
@@ -31,14 +32,11 @@ export const TOML_ACCOUNT_KEYS = ['address', 'desc'] as const;
 /** The keys of an entry of `currencies`, in order; the last four come from the entry's `fields`. */
 export const TOML_CURRENCY_KEYS = ['code', 'issuer', 'display_decimals', 'symbol', 'name', 'desc'] as const;
 
-/** The keys of an entry of `validators`, in order; the last three come from the entry's `fields` (D8 may add keys). */
-export const TOML_VALIDATOR_KEYS = ['public_key', 'owner_country', 'server_country', 'unl'] as const;
+/** The keys of an entry of `validators`, in order: the facts come through D8's rules, as the validator routes have them. */
+export const TOML_VALIDATOR_KEYS = ['public_key', 'owner_country', 'server_country', 'network', 'unl'] as const;
 
 /** The `fields` of a currency that are served, besides `display_decimals`: text. */
 const CURRENCY_TEXT_FIELDS = ['symbol', 'name', 'desc'] as const;
-
-/** The `fields` of a validator that are served: text. */
-const VALIDATOR_TEXT_FIELDS = ['owner_country', 'server_country', 'unl'] as const;
 
 /** The most decimals a currency shows (spec 6): `display_decimals` is an integer from 0 to this. */
 const MAX_DISPLAY_DECIMALS = 30;
@@ -95,14 +93,14 @@ function currencyObject(currency: TomlCurrency): Record<string, unknown> {
   return object;
 }
 
-/** An entry of `validators`: of `fields` only the texts. */
+/** An entry of `validators`, read by `validatorTomlEntryOf` so that this route and the validator routes never disagree on a country. */
 function validatorObject(validator: TomlValidator): Record<string, string> {
-  const fields = fieldsOf(validator.fields);
+  const { ownerCountry, serverCountry, network, unl } = validatorTomlEntryOf(validator);
   const object: Record<string, string> = { public_key: validator.public_key };
-  for (const key of VALIDATOR_TEXT_FIELDS) {
-    const text = textOf(fields, key);
-    if (text !== undefined) object[key] = text;
-  }
+  if (ownerCountry !== '') object.owner_country = ownerCountry;
+  if (serverCountry !== '') object.server_country = serverCountry;
+  if (network !== '') object.network = network;
+  if (unl !== '') object.unl = unl;
   return object;
 }
 

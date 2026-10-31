@@ -84,7 +84,7 @@ describe('the keys of GET /v2/toml/{domain}', () => {
     ]);
     expect(TOML_ACCOUNT_KEYS).toEqual(['address', 'desc']);
     expect(TOML_CURRENCY_KEYS).toEqual(['code', 'issuer', 'display_decimals', 'symbol', 'name', 'desc']);
-    expect(TOML_VALIDATOR_KEYS).toEqual(['public_key', 'owner_country', 'server_country', 'unl']);
+    expect(TOML_VALIDATOR_KEYS).toEqual(['public_key', 'owner_country', 'server_country', 'network', 'unl']);
   });
 });
 
@@ -153,7 +153,7 @@ describe('tomlObject', () => {
     expect(Object.keys(toml)).toEqual([...TOML_KEYS].filter((k) => k !== 'reason' && k !== 'status_code'));
     for (const account of toml.accounts as object[]) expectKeysInOrder(account, TOML_ACCOUNT_KEYS);
     for (const c of toml.currencies as object[]) expect(Object.keys(c)).toEqual([...TOML_CURRENCY_KEYS]);
-    for (const v of toml.validators as object[]) expect(Object.keys(v)).toEqual([...TOML_VALIDATOR_KEYS]);
+    for (const v of toml.validators as object[]) expectKeysInOrder(v, TOML_VALIDATOR_KEYS);
   });
 
   it('gives a toml that says nothing as the domain, the address, the status and the instant of the check', () => {
@@ -385,6 +385,33 @@ describe('tomlObject', () => {
         { public_key: 'nHUyx7RfD6Pq7f3Sx1n8rC4vGhzMpKq1QYdn4s4Ys3xqVKaTHyD3' },
       ]);
       expect(JSON.stringify(toml)).not.toMatch(/@|twitter|other\.example|Northpeak 1/);
+    });
+  });
+
+  describe("a validator through D8's rules", () => {
+    const KEY = 'nHBtpPEVwUVZPGs1PwtBRXRVTbeoUoEUCvZuyZfdoBEVRcs2zEqu';
+
+    it("serves a validator entry through D8's rules", () => {
+      const fields = { owner_country: 'no', server_country: 'Germany', unl: 'http://x.example' };
+      expect(tomlObject(row({ validators: [validator(KEY, fields, 'main')] }), XRPL).validators).toEqual([
+        { public_key: KEY, owner_country: 'NO', network: 'main' },
+      ]);
+      expect(tomlObject(row({ validators: [validator(KEY, {}, '21337')] }), XAHAU).validators).toEqual([
+        { public_key: KEY, network: '21337' },
+      ]);
+    });
+
+    it('reads UK as GB, and a lower-case code with spaces, as the validator routes do', () => {
+      const fields = { owner_country: 'UK', server_country: ' de ' };
+      expect(tomlObject(row({ validators: [validator(KEY, fields)] }), XRPL).validators).toEqual([
+        { public_key: KEY, owner_country: 'GB', server_country: 'DE' },
+      ]);
+    });
+
+    it('orders an entry public_key, owner_country, server_country, network, unl', () => {
+      const fields = { unl: 'https://vl.ripple.com', server_country: 'DE', owner_country: 'NO' };
+      const [entry] = tomlObject(row({ validators: [validator(KEY, fields, 'main')] }), XRPL).validators as object[];
+      expect(Object.keys(entry)).toEqual([...TOML_VALIDATOR_KEYS]);
     });
   });
 

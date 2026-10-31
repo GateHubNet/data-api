@@ -2418,6 +2418,7 @@ network = "testnet"
       [s.unl[2], 'kept.example'],
       [s.unl[3], 'failing.example'],
       [s.unl[4], 'atsign.example'],
+      [s.unl[5], 'same.example'],
     ] as const;
     await insertManifests(
       h.ch,
@@ -2437,10 +2438,19 @@ network = "testnet"
       }),
       read(s.unl[1].key, 'shoreline.example'),
       read(s.others[1].key, 'tidewater.example'),
-      ...named.map(([member, domain]) => read(member.key, domain)),
+      ...named.map(([member, domain]) =>
+        read(member.key, domain, domain === 'same.example' ? { server_country: 'DE' } : {}),
+      ),
     ]);
     await putToml(h, XRPL, 'northpeak.example', FILE, FETCHED_AT);
     await putToml(h, XRPL, 'kept.example', FILE, FETCHED_AT);
+    await putToml(
+      h,
+      XRPL,
+      'same.example',
+      `# Hand-written test data (D8).\n[[VALIDATORS]]\npublic_key = "${s.unl[5].key}"\nserver_country = "de"\n`,
+      FETCHED_AT,
+    );
     await putToml(h, XRPL, 'failing.example', FILE, FETCHED_AT);
     // the same clock as failToml's, so that the failure is the newer row
     await putToml(h, XRPL, 'tidewater.example', FILE);
@@ -2523,6 +2533,12 @@ network = "testnet"
     const plan = await explain(h, 'indexes = 1', STORED_TOMLS_SQL, { domains: ['kept.example'] });
     expect(plan).toContain('domain');
     expect(plan).toMatch(/PrimaryKey[\s\S]*Keys:[\s\S]*domain/);
+  });
+
+  it('gives a validator the same countries as the validator routes', async () => {
+    const toml = await api.get('/v2/toml/same.example');
+    expect(toml.body.toml.validators).toEqual([{ public_key: s.unl[5].key, server_country: 'DE' }]);
+    expect((await api.get(detailOf(s.unl[5].key))).body.toml.server_country).toBe('DE');
   });
 
   it('serves no @ anywhere in the detail', async () => {
