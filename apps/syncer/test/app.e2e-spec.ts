@@ -271,6 +271,22 @@ describe('AppModule on a real ClickHouse', () => {
     );
   });
 
+  it('fails the boot, naming 016_validator_toml_details.sql and its columns, when the validators worker runs on a database of 001 and 002', async () => {
+    const database = 'syncer_app_e2e_without_016';
+    await withMigrations(['001_baseline.sql', '002_validators_amendments.sql'], (schemaDir) =>
+      bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
+    );
+    await closeApp();
+    expect(await tablesOf(database)).toContain('validator_domains');
+
+    await expect(bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'validators' })).rejects.toThrow(
+      /lacks the schema of 016_validator_toml_details\.sql \(column validator_domains\.owner_country, column validator_domains\.server_country, column validator_domains\.toml_network, column validator_domains\.toml_unl, column validator_domains\.toml_version\), which the validators worker reads and writes/,
+    );
+    // the same database lets a syncer without the validators worker start
+    await bootApp({ GH_CLICKHOUSE_DATABASE: database });
+    await closeApp();
+  });
+
   it('leaves the database alone when migrations are off', async () => {
     const baseUrl = await bootApp({ GH_CLICKHOUSE_DATABASE: 'syncer_app_e2e_untouched' });
     expect(

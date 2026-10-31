@@ -185,6 +185,12 @@ export function insertDomains(
         verified_at: row.checked_at,
         next_check_at: Math.floor(row.checked_at) + 6 * HOUR,
         accounts: [],
+        // a row from before D8
+        owner_country: '',
+        server_country: '',
+        toml_network: '',
+        toml_unl: '',
+        toml_version: 0,
         ...row,
       }),
     ),

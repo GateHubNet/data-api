@@ -32,6 +32,8 @@ const KEY = 'nHUBvDGzZWNgxzsEQzMy3JR7sDDz5wPiuDnj4hZdZpDeM2yeu6gy';
 const TOML_URL = 'https://a.example/.well-known/xrp-ledger.toml';
 const ACCOUNT_1 = encodeAccountID(Buffer.alloc(20, 1));
 const ACCOUNT_2 = encodeAccountID(Buffer.alloc(20, 2));
+/** The toml columns of a row the checker writes when the file gives none of the facts, or it read no file. */
+const NO_FACTS = { owner_country: '', server_country: '', toml_network: '', toml_unl: '', toml_version: 1 };
 
 describe('isTransientReason', () => {
   it.each<[DomainReason, number | undefined, boolean]>([
@@ -82,6 +84,7 @@ describe('nextDomainRow', () => {
     verified_at: NOW - 6 * HOUR,
     next_check_at: NOW - 1,
     accounts: [ACCOUNT_1],
+    ...NO_FACTS,
     ...o,
   });
 
@@ -97,6 +100,7 @@ describe('nextDomainRow', () => {
       verified_at: NOW,
       next_check_at: NOW + 6 * HOUR,
       accounts: [ACCOUNT_1, ACCOUNT_2],
+      ...NO_FACTS,
     });
   });
 
@@ -136,6 +140,7 @@ describe('nextDomainRow', () => {
         verified_at: null,
         next_check_at: NOW + 6 * HOUR,
         accounts: [],
+        ...NO_FACTS,
       });
     },
   );
@@ -147,6 +152,7 @@ describe('nextDomainRow', () => {
       status_code: 404,
       next_check_at: NOW + 6 * HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
   });
 
@@ -176,6 +182,7 @@ describe('nextDomainRow', () => {
         verified_at: NOW - 23 * HOUR,
         next_check_at: NOW + HOUR,
         accounts: [ACCOUNT_1, ACCOUNT_2],
+        ...NO_FACTS,
       });
     }
   });
@@ -199,6 +206,7 @@ describe('nextDomainRow', () => {
       verified_at: NOW - 25 * HOUR,
       next_check_at: NOW + HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
   });
 
@@ -210,6 +218,7 @@ describe('nextDomainRow', () => {
       status_code: 502,
       next_check_at: NOW + HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
   });
 
@@ -220,6 +229,7 @@ describe('nextDomainRow', () => {
       verified_at: null,
       next_check_at: NOW + HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
     const failed = previous({ status: 'unverified', reason: 'timeout', verified_at: NOW - HOUR, accounts: [] });
     expect(nextDomainRow(failed, check({ reason: 'timeout' }), NOW, RECHECK_MS)).toMatchObject({
@@ -227,6 +237,7 @@ describe('nextDomainRow', () => {
       reason: 'timeout',
       verified_at: NOW - HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
   });
 
@@ -239,6 +250,65 @@ describe('nextDomainRow', () => {
     ]) {
       expect(nextDomainRow(prev, failure, NOW, RECHECK_MS)).toMatchObject({ status: 'unverified', accounts: [] });
     }
+  });
+
+  describe('the toml facts', () => {
+    const ENTRY = {
+      ownerCountry: 'NO',
+      serverCountry: 'DE',
+      network: 'main',
+      unl: 'https://vl.ripple.com',
+      invalid: [],
+    };
+    const FACTS = {
+      owner_country: 'NO',
+      server_country: 'DE',
+      toml_network: 'main',
+      toml_unl: 'https://vl.ripple.com',
+    };
+
+    it('writes the facts and toml_version 1 on verified', () => {
+      expect(nextDomainRow(undefined, check({ entry: ENTRY }), NOW, RECHECK_MS)).toMatchObject({
+        status: 'verified',
+        ...FACTS,
+        toml_version: 1,
+      });
+    });
+
+    it('writes empty facts and toml_version 1 on verified without an entry', () => {
+      expect(nextDomainRow(previous(FACTS), check(), NOW, RECHECK_MS)).toMatchObject(NO_FACTS);
+    });
+
+    it('writes empty facts and toml_version 1 on a definite failure', () => {
+      const row = nextDomainRow(
+        previous({ ...FACTS, toml_version: 0 }),
+        check({ reason: 'not_listed' }),
+        NOW,
+        RECHECK_MS,
+      );
+      expect(row).toMatchObject({ status: 'unverified', ...NO_FACTS });
+    });
+
+    it("keeps prev's facts and toml_version through a transient failure within 24 h", () => {
+      const prev = previous({ ...FACTS, toml_version: 0, verified_at: NOW - 2 * HOUR });
+      expect(nextDomainRow(prev, check({ reason: 'timeout' }), NOW, RECHECK_MS)).toMatchObject({
+        status: 'verified',
+        ...FACTS,
+        toml_version: 0,
+      });
+    });
+
+    it('clears them after the grace', () => {
+      const prev = previous({ ...FACTS, toml_version: 0, verified_at: NOW - 25 * HOUR });
+      expect(nextDomainRow(prev, check({ reason: 'timeout' }), NOW, RECHECK_MS)).toMatchObject({
+        status: 'unverified',
+        ...NO_FACTS,
+      });
+    });
+
+    it.each<[DomainReason]>([['manifest_unverified'], ['domain_invalid']])('writes empty facts for %s', (reason) => {
+      expect(nextDomainRow(previous(FACTS), check({ reason }), NOW, RECHECK_MS)).toMatchObject(NO_FACTS);
+    });
   });
 
   it('records the URL it fetched, or would have, and does not change the row it was given', () => {
@@ -384,6 +454,11 @@ class FakeClickHouse {
         verified_ms: d.verified_at === null ? null : String(Math.round(d.verified_at * 1000)),
         next_check: d.next_check_at,
         accounts: d.accounts,
+        stored_owner_country: d.owner_country ?? '',
+        stored_server_country: d.server_country ?? '',
+        stored_toml_network: d.toml_network ?? '',
+        stored_toml_unl: d.toml_unl ?? '',
+        stored_toml_version: d.toml_version ?? 1,
       }));
     }
     throw new Error(`unexpected query: ${sql}`);
@@ -1250,6 +1325,54 @@ describe('DomainChecker', () => {
         verified_at: NOW,
         next_check_at: NOW + 6 * HOUR,
         accounts: [ACCOUNT_2],
+        ...NO_FACTS,
+      });
+    });
+
+    it("writes the facts of the validator's entry with its verdict", async () => {
+      const { row } = await checkWith(
+        `# Hand-written test data\n[[VALIDATORS]]\npublic_key = "KEY"\nserver_country = "de"\nnetwork = 21337\n`,
+      );
+      expect(row).toMatchObject({
+        status: 'verified',
+        server_country: 'DE',
+        owner_country: '',
+        toml_network: '21337',
+        toml_version: 1,
+      });
+    });
+
+    it('reads the stored facts, so that a blip keeps them with the version they were read at', async () => {
+      const t = setup();
+      const a = validator(1);
+      t.ch.seen.push({ key: a.master.base58, lastSeen: NOW - 60 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
+      t.ch.domains.push({
+        validation_public_key: a.master.base58,
+        domain: 'a.example',
+        status: 'verified',
+        reason: '',
+        status_code: 0,
+        toml_url: url('a.example'),
+        checked_at: NOW - 2 * HOUR,
+        verified_at: NOW - 2 * HOUR,
+        next_check_at: NOW - 1,
+        accounts: [],
+        owner_country: 'NO',
+        server_country: 'DE',
+        toml_network: 'main',
+        toml_unl: 'https://vl.ripple.com',
+        toml_version: 0,
+      });
+      t.serve({ [url('a.example')]: new SafeFetchError('timeout', 'x') });
+      await t.checker.pass();
+      expect(t.ch.written[0]).toMatchObject({
+        status: 'verified',
+        owner_country: 'NO',
+        server_country: 'DE',
+        toml_network: 'main',
+        toml_unl: 'https://vl.ripple.com',
+        toml_version: 0,
       });
     });
 
@@ -1444,6 +1567,7 @@ describe('DomainChecker', () => {
           // the later in the list, the more recently due, so that the order of the list is not the order wanted
           next_check_at: NOW - 100 - (99 - i) * 10,
           accounts: [],
+          ...NO_FACTS,
         });
       }
       for (const [i, v] of fresh.entries()) {

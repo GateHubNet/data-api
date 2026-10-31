@@ -779,7 +779,7 @@ describe('the validators worker (e2e)', () => {
                 argMax(status, checked_at) AS status, argMax(reason, checked_at) AS reason,
                 argMax(status_code, checked_at) AS status_code, argMax(toml_url, checked_at) AS toml_url,
                 toUnixTimestamp64Milli(max(checked_at)) AS checked_ms,
-                toUnixTimestamp64Milli(argMax(verified_at, checked_at)) AS verified_ms,
+                toUnixTimestamp64Milli(tupleElement(argMax(tuple(verified_at), checked_at), 1)) AS verified_ms,
                 toUnixTimestamp(argMax(next_check_at, checked_at)) AS next_check,
                 argMax(accounts, checked_at) AS accounts
            FROM ${Table.ValidatorDomains}
@@ -865,6 +865,39 @@ describe('the validators worker (e2e)', () => {
       node.requests.length = 0;
       delete node.answers.manifest;
       for (const table of [Table.ValidatorDomains, Table.ValidatorSeen]) await db.ch.command(`TRUNCATE TABLE ${table}`);
+    });
+
+    it('reads a newer row without verified_at as no last success', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putList([v.master.base58]);
+      const at = clock.ms / 1000;
+      const row = {
+        validation_public_key: v.master.base58,
+        domain: NORTHPEAK,
+        status: 'verified',
+        reason: '',
+        status_code: 0,
+        toml_url: `https://${NORTHPEAK}${TOML_PATH}`,
+        accounts: [],
+        owner_country: '',
+        server_country: '',
+        toml_network: '',
+        toml_unl: '',
+        toml_version: 1,
+      };
+      await db.ch.insert(Table.ValidatorDomains, [
+        { ...row, checked_at: at - 7200, verified_at: at - 7200, next_check_at: at - 3600 },
+        { ...row, checked_at: at - 3600, verified_at: null, next_check_at: at - 1 },
+      ]);
+      web.serveToml(NORTHPEAK, TOML_PATH, 'this is not TOML');
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(1);
+
+      // the definite failure carries the last success of the newest row: none
+      const [newest] = await domainRows();
+      expect(newest).toMatchObject({ status: 'unverified', reason: 'toml_invalid', verified_ms: null });
     });
 
     it('verifies a domain whose hand-written TOML lists the key, and stores the accounts it names', async () => {

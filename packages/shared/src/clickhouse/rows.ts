@@ -872,12 +872,14 @@ export interface ValidatorDomainsRow {
   next_check_at: UnixSeconds;
   /** The `[[ACCOUNTS]]` addresses of the last TOML that verified, sorted; empty when unverified. */
   accounts: string[];
-  /** Migration 016. Filled by the checker from D8 on (`nextDomainRow`). */
-  owner_country?: string;
-  server_country?: string;
-  toml_network?: string;
-  toml_unl?: string;
-  toml_version?: number;
+  /** Upper-case ISO 3166-1 alpha-2 codes from the `[[VALIDATORS]]` entry that lists the key; `''` when not given or not verified. */
+  owner_country: string;
+  server_country: string;
+  /** The file's claims, which nothing checks; `''` when absent or not verified. */
+  toml_network: string;
+  toml_unl: string;
+  /** What the checker read of the file: 0 for a row from before D8 (a transient failure within the grace carries it on), else `TOML_DETAILS_VERSION`. */
+  toml_version: number;
 }
 
 /** The ledger state the node reports: enabled amendments, majorities, negative UNL and fees at `ledger_index`. */

@@ -75,6 +75,52 @@ export async function assertValidatorsSchema(
   );
 }
 
+/** The migration that adds the toml facts to `validator_domains`. */
+export const VALIDATOR_TOML_MIGRATION = '016_validator_toml_details.sql';
+
+/** The columns `VALIDATOR_TOML_MIGRATION` adds. */
+const VALIDATOR_TOML_COLUMNS = ['owner_country', 'server_country', 'toml_network', 'toml_unl', 'toml_version'] as const;
+
+/**
+ * Fails the boot when the validators worker is enabled and `validator_domains` lacks the columns of
+ * `016_validator_toml_details.sql`: the domain checker reads them in every pass and writes them with every row, so without them
+ * every pass fails. It reads `system.columns`, since 016 adds columns and no table. It runs after the boot-time migrations and
+ * after the check of 015. A check that cannot be made (ClickHouse unreachable) does not fail the boot: it is said, and the worker
+ * reports the failures of its reads as it always does.
+ */
+export async function assertValidatorTomlSchema(
+  ch: Pick<ClickHouseService, 'query'>,
+  enabled: ReadonlySet<WorkerName>,
+  database: string,
+  logger: { warn(message: string): void },
+): Promise<void> {
+  if (!enabled.has('validators')) return;
+  let rows: { column_name: string }[];
+  try {
+    rows = await ch.query<{ column_name: string }>(
+      `SELECT name AS column_name
+         FROM system.columns
+        WHERE database = currentDatabase() AND table IN {tables:Array(String)}`,
+      { tables: [Table.ValidatorDomains] },
+    );
+  } catch (err) {
+    logger.warn(
+      `Could not check that ${VALIDATOR_TOML_MIGRATION} is applied (${err instanceof Error ? err.message : String(err)}); ` +
+        'the workers start without the check',
+    );
+    return;
+  }
+  const columns = new Set(rows.map((row) => row.column_name));
+  const missing = VALIDATOR_TOML_COLUMNS.filter((column) => !columns.has(column));
+  if (missing.length === 0) return;
+  throw new Error(
+    `The ClickHouse database "${database}" lacks the schema of ${VALIDATOR_TOML_MIGRATION} ` +
+      `(${missing.map((column) => `column ${Table.ValidatorDomains}.${column}`).join(', ')}), which the validators worker ` +
+      'reads and writes: apply the migrations (pnpm --filter @gatehub/data-api-shared ch:migrate, or ' +
+      'GH_RUN_MIGRATIONS_ON_BOOT=true) and start the syncer again',
+  );
+}
+
 /** The migration that adds what the tomls worker reads and writes. */
 export const TOMLS_MIGRATION = '012_display_names.sql';
 

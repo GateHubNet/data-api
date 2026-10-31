@@ -1,5 +1,10 @@
-import { parseTomlText } from '@gatehub/data-api-shared';
-import { isValidClassicAddress } from 'ripple-address-codec';
+import {
+  NetworkProfile,
+  readToml,
+  UnixSeconds,
+  ValidatorTomlEntry,
+  validatorTomlEntryOf,
+} from '@gatehub/data-api-shared';
 
 // the parse moved to the shared package with `readToml`; `domain-checker.ts` and the spec keep importing the error from here
 export { TomlInvalidError } from '@gatehub/data-api-shared';
@@ -12,43 +17,29 @@ export interface TomlMatch {
   listed: boolean;
   /** The classic addresses of the `[[ACCOUNTS]]` entries, sorted, at most `MAX_ACCOUNTS`; none unless `listed`. */
   accounts: string[];
-}
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-/** The entries of a table array (`[[NAME]]`, or an array of inline tables) of the file; anything else has none. */
-function entriesOf(document: Record<string, unknown>, name: string): Record<string, unknown>[] {
-  if (!Object.prototype.hasOwnProperty.call(document, name)) return [];
-  const value = document[name];
-  return Array.isArray(value) ? value.filter(isRecord) : [];
-}
-
-/** The trimmed text of a field of an entry, `undefined` when it is missing or not text. */
-function textOf(entry: Record<string, unknown>, field: string): string | undefined {
-  const value = Object.prototype.hasOwnProperty.call(entry, field) ? entry[field] : undefined;
-  return typeof value === 'string' ? value.trim() : undefined;
+  /** The facts of the first entry that names the key; only when `listed`. */
+  entry?: ValidatorTomlEntry;
 }
 
 /**
- * What a validator's TOML file says about one master key (spec 2.2, 8.2). The file is parsed, never evaluated, and only two
- * fields are read: the `public_key` of the `[[VALIDATORS]]` entries (the key is listed when one equals `masterKey` once
- * trimmed) and, only when it is listed, the `address` of the `[[ACCOUNTS]]` entries, which are kept when they are classic
- * addresses with a valid checksum (an X-address, a bad checksum, a missing or non-text address is skipped), once each,
- * sorted, the first `MAX_ACCOUNTS`. Every other field is ignored. A byte order mark at the start of the text is ignored.
+ * What a validator's TOML file says about one master key (spec 2.2, 8.2; D8 1.1), read with `readToml`: the file is parsed,
+ * never evaluated, and every text is cleaned. The key is listed when a `[[VALIDATORS]]` entry's `public_key` equals `masterKey`.
+ * Only then are the `[[ACCOUNTS]]` addresses taken (classic addresses with a valid checksum, once each, sorted, the first
+ * `MAX_ACCOUNTS`, whatever their network) and the facts of the first entry that names the key (a second one is ignored, and no
+ * other entry is read). `readToml` keeps at most 100 entries, so a key listed past the 100th is not listed.
+ * A byte order mark at the start of the text is ignored.
  *
  * Throws `TomlInvalidError` when the text is not TOML.
  */
-export function matchToml(text: string, masterKey: string): TomlMatch {
-  const document = parseTomlText(text);
-
-  const listed = entriesOf(document, 'VALIDATORS').some((entry) => textOf(entry, 'public_key') === masterKey);
-  if (!listed) return { listed, accounts: [] };
-
-  const addresses = new Set<string>();
-  for (const entry of entriesOf(document, 'ACCOUNTS')) {
-    const address = textOf(entry, 'address');
-    if (address !== undefined && isValidClassicAddress(address)) addresses.add(address);
-  }
-  return { listed, accounts: [...addresses].sort().slice(0, MAX_ACCOUNTS) };
+export function matchToml(
+  text: string,
+  masterKey: string,
+  profile: Pick<NetworkProfile, 'name'>,
+  fetchedAt: UnixSeconds,
+): TomlMatch {
+  const { validators, accounts } = readToml(text, profile, fetchedAt);
+  const validator = validators.find((entry) => entry.public_key === masterKey);
+  if (validator === undefined) return { listed: false, accounts: [] };
+  const addresses = [...new Set(accounts.map((account) => account.address))];
+  return { listed: true, accounts: addresses.sort().slice(0, MAX_ACCOUNTS), entry: validatorTomlEntryOf(validator) };
 }

@@ -5,9 +5,11 @@ import {
   assertSupplySchema,
   assertTomlsSchema,
   assertValidatorsSchema,
+  assertValidatorTomlSchema,
   ISSUED_TOKENS_MIGRATION,
   SUPPLY_MIGRATION,
   TOMLS_MIGRATION,
+  VALIDATOR_TOML_MIGRATION,
   VALIDATORS_MIGRATION,
 } from './schema-check';
 
@@ -241,6 +243,55 @@ describe('assertIssuedTokensSchema', () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(ISSUED_TOKENS_MIGRATION));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
+  });
+});
+
+describe('assertValidatorTomlSchema', () => {
+  const COLUMNS = ['owner_country', 'server_country', 'toml_network', 'toml_unl', 'toml_version'];
+  const ALL_OF_016 = COLUMNS.map((column) => `${Table.ValidatorDomains}.${column}`);
+
+  it('checks nothing without the validators worker', async () => {
+    const db = database([]);
+    const warn = jest.fn();
+    await assertValidatorTomlSchema(db.ch, workers('validations', 'ingest', 'aggregator', 'tomls'), 'xrpl', { warn });
+    await assertValidatorTomlSchema(db.ch, workers(), 'xrpl', { warn });
+    expect(db.query).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('passes a database with the five columns, reading system.columns of the database with bound values', async () => {
+    const db = database(ALL_OF_016);
+    await expect(assertValidatorTomlSchema(db.ch, workers('validators'), 'xrpl', { warn: jest.fn() })).resolves.toBe(
+      undefined,
+    );
+    expect(db.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).toContain('FROM system.columns');
+    expect(sql).toContain('database = currentDatabase()');
+    expect(params).toEqual({ tables: [Table.ValidatorDomains] });
+  });
+
+  it('fails the boot naming the file, the database, the worker and each column that is missing', async () => {
+    const half = database(ALL_OF_016.filter((c) => !c.endsWith('toml_unl') && !c.endsWith('toml_version')));
+    const check = assertValidatorTomlSchema(half.ch, workers('validators', 'ingest'), 'xahau', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(
+      `The ClickHouse database "xahau" lacks the schema of ${VALIDATOR_TOML_MIGRATION} ` +
+        `(column ${Table.ValidatorDomains}.toml_unl, column ${Table.ValidatorDomains}.toml_version), which the validators worker reads and writes`,
+    );
+    await expect(check).rejects.toThrow('ch:migrate');
+  });
+
+  it('does not fail the boot when the check cannot be made, and says so', async () => {
+    const ch = {
+      query: jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:8123')),
+    } as unknown as Pick<ClickHouseService, 'query'>;
+    const warn = jest.fn();
+    await expect(assertValidatorTomlSchema(ch, workers('validators'), 'xrpl', { warn })).resolves.toBe(undefined);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(VALIDATOR_TOML_MIGRATION));
+  });
+
+  it('names 016', () => {
+    expect(VALIDATOR_TOML_MIGRATION).toBe('016_validator_toml_details.sql');
   });
 });
 

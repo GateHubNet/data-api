@@ -9,8 +9,11 @@ import {
   NEWEST_MANIFEST_ORDER,
   NodeClient,
   Table,
+  TOML_DETAILS_VERSION,
+  UnixSeconds,
   ValidatorDomainsRow,
   ValidatorManifestsRow,
+  ValidatorTomlEntry,
   verifyManifest,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
@@ -68,6 +71,8 @@ export interface DomainCheck {
   statusCode?: number;
   /** The accounts of a verified domain: sorted, at most 10. */
   accounts?: string[];
+  /** The facts of the `[[VALIDATORS]]` entry of a verified domain. */
+  entry?: ValidatorTomlEntry;
 }
 
 /**
@@ -84,12 +89,14 @@ export function isTransientReason(reason: DomainReason, statusCode?: number): bo
 /**
  * The row to store for a check (spec 2.2). `prev` is the stored row of the same (validator, domain), `now` unix seconds.
  *
- * - **verified**: `verified`, `verified_at` now, the accounts, the next check after `recheckMs`.
- * - **a definite failure**: `unverified` with the reason (and the status code of an `http_status`), no accounts, the time of
- *   the last success kept, the next check after `recheckMs`.
+ * - **verified**: `verified`, `verified_at` now, the accounts and the facts of the entry, the next check after `recheckMs`.
+ * - **a definite failure**: `unverified` with the reason (and the status code of an `http_status`), no accounts and no facts,
+ *   the time of the last success kept, the next check after `recheckMs`.
  * - **a transient failure**: the next check after an hour. A domain that was verified at most 24 h ago stays `verified`
- *   (its `verified_at` and accounts unchanged), so that a website that blips does not flap the badge; otherwise it is
- *   `unverified` with the reason and no accounts.
+ *   (its `verified_at`, accounts, facts and `toml_version` unchanged), so that a website that blips does not flap the badge;
+ *   otherwise it is `unverified` with the reason, no accounts and no facts.
+ *
+ * Every row but that of the grace has `toml_version` `TOML_DETAILS_VERSION`.
  */
 export function nextDomainRow(
   prev: ValidatorDomainsRow | undefined,
@@ -102,6 +109,11 @@ export function nextDomainRow(
     domain: check.domain,
     toml_url: check.tomlUrl,
     checked_at: now,
+    owner_country: '',
+    server_country: '',
+    toml_network: '',
+    toml_unl: '',
+    toml_version: TOML_DETAILS_VERSION,
   };
   // a whole second: `next_check_at` is a `DateTime`
   const after = (seconds: number) => Math.ceil(now + seconds);
@@ -115,6 +127,10 @@ export function nextDomainRow(
       verified_at: now,
       next_check_at: after(recheckMs / 1000),
       accounts: [...(check.accounts ?? [])],
+      owner_country: check.entry?.ownerCountry ?? '',
+      server_country: check.entry?.serverCountry ?? '',
+      toml_network: check.entry?.network ?? '',
+      toml_unl: check.entry?.unl ?? '',
     };
   }
 
@@ -139,6 +155,11 @@ export function nextDomainRow(
       verified_at: verifiedAt,
       next_check_at: after(DOMAIN_TRANSIENT_RECHECK_S),
       accounts: [...prev.accounts],
+      owner_country: prev.owner_country,
+      server_country: prev.server_country,
+      toml_network: prev.toml_network,
+      toml_unl: prev.toml_unl,
+      toml_version: prev.toml_version,
     };
   }
   return unverified(DOMAIN_TRANSIENT_RECHECK_S);
@@ -167,6 +188,11 @@ interface StoredDomainRow {
   verified_ms: number | string | null;
   next_check: number | string;
   accounts: string[];
+  stored_owner_country: string;
+  stored_server_country: string;
+  stored_toml_network: string;
+  stored_toml_unl: string;
+  stored_toml_version: number | string;
 }
 
 /** A (validator, domain) pair to check. `failure` is set when the check has no need of the website. */
@@ -264,7 +290,7 @@ export class DomainChecker {
 
   constructor(
     @Inject(SyncerConfig) private readonly cfg: CheckerConfig,
-    @Inject(NETWORK_PROFILE) private readonly profile: Pick<NetworkProfile, 'tomlPath'>,
+    @Inject(NETWORK_PROFILE) private readonly profile: Pick<NetworkProfile, 'tomlPath' | 'name'>,
     @Inject(ClickHouseService) private readonly ch: CheckerStore,
     @Inject(PrometheusService) private readonly metrics: Pick<PrometheusService, 'validatorsDomainChecksTotal'>,
     @Inject(SAFE_FETCHER) private readonly fetcher: Pick<SafeFetcher, 'get'>,
@@ -469,6 +495,7 @@ export class DomainChecker {
     return pairs;
   }
 
+  /** The newest row of each pair. `verified_at` goes through a tuple because `argMax` skips a NULL, and would read an older time. */
   private async storedDomains(keys: string[]): Promise<Map<string, ValidatorDomainsRow>> {
     const rows = await this.ch.query<StoredDomainRow>(
       `SELECT validation_public_key, domain,
@@ -477,9 +504,14 @@ export class DomainChecker {
               argMax(status_code, checked_at) AS status_code,
               argMax(toml_url, checked_at) AS toml_url,
               toUnixTimestamp64Milli(max(checked_at)) AS checked_ms,
-              toUnixTimestamp64Milli(argMax(verified_at, checked_at)) AS verified_ms,
+              toUnixTimestamp64Milli(tupleElement(argMax(tuple(verified_at), checked_at), 1)) AS verified_ms,
               toUnixTimestamp(argMax(next_check_at, checked_at)) AS next_check,
-              argMax(accounts, checked_at) AS accounts
+              argMax(accounts, checked_at) AS accounts,
+              argMax(owner_country, checked_at) AS stored_owner_country,
+              argMax(server_country, checked_at) AS stored_server_country,
+              argMax(toml_network, checked_at) AS stored_toml_network,
+              argMax(toml_unl, checked_at) AS stored_toml_unl,
+              argMax(toml_version, checked_at) AS stored_toml_version
          FROM ${Table.ValidatorDomains}
         WHERE validation_public_key IN {keys:Array(String)}
         GROUP BY validation_public_key, domain`,
@@ -499,6 +531,11 @@ export class DomainChecker {
           verified_at: row.verified_ms === null ? null : Number(row.verified_ms) / 1000,
           next_check_at: Number(row.next_check),
           accounts: row.accounts,
+          owner_country: row.stored_owner_country,
+          server_country: row.stored_server_country,
+          toml_network: row.stored_toml_network,
+          toml_unl: row.stored_toml_unl,
+          toml_version: Number(row.stored_toml_version),
         },
       ]),
     );
@@ -556,12 +593,14 @@ export class DomainChecker {
   private async checkDomain(group: Candidate[], stored: Map<string, ValidatorDomainsRow>): Promise<number> {
     const file = await this.fetchFile(group[0].tomlUrl, group[0].domain);
     if (this.stopped) return 0;
+    // the time the file arrived, not the start of a pass that can last minutes
+    const fetchedAt = this.now() / 1000;
     const checks = group.map(
       (c): DomainCheck => ({
         key: c.key,
         domain: c.domain,
         tomlUrl: c.tomlUrl,
-        ...('text' in file ? judge(file.text, c.key) : file),
+        ...('text' in file ? judge(file.text, c.key, this.profile, Math.floor(fetchedAt)) : file),
       }),
     );
     return this.record(checks, stored);
@@ -658,10 +697,15 @@ function verdictOf(key: string, hex: string): Verdict {
 }
 
 /** What the file says about the key: verified, or why not. */
-function judge(text: string, key: string): Pick<DomainCheck, 'reason' | 'accounts'> {
+function judge(
+  text: string,
+  key: string,
+  profile: Pick<NetworkProfile, 'name'>,
+  fetchedAt: UnixSeconds,
+): Pick<DomainCheck, 'reason' | 'accounts' | 'entry'> {
   try {
-    const { listed, accounts } = matchToml(text, key);
-    return listed ? { reason: '', accounts } : { reason: 'not_listed' };
+    const { listed, accounts, entry } = matchToml(text, key, profile, fetchedAt);
+    return listed ? { reason: '', accounts, entry } : { reason: 'not_listed' };
   } catch (err) {
     if (err instanceof TomlInvalidError) return { reason: 'toml_invalid' };
     throw err;
