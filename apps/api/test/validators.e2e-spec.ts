@@ -1179,8 +1179,9 @@ describe('GET /v2/network/validators and /{key}: a fleet of 35 trusted validator
         if (row.fee_vote) expect(Object.keys(row.fee_vote)).toEqual([...FEE_VOTE_KEYS]);
         if (row.amendment_votes) expect(Object.keys(row.amendment_votes)).toEqual(['ledger_index', 'yes']);
       }
+      // the fleet's rows are from before D8: no toml
       expect(Object.keys(rowOf(unlList, s.unl[0].key))).toEqual(
-        [...VALIDATOR_ROW_KEYS].filter((key) => key !== 'version_build'),
+        [...VALIDATOR_ROW_KEYS].filter((key) => key !== 'version_build' && key !== 'toml'),
       );
       expect(JSON.stringify(unlList.body)).not.toContain('null');
     });
@@ -1542,8 +1543,9 @@ describe('GET /v2/network/validators and /{key}: a fleet of 35 trusted validator
     });
 
     it('lists its keys in the order of the row, then DETAIL_TAIL_KEYS', () => {
+      // the fleet's rows are from before D8: no toml
       expect(Object.keys(northpeak.body)).toEqual(
-        [...VALIDATOR_ROW_KEYS, ...DETAIL_TAIL_KEYS].filter((key) => key !== 'version_build'),
+        [...VALIDATOR_ROW_KEYS, ...DETAIL_TAIL_KEYS].filter((key) => key !== 'version_build' && key !== 'toml'),
       );
       expect(Object.keys(northpeak.body.amendment_votes)).toEqual([...DETAIL_AMENDMENT_VOTES_KEYS]);
       expect(Object.keys(northpeak.body.amendment_votes.votes[0])).toEqual(
@@ -2057,6 +2059,150 @@ describe('GET /v2/network/validators and /{key}: on Xahau', () => {
 // ===================================================================================================================
 // Xahau Testnet: the fixed list
 // ===================================================================================================================
+
+describe('toml on the validator rows', () => {
+  describe('XRPL: a fleet whose domains were read by D8', () => {
+    let h: Harness;
+    let api: ApiClient;
+    let s: FleetScenario;
+    let list: Answer;
+    const rowOf = (answer: Answer, key: string): Record<string, any> =>
+      answer.body.validators.find((row: { validation_public_key: string }) => row.validation_public_key === key);
+
+    beforeAll(async () => {
+      h = (
+        await startWithDirectory({
+          seed: 'none',
+          network: 'xrpl',
+          env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xrpl },
+        })
+      ).h;
+      api = await h.api();
+      s = await seedFleet(h.ch, { activity: true });
+      const now = Date.now() / 1000;
+      await insertDomains(h.ch, [
+        {
+          validation_public_key: s.unl[0].key,
+          domain: 'northpeak.example',
+          checked_at: now - 10,
+          owner_country: 'NO',
+          server_country: 'DE',
+          toml_network: 'main',
+          toml_unl: 'https://vl.ripple.com',
+          toml_version: 1,
+        },
+        {
+          validation_public_key: s.unl[1].key,
+          domain: 'shoreline.example',
+          checked_at: now - 10,
+          toml_version: 1,
+        },
+      ]);
+      list = await api.get(`${LIST}?scope=all`);
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('serves toml on the rows: full, {}, and none for the others', () => {
+      expect(rowOf(list, s.unl[0].key).toml).toEqual({
+        owner_country: 'NO',
+        server_country: 'DE',
+        network: 'main',
+        unl: 'https://vl.ripple.com',
+      });
+      expect(Object.keys(rowOf(list, s.unl[0].key)).at(-1)).toBe('toml');
+      expect(rowOf(list, s.unl[1].key).toml).toEqual({});
+      expect(rowOf(list, s.unl[2].key)).not.toHaveProperty('toml');
+      expect(rowOf(list, s.others[1].key)).not.toHaveProperty('toml');
+    });
+
+    it('has toml on the detail too', async () => {
+      const detail = await api.get(detailOf(s.unl[0].key));
+      expect(detail.body.toml).toEqual(rowOf(list, s.unl[0].key).toml);
+    });
+
+    it('writes the toml columns into the CSV', async () => {
+      const csv = await api.get(`${LIST}?format=csv`);
+      const header = csv.text
+        .split('\n')[0]
+        .split(',')
+        .map((cell) => cell.replace(/^"|"$/g, ''));
+      expect(header).toEqual(
+        expect.arrayContaining(['toml.owner_country', 'toml.server_country', 'toml.network', 'toml.unl']),
+      );
+    });
+  });
+
+  describe('Xahau', () => {
+    let h: Harness;
+    let api: ApiClient;
+    let list: Answer;
+    const members = fleet('xahau', 2);
+    const rowOf = (key: string): Record<string, any> =>
+      list.body.validators.find((row: { validation_public_key: string }) => row.validation_public_key === key);
+
+    beforeAll(async () => {
+      h = (
+        await startWithDirectory({
+          seed: 'none',
+          network: 'xahau',
+          env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xahau },
+        })
+      ).h;
+      api = await h.api();
+      const now = Math.floor(Date.now() / 1000);
+      await insertLists(h.ch, [
+        {
+          publisher: 'vl.xahau.org',
+          sequence: 2_026_092_401,
+          expiration: now + 86_400,
+          validators: members.map((m) => m.key),
+        },
+      ]);
+      await insertPublishers(h.ch, [{ publisher: 'vl.xahau.org', checked_at: now - 10 }]);
+      await insertManifests(h.ch, [
+        { ephemeral_key: members[0].ephemeral, master_key: members[0].key, seq: 1, domain: 'north.example' },
+        { ephemeral_key: members[1].ephemeral, master_key: members[1].key, seq: 1, domain: 'south.example' },
+      ]);
+      await insertDomains(h.ch, [
+        {
+          validation_public_key: members[0].key,
+          domain: 'north.example',
+          checked_at: now - 10,
+          server_country: 'FI',
+          toml_network: '21337',
+          toml_version: 1,
+        },
+      ]);
+      await insertDomains(h.ch, [
+        {
+          validation_public_key: members[1].key,
+          domain: 'south.example',
+          checked_at: now - 100,
+          verified_at: now - 100,
+        },
+      ]);
+      await insertDomains(h.ch, [
+        { validation_public_key: members[1].key, domain: 'south.example', checked_at: now - 10, verified_at: null },
+      ]);
+      list = await api.get(LIST);
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('serves a Xahau network ID as text', () => {
+      expect(rowOf(members[0].key).toml).toEqual({ server_country: 'FI', network: '21337' });
+    });
+
+    // two inserts: within one insert the engine keeps the newest row alone
+    it('reads a newer row without verified_at as no last success', () => {
+      expect(rowOf(members[1].key).domain_verification.status).toBe('verified');
+      expect(rowOf(members[1].key).domain_verification).not.toHaveProperty('verified');
+    });
+  });
+});
 
 describe('Xahau Testnet: the fixed list', () => {
   let h: Harness;

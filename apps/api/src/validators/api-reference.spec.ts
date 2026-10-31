@@ -28,6 +28,7 @@ import {
   LIST_BODY_KEYS,
   MANIFEST_KEYS,
   ROW_AMENDMENT_VOTES_KEYS,
+  TOML_KEYS,
   VALIDATOR_ROW_KEYS,
   VOTE_ENTRY_KEYS,
   YES_ENTRY_KEYS,
@@ -55,6 +56,7 @@ const OBJECTS: Record<string, readonly string[]> = {
   // GET /v2/network/validators and GET /v2/network/validators/{key}
   'the validators answer': LIST_BODY_KEYS,
   'a validator row': VALIDATOR_ROW_KEYS,
+  'toml on a validator row': TOML_KEYS,
   'an agreement window': AGREEMENT_KEYS,
   domain_verification: DOMAIN_VERIFICATION_KEYS,
   fee_vote: FEE_VOTE_KEYS,

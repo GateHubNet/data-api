@@ -1,7 +1,7 @@
 import { compact } from '../common/format';
 import type { AgreementWindow } from './agreement-windows';
 import type { AmendmentsAssembly, AmendmentStatus } from './amendment-status';
-import type { DirectoryEntry, DomainState, ManifestInfo } from './directory';
+import type { DirectoryEntry, DomainState, ManifestInfo, TomlFacts } from './directory';
 import { instant, wholeUnits } from './summary-object';
 
 /*
@@ -35,7 +35,11 @@ export const VALIDATOR_ROW_KEYS = [
   'amendment_votes',
   'first_seen',
   'last_seen',
+  'toml',
 ] as const;
+
+/** The keys of `toml` on a validator row, in order: what the verified file's `[[VALIDATORS]]` entry says (D8). */
+export const TOML_KEYS = ['owner_country', 'server_country', 'network', 'unl'] as const;
 
 /** The keys of a window of agreement, in order. */
 export const AGREEMENT_KEYS = ['missed', 'total', 'score', 'incomplete', 'partial'] as const;
@@ -126,6 +130,13 @@ export interface DetailAmendmentVotes {
   votes: VoteEntry[];
 }
 
+export interface TomlObject {
+  owner_country?: string;
+  server_country?: string;
+  network?: string;
+  unl?: string;
+}
+
 export interface ValidatorRow {
   validation_public_key: string;
   domain?: string;
@@ -147,6 +158,7 @@ export interface ValidatorRow {
   amendment_votes?: RowAmendmentVotes;
   first_seen?: string;
   last_seen?: string;
+  toml?: TomlObject;
 }
 
 export interface ManifestObject {
@@ -231,6 +243,15 @@ function yesOf(entry: DirectoryEntry, amendments: NamedAmendments): YesEntry[] {
   });
 }
 
+/** `toml` of a row: `{}` when the verified file gives none of the four. */
+const tomlOf = (facts: TomlFacts): TomlObject =>
+  compact({
+    owner_country: facts.ownerCountry,
+    server_country: facts.serverCountry,
+    network: facts.network,
+    unl: facts.unl,
+  });
+
 const manifestOf = (manifest: ManifestInfo): ManifestObject =>
   compact({
     sequence: manifest.sequence,
@@ -265,6 +286,7 @@ function rowOf<V>(entry: DirectoryEntry, votes: V | undefined): RowWith<V> {
     amendment_votes: votes,
     first_seen: entry.firstSeen === undefined ? undefined : instant(entry.firstSeen),
     last_seen: entry.lastSeen === undefined ? undefined : instant(entry.lastSeen),
+    toml: entry.toml === undefined ? undefined : tomlOf(entry.toml),
   });
 }
 

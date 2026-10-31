@@ -5559,7 +5559,9 @@ Link: <https://xrpl.data.example.com/v2/network/validators?limit=2&marker=WzAsIn
 
 Keys of the validators answer, in order: `result, count, marker, validators`.
 
-Keys of a validator row, in order: `validation_public_key, domain, current_index, agreement_1h, agreement_24h, partial, unl, agreement_30d, signing_key, domain_verification, unl_lists, negative_unl, version, version_build, version_latest, server_version, fee_vote, amendment_votes, first_seen, last_seen`.
+Keys of a validator row, in order: `validation_public_key, domain, current_index, agreement_1h, agreement_24h, partial, unl, agreement_30d, signing_key, domain_verification, unl_lists, negative_unl, version, version_build, version_latest, server_version, fee_vote, amendment_votes, first_seen, last_seen, toml`.
+
+Keys of toml on a validator row, in order: `owner_country, server_country, network, unl`.
 
 Keys of an agreement window, in order: `missed, total, score, incomplete, partial`.
 

@@ -13,6 +13,7 @@ import {
   LIST_BODY_KEYS,
   MANIFEST_KEYS,
   ROW_AMENDMENT_VOTES_KEYS,
+  TOML_KEYS,
   VALIDATOR_ROW_KEYS,
   validatorDetail,
   validatorRow,
@@ -86,6 +87,8 @@ const FULL: DirectoryEntry = {
   signingKey: 'n9Signing',
   manifest: { sequence: 4, signingKey: 'n9Signing', signingKeysSeen: 4, domain: 'northpeak.example' },
   domainState: VERIFIED,
+  toml: { ownerCountry: 'NO', serverCountry: 'DE', network: 'main', unl: 'https://vl.ripple.com' },
+  serverCountry: 'DE',
   currentIndex: 107_748_183,
   partial: false,
   agreement1h: window({ missed: 0, total: 921, score: '1.0000', partial: 0 }),
@@ -144,7 +147,9 @@ describe('the key constants', () => {
       'amendment_votes',
       'first_seen',
       'last_seen',
+      'toml',
     ]);
+    expect([...TOML_KEYS]).toEqual(['owner_country', 'server_country', 'network', 'unl']);
     expect([...AGREEMENT_KEYS]).toEqual(['missed', 'total', 'score', 'incomplete', 'partial']);
     expect([...DOMAIN_VERIFICATION_KEYS]).toEqual([
       'status',
@@ -197,6 +202,24 @@ describe('validatorRow', () => {
       },
       first_seen: '2026-07-21T15:42:53.000Z',
       last_seen: '2026-10-19T15:42:50.204Z',
+      toml: { owner_country: 'NO', server_country: 'DE', network: 'main', unl: 'https://vl.ripple.com' },
+    });
+  });
+
+  it('has toml last, after last_seen', () => {
+    const keys = Object.keys(validatorRow(FULL, AMENDMENTS));
+    expect(keys.slice(-2)).toEqual(['last_seen', 'toml']);
+    expect(Object.keys(validatorRow(FULL, AMENDMENTS).toml ?? {})).toEqual([...TOML_KEYS]);
+  });
+
+  it('leaves toml out without facts, writes {} for empty facts, and every key it has', () => {
+    expect(validatorRow({ ...FULL, toml: undefined }, AMENDMENTS)).not.toHaveProperty('toml');
+    expect(validatorRow({ ...FULL, toml: {} }, AMENDMENTS).toml).toEqual({});
+    expect(
+      validatorRow({ ...FULL, toml: { serverCountry: 'FI', unl: 'https://vl.example' } }, AMENDMENTS).toml,
+    ).toEqual({
+      server_country: 'FI',
+      unl: 'https://vl.example',
     });
   });
 

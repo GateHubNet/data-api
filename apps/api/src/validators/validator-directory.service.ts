@@ -358,6 +358,11 @@ export class ValidatorDirectoryService {
       checked_ms: Num;
       verified_ms: Num | null;
       newest_accounts: string[];
+      newest_owner_country: string;
+      newest_server_country: string;
+      newest_toml_network: string;
+      newest_toml_unl: string;
+      newest_toml_version: Num;
     }>(
       `WITH ${KEY_MAP_WITH}
        SELECT ${MAPPED_KEY} AS domain_key,
@@ -367,8 +372,13 @@ export class ValidatorDirectoryService {
               argMax(status_code, checked_at) AS newest_status_code,
               argMax(toml_url, checked_at) AS newest_toml_url,
               toUnixTimestamp64Milli(max(checked_at)) AS checked_ms,
-              toUnixTimestamp64Milli(argMax(verified_at, checked_at)) AS verified_ms,
-              argMax(accounts, checked_at) AS newest_accounts
+              toUnixTimestamp64Milli(tupleElement(argMax(tuple(verified_at), checked_at), 1)) AS verified_ms,
+              argMax(accounts, checked_at) AS newest_accounts,
+              argMax(owner_country, checked_at) AS newest_owner_country,
+              argMax(server_country, checked_at) AS newest_server_country,
+              argMax(toml_network, checked_at) AS newest_toml_network,
+              argMax(toml_unl, checked_at) AS newest_toml_unl,
+              argMax(toml_version, checked_at) AS newest_toml_version
          FROM ${Table.ValidatorDomains}
         GROUP BY domain_key, domain_name
         ORDER BY domain_key, domain_name`,
@@ -384,6 +394,11 @@ export class ValidatorDirectoryService {
         checked: asSeconds(row.checked_ms),
         ...(row.verified_ms !== null && { verified: asSeconds(row.verified_ms) }),
         accounts: row.newest_accounts,
+        ownerCountry: row.newest_owner_country,
+        serverCountry: row.newest_server_country,
+        tomlNetwork: row.newest_toml_network,
+        tomlUnl: row.newest_toml_unl,
+        tomlVersion: asNumber(row.newest_toml_version),
       }),
     );
   }
