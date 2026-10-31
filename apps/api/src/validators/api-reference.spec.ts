@@ -13,6 +13,8 @@ import {
   ROUND_POINT_KEYS,
   UNL_VOTE_KEYS,
 } from './amendment-object';
+import * as countriesObject from './countries-object';
+import { COUNTRIES_KEYS, COUNTRY_KEYS, UNKNOWN_KEYS } from './countries-object';
 import * as summaryObject from './summary-object';
 import { PUBLISHER_KEYS, SUMMARY_KEYS } from './summary-object';
 import * as validationRowObject from './validation-row-object';
@@ -61,6 +63,10 @@ const OBJECTS: Record<string, readonly string[]> = {
   'toml on a validator row': TOML_KEYS,
   'toml on the validator answer': TOML_DETAIL_KEYS,
   'a toml currency': CURRENCY_KEYS,
+  // GET /v2/network/validators/countries
+  'the countries answer': COUNTRIES_KEYS,
+  'a country': COUNTRY_KEYS,
+  unknown: UNKNOWN_KEYS,
   'an agreement window': AGREEMENT_KEYS,
   domain_verification: DOMAIN_VERIFICATION_KEYS,
   fee_vote: FEE_VOTE_KEYS,
@@ -105,9 +111,9 @@ describe('the "Validators and amendments" section of docs/api-reference.md', () 
     expect(names).toHaveLength(Object.keys(OBJECTS).length);
   });
 
-  it('is checked against every *_KEYS constant of the four objects modules: none is left out of the map', () => {
-    const exported = [summaryObject, validatorObject, amendmentObject, validationRowObject].flatMap((module) =>
-      Object.entries(module).filter(([name]) => name.endsWith('_KEYS')),
+  it('is checked against every *_KEYS constant of the five objects modules: none is left out of the map', () => {
+    const exported = [summaryObject, validatorObject, amendmentObject, validationRowObject, countriesObject].flatMap(
+      (module) => Object.entries(module).filter(([name]) => name.endsWith('_KEYS')),
     );
     expect(exported.length).toBeGreaterThanOrEqual(26);
     const mapped = new Set<unknown>(Object.values(OBJECTS));

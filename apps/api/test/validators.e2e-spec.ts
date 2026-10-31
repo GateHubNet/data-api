@@ -10,6 +10,7 @@ import {
 } from '@gatehub/data-api-shared';
 import { join } from 'node:path';
 import { makeManifest } from '../../../packages/shared/src/test-utils/validator-keys';
+import { COUNTRIES_KEYS } from '../src/validators/countries-object';
 import type { Directory } from '../src/validators/directory';
 import { PUBLISHER_KEYS, SUMMARY_KEYS } from '../src/validators/summary-object';
 import { VALIDATION_ROW_KEYS, VALIDATIONS_BODY_KEYS } from '../src/validators/validation-row-object';
@@ -2071,7 +2072,56 @@ describe('GET /v2/network/validators and /{key}: on Xahau', () => {
 // Xahau Testnet: the fixed list
 // ===================================================================================================================
 
+const COUNTRIES = '/v2/network/validators/countries';
+
+/** Every count of `/countries` is what the list gives with the same scope and country. */
+async function expectCountriesToMatchTheList(api: ApiClient): Promise<void> {
+  for (const scope of ['unl', 'all']) {
+    const { body } = await api.get(`${COUNTRIES}?scope=${scope}`);
+    const listed = async (country?: string): Promise<{ unl: boolean }[]> =>
+      (await api.get(`${LIST}?scope=${scope}&limit=1000${country === undefined ? '' : `&country=${country}`}`)).body
+        .validators;
+    for (const { country, validators, unl } of body.countries) {
+      const rows = await listed(country);
+      expect([country, rows.length, rows.filter((row) => row.unl).length]).toEqual([country, validators, unl]);
+    }
+    const unknown = await listed('unknown');
+    expect([unknown.length, unknown.filter((row) => row.unl).length]).toEqual([
+      body.unknown.validators,
+      body.unknown.unl,
+    ]);
+    const all = await listed();
+    expect([all.length, all.filter((row) => row.unl).length]).toEqual([body.validators, body.unl]);
+    expect(body.located + body.unknown.validators).toBe(body.validators);
+    expect(body.count).toBe(body.countries.length);
+    expect(Object.keys(body)).toEqual([...COUNTRIES_KEYS]);
+  }
+}
+
 describe('toml on the validator rows', () => {
+  describe('an empty database', () => {
+    let h: Harness;
+    beforeAll(async () => {
+      h = await startHarness({ seed: 'none', env: NO_RATE_LIMIT });
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('answers an empty database: validators 0, no country', async () => {
+      const { status, body } = await (await h.api()).get(COUNTRIES);
+      expect(status).toBe(200);
+      expect(body).toMatchObject({
+        validators: 0,
+        unl: 0,
+        located: 0,
+        unknown: { validators: 0, unl: 0 },
+        count: 0,
+        countries: [],
+      });
+    });
+  });
+
   describe('XRPL: a fleet whose domains were read by D8', () => {
     let h: Harness;
     let api: ApiClient;
@@ -2155,6 +2205,62 @@ describe('toml on the validator rows', () => {
       }
     });
 
+    it('counts what the list lists, for every country and unknown, in both scopes', async () => {
+      await expectCountriesToMatchTheList(api);
+      const { body } = await api.get(COUNTRIES);
+      expect(body.countries).toEqual([{ country: 'DE', validators: 1, unl: 1 }]);
+      expect(body).toMatchObject({
+        scope: 'unl',
+        validators: 35,
+        unl: 35,
+        located: 1,
+        unknown: { validators: 34, unl: 34 },
+      });
+      // a verified pair read before D8 counts as unknown
+      expect(rowOf(list, s.others[1].key).domain_verification.status).toBe('verified');
+      const unknown = await api.get(`${LIST}?scope=all&country=unknown&limit=1000`);
+      expect(
+        unknown.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key),
+      ).toContain(s.others[1].key);
+    });
+
+    it('reads nothing beyond the directory', async () => {
+      await api.get(LIST);
+      const spy = jest.spyOn(h.ch, 'query');
+      try {
+        await api.get(COUNTRIES);
+        await api.get(`${LIST}?country=DE`);
+        expect(spy).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('defaults to unl, refuses another scope, ignores other parameters', async () => {
+      expect((await api.get(COUNTRIES)).body.scope).toBe('unl');
+      expect((await api.get(`${COUNTRIES}?country=DE&limit=1&q=x`)).body.scope).toBe('unl');
+      expect((await api.get(`${COUNTRIES}?scope=all`)).body.scope).toBe('all');
+      const refused = await api.get(`${COUNTRIES}?scope=x`);
+      expect([refused.status, refused.body]).toEqual([400, { result: 'error', message: 'invalid scope' }]);
+    });
+
+    it('is JSON with format=csv too', async () => {
+      const answer = await api.get(`${COUNTRIES}?format=csv`);
+      expect(answer.headers['content-type']).toMatch(/json/);
+      expect(answer.body.result).toBe('success');
+    });
+
+    it('sends Cache-Control: private, max-age=30', async () => {
+      expect((await api.get(COUNTRIES)).headers['cache-control']).toBe('private, max-age=30');
+    });
+
+    it('is not read as a validator key', async () => {
+      const answer = await api.get(COUNTRIES);
+      expect(answer.status).toBe(200);
+      expect(answer.body).toHaveProperty('countries');
+      expect(answer.body).not.toHaveProperty('validation_public_key');
+    });
+
     it('writes the toml columns into the CSV', async () => {
       const csv = await api.get(`${LIST}?format=csv`);
       const header = csv.text
@@ -2227,6 +2333,16 @@ describe('toml on the validator rows', () => {
 
     it('serves a Xahau network ID as text', () => {
       expect(rowOf(members[0].key).toml).toEqual({ server_country: 'FI', network: '21337' });
+    });
+
+    it('counts what the list lists, for every country and unknown, in both scopes', async () => {
+      await expectCountriesToMatchTheList(api);
+      expect((await api.get(COUNTRIES)).body).toMatchObject({
+        validators: 2,
+        located: 1,
+        countries: [{ country: 'FI', validators: 1, unl: 1 }],
+        unknown: { validators: 1, unl: 1 },
+      });
     });
 
     // two inserts: within one insert the engine keeps the newest row alone

@@ -17,6 +17,7 @@ import {
   VALIDATIONS_MARKER_CACHE_CONTROL,
   VALIDATORS_CACHE_CONTROL,
 } from './cache-control';
+import { buildCountries, CountriesBody } from './countries-object';
 import { domainTomlFactsOf } from './domain-toml-facts';
 import { buildSummary, ValidatorsSummary } from './summary-object';
 import { buildValidationsBody, ValidationsBody } from './validation-row-object';
@@ -24,15 +25,15 @@ import { ValidatorDirectoryService } from './validator-directory.service';
 import { parseValidatorKey, resolveValidator } from './validator-key';
 import { buildValidatorsBody, validatorDetail, ValidatorDetail, ValidatorsBody } from './validator-object';
 import { ValidatorValidationsService } from './validator-validations.service';
-import { listValidators, parseListQuery } from './validators-query';
+import { listValidators, parseListQuery, parseScope } from './validators-query';
 
 /** The message of the routes of the validators when something other than a Ripple 4xx goes wrong. */
 const FAILURE = 'unable to retrieve validator(s)';
 
 /**
- * `GET /v2/network/validators/summary`, `GET /v2/network/validators`, `GET /v2/network/validators/{key}` and
- * `GET /v2/network/validators/{key}/validations` (spec 3.1 to 3.4). The routes with a validator key come after `summary` in
- * this controller, so that `summary` is never read as a key.
+ * `GET /v2/network/validators/summary`, `GET /v2/network/validators/countries`, `GET /v2/network/validators`,
+ * `GET /v2/network/validators/{key}` and `GET /v2/network/validators/{key}/validations` (spec 3.1 to 3.4; D8 4.4). The routes
+ * with a validator key come after `summary` and `countries` in this controller, so that neither is ever read as a key.
  *
  * The list and the validator are built on the assembly of the amendments (which holds the directory it was built on): their
  * votes name the amendments they vote for, and the detail lists the ones still being decided. One request, one directory.
@@ -61,6 +62,25 @@ export class ValidatorsController {
     const summary = buildSummary(await this.directory.get());
     this.setCacheControl(res);
     return summary;
+  }
+
+  @Get('countries')
+  @RippleRoute(FAILURE)
+  @ApiOperation({
+    summary: 'Get the validators of the network per server country',
+    description:
+      'How many validators of a scope name each country as the server_country of their verified toml, and how many of them are ' +
+      'on the trusted UNL; those without one count as unknown. Every count is what the list gives with the same scope and ' +
+      'country. JSON only.',
+  })
+  @ApiQuery({ name: 'scope', required: false, enum: ['unl', 'all'], description: 'Default: unl.' })
+  async countries(@Query() query: QueryParams, @Res({ passthrough: true }) res: Response): Promise<CountriesBody> {
+    const scope = parseScope(query);
+    // the directory of the list, so that the route and the list agree within the window the assembly is cached
+    const { directory } = await this.amendments.get();
+    const body = buildCountries(directory, scope);
+    this.setCacheControl(res);
+    return body;
   }
 
   @Get()

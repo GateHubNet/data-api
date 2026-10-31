@@ -5624,6 +5624,49 @@ Errors: 400 `invalid scope`, `invalid publisher`, `invalid amendment`, `invalid 
 | Messages `Validator not found`, `unable to retrieve validator(s)`; CSV `validators.csv` | Kept; new 400s for the new parameters |
 | `/manifests`, `/reports`, `/validator_reports`, `/rippled_versions` | Still 404 |
 
+### `GET /v2/network/validators/countries`
+
+The validators of a scope per server country: how many name each country as the `server_country` of their verified toml, and how many of them are on the trusted UNL. The original had no such route.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `scope` | `unl` | As the list's: `unl`, the trusted UNL; `all`, the trusted UNL and every validator seen in the last 24 hours. Anything else: 400 `invalid scope`. |
+
+Other parameters are ignored. JSON only: `format=csv` changes nothing.
+
+```json
+{
+  "result": "success",
+  "scope": "all",
+  "validators": 142,
+  "unl": 35,
+  "located": 125,
+  "unknown": {"validators": 17, "unl": 1},
+  "count": 22,
+  "countries": [
+    {"country": "US", "validators": 27, "unl": 6},
+    {"country": "DE", "validators": 16, "unl": 5},
+    {"country": "NL", "validators": 10, "unl": 3}
+  ],
+  "updated": "2026-10-24T15:42:53.002Z"
+}
+```
+
+(Three of the 22 countries shown.)
+
+- `validators`: the scope's validators, the rows of the list with the same `scope` and no filter. `unl`: of them on the trusted UNL.
+- `located`: of them with a `toml.server_country`. `unknown`: the others (no domain, a domain not verified or not read yet, no valid `server_country`), with how many of them are on the UNL. `located + unknown.validators = validators`.
+- `countries`: one entry per code with at least one validator, `validators` descending, then `unl` descending, then `country`. `count` is its length. Every count is what the list gives with the same `scope` and `country`.
+- `updated`: when the directory was built, the summary's `updated`.
+
+Keys of the countries answer, in order: `result, scope, validators, unl, located, unknown, count, countries, updated`.
+
+Keys of a country, in order: `country, validators, unl`.
+
+Keys of unknown, in order: `validators, unl`.
+
+`Cache-Control: private, max-age=30`, while `GH_CACHE_CONTROL` is not empty. Errors: 400 `invalid scope`; 500 `unable to retrieve validator(s)`.
+
 ### `GET /v2/network/validators/{key}`
 
 One validator: the object of the list, with its vote on every amendment still being decided, its manifest and its agreement of each of the last 30 days. JSON only:
