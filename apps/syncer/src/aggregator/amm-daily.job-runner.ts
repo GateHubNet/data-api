@@ -57,7 +57,7 @@ export const AMM_DAILY_FUNCTIONS: AmmDailyFunctions = {
 };
 
 /**
- * The `amm_daily` job of the aggregator (see `AggregatorService`, job 11), and its hook in the slices of `agg_dirty`: one set per
+ * The `amm_daily` job of the aggregator (see `AggregatorService`, job 12), and its hook in the slices of `agg_dirty`: one set per
  * UTC day with the stats of every AMM pool, today and yesterday, then the back-fill of the closed days. Its state (the days that
  * failed and when to try them again) is its own; the database, the clock, the budgets and the rules of the tick are the
  * service's (`AggregatorJobContext`).

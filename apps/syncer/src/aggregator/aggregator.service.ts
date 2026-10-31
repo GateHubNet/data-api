@@ -12,6 +12,7 @@ import {
   livePeriodsOf,
   liveSetVersions,
   MarketsConfig,
+  MptStateAborted,
   NftCollectionsRecomputeAborted,
   NftRebuildAborted,
   RatesService,
@@ -48,6 +49,7 @@ import {
   utcDayStart,
 } from './job-context';
 import { MarketsLiveJobRunner } from './markets-live.job-runner';
+import { AggregatorMptState, MPT_STATE_FUNCTIONS, MptStateFunctions, MptStateJobRunner } from './mpt-state.job-runner';
 import {
   NFT_COLLECTIONS_FUNCTIONS,
   NftCollectionsFunctions,
@@ -72,6 +74,12 @@ export type { AggregatorAmmPools, AmmPoolsFunctions } from './amm-pools.job-runn
 export type { AggregatorEscrows, EscrowsFunctions } from './escrows.job-runner';
 export { MAX_FAILED_VOLUME_SETS_PER_TICK } from './job-context';
 export type { AggregatorJobName, AggregatorTick } from './job-context';
+export {
+  MAX_ISOLATED_ISSUANCES_PER_BATCH,
+  MPT_ISSUANCE_MAX_RETRY_MS,
+  MPT_ISSUANCE_RETRY_MS,
+} from './mpt-state.job-runner';
+export type { AggregatorMptState, MptStateFunctions } from './mpt-state.job-runner';
 export { MAX_ISOLATED_COLLECTIONS_PER_BATCH, NFT_COLLECTIONS_EVERY_TICKS } from './nft-collections.job-runner';
 export type { NftCollectionsFunctions } from './nft-collections.job-runner';
 export { MAX_ISOLATED_NFTS_PER_BATCH, NFT_MAX_RETRY_MS, NFT_RETRY_MS } from './nft-state.job-runner';
@@ -177,6 +185,15 @@ export const AGGREGATOR_ESCROWS_BUDGET_MS = 2000;
  * over all accounts (the pass goes on at the next tick where its stored cursor says).
  */
 export const AGGREGATOR_TOKENS_BUDGET_MS = 4000;
+
+/**
+ * How much of the tick `mpt_state` (the issuances and the holders that were touched) may use. It runs right after `stats_dirty`, not
+ * before `stats_live`: the jobs before `stats_live` take 27 of the 30 s of the tick at their budgets, and 3 s more would leave `stats_live`
+ * nothing in the worst tick. So it only ever gets what the stats left: during a stats catch-up a new issuance waits (the gauge says so). A
+ * batch is a few queries, so this is a bound for a database that has gone slow, or for the first sweep of a deployment (it goes on where
+ * it stopped at the next tick).
+ */
+export const AGGREGATOR_MPT_STATE_BUDGET_MS = 3000;
 
 /** How much of the tick `nft_collections` (the collections whose NFTs were rebuilt) may use; it runs every `NFT_COLLECTIONS_EVERY_TICKS` ticks. */
 export const AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS = 3000;
@@ -321,6 +338,13 @@ export interface AggregatorOptions {
   /** Replaces the `supply` functions of the shared package; for tests. */
   supplyFunctions?: Partial<SupplyFunctions>;
   /**
+   * With it the `mpt_state` job runs (the current state of every issuance and of its holders) and the slices of `agg_dirty` rebuild the
+   * issuances of their ledgers, with or without the other options; without it they do not.
+   */
+  mptState?: AggregatorMptState;
+  /** Replaces the `mpt_state` functions of the shared package; for tests. */
+  mptStateFunctions?: Partial<MptStateFunctions>;
+  /**
    * With it the `amm_daily` job runs (today and yesterday, the back-fill of the closed days, and the days of `agg_dirty`);
    * without it it does not.
    */
@@ -454,13 +478,22 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     (also without the others), the escrows of the ledgers that closed in the slice are recomputed as of the watermark of the
  *     `escrows` job (a slice above it is the live steps' to read), and the total is read again, with the sentinel rewritten at
  *     the same watermark, if an escrow was written or removed (not after a step of the tick that failed: the slice fails then);
- *     and last, with the `tokens` option (also without the others), each generation of the issued tokens that is live or builds and
+ *     then, with the `tokens` option (also without the others), each generation of the issued tokens that is live or builds and
  *     whose `through_ledger` reaches the first ledger of the slice gets its `repair_from` lowered to it, for the next run of
  *     `tokens` to apply again (the hook writes nothing else, and nothing when `repair_from` would not change; it throws before it
  *     reads while the job has no version floor yet, or when the reads that opened the job's last run (the generations, the head, the
  *     floor) failed, so that the slice fails and its range stays). A failing hook before it, the escrows', skips it for the tick:
- *     the marks wait in `agg_dirty`.
- * 11. **amm_daily** (with the `ammDaily` option; at the first tick and then every `AMM_DAILY_EVERY_TICKS`): one set per UTC day with
+ *     the marks wait in `agg_dirty`. And last, with the `mptState` option (also without the others), the hook of `mpt_state`: the
+ *     issuances the slice names (those touched in its ledgers and those last seen in them) are rebuilt at the head read then, a batch at a
+ *     time, and an issuance that fails on its own is set aside, like the pools of the slice.
+ * 11. **mpt_state** (with the `mptState` option): rebuilds the `mpt_issuances` row of every issuance with a touch above what its row has
+ *     seen, and the `mpt_holders` rows of the pairs touched, `MPT_STATE_BATCH` issuances at a time, oldest touch first, for at most
+ *     `AGGREGATOR_MPT_STATE_BUDGET_MS`; the cursor, the halving of a batch that fails (at most `MAX_ISOLATED_ISSUANCES_PER_BATCH` issuances
+ *     are set aside, retried after `MPT_ISSUANCE_RETRY_MS`, doubling up to an hour) and the retries are those of `amm_pools`. It runs after
+ *     the stats, so that the 27 of the 30 s that the jobs before `stats_live` may take do not grow, and during a stats catch-up it gets
+ *     nothing and a new issuance waits. `syncer_mpt_state_lag_ledgers` is the head less the cursor, set at the end of every run, also one
+ *     that failed or had no budget. Only committed ledgers are read.
+ * 12. **amm_daily** (with the `ammDaily` option; at the first tick and then every `AMM_DAILY_EVERY_TICKS`): one set per UTC day with
  *     the stats of every AMM pool (swap volume, estimated fees, liquidity, closing state, value): today and yesterday, the
  *     stalest first and a day that failed last time behind the others (R87), then the closed days, newest first, that have no
  *     final set of the current `AMM_DAILY_CONFIG_VERSION`, all under `AGGREGATOR_AMM_DAILY_BUDGET_MS`. A day is closed when it is
@@ -468,7 +501,7 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     records the same test in its sentinel, so a day computed too early is computed again). The back-fill starts at the day of
  *     the first pool activity. A closed day that fails waits (5 minutes, doubling) while the older days go on. The days of an
  *     `agg_dirty` slice are recomputed with the slice.
- * 12. **nft_collections** (with the `nfts` option; at the first tick and then every `NFT_COLLECTIONS_EVERY_TICKS`): the
+ * 13. **nft_collections** (with the `nfts` option; at the first tick and then every `NFT_COLLECTIONS_EVERY_TICKS`): the
  *     `nft_collections` row of a collection (supply, holders, mints, burns, sales, volume in the native currency) and the
  *     `nft_collection_holders` rows, for the collections whose NFTs `nft_state` rebuilt, `NFT_COLLECTIONS_BATCH` at a time, oldest
  *     first, under one version per batch and for at most `AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS`. The queue of collections is in
@@ -479,16 +512,16 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     those are set aside in memory, each counted as an error, and tried again after `NFT_RETRY_MS`, doubling up to an hour, while
  *     the other collections go on; a batch that fails as a whole (the database) is the failure of the job, and its collections go
  *     back to the end of the queue. A collection with no NFT left is deleted from both tables.
- * 13. **rates_daily** (with `aggregates`): the rates of the closed final days, newest first (`RatesDailyJobRunner`).
- * 14. **account_rollups** (with `aggregates`): the discovery of heavy accounts and their day rollups, the increment of each new
+ * 14. **rates_daily** (with `aggregates`): the rates of the closed final days, newest first (`RatesDailyJobRunner`).
+ * 15. **account_rollups** (with `aggregates`): the discovery of heavy accounts and their day rollups, the increment of each new
  *     day and the promotion of the days before (`AccountRollupsJobRunner`).
- * 15. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config
+ * 16. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config
  *     (the NFT volume's is its own, `NFT_VOLUME_CONFIG_VERSION`), newest first, under its own budget. A day is closed when it
  *     is before yesterday AND the ingest has passed it (the newest ledger closed an hour after its end): the wall clock alone
  *     would call a day final while its ledgers are still to come.
  *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
  *     doubling, until the config version changes) and the older days go on.
- * 16. **supply** (with the `supply` option): an hourly snapshot of the native supply, one row of `network_supply` (`SupplyJobRunner`,
+ * 17. **supply** (with the `supply` option): an hourly snapshot of the native supply, one row of `network_supply` (`SupplyJobRunner`,
  *     spec 2026-10-24-supply-design.md): the total coins, the burned, the escrowed (the sentinel of the `escrows` job), the drops in
  *     the AMM pools (XRPL), the accounts and their owner counts at one ledger L, and on Xahau the minted drops by source. A cycle
  *     starts when the newest snapshot began an hour ago, at the ledger of the escrows sentinel, and is spread over ticks, a step at
@@ -498,10 +531,10 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     third failure in a row drops the cycle and starts a wait (5 minutes, doubling up to an hour, reset by a written row).
  *     `syncer_supply_snapshot_age_seconds` is set at every run, and `syncer_supply_cycle_seconds` when a row is written.
  *
- * The AMM jobs (3 and 11), `nft_state` (4), `escrows` (5), `tokens` (8) and `nft_collections` (12) are runners in files of their own
- * (`AmmPoolsJobRunner`, `AmmDailyJobRunner`, `NftStateJobRunner`, `EscrowsJobRunner`, `TokensJobRunner`, `NftCollectionsJobRunner`),
- * with their own state; the service lends them the database, the clock, the budgets and the rules of the tick
- * (`AggregatorJobContext`). The runners of the account and market jobs (6, 7, 13, 14) and of `supply` (16) take the smaller
+ * The AMM jobs (3 and 12), `nft_state` (4), `escrows` (5), `tokens` (8), `mpt_state` (11) and `nft_collections` (13) are runners in files
+ * of their own (`AmmPoolsJobRunner`, `AmmDailyJobRunner`, `NftStateJobRunner`, `EscrowsJobRunner`, `TokensJobRunner`, `MptStateJobRunner`,
+ * `NftCollectionsJobRunner`), with their own state; the service lends them the database, the clock, the budgets and the rules of the tick
+ * (`AggregatorJobContext`). The runners of the account and market jobs (6, 7, 14, 15) and of `supply` (17) take the smaller
  * `AggregateJobDeps` instead; `supply` is also lent the sight of the `amm_pools` runner (its cursor and the pools it has set aside:
  * `AmmPoolsJobRunner.sight`), which it reads when a start is attempted, after job 3 of the tick.
  *
@@ -523,7 +556,7 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *  - **Shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it; the signal of the slice or set
  *    in flight is aborted, so that its rows are not written (the abort, `StatsRecomputeAborted`, `VolumeRecomputeAborted`,
  *    `AggregateSetAborted`, `AmmPoolsRecomputeAborted`, `AmmDailyRecomputeAborted`, `NftRebuildAborted`,
- *    `NftCollectionsRecomputeAborted`, `EscrowsAborted` or `TokensAborted`, is neither logged as an error nor counted); no change
+ *    `NftCollectionsRecomputeAborted`, `EscrowsAborted`, `TokensAborted` or `MptStateAborted`, is neither logged as an error nor counted); no change
  *    to `agg_dirty` is started after it (a narrowing that has inserted its row finishes its delete, so as not to leave the old row
  *    beside the new one). The stop waits for the tick for at most `AGGREGATOR_SHUTDOWN_WAIT_MS`, then abandons it and says so.
  */
@@ -553,6 +586,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly tokens?: TokensJobRunner;
   /** The `supply` job (with the `supply` option). */
   private readonly supply?: SupplyJobRunner;
+  /** The `mpt_state` job and its hook in the slices of `agg_dirty` (with the `mptState` option). */
+  private readonly mptState?: MptStateJobRunner;
   /** The `amm_daily` job and its hook in the slices of `agg_dirty` (with the `ammDaily` option). */
   private readonly ammDaily?: AmmDailyJobRunner;
   /** How many ticks have run their jobs: the cadence of the jobs that do not run at every tick. */
@@ -598,6 +633,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       tokens: AGGREGATOR_TOKENS_BUDGET_MS,
       stats_live: options.liveBudgetMs ?? AGGREGATOR_LIVE_BUDGET_MS,
       stats_dirty: AGGREGATOR_DIRTY_BUDGET_MS,
+      mpt_state: AGGREGATOR_MPT_STATE_BUDGET_MS,
       amm_daily: AGGREGATOR_AMM_DAILY_BUDGET_MS,
       rates_daily: AGGREGATOR_RATES_DAILY_BUDGET_MS,
       account_rollups: AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS,
@@ -673,6 +709,9 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
           options.supplyFunctions,
         )
       : undefined;
+    this.mptState = options.mptState
+      ? new MptStateJobRunner(context, options.mptState, { ...MPT_STATE_FUNCTIONS, ...options.mptStateFunctions })
+      : undefined;
     this.ammDaily = options.ammDaily
       ? new AmmDailyJobRunner(context, options.ammDaily, { ...AMM_DAILY_FUNCTIONS, ...options.ammDailyFunctions })
       : undefined;
@@ -734,6 +773,15 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         : []),
       { name: 'stats_live', budgetMs: this.budgets.stats_live, run: (tick) => this.statsLive(tick) },
       { name: 'stats_dirty', budgetMs: this.budgets.stats_dirty, run: (tick) => this.statsDirty(tick) },
+      ...(this.mptState
+        ? [
+            {
+              name: 'mpt_state',
+              budgetMs: this.budgets.mpt_state,
+              run: (tick: AggregatorTick) => (this.mptState as MptStateJobRunner).run(tick),
+            },
+          ]
+        : []),
       ...(this.ammDaily
         ? [
             {
@@ -769,7 +817,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     }
   }
 
-  /** What the runners of the jobs in files of their own (`amm_pools`, `amm_daily`, `nft_state`, `nft_collections`, `escrows`, `tokens`) are lent of the service. */
+  /** What the runners of the jobs in files of their own (`amm_pools`, `amm_daily`, `nft_state`, `nft_collections`, `escrows`, `tokens`, `mpt_state`) are lent of the service. */
   private jobContext(): AggregatorJobContext {
     return {
       ch: this.ch,
@@ -863,7 +911,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         err instanceof NftRebuildAborted ||
         err instanceof NftCollectionsRecomputeAborted ||
         err instanceof EscrowsAborted ||
-        err instanceof TokensAborted)
+        err instanceof TokensAborted ||
+        err instanceof MptStateAborted)
     ) {
       this.logger.log(`Dropped the ${job} slice in flight at shutdown`);
       return;
@@ -996,6 +1045,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
 
   private async statsDirty(tick: AggregatorTick): Promise<void> {
     this.ammPools?.beginDirtyRun();
+    this.mptState?.beginDirtyRun();
     const ranges = await readDirtyRanges(this.ch, DIRTY_RANGES_PER_TICK);
     // the days whose volumes this tick has recomputed, and the clock reading when it began (see `volumesOfSlice`)
     const volumeDays = new Map<string, number>();
@@ -1120,13 +1170,14 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
    * The hooks of the account and market jobs for a slice `[start, end)` that was recomputed, in this order: the rates of its
    * days (`rates_daily`), its hours of `pair_hourly`, the day rollups of the heavy accounts (`account_rollups`), and then
    * the hook of `nft_state`, which marks the ledgers of the slice in `nft_dirty` (it rebuilds nothing), the hook of `escrows`,
-   * which recomputes the escrows of the slice's ledgers, and last the hook of `tokens`, which marks the slice for the repair of
-   * the generations of the issued tokens. Each gets the slice and the tick, and `marked`, when the range was marked (the day
-   * rollups do not roll a day again for a range that was marked before the roll of it began, as `volumesOfSlice` does). Without
-   * the `aggregates` option there are none of the first three, without the `nfts` option no hook of `nft_state`, without the
-   * `escrows` option none of `escrows` and without the `tokens` option none of `tokens`; the last three do not depend on
-   * `aggregates`. A hook that fails is logged and counted as `<job>_dirty`, and the hooks after it are not run (a failing escrows
-   * hook skips the tokens hook for the tick): false, so that the slice fails and its range stays in the queue. A hook does
+   * which recomputes the escrows of the slice's ledgers, the hook of `tokens`, which marks the slice for the repair of the
+   * generations of the issued tokens, and last the hook of `mpt_state`, which rebuilds the issuances the slice names. Each gets the
+   * slice and the tick, and `marked`, when the range was marked (the day rollups do not roll a day again for a range that was marked
+   * before the roll of it began, as `volumesOfSlice` does). Without the `aggregates` option there are none of the first three, without
+   * the `nfts` option no hook of `nft_state`, without the `escrows` option none of `escrows`, without the `tokens` option none of `tokens`
+   * and without the `mptState` option none of `mpt_state`; the last four do not depend on `aggregates`. A hook that fails is logged and
+   * counted as `<job>_dirty`, and the hooks after it are not run (a failing escrows hook skips the tokens hook for the tick, and a failing
+   * tokens hook the mpt_state hook): false, so that the slice fails and its range stays in the queue. A hook does
    * nothing once the shutdown has begun, which is safe because the range is not changed after it (`recomputeDirty`).
    */
   private async hooksOfSlice(start: number, end: number, marked: number, tick: AggregatorTick): Promise<boolean> {
@@ -1164,11 +1215,17 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       this.failed('tokens_dirty', err, ` in ${iso(start)} - ${iso(end)}`);
       return false;
     }
+    try {
+      await this.mptState?.ofSlice(start, end, tick);
+    } catch (err) {
+      this.failed('mpt_state_dirty', err, ` in ${iso(start)} - ${iso(end)}`);
+      return false;
+    }
     return true;
   }
 
   /**
-   * Whether a job that works in sets, batches or steps (the volume jobs, `amm_pools`, `nft_state`, `escrows`, `tokens`) may start another:
+   * Whether a job that works in sets, batches or steps (the volume jobs, `amm_pools`, `nft_state`, `escrows`, `tokens`, `mpt_state`) may start another:
    * not after the shutdown began, and not past its budget. Running out of the budget
    * is how a long back-fill works, tick after tick, so it is said once (a warning) for as long as the runs of the job keep
    * hitting it, and at debug level after that; a run that finishes in time ends the streak.

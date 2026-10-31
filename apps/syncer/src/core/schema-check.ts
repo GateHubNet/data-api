@@ -295,7 +295,8 @@ export const MPT_MIGRATION = '017_mpt.sql';
 
 /**
  * The tables of `MPT_MIGRATION` each worker needs, and what it does with them. The ingest writes the five ledger tables whenever a
- * ledger has rows for one. The schema is one on every network, so the worker needs its tables wherever it runs.
+ * ledger has rows for one. The `mpt_state` job of the aggregator reads the touches and the two state tables at every run, on every
+ * network, and writes the two aggregates. The schema is one on every network, so the worker needs its tables wherever it runs.
  */
 const MPT_NEEDS: SchemaNeeds = new Map([
   [
@@ -311,13 +312,21 @@ const MPT_NEEDS: SchemaNeeds = new Map([
       does: 'writes',
     },
   ],
+  [
+    'aggregator',
+    {
+      tables: [Table.MptIssuanceStates, Table.MptHolderStates, Table.MptTouches, Table.MptIssuances, Table.MptHolders],
+      does: 'reads and writes',
+    },
+  ],
 ]);
 
 /**
- * Fails the boot when the ingest worker is enabled and the database lacks the five ledger tables of `017_mpt.sql`. The schema is one
- * on every network, so the check does not ask which one this is. On XRPL and XRPL Testnet the ingest inserts into them as soon as a
- * ledger has MPT rows, and an insert into a missing table fails the batch, so that the live runner would retry the same ledgers without
- * end. It runs after the boot-time migrations and after the check of 016. A check that cannot be made (ClickHouse unreachable) does
+ * Fails the boot when the ingest or the aggregator worker is enabled and the database lacks the tables of `017_mpt.sql` it needs. The
+ * schema is one on every network, so the check does not ask which one this is. On XRPL and XRPL Testnet the ingest inserts into the five
+ * ledger tables as soon as a ledger has MPT rows, and an insert into a missing table fails the batch, so that the live runner would retry
+ * the same ledgers without end; the `mpt_state` job of the aggregator would fail at every run, and its hook every slice of `agg_dirty`.
+ * It runs after the boot-time migrations and after the check of 016. A check that cannot be made (ClickHouse unreachable) does
  * not fail the boot: it is said, and the workers report the failures of their reads and writes as they always do.
  */
 export async function assertMptSchema(

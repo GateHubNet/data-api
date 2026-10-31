@@ -193,6 +193,11 @@ const metrics = {
     help: 'through_ledger less repair_from of the live generation of the issued tokens: the ledgers its repair applies again, 0 without a repair.',
     registers: [registry],
   }),
+  mptStateLagLedgers: new Gauge({
+    name: 'syncer_mpt_state_lag_ledgers',
+    help: 'Ledgers between the committed head and the mpt_state cursor',
+    registers: [registry],
+  }),
   supplySnapshotAgeSeconds: new Gauge({
     name: 'syncer_supply_snapshot_age_seconds',
     help: 'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); no sample until it has seen one. Alert above 3 hours.',
@@ -303,6 +308,9 @@ metrics.parserAnomaliesTotal.inc({ kind: 'mpt_unreadable' }, 0);
 // the alert is an increase(), and a series that first shows at its value has none: its first failure would raise nothing
 metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'ok' }, 0);
 metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'error' }, 0);
+// the same: an issuance set aside moves no lag, and its errors are all that say so, up to an hour apart
+metrics.aggregatorErrorsTotal.inc({ job: 'mpt_state' }, 0);
+metrics.aggregatorErrorsTotal.inc({ job: 'mpt_state_dirty' }, 0);
 
 // prom-client gives a gauge without labels a sample of 0 when it is registered. These two are not known until the supply job has seen
 // a snapshot, or written a row: a 0 would read as a snapshot that has just been written, and no alert could fire on a job that
@@ -356,6 +364,7 @@ export class PrometheusService implements OnModuleInit {
   readonly escrowsOpen = metrics.escrowsOpen;
   readonly tokensLive = metrics.tokensLive;
   readonly tokensLagLedgers = metrics.tokensLagLedgers;
+  readonly mptStateLagLedgers = metrics.mptStateLagLedgers;
   readonly tokensBuilding = metrics.tokensBuilding;
   readonly tokensRepairLedgers = metrics.tokensRepairLedgers;
   readonly supplySnapshotAgeSeconds = metrics.supplySnapshotAgeSeconds;

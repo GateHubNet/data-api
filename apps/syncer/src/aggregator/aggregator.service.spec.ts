@@ -980,6 +980,7 @@ describe('AggregatorService volume jobs', () => {
     tokensLagLedgers: { set: jest.Mock };
     tokensBuilding: { set: jest.Mock };
     tokensRepairLedgers: { set: jest.Mock };
+    mptStateLagLedgers: { set: jest.Mock };
   };
   const created: AggregatorService[] = [];
 
@@ -1041,6 +1042,7 @@ describe('AggregatorService volume jobs', () => {
       tokensLagLedgers: { set: jest.fn() },
       tokensBuilding: { set: jest.fn() },
       tokensRepairLedgers: { set: jest.fn() },
+      mptStateLagLedgers: { set: jest.fn() },
     };
     events = [];
     liveCalls = [];

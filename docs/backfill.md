@@ -496,7 +496,7 @@ which starts at the first ledger of the network (32,570 on the XRP Ledger, 1 on 
   from the first account. A fill that keeps writing ledgers below the oldest stored one (a single ascending `--from/--to` run moves the start once, at its first chunk; a fill from the top down moves it with every chunk)
   therefore restarts a first build every ten minutes until it ends; finish the fill first, or expect the restarts (the log says `tokens: generation N was stale while it built; it is retired`). Only the building
   generation restarts: the live one keeps serving.
-- **A `--reprocess` of a range** writes the touches of its ledgers, as for every table, and marks its hours in `agg_dirty`. Each slice's **`tokens` hook**, the last of the hooks, lowers the `repair_from` of the live and the
+- **A `--reprocess` of a range** writes the touches of its ledgers, as for every table, and marks its hours in `agg_dirty`. Each slice's **`tokens` hook**, the last but one of the hooks, lowers the `repair_from` of the live and the
   building generation to the slice's first ledger, and the job applies the touches of `[repair_from, through_ledger]` again, 500 ledgers a window, reading the state at `through_ledger` (a line changed in the range
   and again later keeps its later state). A window that meets a ledger written by an **older parser** (one without touches) ends the repair and marks a **rebuild**: a new generation is built from the state
   tables beside the live one and swapped in, which is how the **program's one reprocess**, over the whole history after its last parser version (about **108 million ledgers, 216,000 windows of 500**), reaches the tokens.

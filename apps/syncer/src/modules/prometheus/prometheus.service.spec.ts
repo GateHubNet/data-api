@@ -195,6 +195,28 @@ describe('PrometheusService', () => {
     }
   });
 
+  it('exposes the gauge of the mpt_state job, label-less, at 0 until a run sets it', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.mptStateLagLedgers.set(0);
+    expect(await service.getMetrics()).toMatch(/^syncer_mpt_state_lag_ledgers 0$/m);
+    service.mptStateLagLedgers.set(42);
+    const text = await service.getMetrics();
+    expect(text).toMatch(
+      /^# HELP syncer_mpt_state_lag_ledgers Ledgers between the committed head and the mpt_state cursor$/m,
+    );
+    expect(text).toMatch(/^# TYPE syncer_mpt_state_lag_ledgers gauge$/m);
+    expect(text).toMatch(/^syncer_mpt_state_lag_ledgers 42$/m);
+  });
+
+  it('has the error series of the mpt_state job from the start, so that its first failure raises an increase()', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    const text = await service.getMetrics();
+    expect(text).toMatch(/^syncer_aggregator_errors_total\{job="mpt_state"\} \d+$/m);
+    expect(text).toMatch(/^syncer_aggregator_errors_total\{job="mpt_state_dirty"\} \d+$/m);
+  });
+
   it('registers the four gauges of the tokens job with their names, types, label sets and help texts (spec section 3.8)', async () => {
     const service = new PrometheusService();
     service.onModuleInit();

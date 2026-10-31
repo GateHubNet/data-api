@@ -259,7 +259,7 @@ log says `Aggregator job escrows failed: ...`; the gauge keeps growing with the 
 for the gauge reads freezes the gauge: the errors rate is the signal. (3) **One escrow cannot be mapped**: `Aggregator job escrows failed for escrow <ID>, set aside: ...`; the step
 commits without it and the lag is not affected. (4) **The hook fails** (`Aggregator job escrows_dirty failed in <from> - <to>: ...`; with the reason `the escrows step of this tick
 failed` the cause is (2), and the slice waits for a step that commits): the slice stays in `agg_dirty`, so
-`SELECT count() FROM xrpl.agg_dirty` does not fall, and the earlier hooks of the slice (rates, pairs, rollups, `nft_dirty`) run again at every tick until it works; fix the cause and the
+`SELECT count() FROM xrpl.agg_dirty` does not fall, and the earlier hooks of the slice (rates, pairs, rollups, `nft_dirty`) run again at every tick until it works (the hooks of `tokens` and `mpt_state` after it wait); fix the cause and the
 next tick drains the queue. (5) `SYSTEM STOP MERGES` on `xrpl.escrows` stops the lightweight `DELETE` a step may wait for: start merges again.
 
 ### `/v2/tokens` lists nothing, a token answers 404, a token is not `listed`, or `syncer_tokens_lag_ledgers` is high
@@ -282,7 +282,7 @@ the job starts the build again from the first account at each housekeeping. Fini
 
 ### `agg_dirty` does not drain: the tokens hook fails
 **Symptom:** `SELECT count() FROM xrpl.agg_dirty` does not fall, `syncer_aggregator_errors_total{job="tokens_dirty"}` rises at each tick, and the log has `Aggregator job tokens_dirty failed in <from> - <to>: ...`
-(`the tokens job has not read its version floor yet` or `could not read its generations at its last run`). The hook of the `tokens` job is the last of a slice's hooks and refuses to run while the job cannot
+(`the tokens job has not read its version floor yet` or `could not read its generations at its last run`). The hook of the `tokens` job comes before only the hook of `mpt_state`, and refuses to run while the job cannot
 read its generations, so the slice stays queued **for every job** and its earlier hooks run again at each tick. A database without **migration 014** does not cause it: the syncer refuses to boot without the
 tables (`lacks the schema of 014_issued_tokens.sql`: apply it with `dc run --rm migrate-xrpl` and start the syncer again). The opening reads fail because ClickHouse refuses them (down, a memory or time limit); if the
 boot log says `Could not check that 014_issued_tokens.sql is applied`, ClickHouse was unreachable at the boot and the migration may be the cause (`Table ... token_generations doesn't exist` in the log of the job):

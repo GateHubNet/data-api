@@ -215,11 +215,11 @@ describe('AppModule on a real ClickHouse', () => {
     await expect(bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' })).rejects.toThrow(
       /lacks the schema of 014_issued_tokens\.sql \(table state_touches, table token_generations, table token_lines, table tokens\), which the aggregator worker reads and writes/,
     );
-    // the same database lets a syncer without a worker that needs 014 start, and the migrations (015 too: the aggregator needs the
-    // tables of the supply job as well) let the aggregator start
+    // the same database lets a syncer without a worker that needs 014 start, and the migrations (015 and 017 too: the aggregator needs
+    // the tables of the supply job and of the mpt_state job as well) let the aggregator start
     await bootApp({ GH_CLICKHOUSE_DATABASE: database });
     await closeApp();
-    await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql'], (schemaDir) =>
+    await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql', '017_mpt.sql'], (schemaDir) =>
       bootApp({
         GH_CLICKHOUSE_DATABASE: database,
         GH_WORKERS: 'aggregator',
@@ -271,7 +271,7 @@ describe('AppModule on a real ClickHouse', () => {
     );
   });
 
-  it('fails the boot, naming 017_mpt.sql and its five ledger tables, when the ingest worker runs on a database of 001, 014 and 015', async () => {
+  it('fails the boot, naming 017_mpt.sql and its tables, when the ingest or the aggregator worker runs on a database of 001, 014 and 015', async () => {
     const database = 'syncer_app_e2e_without_017';
     await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql'], (schemaDir) =>
       bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
@@ -288,7 +288,15 @@ describe('AppModule on a real ClickHouse', () => {
       /lacks the schema of 017_mpt\.sql \(table mpt_issuance_states, table mpt_holder_states, table mpt_touches, table mpt_transfers, table mpt_issuance_transfers\), which the ingest worker writes/,
     );
     expect((refused as Error).message).not.toContain('015_supply.sql');
-    // the same database lets a syncer without the ingest start, and the migration then gives the tables
+    // the aggregator is refused as well, for the tables the mpt_state job reads and the two aggregates it writes
+    const aggregatorRefused = await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' }).catch(
+      (err: Error) => err,
+    );
+    expect(aggregatorRefused).toBeInstanceOf(Error);
+    expect((aggregatorRefused as Error).message).toMatch(
+      /lacks the schema of 017_mpt\.sql \(table mpt_issuance_states, table mpt_holder_states, table mpt_touches, table mpt_issuances, table mpt_holders\), which the aggregator worker reads and writes/,
+    );
+    // the same database lets a syncer without the ingest and the aggregator start, and the migration then gives the tables
     await bootApp({ GH_CLICKHOUSE_DATABASE: database });
     await closeApp();
     await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql', '017_mpt.sql'], (schemaDir) =>
@@ -301,6 +309,8 @@ describe('AppModule on a real ClickHouse', () => {
         'mpt_touches',
         'mpt_transfers',
         'mpt_issuance_transfers',
+        'mpt_issuances',
+        'mpt_holders',
       ]),
     );
   });

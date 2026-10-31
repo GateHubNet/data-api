@@ -62,7 +62,7 @@ const named = (pools: readonly string[]): string =>
     : `${pools.slice(0, MAX_POOLS_NAMED).join(', ')} and ${pools.length - MAX_POOLS_NAMED} more`;
 
 /**
- * The `supply` job of the aggregator (job 16 of a tick, see spec 2026-10-24-supply-design.md, 4.1 and 4.6): an hourly snapshot of
+ * The `supply` job of the aggregator (job 17 of a tick, see spec 2026-10-24-supply-design.md, 4.1 and 4.6): an hourly snapshot of
  * the native supply, `network_supply`, spread over ticks. A **cycle** computes one snapshot at one ledger L: its start takes the
  * reads of the first tick, its steps (the account ranges, the AMM fill-forwards, on Xahau the burned and minted slices) add to the
  * sums, and its write is one insert (`startSupplyCycle`, `runSupplyStep`, `writeSupplySnapshot` of the shared package). The cycle

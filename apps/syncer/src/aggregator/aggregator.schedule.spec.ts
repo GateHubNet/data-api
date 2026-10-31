@@ -6,6 +6,7 @@ import {
   getNetworkProfile,
   LATEST_DAYS,
   MarketsConfig,
+  MptStale,
   NftKey,
   RatesService,
   RollupState,
@@ -23,6 +24,7 @@ import {
   AGGREGATOR_AMM_POOLS_BUDGET_MS,
   AGGREGATOR_ESCROWS_BUDGET_MS,
   AGGREGATOR_MARKETS_LIVE_BUDGET_MS,
+  AGGREGATOR_MPT_STATE_BUDGET_MS,
   AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS,
   AGGREGATOR_NFT_STATE_BUDGET_MS,
   AGGREGATOR_PAIR_HOURLY_BUDGET_MS,
@@ -38,6 +40,7 @@ import {
   AmmDailyFunctions,
   AmmPoolsFunctions,
   EscrowsFunctions,
+  MptStateFunctions,
   NFT_COLLECTIONS_EVERY_TICKS,
   NftCollectionsFunctions,
   NftStateFunctions,
@@ -46,7 +49,7 @@ import {
 } from './aggregator.service';
 
 /**
- * The order of a tick with the account and market jobs registered (and the AMM jobs, the NFT jobs, the escrows job, the tokens job and the supply job), and what that order is for: the live
+ * The order of a tick with the account and market jobs registered (and the AMM jobs, the NFT jobs, the escrows job, the tokens job, the mpt_state job and the supply job), and what that order is for: the live
  * volume jobs are not starved, whatever the jobs after them are doing. The shared functions of the jobs, the volume
  * functions and the database are fakes; the services, the runners and their hooks in `agg_dirty` are the real ones.
  */
@@ -67,6 +70,7 @@ const EVERY_JOB = [
   'tokens',
   'stats_live',
   'stats_dirty',
+  'mpt_state',
   'amm_daily',
   'nft_collections',
   'rates_daily',
@@ -534,6 +538,46 @@ class SupplyWorld {
   }
 }
 
+/**
+ * The functions of `mpt_state`, as its runner calls them. By default the world is quiet: nothing is stale and no slice names an issuance.
+ * `busy()` gives the job far more to do than its budget lets it (an issuance to rebuild at every ask, `rebuildMs` of the fake clock
+ * each). A rebuild is noted as `mpt_rebuild`, and the read of a slice as `mpt_state_of`, which a test makes fail by naming `sliceFails`.
+ */
+class MptWorld {
+  rebuildMs = 0;
+  sliceFails?: Error;
+  private endless = false;
+  private issuances = 0;
+
+  constructor(private readonly note: (event: string) => void) {}
+
+  busy(rebuildMs: number): void {
+    this.rebuildMs = rebuildMs;
+    this.endless = true;
+  }
+
+  fns(): Partial<MptStateFunctions> {
+    return {
+      head: async () => 1_000_000,
+      watermark: async () => 0,
+      changedSince: async (_ch, ledger) => {
+        if (!this.endless) return { issuances: [], upTo: ledger };
+        const issuances: MptStale[] = [{ id: `ISSUANCE${++this.issuances}`, holders: [] }];
+        return { issuances, upTo: ledger + 1 };
+      },
+      closedIn: async () => {
+        this.note('mpt_state_of');
+        if (this.sliceFails) throw this.sliceFails;
+        return [];
+      },
+      rebuild: async () => {
+        this.note('mpt_rebuild');
+        if (this.rebuildMs > 0) jest.setSystemTime(Date.now() + this.rebuildMs);
+      },
+    };
+  }
+}
+
 describe('the schedule of the aggregator with the account and market jobs', () => {
   let ch: FakeClickHouse;
   let world: D2World;
@@ -541,6 +585,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
   let escrowsWorld: EscrowsWorld;
   let tokensWorld: TokensWorld;
   let supplyWorld: SupplyWorld;
+  let mptWorld: MptWorld;
   let logger: { log: jest.Mock; warn: jest.Mock; error: jest.Mock; debug: jest.Mock };
   let metrics: Record<
     | 'aggregatorRunsTotal'
@@ -562,7 +607,8 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     | 'tokensBuilding'
     | 'tokensRepairLedgers'
     | 'supplySnapshotAgeSeconds'
-    | 'supplyCycleSeconds',
+    | 'supplyCycleSeconds'
+    | 'mptStateLagLedgers',
     { inc: jest.Mock; set: jest.Mock }
   >;
   const created: AggregatorService[] = [];
@@ -594,6 +640,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     escrowsWorld = new EscrowsWorld(note);
     tokensWorld = new TokensWorld(note);
     supplyWorld = new SupplyWorld(note);
+    mptWorld = new MptWorld(note);
     logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
     metrics = {
       aggregatorRunsTotal: { inc: jest.fn(), set: jest.fn() },
@@ -616,6 +663,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       tokensRepairLedgers: { inc: jest.fn(), set: jest.fn() },
       supplySnapshotAgeSeconds: { inc: jest.fn(), set: jest.fn() },
       supplyCycleSeconds: { inc: jest.fn(), set: jest.fn() },
+      mptStateLagLedgers: { inc: jest.fn(), set: jest.fn() },
     };
     recompute = jest.fn(async (_ch: unknown, from: Date, to: Date) => {
       const f = from.getTime() / 1000;
@@ -635,7 +683,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     jest.useRealTimers();
   });
 
-  /** A service with every job registered; the volume sets, the AMM sets, the NFT sets, the escrows, the tokens, the supply snapshot and the account and market sets are the fakes above. */
+  /** A service with every job registered; the volume sets, the AMM sets, the NFT sets, the escrows, the tokens, the supply snapshot, the issuances and the account and market sets are the fakes above. */
   function service(options: AggregatorOptions = {}): AggregatorService {
     const amm = quietAmm(note);
     const svc = new AggregatorService(ch.asService(), metrics as never, { register: jest.fn() } as never, {
@@ -666,6 +714,8 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       tokensFunctions: tokensWorld.fns(),
       supply: { profile: getNetworkProfile('xrpl') },
       supplyFunctions: supplyWorld.fns(),
+      mptState: { rates },
+      mptStateFunctions: mptWorld.fns(),
       ammDaily: { rates },
       ammDailyFunctions: amm.daily,
       // amm_daily at every tick, so that every tick of a test has every job
@@ -698,7 +748,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     });
   };
 
-  it('the jobs of a tick are volume_live, volume_daily, amm_pools, nft_state, escrows, pair_hourly, markets_live, tokens, stats_live, stats_dirty, amm_daily, nft_collections, rates_daily, account_rollups, volume_backfill, supply', async () => {
+  it('the jobs of a tick are volume_live, volume_daily, amm_pools, nft_state, escrows, pair_hourly, markets_live, tokens, stats_live, stats_dirty, mpt_state, amm_daily, nft_collections, rates_daily, account_rollups, volume_backfill, supply', async () => {
     caughtUp();
     await service().tick();
     expect(runs()).toEqual(EVERY_JOB);
@@ -710,7 +760,11 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     expect(at('markets_live')).toBeLessThan(at('stats'));
     // and amm_daily after the stats (its quiet sets of today and yesterday)
     expect(at('stats')).toBeLessThan(at('amm_daily'));
-    // and supply is the last of them, after volume_backfill (job 16)
+    // and mpt_state is job 11, right after the stats
+    expect(runs().indexOf('stats_dirty') + 1).toBe(runs().indexOf('mpt_state'));
+    expect(runs().indexOf('mpt_state')).toBe(10);
+    // and supply is the last of them, after volume_backfill (job 17)
+    expect(runs()).toHaveLength(17);
     expect(runs().slice(-2)).toEqual(['volume_backfill', 'supply']);
   });
 
@@ -726,6 +780,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       'tokens',
       'stats_live',
       'stats_dirty',
+      'mpt_state',
       'amm_daily',
       'nft_collections',
       'rates_daily',
@@ -743,6 +798,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       'tokens',
       'stats_live',
       'stats_dirty',
+      'mpt_state',
       'amm_daily',
       'nft_collections',
       'volume_backfill',
@@ -763,6 +819,9 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     metrics.aggregatorRunsTotal.inc.mockClear();
     await service({ supply: undefined }).tick();
     expect(runs()).toEqual(EVERY_JOB.filter((job) => job !== 'supply'));
+    metrics.aggregatorRunsTotal.inc.mockClear();
+    await service({ mptState: undefined }).tick();
+    expect(runs()).toEqual(EVERY_JOB.filter((job) => job !== 'mpt_state'));
     // and with neither the volume jobs nor the supply job, the last job of a tick is account_rollups
     metrics.aggregatorRunsTotal.inc.mockClear();
     await service({ volumes: undefined, supply: undefined }).tick();
@@ -873,6 +932,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     nftWorld.busy(SET_MS);
     escrowsWorld.busy(SET_MS);
     tokensWorld.busy(SET_MS);
+    mptWorld.busy(SET_MS);
     statsMs = SET_MS;
     ch.watermark = unix('2026-03-01T00:00:00Z');
     ch.closes = Array.from({ length: 230 }, (_, i) => unix('2026-03-01T00:30:00Z') + i * DAY);
@@ -921,6 +981,60 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       'markets_live',
       'tokens',
     ]);
+    // and mpt_state, for all its work, took none of those 27 s: it comes after the stats, and in this tick there is nothing left for it,
+    // and it says so through its gauge all the same
+    expect(count('mpt_rebuild')).toBe(0);
+    expect(metrics.mptStateLagLedgers.set).toHaveBeenCalledTimes(1);
+    expect(runs()).toContain('mpt_state');
+  });
+
+  it('runs mpt_state after stats_dirty with its own budget, which it alone uses and which does not shorten the budgets of the jobs after it', async () => {
+    expect(AGGREGATOR_MPT_STATE_BUDGET_MS).toBe(3000);
+    caughtUp();
+    world.busy(1000);
+    mptWorld.busy(1000);
+    await service().tick();
+    // an issuance at a time while the budget of the job is not spent: 1 s a rebuild, the 3 s of the job
+    expect(count('mpt_rebuild')).toBe(AGGREGATOR_MPT_STATE_BUDGET_MS / 1000);
+    // after the stats (a run is counted when the job ends), before amm_daily
+    expect(runs().slice(8, 12)).toEqual(['stats_live', 'stats_dirty', 'mpt_state', 'amm_daily']);
+    expect(events().findIndex((event) => event.startsWith('stats'))).toBeLessThan(
+      events().findIndex((event) => event === 'mpt_rebuild'),
+    );
+    expect(events().findIndex((event) => event === 'mpt_rebuild')).toBeLessThan(
+      events().findIndex((event) => event.startsWith('amm_daily')),
+    );
+    // the jobs after it have all of their own budgets all the same (3 + 3 + 3 s are gone when rates_daily starts)
+    expect(count('rates_daily ')).toBe(AGGREGATOR_RATES_DAILY_BUDGET_MS / 1000);
+    expect(count('account_rollups_recount')).toBe(AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS / 1000);
+    expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+
+    log.length = 0;
+    jest.setSystemTime(NOW);
+    await service({ budgetsMs: { mpt_state: 1000 } }).tick();
+    expect(count('mpt_rebuild')).toBe(1);
+    expect(count('rates_daily ')).toBe(AGGREGATOR_RATES_DAILY_BUDGET_MS / 1000);
+  });
+
+  it('a stats catch-up that uses its budget leaves mpt_state nothing in that tick: a new issuance waits, and the live sets do not', async () => {
+    // the stats alone have months to catch up on, and the jobs before them are quiet: stats_live takes its 20 s and stats_dirty its 10 s
+    statsMs = 1000;
+    mptWorld.busy(1000);
+    ch.watermark = unix('2026-03-01T00:00:00Z');
+    ch.closes = Array.from({ length: 230 }, (_, i) => unix('2026-03-01T00:30:00Z') + i * DAY);
+    ch.closes.push(NOW_SECONDS - 3);
+    for (let i = 0; i < 30; i++) {
+      ch.dirty.push({
+        from: unix('2026-01-01T00:00:00Z') + i * DAY,
+        to: unix('2026-01-02T00:00:00Z') + i * DAY,
+        created: 1000 + i,
+      });
+    }
+    await service().tick();
+    expect(count('live')).toBe(15);
+    expect(count('stats')).toBe(AGGREGATOR_TICK_BUDGET_MS / statsMs);
+    expect(count('mpt_rebuild')).toBe(0);
+    expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
   });
 
   it('every D2 job has a budget of its own, and budgetsMs changes it', async () => {
@@ -950,7 +1064,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     expect(count('account_rollups_recount')).toBe(AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS / 1000);
   });
 
-  it('with every job registered, nft_state, escrows, tokens, supply and every D2 job using its whole budget, volume_live and volume_daily run first and finish in every one of 10 ticks, and a tick ends within AGGREGATOR_TICK_BUDGET_MS plus one set and one supply step', async () => {
+  it('with every job registered, nft_state, escrows, tokens, mpt_state, supply and every D2 job using its whole budget, volume_live and volume_daily run first and finish in every one of 10 ticks, and a tick ends within AGGREGATOR_TICK_BUDGET_MS plus one set and one supply step', async () => {
     // The most any tick can be asked for: 230 days of stats to catch up and 30 ranges of agg_dirty to drain, 4 s a slice, and
     // every D2 job with far more to do than its budget (1 s a set). The longest set is the slice of the stats. Supply is last and
     // finds the tick spent: it takes the one unit of a run it is owed (its start, then at every later tick one step of 1 s).
@@ -962,6 +1076,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     escrowsWorld.busy(1000);
     tokensWorld.busy(1000);
     supplyWorld.busy(SUPPLY_STEP_MS);
+    mptWorld.busy(1000);
     ch.watermark = unix('2026-03-01T00:00:00Z');
     ch.closes = Array.from({ length: 230 }, (_, i) => unix('2026-03-01T00:30:00Z') + i * DAY);
     ch.closes.push(NOW_SECONDS - 3);
@@ -997,6 +1112,11 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       expect(count('nft_rebuild')).toBe(AGGREGATOR_NFT_STATE_BUDGET_MS / 1000);
       expect(count('escrows_step')).toBe(AGGREGATOR_ESCROWS_BUDGET_MS / 1000);
       expect(count('tokens_pass')).toBe(AGGREGATOR_TOKENS_BUDGET_MS / 1000);
+      // stats_live starts within the 27 s of the jobs before it, and mpt_state, after the stats, finds the tick spent
+      expect((log.find((entry) => entry.event.startsWith('stats'))?.at as number) - tickStart).toBeLessThanOrEqual(
+        27_000,
+      );
+      expect(count('mpt_rebuild')).toBe(0);
       expect(count('markets_live')).toBeGreaterThanOrEqual(1);
       expect(count('rates_daily ')).toBeGreaterThanOrEqual(1);
       // supply started its cycle at the first tick, and took one step, no more, at each of the others: the tick was spent
@@ -1215,7 +1335,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
   });
 
-  describe('a slice of agg_dirty runs the hooks of rates_daily, pair_hourly, account_rollups, nft_state, escrows and tokens after its volume sets; a failing hook is failed("<job>_dirty", …), fails the slice and keeps the range', () => {
+  describe('a slice of agg_dirty runs the hooks of rates_daily, pair_hourly, account_rollups, nft_state, escrows, tokens and mpt_state after its volume sets; a failing hook is failed("<job>_dirty", …), fails the slice and keeps the range', () => {
     const HOOKS = {
       rates_daily: `rates_daily_mark 2026-10-14..2026-10-${14 + LATEST_DAYS}`,
       pair_hourly: `pair_hourly ${DIRTY_FROM} ${DIRTY_TO}`,
@@ -1229,9 +1349,9 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       await service().tick();
       const at = events().indexOf(`stats ${DIRTY_FROM}`);
       // the volume sets of the slice's day, then the hooks of the AMM jobs (amm_pools finds no pool in the slice; the day's
-      // amm_daily set), then D2's, then the mark of the ledgers of the slice in nft_dirty, then the escrows of the slice, and last
-      // the mark of the slice for the repair of the generation of the tokens (the first ledger of the slice)
-      expect(events().slice(at, at + 14)).toEqual([
+      // amm_daily set), then D2's, then the mark of the ledgers of the slice in nft_dirty, then the escrows of the slice, then the
+      // mark of the slice for the repair of the generation of the tokens (the first ledger of the slice), and last the issuances
+      expect(events().slice(at, at + 15)).toEqual([
         `stats ${DIRTY_FROM}`,
         'daily trade_volume 2026-10-14',
         'daily payment_volume 2026-10-14',
@@ -1246,10 +1366,64 @@ describe('the schedule of the aggregator with the account and market jobs', () =
         'escrows_recompute 1000',
         'escrows_total',
         'tokens_repair_from 100',
+        'mpt_state_of',
       ]);
       expect(ch.dirty).toEqual([]);
       expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
       expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('runs the hook of mpt_state without the other options, which only the other hooks need', async () => {
+      caughtUp();
+      markRange();
+      await service({
+        volumes: undefined,
+        ammPools: undefined,
+        nfts: undefined,
+        escrows: undefined,
+        tokens: undefined,
+        supply: undefined,
+        ammDaily: undefined,
+        aggregates: undefined,
+      }).tick();
+      expect(events()).toEqual(expect.arrayContaining([`stats ${DIRTY_FROM}`, 'mpt_state_of']));
+      expect(ch.dirty).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+    });
+
+    it('fails a slice whose mpt_state hook throws (mpt_state_dirty): counted and logged, the range kept, after the other hooks ran; the next tick does it again', async () => {
+      caughtUp();
+      markRange();
+      rolledAccount();
+      mptWorld.sliceFails = new Error('memory limit');
+      const svc = service();
+      await svc.tick();
+
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'mpt_state_dirty' }]]);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(`Aggregator job mpt_state_dirty failed${DIRTY_WHERE}: memory limit`);
+      for (const hook of Object.values(HOOKS)) expect(events()).toContain(hook);
+      expect(events()).toContain('nft_state_mark 100 200');
+      expect(events()).toContain('escrows_total');
+      expect(events()).toContain('tokens_repair_from 100');
+      expect(ch.dirty).toEqual([{ from: unix(DIRTY_FROM), to: unix(DIRTY_TO), created: 1000 }]);
+      expect(runs()).toEqual(EVERY_JOB);
+
+      mptWorld.sliceFails = undefined;
+      metrics.aggregatorErrorsTotal.inc.mockClear();
+      await svc.tick();
+      expect(ch.dirty).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+    });
+
+    it('a failing tokens hook skips the hook of mpt_state for the tick: the mark waits in agg_dirty', async () => {
+      caughtUp();
+      markRange();
+      rolledAccount();
+      tokensWorld.markFails = new Error('memory limit');
+      await service().tick();
+      expect(events()).not.toContain('mpt_state_of');
+      expect(ch.dirty).toHaveLength(1);
     });
 
     it('runs the hook of nft_state without the aggregates option, which only the other hooks need', async () => {

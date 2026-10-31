@@ -425,11 +425,18 @@ describe('assertMptSchema', () => {
     Table.MptTransfers,
     Table.MptIssuanceTransfers,
   ];
+  const MPT_AGGREGATOR_TABLES = [
+    Table.MptIssuanceStates,
+    Table.MptHolderStates,
+    Table.MptTouches,
+    Table.MptIssuances,
+    Table.MptHolders,
+  ];
 
-  it('checks nothing when the ingest worker is not enabled', async () => {
+  it('checks nothing when neither the ingest nor the aggregator worker is enabled', async () => {
     const db = tablesOf();
     const warn = jest.fn();
-    await assertMptSchema(db.ch, workers('validations', 'fee_stats', 'validators', 'tomls', 'aggregator'), 'xrpl', {
+    await assertMptSchema(db.ch, workers('validations', 'fee_stats', 'validators', 'tomls'), 'xrpl', {
       warn,
     });
     await assertMptSchema(db.ch, workers(), 'xrpl', { warn });
@@ -462,6 +469,25 @@ describe('assertMptSchema', () => {
       await expect(check).rejects.toThrow('apply the migrations');
     }
     expect(MPT_MIGRATION).toBe('017_mpt.sql');
+  });
+
+  it('passes a database with the tables the mpt_state job needs for the aggregator, reading only those', async () => {
+    const db = tablesOf(...MPT_AGGREGATOR_TABLES);
+    await expect(assertMptSchema(db.ch, workers('aggregator'), 'xrpl', { warn: jest.fn() })).resolves.toBe(undefined);
+    expect(db.query.mock.calls[0][1]).toEqual({ tables: MPT_AGGREGATOR_TABLES });
+  });
+
+  it('fails the boot of the aggregator worker on a database without 017, naming the tables it reads and writes, on every network', async () => {
+    for (const database of ['xrpl', 'xrpl_testnet', 'xahau', 'xahau_testnet']) {
+      const check = assertMptSchema(tablesOf(Table.Ledgers).ch, workers('aggregator'), database, { warn: jest.fn() });
+      await expect(check).rejects.toThrow(MPT_MIGRATION);
+      await expect(check).rejects.toThrow(
+        `(table ${Table.MptIssuanceStates}, table ${Table.MptHolderStates}, table ${Table.MptTouches}, ` +
+          `table ${Table.MptIssuances}, table ${Table.MptHolders})`,
+      );
+      await expect(check).rejects.toThrow('the aggregator worker reads and writes');
+      await expect(check).rejects.toThrow(`database "${database}"`);
+    }
   });
 
   it('names exactly the tables that are missing', async () => {

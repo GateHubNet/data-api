@@ -19,7 +19,7 @@ import { AggregatorService } from './aggregator.service';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 
-/** The metrics of the aggregator, of the account and market jobs, of the NFT jobs, of the escrows job, of the tokens job and of the supply job, over fakes. */
+/** The metrics of the aggregator, of the account and market jobs, of the NFT jobs, of the escrows job, of the tokens job, of the supply job and of the mpt_state job, over fakes. */
 const fakeMetrics = () => ({
   aggregatorRunsTotal: { inc: jest.fn() },
   aggregatorErrorsTotal: { inc: jest.fn() },
@@ -41,6 +41,7 @@ const fakeMetrics = () => ({
   tokensRepairLedgers: { set: jest.fn() },
   supplySnapshotAgeSeconds: { set: jest.fn() },
   supplyCycleSeconds: { set: jest.fn() },
+  mptStateLagLedgers: { set: jest.fn() },
 });
 
 describe('AggregatorModule', () => {
@@ -258,6 +259,24 @@ describe('AggregatorModule', () => {
       expect(options.supply?.ammSight).toBeUndefined();
     }
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/^Supply job on: /));
+  });
+
+  it('turns the mpt_state job on with the one RatesService, on every network', () => {
+    const ch = { query: jest.fn() } as unknown as ClickHouseService;
+    for (const network of ['xrpl', 'xrpl-testnet', 'xahau', 'xahau-testnet'] as const) {
+      const log = jest.fn();
+      const options = aggregatorOptions(
+        ch,
+        getNetworkProfile(network),
+        { accountRollupMinRows: 1 } as SyncerConfig,
+        {
+          log,
+        } as never,
+      );
+      expect(options.mptState?.rates).toBeInstanceOf(RatesService);
+      expect(options.mptState?.rates).toBe(options.ammPools?.rates);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/^MPT state job on: /));
+    }
   });
 
   it('refuses to boot on a markets config that is not valid, and says what is wrong with it', async () => {

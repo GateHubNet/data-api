@@ -41,6 +41,8 @@ deviation from the boards. Each is built as written unless the owner says otherw
 | 16 | Coverage is D3's `FeatureCoverageService` (`MPT_PARSER_VERSION`, MPTokensV1). On Xahau (`NetworkProfile.hasMpt` false) the routes read nothing and answer `complete: true`: D3's rule for a feature the network cannot have, as D5 applies it to delegation (section 7). | Yes: nothing can be missing where MPT cannot exist. |
 | 17 | **Consistency pass:** the MPT amount object is D5's (D5 §5.1: `{ currency: <issuance ID>, issuer, value: <integer units>, mpt_issuance_id }`), built before D9; D9 serves every MPT amount in it and adds the scale and ticker only through `?ids=` (section 7.5). `/v2/accounts/{a}/mpt` puts `coverage` right after `result` (D3's placement), not after `close_time`. | Yes: D5 and E10 show MPT escrows before D9 exists; one placement for every list. |
 
+> **Dated note (2026-10-31, ruling C30(k)).** Decision 15's "about 30 s" is about a minute: the aggregator's tick is 60 s, so a new issuance waits for the next tick. And during a stats catch-up it waits longer: see the dated note of section 6 (ruling C13, to confirm).
+
 ## Goal
 
 Serve every figure of the Mpt board and of the token list's MPT tab from the index: issuances with their state, flags, decoded
@@ -374,6 +376,8 @@ rebuilds an issuance. The explorer does not decode it: it shows what the API dec
 ## 6. Aggregation: the `mpt_state` job
 
 > **Dated note (2026-10-31, rulings C10, C11).** `last_ledger` claims every pair touched below it, so `rebuildMptIssuances` first reads, for its IDs, every pair touched above each `last_ledger` up to the head (a key range of `mpt_touches` from the lowest of them) and unions it with the holders handed in. A retry after a set-aside, the hook at a newer head and the read of a tie need nothing else. ClickHouse refuses a URL parameter over 128 KiB, so pairs are read and deleted `MPT_HOLDERS_READ_CHUNK` (2,000) at a time, sorted, through `arrayZip`; `MPT_HOLDERS_CHUNK` stays 5,000 rows per insert. `agg_dirty` also finds every pair of any issuance whose newest `mpt_holders` row last saw the slice (C30(g)).
+
+> **Dated note (2026-10-31, rulings C13, C14, C15; C13 for the owner to confirm).** `mpt_state` runs right after `stats_dirty` (job 11 of 17), so that the jobs before `stats_live` keep to their 27 of the 30 s of a tick; during a stats catch-up it gets no budget and a new issuance waits. "R86 and R87" name nothing in the AMM runner and do not apply. The gauge is set after every run, a failed one or one without budget too, and the memory of a batch that failed rolls only at a run that attempts a batch, so that a lone poison issuance is set aside across runs with no budget. A retry of an issuance set aside by the live sweep holds only its ID; one set aside by a slice keeps what the slice named, which may be below its `last_ledger`.
 
 `packages/shared/src/aggregate/mpt-state.job.ts` (the reads and writes) and `apps/syncer/src/aggregator/mpt-state.job-runner.ts` (the
 runner), registered in `aggregator.service.ts` as `mpt_state`: every tick, budget `AGGREGATOR_MPT_STATE_BUDGET_MS` = 3000. It follows
