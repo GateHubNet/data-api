@@ -740,6 +740,11 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     verified_at: 1_699_999_990.375,
     next_check_at: CLOSE + 3_600,
     accounts: [ALICE, BOB],
+    owner_country: 'NO',
+    server_country: 'DE',
+    toml_network: 'main',
+    toml_unl: 'https://vl.ripple.com',
+    toml_version: 1,
   },
   [Table.NetworkState]: {
     ledger_index: LEDGER,

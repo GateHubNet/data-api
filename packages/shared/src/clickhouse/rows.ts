@@ -872,6 +872,12 @@ export interface ValidatorDomainsRow {
   next_check_at: UnixSeconds;
   /** The `[[ACCOUNTS]]` addresses of the last TOML that verified, sorted; empty when unverified. */
   accounts: string[];
+  /** Migration 016. Filled by the checker from D8 on (`nextDomainRow`). */
+  owner_country?: string;
+  server_country?: string;
+  toml_network?: string;
+  toml_unl?: string;
+  toml_version?: number;
 }
 
 /** The ledger state the node reports: enabled amendments, majorities, negative UNL and fees at `ledger_index`. */

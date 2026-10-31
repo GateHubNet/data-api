@@ -406,6 +406,15 @@ const MIGRATION_014_TABLES: Table[] = [Table.StateTouches, Table.TokenGeneration
 const MIGRATION_015 = '015_supply.sql';
 /** The tables of migration 015. */
 const MIGRATION_015_TABLES: Table[] = [Table.GenesisMints, Table.Imports, Table.RewardClaims, Table.NetworkSupply];
+const MIGRATION_016 = '016_validator_toml_details.sql';
+/** The columns migration 016 adds to `validator_domains`, with their types. */
+const MIGRATION_016_COLUMNS = [
+  { name: 'owner_country', type: 'LowCardinality(String)' },
+  { name: 'server_country', type: 'LowCardinality(String)' },
+  { name: 'toml_network', type: 'String' },
+  { name: 'toml_unl', type: 'String' },
+  { name: 'toml_version', type: 'UInt8' },
+];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -2179,6 +2188,98 @@ describe('migrations (e2e)', () => {
       } finally {
         await svc.close();
       }
+    });
+  });
+
+  describe('migration 016', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-016-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const columnsOf = async (database: string) =>
+      admin.query<{ name: string; type: string }>(
+        `SELECT name, type FROM system.columns
+         WHERE database = {db:String} AND table = {t:String} AND name IN {names:Array(String)}
+         ORDER BY position`,
+        { db: database, t: Table.ValidatorDomains, names: MIGRATION_016_COLUMNS.map((c) => c.name) },
+      );
+
+    it('is one ALTER of validator_domains that adds the five columns', () => {
+      const statements = statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_016), 'utf8'));
+      expect(statements).toHaveLength(1);
+      expect(statements[0]!.startsWith('ALTER TABLE validator_domains')).toBe(true);
+      expect(statements[0]!.match(/ADD COLUMN IF NOT EXISTS/g)).toHaveLength(5);
+      for (const { name } of MIGRATION_016_COLUMNS) {
+        expect(statements[0]!.match(new RegExp(`ADD COLUMN IF NOT EXISTS ${name} `, 'g'))).toHaveLength(1);
+      }
+    });
+
+    it('applies 016 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_016_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_016);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_016);
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await columnsOf(config.database)).toEqual([]);
+      const svc = new ClickHouseService(config);
+      try {
+        // a row written before the columns were there
+        const {
+          owner_country: _owner,
+          server_country: _server,
+          toml_network: _network,
+          toml_unl: _unl,
+          toml_version: _version,
+          ...older
+        } = SAMPLE_ROWS[Table.ValidatorDomains];
+        await svc.insert(Table.ValidatorDomains, [older]);
+
+        copyReal([MIGRATION_016]);
+        expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_016], skipped: before });
+        expect(await columnsOf(config.database)).toEqual(MIGRATION_016_COLUMNS);
+        expect(
+          await svc.query(
+            `SELECT owner_country, server_country, toml_network, toml_unl, toml_version FROM ${Table.ValidatorDomains}`,
+          ),
+        ).toEqual([{ owner_country: '', server_country: '', toml_network: '', toml_unl: '', toml_version: 0 }]);
+
+        expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+      } finally {
+        await svc.close();
+      }
+    });
+
+    it('completes 016 after a half-applied run', async () => {
+      const config = { ...ch.config, database: 'ctl_016_half' };
+      const before = realFiles().filter((f) => f !== MIGRATION_016);
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      await admin.command(
+        `ALTER TABLE ${config.database}.${Table.ValidatorDomains} ADD COLUMN owner_country LowCardinality(String) DEFAULT ''`,
+      );
+
+      copyReal([MIGRATION_016]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_016], skipped: before });
+      expect(await columnsOf(config.database)).toEqual(MIGRATION_016_COLUMNS);
     });
   });
 });
