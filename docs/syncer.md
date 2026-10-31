@@ -1020,18 +1020,22 @@ and the next one is made on time.
   the node (`manifest` with the master key; 5 s, no retry) at most once in 10 minutes per key, at most 100 keys and 4 requests at a
   time in a pass, and the answer is stored with `source = 'rpc'` and checked in a later pass like any manifest. No domain: no check
   and no row.
-- **Which pairs are due.** A (validator, domain) pair with no stored row, or with `next_check_at` passed; a changed domain is a new
-  pair, checked in the next pass. Never-checked pairs first, then the oldest `next_check_at`, at most 100 a pass.
+- **Which pairs are due.** A (validator, domain) pair with no stored row, or with `next_check_at` passed (a changed domain is a new
+  pair, checked in the next pass), or `verified` with a `toml_version` below `TOML_DETAILS_VERSION` and checked at least an hour ago, so
+  that details appear within minutes of a deploy that reads more of a file. The hour keeps a pair whose re-check met a transient failure from being
+  fetched every minute: within the grace it keeps its old version. Unverified pairs keep their schedule, as nothing would be read of their files. Never-checked
+  pairs and those below the version first, then the oldest `next_check_at`, at most 100 a pass.
 - **The checks.** A domain that is not properly formed (rippled's `isProperlyFormedTomlDomain`: no IP literal, port, path or single
   label) is `domain_invalid` before any DNS query. Otherwise the file `https://{domain}/.well-known/xrp-ledger.toml` (Xahau:
   `/.well-known/xahau.toml`; no fall-back to the other name) is fetched through the safe fetcher (`GH_DOMAIN_FETCH_TIMEOUT_MS`, 256
   KiB, 3 redirects, each checked like the first URL): **one fetch per domain per pass**, shared by the validators that name it, at
   most **4 in flight**. The rows of a domain are written as soon as it is done.
-- **What is read of the file.** It is parsed (`smol-toml`), never evaluated. The key is listed when a `[[VALIDATORS]]` entry has it as
-  `public_key` (trimmed). Only then are the `[[ACCOUNTS]]` read: the `address` of each entry (trimmed), kept when it is a classic
-  address with a valid checksum (an X-address, a bad checksum, a missing or non-text address is skipped), once each, sorted, the first
-  10. Every other field is ignored, and nothing in the file is fetched or followed. A byte order mark at the start of the file is ignored. A file that
+- **What is read of the file.** It is read with `readToml` (`smol-toml`, never evaluated; every text cleaned). The key is listed when a `[[VALIDATORS]]` entry has it as
+  `public_key`; at most 100 entries are kept, so a key past the 100th is not listed. Only then are the `[[ACCOUNTS]]` taken: the classic
+  addresses with a valid checksum (an X-address, a bad checksum, a missing or non-text address is skipped), once each, sorted, the first
+  10; and the four facts of the first entry that lists the key (a second one is ignored, and no other entry is read): `owner_country`, `server_country`, `network` and `unl`, by the rules of `validatorTomlEntryOf` ([api-reference](api-reference.md#get-v2networkvalidators)). A value the rules refuse counts as not given and is quoted in the log. Nothing in the file is fetched or followed. A byte order mark at the start of the file is ignored. A file that
   is not TOML is `toml_invalid`, and its error says nothing of its content.
+- **The write to the store.** After the rows of a domain's validators, every file fetched is written once to `domain_tomls`: `recordToml` for a file read as TOML, whatever its verdicts, and `nextTomlRow` over the stored row (one keyed read) for a fetch failure or `toml_invalid`. `domain_invalid` and `manifest_unverified` make no fetch and write nothing. So a domain only a validator names is in the store and loses its content when its file goes, and a domain named by both a validator and an account has one current row, the newest check whoever made it. A row is stamped with the time its file arrived. A failed store write is counted and logged by the name of the error, and does not fail the pass: the verdicts are written, and the next check writes the store again.
 - **The result of a pair.**
 
   | Result | Reason | Next check |
@@ -1040,12 +1044,12 @@ and the next one is made on time.
   | `unverified` | `not_listed`, `toml_invalid`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid`, `manifest_unverified`, `http_status` with a 4xx other than 429 (`status_code` is the status) | 6 h |
   | `unverified` | transient: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | 1 h |
 
-  A transient failure within 24 h of the last success keeps `verified` (with `verified_at` and `accounts` unchanged), so that a website
-  that blips does not flap the badge; after 24 h of failures it is `unverified` with the transient reason and no accounts. A definite
-  failure takes the badge at once and keeps `verified_at`, the time of the last success.
+  A transient failure within 24 h of the last success keeps `verified` (with `verified_at`, `accounts`, the four facts and `toml_version` unchanged), so that a website
+  that blips does not flap the badge; after 24 h of failures it is `unverified` with the transient reason, no accounts and no facts. A definite
+  failure takes the badge and the facts at once and keeps `verified_at`, the time of the last success.
 - **Observability.** `syncer_validators_domain_checks_total{outcome}` counts every check as `verified` or the reason (also a
-  transient failure that left the domain `verified`). The result of a pair is logged when it changes (the validator, the domain
-  quoted, the status, the reason and the status code); a fetch refused by the address policy is logged at `warn` every time, with the
+  transient failure that left the domain `verified`), `syncer_validators_toml_fields_total{field,outcome}` what the entry of a verified check gave (`read`, `absent`, `invalid`), and `syncer_validators_toml_store_writes_total{outcome}` the writes to the store. The result of a pair is logged when it or one of its facts changes (the validator, the domain
+  quoted, the status, the reason and the status code, the server country, and the values the file gave that were ignored, quoted and cut to 16 characters; never a principal); a fetch refused by the address policy is logged at `warn` every time, with the
   domain and the blocked range (`addressClass`). Once a pass, one `warn` says how many manifest lookups the node
   could not answer (and the first message) and how many it answered with an error (their codes, only the codes), and one how many
   fetches failed with an error that is not the safe fetcher's own (the names of the errors, recorded as `connect_error`). A log line

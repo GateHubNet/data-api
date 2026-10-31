@@ -1,9 +1,10 @@
 # ADR-0012: Validators and amendments data
 
 **Status:** Accepted (2026-10-19). Design: [validators and amendments](../superpowers/specs/2026-10-19-validators-amendments-design.md). Amended (2026-10-24): the
-testnets, in [the section at the end of this record](#amendment-2026-10-24-the-testnets) (the fixed validator list `local`, `retired` on XRPL, the family file on a testnet).
+testnets, in [the section near the end of this record](#amendment-2026-10-24-the-testnets) (the fixed validator list `local`, `retired` on XRPL, the family file on a testnet).
 Design: [testnet profiles](../superpowers/specs/2026-10-24-testnet-profiles-design.md); the "plan rulings" below are those of
-[its plan](../superpowers/plans/2026-10-24-testnet-profiles.md).
+[its plan](../superpowers/plans/2026-10-24-testnet-profiles.md). Amended (2026-10-31): validator toml details (D8), in
+[the section at the end of this record](#amendment-2026-10-31-validator-toml-details-d8). Design: [validator toml details](../superpowers/specs/2026-10-24-validator-toml-details-design.md).
 
 ## Context
 The explorer's Validators and Amendments boards need, per network, every validator (domain, UNL membership, software version, agreement,
@@ -211,3 +212,15 @@ protocol family. They add no migration and no parser version.
   `obsolete: true`, as it does `AMMClawback` and `HookOnV2`: Xahau mainnet's board shows it `obsolete`, Xahau Testnet's `enabled` (its ledger lists the ID, and that rule comes first), and
   `syncer_amendments_without_metadata` stays 0.
 - An unnamed ID on a testnet is `unknown` until the file names it, as on mainnet; `amendments:check --network <testnet>` after a new build of a testnet's node finds the names to add ([operations](../operations.md#keep-the-amendment-metadata-current)).
+
+## Amendment (2026-10-31): validator toml details (D8)
+
+This record said that of a verified file only the key and the `[[ACCOUNTS]]` addresses are read. D8 reads more of it, and still only of a file that verifies the pair.
+
+- **What is read of a verified file.** The first `[[VALIDATORS]]` entry that lists the master key: `owner_country` and `server_country` (ISO 3166-1 alpha-2 codes or `XK`, any case, `UK` read as `GB`), `network` (at most 32 characters) and `unl` (an https URL of at most 256 characters, with no user or password). Anything else in those fields counts as not given. Nothing else of the entry is read, and nothing a file holds is fetched or followed. An unverified domain's file gives no facts, so its validator has an unknown location.
+- **The domain's facts come from the per-domain store.** Principals' names, `modified`, the accounts listed and the currencies are read from `domain_tomls` by the validator detail ([ADR-0017](0017-display-names.md)). No new read of a file.
+- **The checker writes its checks there.** Every file it fetched goes to the store, whatever its verdicts, failures included, so a domain only a validator names has a row and loses its content when its file goes. A failed store write is counted and logged and does not fail the pass.
+- **`toml_version`** says what the checker read of a file. A verified pair below `TOML_DETAILS_VERSION` is due again once it was checked an hour ago, so details appear within minutes of the deploy. A transient failure within the grace keeps the old version with the old facts, and the hour keeps such a pair from being fetched every minute.
+- **Migration 016** adds the five columns to `validator_domains`. It is additive. The deploy order is migrate, then the syncer, then the api, and a rollback needs no undo. A syncer with the `validators` worker refuses to boot without the columns, and the validators routes answer 500 without them.
+
+**Consequences.** An api of this release deployed before the syncer serves no `toml` and counts every validator as unknown, without an error. Emails are never read, stored, logged or served. A principal's name is the domain's own publication, served as the toml says it. The three new items of the wire are [ADR-0010](0010-ripple-v2-wire-compatibility.md) Amendment 10.

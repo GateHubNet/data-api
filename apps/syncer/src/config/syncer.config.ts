@@ -373,7 +373,7 @@ export class SyncerConfig {
   @IntValue({ min: 1 })
   domainFetchTimeoutMs: number = 10000;
 
-  /** `GH_TOML_RECHECK_MS`: when the toml of a domain that was read OK is read again (a failure is checked on its own schedule). */
+  /** `GH_TOML_RECHECK_MS`: when the toml of a domain that was read OK is read again (a failure is checked on its own schedule); the next check of a store row the domain checker writes too. */
   @ConfigValue()
   @IntValue({ min: 1 })
   tomlRecheckMs: number = 86_400_000;

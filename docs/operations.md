@@ -778,7 +778,7 @@ SELECT count() FROM (SELECT account, argMax(domain_hex, version) AS h, argMax(de
 
 `domain_tomls` has one row per check, and merges keep the newest row of a domain. **It keeps the row of every domain ever checked**, also of a domain no account
 names any more: the worker does not check it again, and `GET /v2/toml/{domain}` answers its last row. So it grows with the churn of Domains (anyone can set one),
-by at most about 300 checks a minute, and nothing removes those rows yet (left to the validator toml details, D8, or a follow-up). The api reads it by key only,
+by at most about 300 checks a minute, and nothing removes those rows yet. D8 did not take that on: it adds the domains only a validator names, and any later blanking of undiscovered domains must keep those. The api reads it by key only,
 per request: its size costs disk and the worker's schedule read, not the api's memory. `account_domains` is ordered by
 account, so merges keep about one row per account and partition ([data-model](data-model.md#account_domains-p7-order-by-account-migration-012)).
 

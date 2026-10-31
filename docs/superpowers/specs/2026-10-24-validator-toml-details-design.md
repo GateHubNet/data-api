@@ -107,6 +107,8 @@ the API for the validator detail (4.2):
 The content is the row's as D4 keeps it: read at `fetched_at`, carried through a transient failure for 24 h, empty after a definite
 one (D4 §1.2, §4.4).
 
+> **Dated note (2026-10-31, D8's build).** `accounts_listed` is the number of distinct addresses: D4's final wave keeps an address once per network, so "every entry" would count an address listed for two networks twice, where D1's `accounts` has it once. D4's final wave also made the carried content last the recheck interval and 24 h, not 24 h alone. A `network` holding `@` reads as absent (never shown), and a currency whose code holds `@` is not served.
+
 ### 1.3 Country codes
 
 `packages/shared/src/validators/country.ts` (+ spec), used by the syncer (reading files) and the API (the `country` parameter):
@@ -205,6 +207,8 @@ migration: nothing here is global (countries are a network's validators').
 A change of a pair's server country is logged with the result change D1 already logs (`Validator nHU…: domain "x.example" is verified,
 server country DE`). Values from the file are quoted and cut (1.3); a principal's name is never logged. Alert (in
 `docs/observability.md`): `rate(syncer_validators_toml_store_writes_total{outcome="error"}[15m]) > 0` for 30 minutes.
+
+> **Dated amendment (2026-10-31, D8's build).** The alert is `increase(syncer_validators_toml_store_writes_total{outcome="error"}[1h]) > 0`, ticket level, and both series are created at load: a labelled counter has no series until its first increment, and writes come at the check rate, so a rate-for-30-minutes alert could not stay firing.
 
 ### 3.3 Which pairs are due
 
@@ -401,6 +405,7 @@ reached from the validator detail; `/countries` and a `country` filter make no C
 - `toml-match.spec.ts`: the entry's four fields (valid, absent, invalid type, lower-case code, invalid code counted in `invalid`,
   `network` as an integer, `unl` with `http:`, with credentials, too long), the first of two entries with the key, no `entry` when the
   key is not listed, nothing read from another validator's entry. (`cleanTomlText`, principals and `modified` are D4's tests.)
+  **Dated note (2026-10-31, D8's build):** a credentialed or over-long `unl` never reaches the rules through `readToml`, which drops a text holding `@` or over 256 code points: it counts as absent, not `invalid`, and is never logged.
 - `domain-checker.spec.ts`: `nextDomainRow` writes the facts and `toml_version` on `verified`, clears them on a definite failure,
   keeps `prev`'s through a transient failure within 24 h and clears them after; the due rule (a verified row with `toml_version` 0
   checked more than an hour ago is due; one checked 10 minutes ago, and an unverified one, are not); the store write once per fetched

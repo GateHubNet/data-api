@@ -136,7 +136,7 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Ledger objects (extras, both networks) | `/v2/escrows/{id}`, `/v2/checks/{id}`, `/v2/payment_channels/{id}`, each with `/history` (an object's state and the transactions that changed it, with `status` and `coverage`), `/v2/accounts/{address}/escrows/{sequence}` (an escrow by owner and sequence), `/v2/accounts/{address}/delegations` (`direction=given\|held`; empty on Xahau), `/v2/ledger_objects/{id}` (which kind of object an ID is) |
 | Tokens (extras, both networks) | `/v2/tokens` (the issued tokens ranked by holders; `kind`, `min_holders`, `q`), `/v2/tokens/{currency}.{issuer}` (one token: supply, price, the issuer's settings, its toml entry, its markets), `.../holders` and `.../transfers`; each answer has `coverage` |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
-| Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/{key}/validations` |
+| Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/countries`, `/v2/network/validators/{key}/validations` |
 | Amendments | `/v2/network/amendments[/{name}]` |
 | Stats | `/v2/stats[/{family}[/{metric}]]` |
 | Operational | `/liveliness/healthz` (api 3001, syncer 3002), `/metricz` (3000), `/internal/docs` |

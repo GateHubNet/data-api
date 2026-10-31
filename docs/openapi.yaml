@@ -144,6 +144,29 @@ paths:
           description: ''
       tags:
       - network
+  "/v2/network/validators/countries":
+    get:
+      operationId: ValidatorsController_countries
+      summary: Get the validators of the network per server country
+      description: How many validators of a scope name each country as the server_country
+        of their verified toml, and how many of them are on the trusted UNL; those
+        without one count as unknown. Every count is what the list gives with the
+        same scope and country. JSON only.
+      parameters:
+      - name: scope
+        required: false
+        in: query
+        description: 'Default: unl.'
+        schema:
+          enum:
+          - unl
+          - all
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
   "/v2/network/validators":
     get:
       operationId: ValidatorsController_list
@@ -174,6 +197,12 @@ paths:
         description: Default 200, at most 1000.
         schema:
           type: number
+      - name: country
+        required: false
+        in: query
+        description: 'An ISO 3166-1 alpha-2 code, any case (uk is GB): the validators
+          whose toml''s server_country is it. unknown, any case: those without one.'
+        schema: {}
       - name: q
         required: false
         in: query
@@ -210,8 +239,10 @@ paths:
       operationId: ValidatorsController_detail
       summary: Get a validator of the network
       description: 'One validator by its master key, its signing key or 66 hex digits:
-        the row of the list, its vote on every amendment being decided, its manifest
-        and its agreement of each of the last 30 days. JSON only.'
+        the row of the list, its vote on every amendment being decided, the facts
+        of its verified toml with those of its domain (principals, last modified,
+        accounts, currencies), its manifest and its agreement of each of the last
+        30 days. JSON only.'
       parameters:
       - name: key
         required: true
@@ -323,6 +354,60 @@ paths:
           description: ''
       tags:
       - network
+  "/v2/account_names":
+    get:
+      operationId: AccountNamesController_list
+      summary: Get the display names of up to 100 addresses
+      description: 'One entry per address asked, in the order asked (an address asked
+        twice is answered at each place). `display_name` is the name to show and what
+        stands behind it: `verified` (the toml of the account domain lists the address;
+        the text is its description, else the domain), `account` (the name the operator
+        gave the address) or `domain` (the account domain, which nothing vouches for).
+        `domain` is the account domain whatever its state; `account_name`, `account_network_name`
+        and `labels` are served whenever they exist. Any address is answered: one
+        that is no account on this network still has its name and labels and no domain.
+        A key without a value is left out.'
+      parameters:
+      - name: addresses
+        required: true
+        in: query
+        description: 1 to 100 classic addresses separated by `,` (no spaces). A repeated
+          address is answered at each place and counts towards the 100. Case matters.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - account_names
+  "/v2/toml/{domain}":
+    get:
+      operationId: TomlController_get
+      summary: Get what the toml of a domain says
+      description: 'What the toml file of a domain says, as the last check of it stored:
+        the accounts it lists, the currencies, the principals'' names and the validators,
+        only the entries that count on this network (no network, or a name of it).
+        `status` is `ok` (the file was read) or `failed`, with the `reason` and, for
+        `http_status`, the `status_code`; a toml that failed transiently still carries
+        what its last read said until 24 hours after the re-read it missed, one after
+        a definite failure carries nothing but the check. `checked` is when the domain
+        was last checked, `fetched` when the content was read. Emails and social handles
+        are never served. A key without a value is left out. 404 when the domain was
+        never checked (no account and no validator named it while the workers ran,
+        or its first check has not run yet); a domain nobody names any more answers
+        its last check.'
+      parameters:
+      - name: domain
+        required: true
+        in: path
+        description: A domain as an account names it (`northpeak.example`); the case
+          does not matter.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - toml
   "/v2/ledgers":
     get:
       operationId: LedgersController_getLedger
@@ -3469,59 +3554,6 @@ paths:
           description: ''
       tags:
       - nft_sales
-  "/v2/account_names":
-    get:
-      operationId: AccountNamesController_list
-      summary: Get the display names of up to 100 addresses
-      description: 'One entry per address asked, in the order asked (an address asked
-        twice is answered at each place). `display_name` is the name to show and what
-        stands behind it: `verified` (the toml of the account domain lists the address;
-        the text is its description, else the domain), `account` (the name the operator
-        gave the address) or `domain` (the account domain, which nothing vouches for).
-        `domain` is the account domain whatever its state; `account_name`, `account_network_name`
-        and `labels` are served whenever they exist. Any address is answered: one
-        that is no account on this network still has its name and labels and no domain.
-        A key without a value is left out.'
-      parameters:
-      - name: addresses
-        required: true
-        in: query
-        description: 1 to 100 classic addresses separated by `,` (no spaces). A repeated
-          address is answered at each place and counts towards the 100. Case matters.
-        schema: {}
-      responses:
-        '200':
-          description: ''
-      tags:
-      - account_names
-  "/v2/toml/{domain}":
-    get:
-      operationId: TomlController_get
-      summary: Get what the toml of a domain says
-      description: 'What the toml file of a domain says, as the last check of it stored:
-        the accounts it lists, the currencies, the principals'' names and the validators,
-        only the entries that count on this network (no network, or a name of it).
-        `status` is `ok` (the file was read) or `failed`, with the `reason` and, for
-        `http_status`, the `status_code`; a toml that failed transiently still carries
-        what its last read said until 24 hours after the re-read it missed, one after
-        a definite failure carries nothing but the check. `checked` is when the domain
-        was last checked, `fetched` when the content was read. Emails and social handles
-        are never served. A key without a value is left out. 404 when the domain was
-        never checked (no account named it while the worker ran, or its first check
-        has not run yet); a domain no account names any more answers its last check.'
-      parameters:
-      - name: domain
-        required: true
-        in: path
-        description: A domain as an account names it (`northpeak.example`); the case
-          does not matter.
-        schema:
-          type: string
-      responses:
-        '200':
-          description: ''
-      tags:
-      - toml
   "/v2/escrows/{escrow_id}":
     get:
       operationId: EscrowsController_detail

@@ -263,7 +263,7 @@ does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the p
 
 Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs), the [AMM](#amm) endpoints (`/v2/amm/pools...`,
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
-`GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
+`GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary`, `GET /v2/network/validators/countries` and
 `GET /v2/network/validators/{key}/validations`, `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
 [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54), `GET /v2/path_payments` (the [path payments](#path-payments) of the
 network, spec #4) and `GET /v2/accounts/{address}/path_payments` (those of an account). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
@@ -311,6 +311,8 @@ From the issued tokens ([ADR-0019](adr/0019-issued-tokens-from-state-history.md)
 From the supply ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 9, items 103 to 104): [`GET /v2/network/supply`](#get-v2networksupply) (the native supply at one
 ledger, an hourly snapshot, with the `coverage` of each part read from history) and [`GET /v2/network/supply/minted`](#get-v2networksupplyminted) (Xahau's minting per day and
 source, with its `coverage`; empty on the XRP Ledger). The original's `/v2/network/xrp_distribution` is still out of scope (below).
+
+From the validator toml details ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 10, items 105 to 107): `toml` on the [validator rows](#get-v2networkvalidators) and on [the answer for one validator](#get-v2networkvalidatorskey), the `country` filter of the list, and [`GET /v2/network/validators/countries`](#get-v2networkvalidatorscountries).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -3730,8 +3732,8 @@ the `tomls` worker stored (kept 60 s in the api, a domain with no row too).
 
 Errors, in the order they are checked: 400 `invalid domain` (not properly formed once lower-cased: a URL, a path, a port, an IP address, a single
 label such as `localhost`, an underscore, more than 128 characters); 404 `toml not found` (the store has no row for the domain: it was never checked,
-because no account named it while the worker ran, or its first check has not run yet); 500 `unable to retrieve toml`. A domain whose last check failed is
-**not** a 404: it answers with `status: "failed"`. Nor is a domain no account names any more: the store keeps the row of every domain it checked, and
+because no account and no validator named it while the workers ran, or its first check has not run yet); 500 `unable to retrieve toml`. A domain whose last check failed is
+**not** a 404: it answers with `status: "failed"`. Nor is a domain nobody names any more: the store keeps the row of every domain it checked, and
 the answer is its last check, however old (`checked` says when).
 
 A domain whose toml was read (`GET /v2/toml/northpeak.example`):
@@ -3809,7 +3811,7 @@ Keys of a toml account, in order: `address, desc?`.
 
 Keys of a toml currency, in order: `code, issuer?, display_decimals?, symbol?, name?, desc?`.
 
-Keys of a toml validator, in order: `public_key, owner_country?, server_country?, unl?`.
+Keys of a toml validator, in order: `public_key, owner_country?, server_country?, network?, unl?`.
 
 What the fields say:
 
@@ -3835,8 +3837,8 @@ What the fields say:
   `telegram`, `support_handle`, ...) and a text that holds an `@` are not even stored.
 - **`principals`** are the names of the `[[PRINCIPALS]]` (at most 100 characters each, ten of them, no repeat), and **nothing else of a principal**: an
   email and the social handles are never read, and a principal whose name holds an `@` is dropped.
-- **`validators`** are the `[[VALIDATORS]]` entries that count, at most 100: `public_key`, and the text of `owner_country`, `server_country` and `unl`
-  (the URL of a list, text and never followed). **`[[SERVERS]]` and `[ORGANIZATION]` are never read.**
+- **`validators`** are the `[[VALIDATORS]]` entries that count, at most 100: `public_key`, and `owner_country`, `server_country`, `network` and `unl` by the
+  same rules as `toml` on the [validator routes](#get-v2networkvalidators) (a country is an upper-case ISO 3166-1 alpha-2 code, `uk` read as `GB`; `unl` is an https URL of a list, text and never followed). A value the rules refuse is left out. **`[[SERVERS]]` and `[ORGANIZATION]` are never read.**
 - **Text is cleaned.** Every text of a toml loses its control and format characters, its bidirectional overrides and isolates among them (so that a
   name cannot render as another), is then put in Unicode normal form C, has each run of white space made one space, and is trimmed; a text over its cap is
   dropped, not cut.
@@ -5589,6 +5591,7 @@ Keys of a yes entry, in order: `id, name`.
 | `fee_vote` | The fees the validator votes for, in whole units, in its vote record: the newest full vote within 24 hours before the newest stored voting round, whether the validator is trusted or not. A fee the validation left out is the fee in force at that round. `ledger_index` is that round's voting ledger. Absent without a record. |
 | `amendment_votes` | The amendments the record votes yes for, in the order of the record: `{id, name}`, `name` when the amendments know one. Absent without a record. |
 | `first_seen`, `last_seen` | When this deployment first and last saw the validator (a signing key's sightings are its master's). Absent for a member of a list that was never seen. |
+| `toml` | What the `[[VALIDATORS]]` entry that lists the master key says, in the file that verified the domain: `owner_country` and `server_country` (upper-case ISO 3166-1 alpha-2 codes or `XK`; `uk` in a file is `GB`), `network` (as the file says it, lower case: `main`, `testnet`, `21337`) and `unl` (an https URL). These are the file's claims: nothing checks them and nothing fetches the URL, and a `network` naming another network is shown as it is. Present when the domain is `verified` and was read by this release's checker; absent otherwise (no domain, `pending`, `unverified`, or verified before and not read again yet, which takes at most about an hour after the deploy). `{}` when the entry gives none of the four. A key is absent when the file gives no valid value. In the CSV the columns are `toml.owner_country`, `toml.server_country`, `toml.network` and `toml.unl`, and a row whose `toml` is `{}` writes `[Object]` in a column `toml`. |
 
 A member of the UNL that was never seen is a row too, with what its lists and its manifest give:
 
@@ -5623,6 +5626,7 @@ Errors: 400 `invalid scope`, `invalid publisher`, `invalid amendment`, `invalid 
 | Agreement against the ledgers its chain logic saw | Against the indexed validated chain, full validations only, unobserved ledgers left out |
 | Messages `Validator not found`, `unable to retrieve validator(s)`; CSV `validators.csv` | Kept; new 400s for the new parameters |
 | `/manifests`, `/reports`, `/validator_reports`, `/rippled_versions` | Still 404 |
+| No countries, no `toml`, no `country` filter | `toml` on the rows, `country` on the list, and `/v2/network/validators/countries` |
 
 ### `GET /v2/network/validators/countries`
 
@@ -5669,7 +5673,7 @@ Keys of unknown, in order: `validators, unl`.
 
 ### `GET /v2/network/validators/{key}`
 
-One validator: the object of the list, with its vote on every amendment still being decided, its manifest and its agreement of each of the last 30 days. JSON only:
+One validator: the object of the list, with its vote on every amendment still being decided, the facts of its domain's toml, its manifest and its agreement of each of the last 30 days. JSON only:
 `format` and the parameters of the list are ignored.
 
 `key` is a master key (`nH...`) or a signing key (`n9...`), base58, or 66 hex digits starting `02`, `03` or `ED`, in either case (as the validator lists and the negative UNL
@@ -5744,6 +5748,7 @@ Keys of a daily agreement, in order: `date, missed, total, score, incomplete, pa
 | Key | Meaning |
 | --- | --- |
 | `amendment_votes` | Always there. `yes` is the list's (the amendments the record votes yes for, enabled ones included). `votes` has one entry for each amendment whose status is `voting`, `majority` or `unknown`, in the order of `GET /v2/network/amendments`: `{id, name, status, vote}`, `vote` being `yes` or `no` as the record says. An `unknown` amendment (an ID the node lists without a name and nobody voted for) is in it too, without a `name`. A validator without a record has `vote` `none` for all of them, an empty `yes` and no `ledger_index`. |
+| `toml` | The row's `toml`, followed by what the [toml store](#get-v2tomldomain) holds of the validator's domain, when the row has `toml` and that content is in effect (it stays through a transient failure and goes after a definite one): `principals` (the names, at most 10, in file order; absent when none), `modified` (`YYYY-MM-DDTHH:mm:ssZ`, the file's `[METADATA].modified`; absent when none), `accounts_listed` (the distinct `[[ACCOUNTS]]` addresses, whatever their network; absent when 0), `currencies` (the `[[CURRENCIES]]` entries that count on this network, the first 10, `issuer` absent when the entry names none; absent when none), `currencies_listed` (their whole number; absent when 0) and `fetched` (`YYYY-MM-DDTHH:mm:ss.SSSZ`, when that content was read). The store's row is read by key and kept 60 s, so these facts can be a check newer or older than the row's: they are the domain's, not the validator's. A read of the store that fails answers 500. A name is the domain's own publication, served as the toml says it; emails are never read. |
 | `manifest` | The newest manifest: its `sequence`, the `signing_key` it names, `signing_keys_seen`, the distinct signing keys stored for the master key (one less than that is how often the key was rotated), and its `domain` (absent as `domain` of the row is). Absent without a manifest. |
 | `daily_agreement` | The 30 UTC days ending with the day of the newest final hour of agreement, the oldest first: `{date, missed, total, score, incomplete, partial}` as an agreement window, with `date` as `YYYY-MM-DD`. A day whose 24 hours are not all final is `incomplete`; one with no data has `total` 0 and no `score`. An empty list while no hour of agreement is final. |
 | `result` | `success`, last. |
