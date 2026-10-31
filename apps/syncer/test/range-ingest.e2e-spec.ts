@@ -209,6 +209,12 @@ const FAST: Partial<RangeIngestOptions> = {
   logger: QUIET,
 };
 
+/**
+ * `FAST` for a test that counts one fetch of a missing ledger. The wait for the next try ends before it looks at the budget, so with a
+ * backoff of 1 ms a clock that ticks in between asks the node again (seen once in a whole run, always with a clock that ticks).
+ */
+const MISSING_IS_FINAL: Partial<RangeIngestOptions> = { ...FAST, retryBackoffMs: 60_000 };
+
 describe('rangeIngest (e2e)', () => {
   let clickhouse: StartedClickHouse;
   const services: ClickHouseService[] = [];
@@ -449,7 +455,12 @@ describe('rangeIngest (e2e)', () => {
       const source = new TestSource(FIXTURES.filter((l) => l.header.ledger_index !== missing));
 
       await expect(
-        rangeIngest(source, svc, ctx, { from: FIXTURE_FROM, to: FIXTURE_TO, indexes: FIXTURE_INDEXES, ...FAST }),
+        rangeIngest(source, svc, ctx, {
+          from: FIXTURE_FROM,
+          to: FIXTURE_TO,
+          indexes: FIXTURE_INDEXES,
+          ...MISSING_IS_FINAL,
+        }),
       ).rejects.toBeInstanceOf(LedgerNotAvailableError);
 
       // Not retried, and nothing of its chunk is committed.
@@ -566,10 +577,12 @@ describe('rangeIngest (e2e)', () => {
       const svc = await freshService();
       const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(20)));
 
-      await expect(rangeIngest(source, svc, ctx, { from: L(1), to: L(30), ...FAST })).rejects.toMatchObject({
-        name: 'LedgerNotAvailableError',
-        ledgerIndex: L(20),
-      });
+      await expect(rangeIngest(source, svc, ctx, { from: L(1), to: L(30), ...MISSING_IS_FINAL })).rejects.toMatchObject(
+        {
+          name: 'LedgerNotAvailableError',
+          ledgerIndex: L(20),
+        },
+      );
 
       expect(source.fetchCount(L(20))).toBe(1);
       // The first chunk (9999986..9999999) is complete; the second never wrote its ledgers.
@@ -1727,7 +1740,7 @@ describe('rangeIngest (e2e)', () => {
       const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(7)));
 
       await expect(
-        rangeIngest(source, svc, ctx, { from: L(1), to: L(14), reprocess: true, ...FAST }),
+        rangeIngest(source, svc, ctx, { from: L(1), to: L(14), reprocess: true, ...MISSING_IS_FINAL }),
       ).rejects.toBeInstanceOf(LedgerNotAvailableError);
 
       expect(source.fetchCount(L(7))).toBe(1);
