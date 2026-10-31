@@ -304,6 +304,12 @@ describe.each(WORLDS)('GET /v2/nft_sales over the recorded $seed ledgers', (worl
       expect(await list(`${other}%2B${USD_ISSUER}`)).toEqual([]);
     });
 
+    it('an MPT as parseAsset reads it: no sale is priced in one, so an empty list, not a 400 (ruling C16)', async () => {
+      const id = '0598F6E09E30A809E63A1F02DE789586D2F4FDA9EF5200E3';
+      expect(await list(id.toLowerCase())).toEqual([]);
+      expect(await answer(`currency=${id}%2B${USD_ISSUER}`)).toEqual([400, 'issuer does not match mpt issuance']);
+    });
+
     it('CUR+issuer, as /v2/payments/{currency} reads it: %2B, a + that arrived as a space, | and . match the same sales', async () => {
       const usd = served(pricedIn('USD', USD_ISSUER));
       expect(usd).toHaveLength(1);

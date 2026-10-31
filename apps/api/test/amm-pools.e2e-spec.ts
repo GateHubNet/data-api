@@ -515,6 +515,16 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
       expect(none.body).toEqual({ result: 'success', count: 0, pools: [] });
     });
 
+    it('filters by an MPT as parseAsset reads it: no pool holds one, so an empty list, not a 400 (ruling C16)', async () => {
+      const id = '0598F6E09E30A809E63A1F02DE789586D2F4FDA9EF5200E3';
+      for (const query of [`asset=${id.toLowerCase()}`, `asset2=${id}`]) {
+        const res = await get(`/v2/amm/pools?${query}`);
+        expect([query, res.status, res.body]).toEqual([query, 200, { result: 'success', count: 0, pools: [] }]);
+      }
+      const other = await get(`/v2/amm/pools?asset=${id}%2BrMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q`);
+      expect([other.status, other.body.message]).toEqual([400, 'issuer does not match mpt issuance']);
+    });
+
     it('takes a raw + as the separator too: a query string decodes it as a space, and %2B is the strict form', async () => {
       const wanted = expectedPools((a) => !DELETED.includes(a));
       const usd = wanted.find((p) => p.base_currency === 'USD' || p.counter_currency === 'USD')!;

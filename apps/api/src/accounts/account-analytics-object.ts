@@ -24,6 +24,7 @@ export const CHANGE_TYPE_ORDER = [
   'escrow_cancel',
   'paychannel_fund',
   'paychannel_payout',
+  'clawback',
 ] as const;
 
 const midnight = (day: string): string => `${day}T00:00:00Z`;
@@ -266,7 +267,7 @@ function add(to: Sums, count: number, inn: BigNumber, out: BigNumber, inValue: B
   to.outValue = to.outValue.plus(outValue);
 }
 
-/** Where a change type stands in the lists: the ten in `CHANGE_TYPE_ORDER`, any other after them, the unclassified last. */
+/** Where a change type stands in the lists: the eleven in `CHANGE_TYPE_ORDER`, any other after them, the unclassified last. */
 function typeRank(type: string): number {
   if (type === '') return CHANGE_TYPE_ORDER.length + 1;
   const at = (CHANGE_TYPE_ORDER as readonly string[]).indexOf(type);

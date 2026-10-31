@@ -35,6 +35,8 @@ export const XRPL_PATH_PAYMENTS_DIR = join(FIXTURES, 'xrpl', 'path-payments');
 export const XRPL_NFT_DIR = join(FIXTURES, 'xrpl', 'nft');
 /** Mainnet ledgers recorded around escrows, checks, payment channels and delegations (D5, Task 1): see its `FINDINGS.md`. */
 export const XRPL_OBJECTS_DIR = join(FIXTURES, 'xrpl', 'objects');
+/** Mainnet ledgers recorded around MPT transactions (issuances, authorizes, payments, clawbacks, escrows; D9, Task 1): see its `FINDINGS.md`. */
+export const XRPL_MPT_DIR = join(FIXTURES, 'xrpl', 'mpt');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
 /** Xahau ledgers recorded around URIToken transactions (mints, sell offers, a buy, a burn, a Remit): see the fixtures README. */
 export const XAHAU_URITOKEN_DIR = join(FIXTURES, 'xahau', 'uritoken');
@@ -62,6 +64,7 @@ export type SeedName =
   | 'xrpl-path-payments'
   | 'xrpl-nft'
   | 'xrpl-objects'
+  | 'xrpl-mpt'
   | 'xahau-recorded'
   | 'xahau-uritoken'
   | 'xahau-flag'
@@ -78,6 +81,7 @@ const DIRS: Record<SeedName, string[]> = {
   'xrpl-path-payments': [XRPL_PATH_PAYMENTS_DIR],
   'xrpl-nft': [XRPL_NFT_DIR],
   'xrpl-objects': [XRPL_OBJECTS_DIR],
+  'xrpl-mpt': [XRPL_MPT_DIR],
   'xahau-recorded': [XAHAU_RECORDED_DIR],
   'xahau-uritoken': [XAHAU_URITOKEN_DIR],
   'xahau-flag': [XAHAU_FLAG_DIR],
@@ -108,6 +112,7 @@ export const SEED_NETWORK: Record<SeedName, NetworkName> = {
   'xrpl-path-payments': 'xrpl',
   'xrpl-nft': 'xrpl',
   'xrpl-objects': 'xrpl',
+  'xrpl-mpt': 'xrpl',
   'xahau-recorded': 'xahau',
   'xahau-uritoken': 'xahau',
   'xahau-flag': 'xahau',

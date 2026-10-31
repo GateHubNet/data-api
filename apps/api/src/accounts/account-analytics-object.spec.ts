@@ -635,9 +635,11 @@ describe('toBalanceChanges', () => {
       'escrow_cancel',
       'paychannel_fund',
       'paychannel_payout',
+      'clawback',
     ]);
     const shuffled = [
       '',
+      'clawback',
       'paychannel_payout',
       'exchange',
       'escrow_cancel',
@@ -650,17 +652,18 @@ describe('toBalanceChanges', () => {
       groups: shuffled.map((type) => group('2020-01-01', type, 'XRP', '', 1, '1', '0')),
       rates: new Map(),
     });
-    // a type that is none of the ten comes after them and before the unclassified
+    // a type that is none of the eleven comes after them and before the unclassified
     expect(totals.map((t) => t.change_type)).toEqual([
       'transaction_cost',
       'exchange',
       'intermediary',
       'escrow_cancel',
       'paychannel_payout',
+      'clawback',
       'weird',
       undefined,
     ]);
-    expect(Object.keys(totals[6])).toEqual(['count', 'in_value', 'out_value', 'net_value']);
+    expect(Object.keys(totals[7])).toEqual(['count', 'in_value', 'out_value', 'net_value']);
   });
 
   it('rows without interval: by type, then in_value + out_value largest first, then currency and issuer', () => {

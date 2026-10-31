@@ -1,4 +1,4 @@
-import type { Asset } from '@gatehub/data-api-shared';
+import { type Asset, isMptIssuanceId, mptIssuerOf } from '@gatehub/data-api-shared';
 import { isValidClassicAddress } from 'ripple-address-codec';
 import { badRequest } from './errors';
 
@@ -46,13 +46,27 @@ function toAsset(a: AssetParts, native: string): Asset {
 }
 
 /**
+ * The asset of an MPT: 48 hex digits are always an issuance ID, and its issuer is the one the ID holds (an ID is `Sequence | Issuer`).
+ * An issuer given has to be a classic address (400, as for any currency) and that one (400 `issuer does not match mpt issuance`).
+ */
+function mptAsset(a: AssetParts, role?: AssetRole): Asset {
+  requireValidIssuer(a, role);
+  const id = a.currency as string;
+  const issuer = mptIssuerOf(id);
+  if (a.issuer && a.issuer !== issuer) throw badRequest('issuer does not match mpt issuance');
+  return { currency: id, issuer };
+}
+
+/**
  * One asset from a path segment such as `USD+rvYAf…`. `native` is the network's native currency (`XRP` or `XAH`):
  * it must have no issuer, and every other currency, including `XRP` on Xahau, needs one. The issuer must be a classic
- * address. With a `role` the messages name the side (`base issuer is required`). Answers 400 with the Ripple message.
+ * address. An MPT is `<48hex>` or `<48hex>+<its issuer>` (`mptAsset`). With a `role` the messages name the side
+ * (`base issuer is required`). Answers 400 with the Ripple message.
  */
 export function parseAsset(raw: string, native: string, role?: AssetRole): Asset {
   const parts = splitAsset(raw);
   requireCurrency(parts, role);
+  if (isMptIssuanceId(parts.currency as string)) return mptAsset(parts, role);
   rejectNativeIssuer(parts, native);
   requireIssuer(parts, native, role);
   requireValidIssuer(parts, role);

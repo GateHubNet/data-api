@@ -1062,3 +1062,82 @@ describe('payments API endpoint on the xahau-recorded ledgers', () => {
     expect((await get('/v2/payments?start=2030-01-01')).body.count).toBe(0);
   });
 });
+
+describe('payments API endpoint on the recorded MPT ledgers', () => {
+  const seed = 'xrpl-mpt';
+  const all = [...fixturePayments(seed)].sort(byKey);
+  /** `payment_transfer_fee` and the ledgers of the other MPT payments. */
+  const ID = '0598F6E09E30A809E63A1F02DE789586D2F4FDA9EF5200E3';
+  const ISSUER = 'rERShrtUSEXkrwtTpugPV4v8E787vpx1kb';
+  const isMpt = (p: FixturePayment): boolean => /^[0-9A-F]{48}$/.test(p.row.currency);
+  const withId = (p: FixturePayment): Record<string, unknown> => ({
+    ...paymentOf(p.row),
+    ...(isMpt(p) && { mpt_issuance_id: p.row.currency }),
+  });
+  const theId = all.filter((p) => p.row.currency === ID);
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  beforeAll(async () => {
+    h = await startHarness({ seed, env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the seed holds the six recorded MPT payments, among others', () => {
+    expect(all.filter(isMpt)).toHaveLength(6);
+    expect(theId).toHaveLength(1);
+    expect(all.length).toBeGreaterThan(6);
+  });
+
+  it('/v2/payments/<id in lower case> lists the payments of that issuance, mpt_issuance_id the last key', async () => {
+    const res = await api.ok<ListBody>(`/v2/payments/${ID.toLowerCase()}?limit=1000`, 'payments');
+    expect(res.body.payments).toEqual(theId.map(withId));
+    const [payment] = res.body.payments;
+    expect(Object.keys(payment).slice(-2)).toEqual(['transaction_cost', 'mpt_issuance_id']);
+    expect(payment).toMatchObject({ currency: ID, issuer: ISSUER, mpt_issuance_id: ID, amount: '1000000' });
+  });
+
+  it('takes the ID with its own issuer, and answers 400 for another', async () => {
+    for (const path of [`${ID}+${ISSUER}`, `${ID}%7C${ISSUER}`, `${ID.toLowerCase()}.${ISSUER}`]) {
+      const res = await api.ok<ListBody>(`/v2/payments/${path}?limit=1000`, 'payments');
+      expect([path, res.body.payments]).toEqual([path, theId.map(withId)]);
+    }
+    const other = await get(`/v2/payments/${ID}+rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q`);
+    expect([other.status, other.body]).toEqual([
+      400,
+      { result: 'error', message: 'issuer does not match mpt issuance' },
+    ]);
+    const bad = await get(`/v2/payments/${ID}+rBad`);
+    expect([bad.status, bad.body]).toEqual([400, { result: 'error', message: 'invalid issuer address' }]);
+    // the dates are checked before the rest of the currency, as for any currency
+    const dated = await get(`/v2/payments/${ID}+rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q?start=x`);
+    expect(dated.body.message).toBe('invalid start date format');
+  });
+
+  it('an ID of the right length that nothing paid in is an empty list, and 40 hex digits still need an issuer', async () => {
+    const none = await get(`/v2/payments/${'0'.repeat(8)}${ID.slice(8)}`);
+    expect([none.status, none.body]).toEqual([200, { result: 'success', count: 0, payments: [] }]);
+    const forty = await get(`/v2/payments/${'A'.repeat(40)}`);
+    expect([forty.status, forty.body.message]).toEqual([400, 'issuer is required']);
+  });
+
+  it('/v2/payments includes the MPT payments, each with mpt_issuance_id last, and no other payment has it', async () => {
+    const seen = (await api.pages<ListBody>('/v2/payments', 200, 'payments')).flatMap((page) => page.payments);
+    expect(seen).toEqual(all.map(withId));
+    expect(seen.filter((p) => 'mpt_issuance_id' in p)).toHaveLength(6);
+  });
+
+  it('the CSV has an mpt_issuance_id column only when a row of the page has one', async () => {
+    const withColumn = await get(`/v2/payments/${ID}?format=csv`);
+    expect(withColumn.headers['content-disposition']).toBe(csvDisposition(`payments - ${ID}`));
+    const [header, row] = withColumn.text.split('\n');
+    expect(header.endsWith(',"transaction_cost","mpt_issuance_id"')).toBe(true);
+    expect(row.endsWith(`,"${ID}"`)).toBe(true);
+    const native = await get('/v2/payments/XRP?format=csv&limit=5');
+    expect(native.text.split('\n')[0]).not.toContain('mpt_issuance_id');
+  });
+});

@@ -1037,3 +1037,42 @@ describe('account payments API endpoint on the xahau-recorded ledgers', () => {
     expect((await get(`${path(PAYEE)}?start=2030-01-01`)).body.count).toBe(0);
   });
 });
+
+describe('account payments API endpoint on the recorded MPT ledgers', () => {
+  const seed = 'xrpl-mpt';
+  /** `payment_redeem` and `payment_holder_to_holder`: the holder of the one, the issuer of the other. */
+  const ID = '0631375471048C4D35D2044917EE3C26F60E6CA8FC954A71';
+  const HOLDER = 'rG4w2E3eHBiJvBSmjwBbJHi7FrCdowtDNd';
+  const OTHER_ID = '063AD9F575D20B5318CEE1E1ED7891C54A983F23C47481C1';
+  const SOURCE = 'rD9nGmG8wVwguyZcz8rLT4d2MZ1EyFGDSS';
+  const rows = [...fixtureAccountPayments(seed)].sort(byKey);
+  let h: Harness;
+  let api: ApiClient;
+  beforeAll(async () => {
+    h = await startHarness({ seed, env: NO_RATE_LIMIT });
+    api = await h.api();
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('?currency=<id in lower case> keeps the payments of that issuance, mpt_issuance_id the last key', async () => {
+    const res = await api.ok<ListBody>(`${path(HOLDER)}?currency=${ID.toLowerCase()}`, 'payments');
+    expect(rows.filter((r) => r.account === HOLDER && r.currency === ID)).toHaveLength(1);
+    expect(res.body.count).toBe(1);
+    expect(res.body.payments[0]).toMatchObject({ currency: ID, mpt_issuance_id: ID, source: HOLDER, amount: '1' });
+    expect(Object.keys(res.body.payments[0]).slice(-2)).toEqual(['transaction_cost', 'mpt_issuance_id']);
+    // another issuance of the same account's list is not this one
+    const other = await api.ok<ListBody>(`${path(HOLDER)}?currency=${OTHER_ID}`, 'payments');
+    expect(other.body.count).toBe(0);
+  });
+
+  it('lists an MPT payment beside the rest of the account, and the CSV gains its column', async () => {
+    const res = await api.ok<ListBody>(`${path(SOURCE)}?limit=1000`, 'payments');
+    const mpt = res.body.payments.filter((p: Payment) => p.currency === OTHER_ID);
+    expect(mpt).toHaveLength(1);
+    expect(mpt[0].mpt_issuance_id).toBe(OTHER_ID);
+    const csv = await api.get(`${path(SOURCE)}?format=csv&currency=${OTHER_ID}`);
+    expect(csv.text.split('\n')[0].endsWith(',"transaction_cost","mpt_issuance_id"')).toBe(true);
+  });
+});

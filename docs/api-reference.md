@@ -42,6 +42,8 @@ Ledger and XRPL Testnet, `XAH` on Xahau and Xahau Testnet. Wherever this page sa
 currency called `XRP`, and `XAH` on the XRP Ledger is an issued currency called `XAH`. Amounts of the native currency are
 always in whole units (drops divided by 1,000,000), as exact decimal text.
 
+An **MPT** is written `<48hex>` or `<48hex>+<issuer>`: 48 hex digits in any case are always an issuance ID, upper-cased in answers, and the issuer is the one the ID holds, so another one answers 400 `issuer does not match mpt issuance` ([MPT](#mpt)); 3-character and 40-hex codes stay issued currencies. A route that takes such an asset as a filter and holds no MPT (`asset` and `asset2` of [`/v2/amm/pools`](#amm), `currency` of [`/v2/nft_sales`](#nfts)) answers an MPT with an empty list, not a 400.
+
 **The testnets.** A testnet answers with the same routes, the same shapes and the same guarantees as the network it follows: wherever this
 page says "the XRP Ledger" or "Xahau" without a sentence about the testnets, XRPL Testnet answers as the XRP Ledger does and Xahau Testnet
 as Xahau does (XRPL Testnet has AMM pools, Xahau Testnet has none). Besides the host, the native currency and the CTID network id,
@@ -482,7 +484,7 @@ oldest first.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `currency` (path) | all | `CUR+issuer` (the separators `+`, `\|` and `.` all work, the currency is upper-cased) or the native currency alone. The currency is that of the payment's `Amount`. |
+| `currency` (path) | all | `CUR+issuer` (the separators `+`, `\|` and `.` all work, the currency is upper-cased), the native currency alone, or an MPT: its issuance ID, with or without its issuer (`<48hex>[+issuer]`). The currency is that of the payment's `Amount`. |
 | `start` | the beginning | |
 | `end` | the newest ledger | |
 | `descending` | false | |
@@ -510,12 +512,14 @@ oldest first.
 
 Key order is the order of the original's row: `amount, delivered_amount, destination_balance_changes, max_amount?,
 source_balance_changes, tx_index, currency, destination, destination_tag?, executed_time, invoice_id?, issuer?, ledger_index,
-source, source_currency, source_tag?, tx_hash, transaction_cost`. `issuer` is absent for the native currency, tags that
+source, source_currency, source_tag?, tx_hash, transaction_cost, mpt_issuance_id?`. `issuer` is absent for the native currency, tags that
 the payment does not have are absent (a tag of `0` is a tag and is served). `transaction_cost` is the fee in whole units.
 The balance changes carry an empty `counterparty` for the native currency; the native balance change of the source does not include the fee (that is `transaction_cost`).
 
+An **MPT payment** has the issuance ID as its `currency`, the issuer the ID holds as its `issuer`, its amounts in the ledger's integer units, never scaled, and `mpt_issuance_id` as its last key; no other payment has that key, and the CSV has its column only when a row of the page has one. `delivered_amount` is the existing rule (`DeliveredAmount`, else `delivered_amount`, else `Amount`), so a partial MPT payment recorded before the amendment `fixMPTDeliveredAmount` (none is known) would report `Amount`, and the `fee` of its [transfer](#get-v2mptissuanceidtransfers) would then be 0.
+
 Errors, in the order they are checked: 400 `invalid issuer address`, `invalid start date format`, `invalid end date format`,
-then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on Xahau), `issuer is required`;
+then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on Xahau), `issuer is required`, `issuer does not match mpt issuance`;
 `invalid marker`; 500 `unable to retrieve payments`.
 
 **Differences from data.ripple.com**
@@ -525,7 +529,6 @@ then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on 
 - The response has no top-level `currency`/`issuer` (the original's route read them from a result that never had them).
 - The CSV file name is built from the request (`payments - USD rIssuer.csv`); the original's formula repeated the currency and
   in practice produced `payments  .csv`.
-- Payments with MPT amounts are not payments of this API.
 - A missing `end` is open-ended (the original used the time of the request).
 - A **delegated** Payment (a `Delegate` signs it for the sender and pays its fee) has its fee booked to the delegate: the native `source_balance_changes` of the sender are the
   amount alone, and a delegate that is the `destination` (a sweep to itself) has what arrived as its native `destination_balance_changes`, the fee not taken out (none
@@ -1050,7 +1053,7 @@ first; the fee of a transaction comes first, as a `transaction_cost` row without
 | --- | --- | --- |
 | `currency` | all | Upper-cased. |
 | `counterparty` (alias `issuer`) | all | Not allowed together with the native currency. |
-| `change_type` (alias `type`) | all | One of `transaction_cost`, `exchange`, `intermediary`, `payment_source`, `payment_destination`, `escrow_create`, `escrow_cancel`, `escrow_finish`, `paychannel_fund`, `paychannel_payout`. |
+| `change_type` (alias `type`) | all | One of `transaction_cost`, `exchange`, `intermediary`, `payment_source`, `payment_destination`, `escrow_create`, `escrow_cancel`, `escrow_finish`, `paychannel_fund`, `paychannel_payout`, `clawback`. |
 | `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | |
 | `format` | json | `csv`: file `<address> - balance changes[ <CURRENCY>].csv`. |
 
@@ -1063,13 +1066,15 @@ first; the fee of a transaction comes first, as a `transaction_cost` row without
 
 Key order: `amount_change, escrow_balance_change?, final_balance, node_index?, paychannel_final_balance?,
 paychannel_fund_change?, paychannel_fund_final_balance?, tx_index, change_type?, counterparty?, currency, escrow_counterparty?,
-executed_time, ledger_index, paychannel_counterparty?, tx_hash`. The native currency has no `counterparty`; the fee row has no
+executed_time, ledger_index, paychannel_counterparty?, tx_hash, mpt_issuance_id?`. The native currency has no `counterparty`; the fee row has no
 `node_index`; `change_type` is absent on changes of transaction types the original never classified; the `escrow_*` and
 `paychannel_*` fields appear only on the changes of a party to an escrow or payment channel. Amounts are exact decimal strings.
 
+The change of an **MPT** has the issuance ID as its `currency` (`currency=` takes it in any case) and `mpt_issuance_id` as its last key; no other change has that key, and the CSV has its column only when a row of the page has one. Its amounts are the ledger's integer units, never scaled. A holder's row has the issuer as its `counterparty`, and the issuer's mirror row, with the sign reversed, has the holder: `final_balance` of the mirror is minus what that holder holds, as on a trust line. `clawback` is the type of the rows of a `Clawback`, of an MPT or of an issued token, from the re-ingest of its ledger on (parser version 10).
+
 Errors: 400 `invalid start date format`, `invalid end date format`, `counterparty cannot be specified for XRP` (`XAH`),
 `invalid change_type - use: transaction_cost, exchange, intermediary, payment_source, payment_destination, escrow_create,
-escrow_cancel, escrow_finish, paychannel_fund, paychannel_payout`, `invalid marker`; 500 `unable to retrieve balance changes`.
+escrow_cancel, escrow_finish, paychannel_fund, paychannel_payout, clawback`, `invalid marker`; 500 `unable to retrieve balance changes`.
 
 **Differences**: the filter accepts the five escrow/payment-channel change types as well as the original's five (the rows carry
 them and the original rejected them, so no client could filter on a type it was served); balance changes are produced for
@@ -1452,8 +1457,8 @@ rollups.
 **Values.** The value of an amount follows the rule of `reports` and `stats/value`: the native currency is worth itself, an issued
 amount is worth the amount over the rate of its asset on its UTC day (units of the asset per native coin, as
 [`/v2/exchange_rates`](#get-v2exchange_ratesbasecounter) gives it in strict mode), the quotient cut to 17 significant digits for
-each group and day; an asset without a rate that day, or with a rate of 0, is worth 0 (so are LP tokens and any other asset with no
-DEX rate); sums of values are exact. For a balance change the asset is `(currency, counterparty)`, or `(currency, the account
+each group and day; an asset without a rate that day, or with a rate of 0, is worth 0 (so are LP tokens, MPTs and any other asset with no
+DEX rate: an MPT has its line in these routes, in `stats` and in `reports`, its amounts in raw integer units and its value 0); sums of values are exact. For a balance change the asset is `(currency, counterparty)`, or `(currency, the account
 itself)` where the change's balance is below 0: the account owes on that line, so what it moves is its own IOU. The rates of closed
 days are precomputed once a day for every asset (`native_rates_daily`); today, and yesterday until the ingest has passed it, are
 worked out on read and kept for 60 seconds, so a value of those days may be a minute old. Where a closed day has no stored rate yet
@@ -1534,7 +1539,7 @@ The sums of the balance changes of the account in the window, by change type, wi
 | `interval` | none | Without it the `rows` are per change type and asset; with `day`, `week` or `month` they are per bucket and change type. |
 | `format` | json | `csv`: file `<address> - balance change totals.csv`, the `rows`. |
 
-Every balance change of the window counts once, the fee rows (`transaction_cost`) included. A **change type** is one of the ten of
+Every balance change of the window counts once, the fee rows (`transaction_cost`) included. A **change type** is one of the eleven of
 `balance_changes`; the changes of transaction types the original never classified have none, and are grouped without a `change_type`
 key (as the objects of `balance_changes` leave it out). `in` is the sum of the positive changes, `out` the sum of the negative ones
 as a positive amount, `in_value` and `out_value` their values in the native currency (see Values above), `net_value` is `in_value -
@@ -1542,7 +1547,7 @@ out_value`, `count` the number of changes. An asset has no `issuer` key for the 
 `issuer` is the account itself.
 
 Change types come in this order: `transaction_cost`, `payment_destination`, `payment_source`, `exchange`, `intermediary`,
-`escrow_create`, `escrow_finish`, `escrow_cancel`, `paychannel_fund`, `paychannel_payout`, then the changes without one. `totals` has an
+`escrow_create`, `escrow_finish`, `escrow_cancel`, `paychannel_fund`, `paychannel_payout`, `clawback`, then the changes without one. `totals` has an
 entry for each type that has a change, in that order. `rows` without an `interval` are ordered by type, then by `in_value + out_value`,
 largest first, then by currency and issuer; with an `interval`, by date, then type, and only for the buckets and types that have a
 change.

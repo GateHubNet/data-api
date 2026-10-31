@@ -39,7 +39,7 @@ const NOBODY = 'rrrrUBy92h6worVCYERZcVCzgzgmHb17Dx';
 /** The 400 of a `change_type` that is none of the types a row can have (R59: the five of the original and the five of escrows and payment channels). */
 const INVALID_CHANGE_TYPE =
   'invalid change_type - use: transaction_cost, exchange, intermediary, payment_source, payment_destination, ' +
-  'escrow_create, escrow_cancel, escrow_finish, paychannel_fund, paychannel_payout';
+  'escrow_create, escrow_cancel, escrow_finish, paychannel_fund, paychannel_payout, clawback';
 
 interface Key {
   ledger_index: number;
@@ -1221,5 +1221,83 @@ describe('account balance changes API endpoint on the xahau-recorded ledgers', (
     const csv = await get(`${path(EVERNODE)}?format=csv&currency=evr&limit=5`);
     expect(csv.headers['content-disposition']).toBe(csvDisposition(`${EVERNODE} - balance changes EVR`));
     expect(csv.text.split('\n')).toHaveLength(1 + 5);
+  });
+});
+
+describe('account balance changes API endpoint on the recorded MPT ledgers', () => {
+  const seed = 'xrpl-mpt';
+  /** `clawback_full`: the issuer's and the holder's rows of one issuance, the payment that minted it and the clawback. */
+  const ID = '064E273A6D15D1F5614B4D4E3183F835BCD62E7F6FD9FFD8';
+  const ISSUER = 'rwA8orrVtNPuBykRvQdDJzRDQbe7CuxCiR';
+  const HOLDER = 'rMNysCkYEX9L3SrSPqavVVXYFT2v5CEVpo';
+  const rows = [...fixtureBalanceChanges(seed)].sort((a, b) => byKey(a, b) || (a.account < b.account ? -1 : 1));
+  const withId = (r: BalanceChangesRow): Record<string, unknown> => ({
+    ...changeOf(r),
+    ...(/^[0-9A-F]{48}$/.test(r.currency) && { mpt_issuance_id: r.currency }),
+  });
+  const mine = (account: string): BalanceChangesRow[] => rows.filter((r) => r.account === account);
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  beforeAll(async () => {
+    h = await startHarness({ seed, env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('lists the holder rows and their mirrors, mpt_issuance_id the last key', async () => {
+    for (const account of [HOLDER, ISSUER]) {
+      const res = await api.ok<ListBody>(`${path(account)}?currency=${ID.toLowerCase()}`, 'balance_changes');
+      const expected = mine(account).filter((r) => r.currency === ID);
+      expect(expected).toHaveLength(2);
+      expect(res.body.balance_changes).toEqual(expected.map(withId));
+      for (const change of res.body.balance_changes) {
+        expect(Object.keys(change).slice(-2)).toEqual(['tx_hash', 'mpt_issuance_id']);
+        expect(change.mpt_issuance_id).toBe(ID);
+      }
+    }
+    // the holder's and the issuer's changes of the mint and of the clawback mirror each other
+    const holder = await api.ok<ListBody>(`${path(HOLDER)}?currency=${ID}`, 'balance_changes');
+    expect(holder.body.balance_changes.map((c: Change) => [c.change_type, c.counterparty, c.amount_change])).toEqual([
+      ['payment_destination', ISSUER, '1'],
+      ['clawback', ISSUER, '-1'],
+    ]);
+  });
+
+  it('a list that holds native and MPT rows has mpt_issuance_id on the MPT rows alone', async () => {
+    const res = await api.ok<ListBody>(`${path(ISSUER)}?limit=1000`, 'balance_changes');
+    expect(res.body.balance_changes).toEqual(mine(ISSUER).map(withId));
+    expect(res.body.balance_changes.filter((c: Change) => c.currency === 'XRP').length).toBeGreaterThan(0);
+    expect(res.body.balance_changes.filter((c: Change) => c.currency === 'XRP' && 'mpt_issuance_id' in c)).toEqual([]);
+  });
+
+  it('accepts change_type=clawback, of an MPT and of an issued token, and lists it in the message', async () => {
+    const res = await api.ok<ListBody>(`${path(HOLDER)}?change_type=clawback`, 'balance_changes');
+    expect(res.body.balance_changes).toEqual(
+      mine(HOLDER)
+        .filter((r) => r.change_type === 'clawback')
+        .map(withId),
+    );
+    expect(res.body.count).toBe(1);
+    // the alias too
+    expect((await get(`${path(HOLDER)}?type=clawback`)).body.count).toBe(1);
+    // `clawback_issued`: a row with a currency code, with no mpt_issuance_id
+    const issued = rows.filter((r) => r.change_type === 'clawback' && r.currency.length !== 48);
+    expect(issued).toHaveLength(2);
+    const holder = await api.ok<ListBody>(`${path(issued[0].account)}?change_type=clawback`, 'balance_changes');
+    expect(holder.body.balance_changes).toEqual([changeOf(issued[0])]);
+    const bad = await get(`${path(HOLDER)}?change_type=x`);
+    expect([bad.status, bad.body.message]).toEqual([400, INVALID_CHANGE_TYPE]);
+    expect(bad.body.message.endsWith(', clawback')).toBe(true);
+  });
+
+  it('the CSV has an mpt_issuance_id column only when a row of the page has one', async () => {
+    const mpt = await get(`${path(HOLDER)}?format=csv&currency=${ID}`);
+    expect(mpt.text.split('\n')[0].endsWith(',"tx_hash","mpt_issuance_id"')).toBe(true);
+    const native = await get(`${path(HOLDER)}?format=csv&currency=XRP`);
+    expect(native.text.split('\n')[0]).not.toContain('mpt_issuance_id');
   });
 });

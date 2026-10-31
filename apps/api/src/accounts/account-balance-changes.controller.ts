@@ -17,9 +17,9 @@ import { BalanceChangeObject } from './balance-change-object';
 /**
  * The `change_type`s that can be asked for (R59). `types` of `accountBalanceChanges.js` lists the first five, but the
  * rows carry five more (the parser writes `escrow_*` and `paychannel_*` exactly as the original's did) and the original
- * answered `invalid change_type` for them, so no client could ever filter on a type it was served. All ten are accepted;
- * the message lists them, and `fee` / `network fee` (what the original stored for the fee, which the filter never
- * found) and other spellings are still rejected.
+ * answered `invalid change_type` for them, so no client could ever filter on a type it was served. All ten are accepted,
+ * and `clawback`, the type of the rows of a `Clawback` (parser version 10); the message lists them, and `fee` / `network fee`
+ * (what the original stored for the fee, which the filter never found) and other spellings are still rejected.
  */
 const CHANGE_TYPES = [
   'transaction_cost',
@@ -32,6 +32,7 @@ const CHANGE_TYPES = [
   'escrow_finish',
   'paychannel_fund',
   'paychannel_payout',
+  'clawback',
 ];
 
 /**
@@ -68,10 +69,11 @@ export class AccountBalanceChangesController {
   @ApiOperation({
     summary: 'Get the balance changes of an account',
     description:
-      'Every change of a balance of the account (the native currency and its trust lines) made by the transactions of ' +
+      'Every change of a balance of the account (the native currency, its trust lines and its MPTs) made by the transactions of ' +
       'the ledgers that closed between `start` and `end`, oldest first; the fee of a transaction comes first, as a ' +
       '`transaction_cost` without a `node_index`. `currency`, `counterparty` (alias `issuer`) and `change_type` (alias ' +
-      '`type`) keep the changes of that currency, against that counterparty, of that kind. `format=csv` gives the ' +
+      '`type`) keep the changes of that currency, against that counterparty, of that kind. The change of an MPT has the ' +
+      'issuance ID as its `currency`, its amounts in integer units, and `mpt_issuance_id` as its last key. `format=csv` gives the ' +
       'changes as a CSV file.',
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })

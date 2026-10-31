@@ -47,14 +47,16 @@ export class PaymentsController {
     summary: 'Get payments',
     description:
       'The `Payment` transactions between two different accounts of the ledgers that closed between `start` and ' +
-      '`end`, oldest first; with a currency in the path, only the payments of that currency. `format=csv` gives the ' +
+      '`end`, oldest first; with a currency in the path, only the payments of that currency. An MPT payment has the issuance ' +
+      'ID as its `currency`, its amounts in integer units, and `mpt_issuance_id` as its last key. `format=csv` gives the ' +
       'payments as a flat CSV file.',
   })
   @ApiParam({
     name: 'currency',
     required: false,
     description:
-      'A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`, or the native currency alone. Omitted: all currencies.',
+      'A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`, the native currency alone, or an MPT: its 48 hex ' +
+      'digits, with or without its issuer. Omitted: all currencies.',
   })
   @ApiQuery({ name: 'start', required: false, description: 'Start time. Default: the beginning.' })
   @ApiQuery({ name: 'end', required: false, description: 'End time. Default: the newest ledger.' })
