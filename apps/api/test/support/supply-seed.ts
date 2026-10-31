@@ -1,4 +1,13 @@
-import { amendmentId, NetworkSupplyRow, PARSER_VERSION, Table } from '@gatehub/data-api-shared';
+import {
+  amendmentId,
+  GenesisMintsRow,
+  ImportsRow,
+  LedgersRow,
+  NetworkSupplyRow,
+  PARSER_VERSION,
+  RewardClaimsRow,
+  Table,
+} from '@gatehub/data-api-shared';
 import type { Coverage } from '../../src/common/feature-coverage.service';
 import type { Harness } from '../harness';
 import { insertState, ledgerRow } from './validators-seed';
@@ -179,4 +188,184 @@ export async function seedAmongOlderSnapshots(h: Harness, rows: NetworkSupplyRow
   );
   await h.ch.command(`OPTIMIZE TABLE ${Table.NetworkSupply} FINAL`);
   await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.NetworkSupply}`);
+}
+
+// =====================================================================================================================
+// the minted world (Xahau, `supply-minted.e2e-spec.ts`)
+// =====================================================================================================================
+
+/**
+ * Five UTC days of Xahau, the ledgers that closed in them and the mints of three of them, written by hand: what the ingest of parser
+ * 9 would have stored (`genesis_mints`, `imports`, `reward_claims`), in drops. Ledger 1 is Xahau's: its close time is 0
+ * (`docs/operations.md`), and the coverage of every feature starts at it (`NetworkProfile.firstLedger`).
+ *
+ *   day         ledgers      mints (drops)
+ *   2026-10-20  2, 3         a reward of 1,500,000 and one of 250,000 (a claim is their parent), an import of 2,000,000
+ *   2026-10-21  4, 5         none
+ *   2026-10-22  6            a GenesisMint of 5,000,000, and one of 1,000,000 whose parent is no claim
+ *   2026-10-23  7, 8         none
+ *   2026-10-24  9, 10        a reward of 3,000,000, an import of 7 and a GenesisMint of 2^53 + 1
+ *
+ * The last day is the running one: the newest ledger, 10, closed in it.
+ */
+
+/** The days of the world, as UTC dates. */
+export const MINTED_DAYS = ['2026-10-20', '2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24'] as const;
+
+/** 2^53 + 1: the one amount no `number` holds. */
+export const BEYOND_2_53 = '9007199254740993';
+
+/** A ledger of the world: its index and when it closed (`0`: no close time, as Xahau's ledger 1). */
+export interface WorldLedger {
+  index: number;
+  closed: string | 0;
+}
+
+export const MINTED_LEDGERS: WorldLedger[] = [
+  { index: 1, closed: 0 },
+  { index: 2, closed: '2026-10-20T00:00:05Z' },
+  { index: 3, closed: '2026-10-20T12:00:00Z' },
+  { index: 4, closed: '2026-10-21T00:00:00Z' }, // the first second of a day
+  { index: 5, closed: '2026-10-21T23:59:59Z' }, // the last second of a day
+  { index: 6, closed: '2026-10-22T06:00:00Z' },
+  { index: 7, closed: '2026-10-23T00:00:03Z' },
+  { index: 8, closed: '2026-10-23T18:30:00Z' },
+  { index: 9, closed: '2026-10-24T09:00:00Z' },
+  { index: 10, closed: '2026-10-24T09:00:04Z' },
+];
+
+/** The unix seconds of an ISO time, `0` for a ledger without one. */
+const closeOf = (closed: string | 0): number => (closed === 0 ? 0 : unix(closed));
+
+/** The close time of a ledger of the world (or of one a test adds). */
+const closeTimeOfLedger = (index: number, extra: WorldLedger[]): number => {
+  const found = [...MINTED_LEDGERS, ...extra].find((ledger) => ledger.index === index);
+  if (found === undefined) throw new Error(`the minted world has no ledger ${index}`);
+  return closeOf(found.closed);
+};
+
+const claim = (ledger: number, hash: string): RewardClaimsRow => ({
+  ledger_index: ledger,
+  tx_index: 0,
+  tx_hash: hash,
+  close_time: closeTimeOfLedger(ledger, []),
+  account: 'rMintedWorldClaimer',
+  issuer: '',
+  opt_out: 0,
+});
+
+/** A `GenesisMint` entry; a `parent` of `''` has no `EmitDetails`. */
+export const genesisMint = (
+  ledger: number,
+  txIndex: number,
+  mintIndex: number,
+  amount: string | number,
+  parent: string,
+  extra: WorldLedger[] = [],
+): GenesisMintsRow => ({
+  ledger_index: ledger,
+  tx_index: txIndex,
+  mint_index: mintIndex,
+  tx_hash: `MINT-${ledger}-${txIndex}`,
+  close_time: closeTimeOfLedger(ledger, extra),
+  destination: 'rMintedWorldDestination',
+  amount,
+  parent_tx_hash: parent,
+  emit_hook_hash: parent === '' ? '' : 'AAAA',
+});
+
+export const importOf = (
+  ledger: number,
+  txIndex: number,
+  minted: string | number,
+  extra: WorldLedger[] = [],
+): ImportsRow => ({
+  ledger_index: ledger,
+  tx_index: txIndex,
+  tx_hash: `IMPORT-${ledger}-${txIndex}`,
+  close_time: closeTimeOfLedger(ledger, extra),
+  account: 'rMintedWorldImporter',
+  minted,
+  account_created: 0,
+});
+
+/** The claims of the world: the parents of its rewards. */
+export const MINTED_CLAIMS: RewardClaimsRow[] = [claim(2, 'CLAIM-A'), claim(9, 'CLAIM-B')];
+
+export const MINTED_GENESIS_MINTS: GenesisMintsRow[] = [
+  genesisMint(3, 0, 0, 1_500_000, 'CLAIM-A'),
+  genesisMint(3, 0, 1, 250_000, 'CLAIM-A'),
+  genesisMint(6, 0, 0, 5_000_000, ''),
+  genesisMint(6, 1, 0, 1_000_000, 'A-TRANSACTION-THAT-IS-NOT-A-CLAIM'),
+  genesisMint(10, 0, 0, 3_000_000, 'CLAIM-B'),
+  genesisMint(10, 2, 0, BEYOND_2_53, ''),
+];
+
+export const MINTED_IMPORTS: ImportsRow[] = [importOf(3, 1, 2_000_000), importOf(10, 1, 7)];
+
+/** One row of the answer, as the route serves it. */
+export interface MintedRowText {
+  date: string;
+  amount: string;
+  rewards: string;
+  import: string;
+  genesis_mint: string;
+}
+
+const dayRow = (date: string, amount: string, rewards: string, imported: string, genesis: string): MintedRowText => ({
+  date: `${date}T00:00:00Z`,
+  amount,
+  rewards,
+  import: imported,
+  genesis_mint: genesis,
+});
+
+/** The rows of the world, oldest day first: every day is there, the days without a mint with zeros. */
+export const MINTED_ROWS: MintedRowText[] = [
+  dayRow('2026-10-20', '3.75', '1.75', '2', '0'),
+  dayRow('2026-10-21', '0', '0', '0', '0'),
+  dayRow('2026-10-22', '6', '0', '0', '6'),
+  dayRow('2026-10-23', '0', '0', '0', '0'),
+  // 3,000,000 + 7 + 9,007,199,254,740,993 drops: past 2^53, the sum is exact
+  dayRow('2026-10-24', '9007199257.741', '3', '0.000007', '9007199254.740993'),
+];
+
+/** The ledgers as `ledgers` rows: `parser` is the parser that wrote the ledgers up to `olderParserThrough` (8, before the mint tables). */
+function ledgerRows(ledgers: WorldLedger[], olderParserThrough: number): LedgersRow[] {
+  return ledgers.map((ledger) => ({
+    ...ledgerRow(ledger.index, closeOf(ledger.closed)),
+    parser_version: ledger.index <= olderParserThrough ? 8 : PARSER_VERSION,
+  }));
+}
+
+/**
+ * Writes the minted world: its ledgers and its mint rows. With `olderParserThrough` the ledgers up to it were written by parser 8, which
+ * has no mint tables: they are stored, and have no mint rows, and the coverage of the mints starts above them.
+ */
+export async function seedMintedWorld(h: Harness, options: { olderParserThrough?: number } = {}): Promise<void> {
+  const older = options.olderParserThrough ?? 0;
+  await h.ch.insert(Table.Ledgers, ledgerRows(MINTED_LEDGERS, older));
+  const written = <T extends { ledger_index: number }>(rows: T[]): T[] =>
+    rows.filter((row) => row.ledger_index > older);
+  await h.ch.insert(Table.RewardClaims, written(MINTED_CLAIMS));
+  await h.ch.insert(Table.GenesisMints, written(MINTED_GENESIS_MINTS));
+  await h.ch.insert(Table.Imports, written(MINTED_IMPORTS));
+}
+
+/** Writes more ledgers of the current parser (a ledger the live ingest committed after the world was written). */
+export async function seedMoreLedgers(h: Harness, ledgers: WorldLedger[]): Promise<void> {
+  await h.ch.insert(Table.Ledgers, ledgerRows(ledgers, 0));
+}
+
+/**
+ * `days` daily ledgers from the day `first` (`YYYY-MM-DD`), one ledger a day at noon, and Xahau's ledger 1 with no close time: the
+ * ledgers of a history long enough to fill pages. No mint rows.
+ */
+export async function seedDailyLedgers(h: Harness, first: string, days: number): Promise<void> {
+  const start = unix(`${first}T12:00:00Z`);
+  const rows: LedgersRow[] = [{ ...ledgerRow(1, 0), parser_version: PARSER_VERSION }];
+  for (let i = 0; i < days; i++) {
+    rows.push({ ...ledgerRow(2 + i, start + i * 86_400), parser_version: PARSER_VERSION });
+  }
+  await h.ch.insert(Table.Ledgers, rows);
 }

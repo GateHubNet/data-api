@@ -1,6 +1,7 @@
-import { dropsToNative, NetworkSupplyRow } from '@gatehub/data-api-shared';
+import { dropsToNative, MintSums, NetworkSupplyRow } from '@gatehub/data-api-shared';
 import type { Coverage } from '../common/feature-coverage.service';
 import { fmtTime } from '../common/format';
+import type { KeysetKey } from '../common/pagination';
 
 /**
  * The answer of `GET /v2/network/supply` (spec 5.1): the newest snapshot of `network_supply`, with the keys in the order the spec
@@ -17,6 +18,8 @@ import { fmtTime } from '../common/format';
  *    on Xahau, which have a `coverage`.
  * A part that is read from history ends with its `coverage` (`FeatureCoverageService`): the features it is asked of are
  * `supplyFeaturesOf`'s, and `supplyObject` takes them by name.
+ *
+ * The answer of `GET /v2/network/supply/minted` (spec 5.2) is here as well: its key orders and the row of a day (`mintedRow`).
  */
 
 /** The keys of the answer, in order. */
@@ -41,6 +44,16 @@ export const ESCROWED_KEYS = ['amount', 'escrows', 'coverage'] as const;
 export const CIRCULATING_KEYS = ['amount', 'coverage'] as const;
 export const AMM_KEYS = ['amount', 'pools', 'coverage'] as const;
 export const RESERVES_KEYS = ['amount', 'accounts', 'owner_count', 'base', 'increment', 'coverage'] as const;
+
+/** The keys of the answer of `GET /v2/network/supply/minted`, in order: `coverage` right after `result`, the rows last. */
+export const MINTED_BODY_KEYS = ['result', 'coverage', 'marker', 'count', 'rows'] as const;
+/** The keys of a day of that answer, in order: the day's sum, then its three sources. A row has every key. */
+export const MINTED_ROW_KEYS = ['date', 'amount', 'rewards', 'import', 'genesis_mint'] as const;
+/**
+ * The key of a day, and so its marker: the start of the day in unix seconds. A keyset (what `decodeMarker` checks a marker
+ * against), not a key order: it is not one of the `*_KEYS` lists the reference names.
+ */
+export const MINTED_DAY_KEYSET: KeysetKey[] = [{ column: 'day', type: 'DateTime' }];
 
 /**
  * The coverage of each feature the parts are read from, by the name it is registered under in `COVERAGE_FEATURES`. `escrows`
@@ -90,6 +103,24 @@ export interface ReservesPart {
   base: string;
   increment: string;
   coverage: Coverage;
+}
+
+/** One UTC day of the minted answer: the sum of the three sources, and each source, in whole units of the native currency. */
+export interface MintedRow {
+  date: string;
+  amount: string;
+  rewards: string;
+  import: string;
+  genesis_mint: string;
+}
+
+/** The answer of `GET /v2/network/supply/minted`: `marker` is there only when the page has a next one. */
+export interface MintedAnswer {
+  result: 'success';
+  coverage: Coverage;
+  marker?: string;
+  count: number;
+  rows: MintedRow[];
 }
 
 export interface SupplyAnswer {
@@ -189,5 +220,19 @@ export function supplyObject(row: NetworkSupplyRow, currency: 'XRP' | 'XAH', cov
         coverage: stated(coverages, 'account_states'),
       },
     }),
+  };
+}
+
+/**
+ * The row of the UTC day that starts at `dayStart` (unix seconds): `amount` is the sum of the three sources, all added in `bigint`
+ * drops and turned to whole units once each (a day's sum can pass 2^53 drops, and no float is made of it).
+ */
+export function mintedRow(dayStart: number, sums: MintSums): MintedRow {
+  return {
+    date: fmtTime(dayStart),
+    amount: native(sums.rewards + sums.import + sums.genesis_mint),
+    rewards: native(sums.rewards),
+    import: native(sums.import),
+    genesis_mint: native(sums.genesis_mint),
   };
 }

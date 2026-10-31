@@ -15,7 +15,8 @@ import { VolumeService } from './volume.service';
  * `GET /v2/network/payment_volume`, `GET /v2/network/amm_volume` and `GET /v2/network/nft_volume`. The volumes convert to a
  * display currency with the `RatesService` of `RatesModule`. `GET /v2/network/markets` reads the `markets_live` sets and converts
  * the same way. `nft_volume` states the `coverage` of the NFT feature (`FeatureCoverageService`, global). `GET /v2/network/supply`
- * reads the newest snapshot of the `supply` job, with the coverage of each part of it that is read from history. The module exports the
+ * reads the newest snapshot of the `supply` job, with the coverage of each part of it that is read from history, and
+ * `GET /v2/network/supply/minted` lists the minting of a network that mints, a day to a row, from the mint tables. The module exports the
  * `MarketsService`: `TokenMarkets` of the `TokensModule` reads the newest `include` sets through it (`newestSet`).
  */
 @Module({

@@ -507,6 +507,15 @@ A day is a row when it starts within `start` and `end`, the index has a ledger i
 the day `coverage.from_ledger_index` closed in, unless that ledger is `firstLedger`): a covered day with no mint is a row of zeros. The
 newest day is the running one, summed so far.
 
+*Amended 2026-10-30 by the D7 Task 10 build (owner note): the first covered day is never before the day of the first stored ledger at or
+after `coverage.from_ledger_index` whose close time is above 0 (one read by the key, `LIMIT 2`, the second row a spare). Xahau's ledger 1 is
+stored with the close time 0, 1970-01-01 (`docs/operations.md`, `docs/backfill.md`), and `NetworkProfile.firstLedger` is 1, so with the coverage
+at the first ledger the days would have started in 1970: about 19,700 rows of zeros, about 99 pages of 200 in the default order, before the
+network's first real day. With that rule "the index has a ledger in it" (above) is replaced by Ruling 5: every day from the first covered one to
+the day of the newest ledger is a row. `start`, `end` and the marker only narrow that span (a `marker` is a keyset on the day's start: the days
+after it, before it when `descending`, whether or not it is a day start), and the days of a page are worked out from the bounds of the span, the
+page's `limit + 1` of them, never listed whole. The ledgers of a page are one range, from its oldest day to the end of its newest, in both orders.*
+
 ```json
 { "result": "success", "coverage": { "from_ledger_index": 2, "complete": true }, "marker": "…", "count": 2,
   "rows": [
@@ -524,6 +533,12 @@ newest day is the running one, summed so far.
   `invalid interval`, `invalid marker`; 500 `unable to retrieve minted supply`.
 - **Query bound**: the P6 key ranges of the window's ledgers in `genesis_mints`, `imports` and `reward_claims` (256 ledgers more), at most
   1,000,000 ledgers a read.
+  *Amended 2026-10-30 by the D7 Task 10 build: the test is `apps/api/test/supply-minted.e2e-spec.ts`, and its bound is the form of the other
+  bound tests, the rows the read needs plus two granules for each part. Each mint table is one part, with a bulk on either side of the page's
+  ledgers (60,000 mints, 20,000 imports and claims on the day before and on the day after), and a page of two days reads 16,384 rows in the
+  mint query (the mints and the claims of the 256 ledgers before the range; 37,224 allowed) and 8,192 in the imports query (18,384 allowed).
+  Resolving the whole span in place of the page's days reads 164,200, and fails it. The first covered day is one read of `ledgers` by the key
+  from `from_ledger_index`: 11 rows of a table of 40,011 (32,770 allowed).*
 
 ### 5.3 Documentation of the wire
 

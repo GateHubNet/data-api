@@ -1831,7 +1831,7 @@ Errors: the pair errors of the exchanges route, then 400 `invalid period - use: 
 
 ## Network
 
-`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`, and `nft_volume` the same with `coverage` after `result`. `marker` is present only when there is a next page. `markets` and `supply` have an object of their own, described with each route.
+`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`, and `nft_volume` the same with `coverage` after `result`. `marker` is present only when there is a next page. `markets` and `supply` have an object of their own, described with each route, and `supply/minted` is a list like `nft_volume`'s, `coverage` after `result`.
 
 ### `GET /v2/network/fees`
 
@@ -2451,6 +2451,75 @@ On Xahau:
     "coverage": { "from_ledger_index": 1, "complete": true }
   }
 }
+```
+
+### `GET /v2/network/supply/minted`
+
+The native currency created on each UTC day, by source, on a network that mints (Xahau): the history behind the `minted` part of [`GET /v2/network/supply`](#get-v2networksupply), a day to a row. It is an **addition** (not in the original; see
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#2-endpoints-kept-added-dropped)) and uses the contract layer of every route (API key, rate limit, `Cache-Control: private, max-age=60`, errors
+`{"result":"error","message"}`). The design is in the [spec](superpowers/specs/2026-10-24-supply-design.md).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `interval` | `day` | `day` is the only one; an empty value is `day`, anything else answers 400 `invalid interval`. |
+| `start` | the first day the mints are covered for | |
+| `end` | the newest ledger | |
+| `descending` | false | |
+| `limit` | 200 (max 1000) | |
+| `marker` | | The start of the last row's day, in unix seconds. |
+| `format` | json | `csv`: file `network minted.csv`. |
+
+- **A row is a UTC day.** `date` is its start (`YYYY-MM-DDT00:00:00Z`) and `amount` the sum of the three sources, which are the ones of the `minted` part of the supply: `rewards` (what a `ClaimReward` was paid), `import` (what an `Import` credited) and
+  `genesis_mint` (every other `GenesisMint`). Amounts are exact decimal text in whole units of the native currency (`"3.75"`, `"0.000007"`: drops divided by a million, trailing zeros dropped), added in drops, so a day past 2^53 drops is exact.
+- **Which days.** Every day from the first one whose ledgers the index holds whole, to the day of the newest ledger, is a row. A day on which nothing was minted is a row of zeros, so the list has no gaps, and the newest day is the running one, summed so far. The
+  first of them is the day **after** the one `coverage.from_ledger_index` closed in, which has ledgers before it that were stored without their mints (the ingest of parser version 9 writes them, [backfill](backfill.md)); when the coverage starts at the first
+  ledger of the network, 1, it is the day of the first ledger that has a close time: Xahau's ledger 1 is stored with the close time 0 (1970-01-01) and is no day. `start` and `end` only narrow the days: a day is a row when it **starts** at or after `start` and before the
+  end of the period `end` names (`end=2026-10-22` includes the 22nd), and a day whose coverage is missing is not a row, whatever `start` is.
+- **Coverage.** `coverage` stands right after `result`: the coverage of the feature `mints` (parser version 9; [Coverage](#coverage)). `from_ledger_index` is where the mints are indexed from, and `complete` says whether that is back to the network's first
+  ledger, so a `false` means the currency minted before it is in no row. With no ledger stored it is `{ "complete": false }` and the list is empty.
+- **Pages.** `marker` is the start of the last row's day and is there only when there is a next page; the next page begins with the day after it (before it, when `descending`). The `Link` header carries the URL of the next page.
+- **A network that cannot mint** (the XRP Ledger and its testnet) answers `coverage` with `complete` true, `count` 0 and `rows` `[]`: there is nothing to be missing. No mint table is read.
+- **CSV.** The columns are the keys of a row, in order: `date, amount, rewards, import, genesis_mint` (a row has every key). `coverage` and `marker` are not in the file; an empty page is an empty file.
+- **Errors**, checked in this order and before anything is read: 400 `invalid start date format`, `invalid end date format`, `invalid interval`, `invalid marker`; then 401 and 429 as everywhere, and 500 `unable to retrieve minted supply`.
+
+**The examples** are answers of the end-to-end suite (`apps/api/test/supply-minted.e2e-spec.ts`, key order included; the ledgers and the mints are written by hand, `apps/api/test/support/supply-seed.ts`, with made-up figures): five days on Xahau from ledger
+1, mints on three of them, read with `limit=3`. The first page of a list has a `marker`, and its CSV is the three rows.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer.
+
+Keys of the minted answer, in order: `result, coverage, marker?, count, rows`.
+
+Keys of a day row, in order: `date, amount, rewards, import, genesis_mint`.
+
+On Xahau, `GET /v2/network/supply/minted?limit=3`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 1, "complete": true },
+  "marker": "WzE3OTI2MjcyMDBd",
+  "count": 3,
+  "rows": [
+    { "date": "2026-10-20T00:00:00Z", "amount": "3.75", "rewards": "1.75", "import": "2", "genesis_mint": "0" },
+    { "date": "2026-10-21T00:00:00Z", "amount": "0", "rewards": "0", "import": "0", "genesis_mint": "0" },
+    { "date": "2026-10-22T00:00:00Z", "amount": "6", "rewards": "0", "import": "0", "genesis_mint": "6" }
+  ]
+}
+```
+
+The same page as a CSV file, `GET /v2/network/supply/minted?limit=3&format=csv`:
+
+```csv
+"date","amount","rewards","import","genesis_mint"
+"2026-10-20T00:00:00Z","3.75","1.75","2","0"
+"2026-10-21T00:00:00Z","0","0","0","0"
+"2026-10-22T00:00:00Z","6","0","0","6"
+```
+
+On the XRP Ledger, which mints nothing:
+
+```json
+{ "result": "success", "coverage": { "from_ledger_index": 32570, "complete": true }, "count": 0, "rows": [] }
 ```
 
 ---

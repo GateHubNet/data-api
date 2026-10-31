@@ -5,7 +5,11 @@ import {
   BURNED_KEYS,
   CIRCULATING_KEYS,
   ESCROWED_KEYS,
+  MINTED_BODY_KEYS,
+  MINTED_DAY_KEYSET,
   MINTED_KEYS,
+  MINTED_ROW_KEYS,
+  mintedRow,
   RESERVES_KEYS,
   SUPPLY_KEYS,
   SupplyCoverages,
@@ -295,5 +299,76 @@ describe('supplyFeaturesOf', () => {
       ].filter((coverage) => coverage !== undefined);
       expect(used).toHaveLength(supplyFeaturesOf(row, mints).length);
     }
+  });
+});
+
+describe('the keys of the minted answer', () => {
+  it('are the orders of spec 5.2', () => {
+    // coverage right after result (D3's convention for lists), the rows last; a row has the sum first and then the three sources
+    expect([...MINTED_BODY_KEYS]).toEqual(['result', 'coverage', 'marker', 'count', 'rows']);
+    expect([...MINTED_ROW_KEYS]).toEqual(['date', 'amount', 'rewards', 'import', 'genesis_mint']);
+  });
+
+  it('page by the start of the day, in unix seconds', () => {
+    // a keyset, not a key order: the marker is the one value `day`, a DateTime
+    expect(MINTED_DAY_KEYSET).toEqual([{ column: 'day', type: 'DateTime' }]);
+  });
+});
+
+describe('mintedRow', () => {
+  const DAY_START = Date.parse('2026-10-22T00:00:00Z') / 1000;
+
+  it('answers the day in key order, the sum of the three sources first', () => {
+    const row = mintedRow(DAY_START, { rewards: 29_512_338_912n, import: 3_500_066_306n, genesis_mint: 0n });
+    expect(JSON.stringify(row)).toBe(
+      JSON.stringify({
+        date: '2026-10-22T00:00:00Z',
+        amount: '33012.405218',
+        rewards: '29512.338912',
+        import: '3500.066306',
+        genesis_mint: '0',
+      }),
+    );
+    expect(Object.keys(row)).toEqual([...MINTED_ROW_KEYS]);
+  });
+
+  it('answers a day without a mint as zeros', () => {
+    expect(mintedRow(DAY_START, { rewards: 0n, import: 0n, genesis_mint: 0n })).toEqual({
+      date: '2026-10-22T00:00:00Z',
+      amount: '0',
+      rewards: '0',
+      import: '0',
+      genesis_mint: '0',
+    });
+  });
+
+  it('drops trailing zeros and keeps a drop', () => {
+    const row = mintedRow(DAY_START, { rewards: 1_100_000n, import: 7n, genesis_mint: 40_000_000_000n });
+    expect([row.rewards, row.import, row.genesis_mint, row.amount]).toEqual([
+      '1.1',
+      '0.000007',
+      '40000',
+      '40001.100007',
+    ]);
+  });
+
+  it('adds the sources as bigints: sums past 2^53 are exact', () => {
+    // 2^53 + 1 drops of every source: no number holds one of them, and their sum is 3 × (2^53 + 1)
+    const big = 9_007_199_254_740_993n;
+    const row = mintedRow(DAY_START, { rewards: big, import: big, genesis_mint: big });
+    expect(row.rewards).toBe('9007199254.740993');
+    expect(row.amount).toBe('27021597764.222979');
+    expect(row.amount).toBe(
+      ((big * 3n) / 1_000_000n).toString() + '.' + ((big * 3n) % 1_000_000n).toString().padStart(6, '0'),
+    );
+  });
+
+  it('writes the date of a day in the middle of a year and of a leap day', () => {
+    const rows = [
+      Date.parse('2024-02-29T00:00:00Z') / 1000,
+      Date.parse('2023-12-31T00:00:00Z') / 1000,
+      Date.parse('2022-01-01T00:00:00Z') / 1000,
+    ].map((start) => mintedRow(start, { rewards: 0n, import: 0n, genesis_mint: 0n }).date);
+    expect(rows).toEqual(['2024-02-29T00:00:00Z', '2023-12-31T00:00:00Z', '2022-01-01T00:00:00Z']);
   });
 });
