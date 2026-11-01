@@ -10,13 +10,12 @@ import { ClickHouseService } from './clickhouse.service';
 @Module({})
 export class ClickHouseModule {
   static forRoot(config?: Partial<ClickHouseConfig>): DynamicModule {
-    const resolved: ClickHouseConfig = { ...clickHouseConfigFromEnv(), ...config };
+    // A caller that names the server needs no GH_CLICKHOUSE_URL.
+    const env = config?.url ? { ...process.env, GH_CLICKHOUSE_URL: config.url } : process.env;
+    const resolved: ClickHouseConfig = { ...clickHouseConfigFromEnv(env), ...config };
     return {
       module: ClickHouseModule,
-      providers: [
-        { provide: CLICKHOUSE_CONFIG, useValue: resolved },
-        ClickHouseService,
-      ],
+      providers: [{ provide: CLICKHOUSE_CONFIG, useValue: resolved }, ClickHouseService],
       exports: [ClickHouseService],
     };
   }

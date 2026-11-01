@@ -46,7 +46,18 @@ export function sharedDatabaseFromEnv(env: NodeJS.ProcessEnv = process.env): str
 }
 
 /**
- * Build the connection config from `env`. The database is `GH_CLICKHOUSE_DATABASE` when set, otherwise the network
+ * The server's address, which has no default: a tool started without it stops here, instead of reaching whatever listens on this
+ * machine's port 8123.
+ */
+function clickHouseUrlFromEnv(env: NodeJS.ProcessEnv): string {
+  const url = env.GH_CLICKHOUSE_URL?.trim();
+  if (!url)
+    throw new Error('GH_CLICKHOUSE_URL is not set: name the ClickHouse server, for example http://localhost:8123');
+  return url;
+}
+
+/**
+ * Build the connection config from `env`. The server is `GH_CLICKHOUSE_URL`, which is required. The database is `GH_CLICKHOUSE_DATABASE` when set, otherwise the network
  * profile's default (`xrpl`, `xahau`, `xrpl_testnet` or `xahau_testnet`); the profile defaults to the one selected by
  * `GH_NETWORK` in `env`.
  */
@@ -55,7 +66,7 @@ export function clickHouseConfigFromEnv(
   profile: NetworkProfile = getNetworkProfile(env.GH_NETWORK || undefined),
 ): ClickHouseConfig {
   return {
-    url: env.GH_CLICKHOUSE_URL ?? 'http://localhost:8123',
+    url: clickHouseUrlFromEnv(env),
     username: env.GH_CLICKHOUSE_USER ?? 'default',
     password: env.GH_CLICKHOUSE_PASSWORD ?? '',
     database: assertValidDatabaseName(env.GH_CLICKHOUSE_DATABASE ?? profile.defaultDatabase),

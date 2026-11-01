@@ -41,7 +41,8 @@ async function boot(
   for (const key of Object.keys(process.env)) {
     if (key.startsWith('GH_') && key !== 'GH_ENV') delete process.env[key];
   }
-  Object.assign(process.env, env);
+  // Required, and nothing here connects: the ClickHouse service is stubbed.
+  Object.assign(process.env, { GH_CLICKHOUSE_URL: 'http://127.0.0.1:1' }, env);
   try {
     let booted: Booted | undefined;
     await jest.isolateModulesAsync(async () => {

@@ -48,7 +48,7 @@ network, and the shared database that the apis of every network read ([ADR-0014]
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `GH_CLICKHOUSE_URL` | `http://localhost:8123` | HTTP interface of the server. |
+| `GH_CLICKHOUSE_URL` | none, required | HTTP interface of the server. Every app and tool refuses to start without it, so that none reaches whatever listens on its machine by accident. |
 | `GH_CLICKHOUSE_USER` | `default` | |
 | `GH_CLICKHOUSE_PASSWORD` | empty | A secret. |
 | `GH_CLICKHOUSE_DATABASE` | the database of the network's profile: `xrpl`, `xahau`, `xrpl_testnet`, `xahau_testnet` | Plain lowercase identifier (`^[a-z_][a-z0-9_]*$`): it is written into DDL. |

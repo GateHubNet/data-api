@@ -141,7 +141,7 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
  * `clickHouseConfigFromEnv()`. One job runs it, before the apis of every network start: two runners on one
  * `schema_migrations` would race.
  */
-export function runSharedMigrations(opts: Omit<MigrateOptions, 'schemaDir'> = {}): Promise<MigrateResult> {
+export async function runSharedMigrations(opts: Omit<MigrateOptions, 'schemaDir'> = {}): Promise<MigrateResult> {
   const config = opts.config ?? { ...clickHouseConfigFromEnv(), database: sharedDatabaseFromEnv() };
   return runMigrations({ ...opts, config, schemaDir: SHARED_SCHEMA_DIR });
 }

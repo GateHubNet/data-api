@@ -91,6 +91,7 @@ cp apps/syncer/.env.example apps/syncer/.env
 #   defaults: GH_NETWORK=xrpl; GH_NODE_ENDPOINTS is commented out in both examples, so the nodes are the public ones of the network (for
 #   xrpl wss://s2.ripple.com, Ripple's full-history server, then wss://xrplcluster.com); GH_API_KEYS is empty (no authentication)
 
+export GH_CLICKHOUSE_URL=http://localhost:8123  # required, with no default; ch:migrate reads no .env file
 pnpm ch:migrate                            # creates the database of GH_NETWORK (xrpl) and applies the schema
 pnpm ch:migrate:shared                     # creates the shared database (account names, labels) and applies its own schema
 
