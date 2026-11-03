@@ -1,0 +1,30 @@
+{
+  "info": {
+    "complete_ledgers": "32570-107873207",
+    "load_factor": 1,
+    "time": "2026-Oct-24 14:34:05.221454 UTC",
+    "uptime": 88281,
+    "clio_version": "2.8.0",
+    "libxrpl_version": "3.3.0",
+    "validated_ledger": {
+      "age": 4,
+      "hash": "39BA12EBABBD857FDCB662D1A6EF4AF6CBF6CC2B7762F0E88263386D6A852CE1",
+      "seq": 107873207,
+      "base_fee_xrp": 0.00001,
+      "reserve_base_xrp": 1,
+      "reserve_inc_xrp": 0.2
+    },
+    "cache": {
+      "size": 20118963,
+      "is_enabled": true,
+      "is_full": true,
+      "latest_ledger_seq": 107873207,
+      "object_hit_rate": 0.9795084595680237,
+      "successor_hit_rate": 0.5698252320289612
+    },
+    "validation_quorum": 28,
+    "rippled_version": "3.4.1",
+    "network_id": 0
+  },
+  "validated": true
+}

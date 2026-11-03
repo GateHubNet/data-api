@@ -46,6 +46,14 @@ export interface Drops {
 }
 
 /** The domain verification of a validator (spec 3.2). */
+/** What the `[[VALIDATORS]]` entry of a verified file says (D8): each absent when the file gives no valid value. */
+export interface TomlFacts {
+  readonly ownerCountry?: string;
+  readonly serverCountry?: string;
+  readonly network?: string;
+  readonly unl?: string;
+}
+
 export interface DomainState {
   readonly status: 'verified' | 'unverified' | 'pending';
   readonly reason?: string;
@@ -56,6 +64,8 @@ export interface DomainState {
   /** The last success. */
   readonly verified?: number;
   readonly accounts?: readonly string[];
+  /** Set only when the domain is verified and was read by D8's checker; `{}` when its file gives none of the four. */
+  readonly toml?: TomlFacts;
 }
 
 export interface ManifestInfo {
@@ -76,6 +86,10 @@ export interface DirectoryEntry {
   readonly signingKey?: string;
   readonly manifest?: ManifestInfo;
   readonly domainState?: DomainState;
+  /** Its `domainState.toml`. */
+  readonly toml?: TomlFacts;
+  /** Its `toml.serverCountry`, which the `country` filter and the countries route read. */
+  readonly serverCountry?: string;
   /** The ledger of its newest validation among the last 300, and whether that validation was partial. */
   readonly currentIndex?: number;
   readonly partial?: boolean;
@@ -225,6 +239,12 @@ export interface DomainRow {
   checked: number;
   verified?: number;
   accounts: string[];
+  ownerCountry: string;
+  serverCountry: string;
+  tomlNetwork: string;
+  tomlUnl: string;
+  /** What the checker read of the file: 0 for a row from before D8. */
+  tomlVersion: number;
 }
 
 /** The newest row of a configured publisher in `unl_publishers`. */
@@ -302,8 +322,24 @@ function recordFeesOf(record: VoteRow, round: RoundInfo | undefined): Drops | un
   return { base_fee: base, reserve_base: reserveBase, reserve_inc: reserveInc };
 }
 
+/** The facts of a row: only of a verified domain that D8's checker read, each absent when the file gives none. */
+function tomlFactsOf(row: DomainRow): TomlFacts | undefined {
+  if (row.status !== 'verified' || !(row.tomlVersion >= 1)) return undefined;
+  return compact({
+    ownerCountry: row.ownerCountry === '' ? undefined : row.ownerCountry,
+    serverCountry: row.serverCountry === '' ? undefined : row.serverCountry,
+    network: row.tomlNetwork === '' ? undefined : row.tomlNetwork,
+    unl: row.tomlUnl === '' ? undefined : row.tomlUnl,
+  });
+}
+
 function domainStateOf(domain: string, rows: readonly DomainRow[], tomlPath: string): DomainState {
-  const row = rows.find((candidate) => candidate.domain.toLowerCase() === domain.toLowerCase());
+  // the newest: a manifest that changes the case of its domain makes a new pair, and the old one is checked no more
+  const row = rows
+    .filter((candidate) => candidate.domain.toLowerCase() === domain.toLowerCase())
+    .reduce<
+      DomainRow | undefined
+    >((newest, each) => (newest === undefined || each.checked > newest.checked ? each : newest), undefined);
   if (row === undefined) return { status: 'pending', tomlUrl: `https://${domain}${tomlPath}` };
   return compact({
     status: row.status,
@@ -313,6 +349,7 @@ function domainStateOf(domain: string, rows: readonly DomainRow[], tomlPath: str
     checked: row.checked,
     verified: row.verified,
     accounts: row.status === 'verified' && row.accounts.length > 0 ? row.accounts : undefined,
+    toml: tomlFactsOf(row),
   });
 }
 
@@ -458,6 +495,8 @@ export function assembleDirectory(reads: DirectoryReads): Directory {
         ? { agreement1h: NO_AGREEMENT, agreement24h: NO_AGREEMENT, agreement30d: NO_AGREEMENT, daily: [] }
         : agreementWindows(reads.sentinels, reads.hourly.get(key) ?? noRows, newestFinal);
     const newest = activity.get(key);
+    const domainState =
+      domain === undefined ? undefined : domainStateOf(domain, domains.get(key) ?? [], reads.tomlPath);
 
     entries.set(
       key,
@@ -474,7 +513,9 @@ export function assembleDirectory(reads: DirectoryReads): Directory {
                 signingKeysSeen: manifest.signingKeysSeen,
                 domain,
               }),
-        domainState: domain === undefined ? undefined : domainStateOf(domain, domains.get(key) ?? [], reads.tomlPath),
+        domainState,
+        toml: domainState?.toml,
+        serverCountry: domainState?.toml?.serverCountry,
         currentIndex: newest?.ledgerIndex,
         partial: newest === undefined ? undefined : !newest.full,
         ...windows,

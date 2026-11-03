@@ -1,0 +1,19 @@
+{
+  "index": "4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651",
+  "ledger_hash": "86BE78CC253B3610FF3E300689DEAC24EE0F48E79635998FD2FE4DA5E82DEFA0",
+  "ledger_index": 13465944,
+  "node": {
+    "AccountCount": "84e7",
+    "BaseFee": "a",
+    "Flags": 0,
+    "LedgerEntryType": "FeeSettings",
+    "NetworkID": 21338,
+    "PreviousTxnID": "8EF9DF5B7880C2630D4F85EDA2C0BBDA96D93740C3C3D92F62CE7CFF4FCA1D00",
+    "PreviousTxnLgrSeq": 13464955,
+    "ReferenceFeeUnits": 10,
+    "ReserveBase": 1000000,
+    "ReserveIncrement": 200000,
+    "index": "4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651"
+  },
+  "validated": true
+}

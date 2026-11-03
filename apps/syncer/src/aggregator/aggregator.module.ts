@@ -1,6 +1,7 @@
 import {
   assertValidMarketsConfig,
   ClickHouseService,
+  DailyRates,
   loadMarketsConfig,
   NetworkProfile,
   RatesService,
@@ -11,10 +12,11 @@ import { AGGREGATOR_OPTIONS, AggregatorOptions, AggregatorService } from './aggr
 
 /**
  * The options of the aggregator that come from the deployment: the markets config of the network (`GH_MARKETS_CONFIG`, else the
- * bundled `config/markets/<network>.json`), the rates of the network, which the volume jobs, the value of a pool and the
- * account and market jobs share (one `RatesService`), and the size from which an account is rolled up
- * (`GH_ACCOUNT_ROLLUP_MIN_ROWS`). A config that is not valid stops the boot with a message that says what is wrong with it,
- * instead of failing every tick.
+ * bundled `config/markets/<network>.json`), the rates of the network, which the volume jobs, the value of a pool, the NFT
+ * jobs, the escrows job, the tokens job, the mpt_state job and the account and market jobs share (one `RatesService`, with the daily rates of the
+ * NFT prices over it), the profile of the network (which the tokens job matches the tomls with, and the supply job asks whether
+ * the network has an AMM and whether it mints), and the size from which an account is rolled up (`GH_ACCOUNT_ROLLUP_MIN_ROWS`).
+ * A config that is not valid stops the boot with a message that says what is wrong with it, instead of failing every tick.
  */
 export function aggregatorOptions(
   ch: ClickHouseService,
@@ -34,9 +36,28 @@ export function aggregatorOptions(
   logger.log(
     'AMM daily job on: the per-day stats of every pool, from the exchanges, the liquidity and the pool states',
   );
+  logger.log('NFT state job on: the state of every NFT and the holdings of the accounts, from nft_events');
+  logger.log(
+    'NFT collections job on: the supply, holders and volume of every collection, from nfts and the collection events',
+  );
+  logger.log('Escrows job on: the current state of every escrow and the escrowed total, from object_changes');
+  logger.log(
+    'Tokens job on: the generations of the issued tokens, from trust_line_states, state_touches, account_states and the stored tomls',
+  );
+  logger.log(
+    'Supply job on: an hourly snapshot of the native supply, from the escrows sentinel, the state tables, the AMM pools and the mint tables',
+  );
+  logger.log(
+    'MPT state job on: the current state of every issuance and holder, from mpt_issuance_states and mpt_holder_states',
+  );
   return {
     volumes: { rates, markets },
     ammPools: { rates },
+    nfts: { rates, dailyRates: new DailyRates(ch, rates) },
+    escrows: { rates, nativeCurrency: profile.nativeCurrency },
+    tokens: { profile, rates },
+    supply: { profile },
+    mptState: { rates },
     ammDaily: { rates },
     aggregates: { rates, accountRollupMinRows: config.accountRollupMinRows },
   };
@@ -44,10 +65,11 @@ export function aggregatorOptions(
 
 /**
  * The `aggregator` worker: the `AggregatorService`, which keeps `stats_hourly`, the volume tables (`volume_live`,
- * `volume_daily`), `amm_pools` and `amm_daily` (the last one every fifth tick of a minute) and the account and market tables
- * (`pair_hourly`, `markets_live`, `native_rates_daily`, the account rollups) up to date once a minute. It needs what the
- * global core module provides (`ClickHouseService`, `PrometheusService`, `ShutdownSignals`, `NETWORK_PROFILE`,
- * `SyncerConfig`), so it imports nothing.
+ * `volume_daily`), `amm_pools`, `nfts`, `escrows` (and the sentinel of its total), the generations of the issued tokens
+ * (`token_generations`, `token_lines`, `tokens`), `mpt_issuances` and `mpt_holders`, `amm_daily` and `nft_collections` (the last two every fifth tick of a minute)
+ * and the account and market tables (`pair_hourly`, `markets_live`, `native_rates_daily`, the account rollups) up to date once a
+ * minute, and writes the hourly snapshot of the native supply (`network_supply`). It needs what the global core module provides (`ClickHouseService`,
+ * `PrometheusService`, `ShutdownSignals`, `NETWORK_PROFILE`, `SyncerConfig`), so it imports nothing.
  */
 @Module({
   providers: [

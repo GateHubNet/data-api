@@ -115,7 +115,7 @@ export interface AmendmentView {
   readonly id: string;
   readonly name?: string;
   readonly status: AmendmentStatus;
-  /** Xahau: behaviour that is always on although the ledger does not list the amendment. */
+  /** Behaviour that is always on although a ledger begun after its retirement does not list the amendment (XRPL's 15, Xahau's). */
   readonly retired?: true;
   readonly meta?: Readonly<AmendmentMeta>;
   /** The node's `supported`, when it lists the amendment. */

@@ -17,6 +17,14 @@ import { fmtTime, precision8 } from '../common/format';
  * component has no original; its keys are `amm_account, base, counter, count, amount, rate, converted_amount, fees_est?`, the
  * sides formatted as a trade component formats them. `fees_est` (the estimated fees of a pool, converted like `converted_amount`)
  * is there on the live day row only, where the row has the sum of them after `end_time` (D2b.3, D9).
+ *
+ * The NFT volume (`/v2/network/nft_volume`, spec 5.12) has a component per collection, `issuer, taxon?, count, amount, rate,
+ * converted_amount` (`NFT_VOLUME_COMPONENT_KEYS`; `taxon` is the XRPL taxon, a URIToken's collection has none). `amount` is the
+ * volume in the native currency of the sales with a rate that day and `count` those sales, so `rate` is 1 and `converted_amount`
+ * is `amount`; with a display currency they follow the other metrics (`rate /= X`, `converted_amount *= X`, X the double of the
+ * display rate). The row's `count` is every sale of the window, the sales with no rate that day included: it is the `count` of
+ * the set's sentinel, which a bucket of days adds up (`VolumeBucket.sentinelCount`). The amounts of this metric are exact
+ * decimals, their sums too (not Float64's). The answer is `{result, coverage, count, marker?, rows}` (`NFT_VOLUME_BODY_KEYS`).
  */
 
 export type VolumeAsset = { currency: string; issuer?: string };
@@ -52,8 +60,27 @@ export interface PaymentComponent {
   converted_amount: string;
 }
 
+export interface NftVolumeComponent {
+  /** The issuer of the collection. */
+  issuer: string;
+  /** The taxon of the collection: XRPL only. */
+  taxon?: number;
+  /** The sales of the collection that have a price in the native currency. */
+  count: number;
+  /** The volume in the native currency, exact. */
+  amount: string;
+  rate: string;
+  converted_amount: string;
+}
+
+/** The keys of a component of the NFT volume, in order. */
+export const NFT_VOLUME_COMPONENT_KEYS = ['issuer', 'taxon', 'count', 'amount', 'rate', 'converted_amount'] as const;
+
+/** The keys of the answer of `/v2/network/nft_volume`, in order: `coverage` is the key right after `result`. */
+export const NFT_VOLUME_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'rows'] as const;
+
 export interface VolumeRow {
-  components: (TradeComponent | PaymentComponent | AmmComponent)[];
+  components: (TradeComponent | PaymentComponent | AmmComponent | NftVolumeComponent)[];
   count: number;
   exchange: VolumeAsset;
   total: string;
@@ -101,6 +128,11 @@ export interface VolumeBucket {
   /** Where the bucket ends, exclusive: the end of a live period, the start of the next day, week or month. */
   end?: number;
   parts: VolumePart[];
+  /**
+   * The `count` of the sentinel of the set (`sentinelCountOf`), the days' added up for a bucket of days. The `count` of the row
+   * of the NFT volume (every sale of the window); the other metrics' is the sum of their parts', and their sentinel counts 0.
+   */
+  sentinelCount?: number;
 }
 
 /** The currency the amounts are shown in, and how many of it one native coin buys (0 when that cannot be told). */
@@ -167,6 +199,14 @@ export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
   return [...parts.values()];
 }
 
+/**
+ * The `count` of the sentinel rows of some stored rows (component empty), added up: the sentinel is no part (`sumParts`), and
+ * for the NFT volume it counts every sale of the window, those with no rate too. 0 for every other metric.
+ */
+export function sentinelCountOf(rows: readonly StoredVolumeRow[]): number {
+  return rows.reduce((sum, row) => (row.component === '' ? sum + Number(row.count) : sum), 0);
+}
+
 /** The largest converted amount first; the same amount in the order of the component ids, so that the order is the same every time. */
 function byConverted(a: VolumePart, b: VolumePart): number {
   return b.converted - a.converted || (a.component < b.component ? -1 : a.component > b.component ? 1 : 0);
@@ -193,14 +233,29 @@ export function toVolumeRow(
   display?: DisplayCurrency,
 ): VolumeRow {
   const x = display ? display.rate.toNumber() : 1;
+  /** The factor of the NFT volume's exact amounts: the double the other metrics multiply by, as the decimal it prints as. */
+  const exactX = new BigNumber(x);
   const listed = bucket.parts.filter((p) => p.converted > 0).sort(byConverted);
 
-  const components = listed.map((p): TradeComponent | PaymentComponent | AmmComponent => {
+  const components = listed.map((p): TradeComponent | PaymentComponent | AmmComponent | NftVolumeComponent => {
     const rate = p.converted > 0 ? p.amount.toNumber() / p.converted : 0;
     const shownRate = display ? (x ? rate / x : 0) : rate;
     const rateOut = rateText(shownRate);
     const amount = p.amount.toString();
     const converted = String(p.converted * x);
+    if (metric === 'nft_volume') {
+      // a collection is `<issuer>` or `<issuer>/<taxon>`. The amounts are exact (the amount is the volume in the native currency,
+      // so the converted amount is the amount, times the display rate): a sum of days or a product is not rounded to a double
+      const [issuer, taxon] = p.component.split('/');
+      return {
+        issuer,
+        ...(taxon !== undefined && { taxon: Number(taxon) }),
+        count: p.count,
+        amount: p.amount.toFixed(),
+        rate: rateOut,
+        converted_amount: p.amount.times(exactX).toFixed(),
+      };
+    }
     if (metric === 'amm_volume') {
       return {
         amm_account: p.component,
@@ -241,9 +296,16 @@ export function toVolumeRow(
       : undefined;
   return {
     components,
-    count: bucket.parts.reduce((sum, p) => sum + p.count, 0),
+    // the NFT volume counts every sale of the window, which is the sentinel's count; the others, the payments or trades of their parts
+    count: metric === 'nft_volume' ? (bucket.sentinelCount ?? 0) : bucket.parts.reduce((sum, p) => sum + p.count, 0),
     exchange: display ? volumeAsset(display.asset) : { currency: native },
-    total: String(total * x),
+    total:
+      metric === 'nft_volume'
+        ? listed
+            .reduce((sum, p) => sum.plus(p.amount), new BigNumber(0))
+            .times(exactX)
+            .toFixed()
+        : String(total * x),
     exchange_rate: precision8(display ? display.rate : 1),
     start_time: fmtTime(bucket.start),
     ...(bucket.end !== undefined && { end_time: fmtTime(bucket.end) }),

@@ -1,4 +1,4 @@
-import { dropsToNative, PaymentsRow } from '@gatehub/data-api-shared';
+import { dropsToNative, isMptIssuanceId, PaymentsRow } from '@gatehub/data-api-shared';
 import { fmtTime } from '../common/format';
 
 /** A balance change of a payment, as the parser stores it: `counterparty` is `''` for the native currency. */
@@ -12,7 +12,8 @@ export interface PaymentBalanceChange {
  * A payment as the Ripple API serves it (`getPayments.js` on the row `lib/hbase/hbase-thrift/data.js` builds). The keys
  * come in the order of the original: the columns of HBase's `d` family, then those of the `f` family, each sorted by
  * name, and at the end the `transaction_cost` that took the place of the stored `fee`. A field the payment does not
- * have is left out (a tag of 0 is a tag, ruling R10; the native currency has no issuer).
+ * have is left out (a tag of 0 is a tag, ruling R10; the native currency has no issuer). An MPT payment (no original has
+ * one) ends with `mpt_issuance_id`: its `currency` is the issuance ID and its amounts are the ledger's integer units.
  */
 export interface PaymentObject {
   amount: string;
@@ -35,6 +36,8 @@ export interface PaymentObject {
   tx_hash: string;
   /** The fee in whole units of the native currency. */
   transaction_cost: string;
+  /** The `currency` of an MPT payment, its 48 hex digits; no other payment has it. */
+  mpt_issuance_id?: string;
 }
 
 /** The columns of `payments` the API reads: what `StoredPayment` holds, with the two that need a conversion. */
@@ -103,5 +106,6 @@ export function toPaymentObject(row: StoredPayment): PaymentObject {
     ...(row.source_tag !== null && { source_tag: row.source_tag }),
     tx_hash: row.tx_hash,
     transaction_cost: dropsToNative(row.fee),
+    ...(isMptIssuanceId(row.currency) && { mpt_issuance_id: row.currency }),
   };
 }

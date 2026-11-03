@@ -1,6 +1,6 @@
-import { getNetworkProfile } from '../src/network';
+import { getNetworkProfile, networkChoiceText } from '../src/network';
 import { AMENDMENTS_OBJECT_INDEX } from '../src/validators/ledger-objects';
-import { askNode } from './amendments-check';
+import { askNode, parseArgs } from './amendments-check';
 
 /** A node that answers `server_info` with `networkId`, `feature` with one amendment and the Amendments object with one ID. */
 function node(networkId: number | undefined) {
@@ -42,5 +42,39 @@ describe('amendments-check: what the node says', () => {
       { command: 'feature' },
       { command: 'ledger_entry', index: AMENDMENTS_OBJECT_INDEX, ledger_index: 'validated' },
     ]);
+  });
+});
+
+describe('amendments-check: the command line', () => {
+  let exit: jest.SpyInstance;
+  let consoleError: jest.SpyInstance;
+  beforeEach(() => {
+    // usage() exits with status 2; the throw stops parseArgs where the exit would
+    exit = jest.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`exit ${code}`);
+    }) as never);
+    consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    exit.mockRestore();
+    consoleError.mockRestore();
+  });
+
+  it('takes a testnet with its default endpoint', () =>
+    expect(parseArgs(['--network', 'xahau-testnet'])).toEqual({
+      network: 'xahau-testnet',
+      endpoint: 'wss://xahau-test.net',
+      clickhouse: false,
+    }));
+
+  it('takes each of the four networks', () =>
+    expect(
+      ['xrpl', 'xahau', 'xrpl-testnet', 'xahau-testnet'].map((network) => parseArgs(['--network', network]).network),
+    ).toEqual(['xrpl', 'xahau', 'xrpl-testnet', 'xahau-testnet']));
+
+  it('refuses another network with exit 2', () => {
+    expect(() => parseArgs(['--network', 'bitcoin'])).toThrow('exit 2');
+    expect(exit).toHaveBeenCalledWith(2);
+    expect(consoleError.mock.calls.map((call) => call.join(' ')).join('\n')).toContain(networkChoiceText('--network'));
   });
 });

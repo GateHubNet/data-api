@@ -87,7 +87,7 @@ interface Run {
 }
 
 /**
- * The `account_rollups` job of the aggregator (job 10 of a tick, see spec 3 and 3.4): the day groups of the heavy accounts
+ * The `account_rollups` job of the aggregator (job 15 of a tick, see spec 3 and 3.4): the day groups of the heavy accounts
  * (those with `GH_ACCOUNT_ROLLUP_MIN_ROWS` balance changes or more), kept per UTC day so that a read of years does not read the
  * millions of rows behind them, and the hook of the slices of `agg_dirty` (`ofSlice`). The job is off when the minimum is 0:
  * the run reads and writes nothing (the hook still keeps existing coverage right, see `ofSlice`). The state of the job (the

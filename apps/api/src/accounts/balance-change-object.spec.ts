@@ -67,6 +67,16 @@ describe('toBalanceChangeObject', () => {
     ]);
   });
 
+  it('ends an MPT change with mpt_issuance_id, after tx_hash; an issued or a native change has none', () => {
+    const id = '0598F6E09E30A809E63A1F02DE789586D2F4FDA9EF5200E3';
+    const mpt = toBalanceChangeObject({ ...FEE, node_index: 2, currency: id, change_type: 'clawback' });
+    expect(Object.keys(mpt).slice(-2)).toEqual(['tx_hash', 'mpt_issuance_id']);
+    expect(mpt.mpt_issuance_id).toBe(id);
+    expect(toBalanceChangeObject(FEE)).not.toHaveProperty('mpt_issuance_id');
+    // 40 hex digits are an issued currency
+    expect(toBalanceChangeObject({ ...FEE, currency: 'A'.repeat(40) })).not.toHaveProperty('mpt_issuance_id');
+  });
+
   it('serves the amounts as stored, the time as YYYY-MM-DDTHH:mm:ssZ, and leaves out what the fee row does not have', () => {
     expect(toBalanceChangeObject(FEE)).toEqual({
       amount_change: '-0.015',

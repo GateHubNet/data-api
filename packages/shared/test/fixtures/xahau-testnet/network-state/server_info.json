@@ -1,0 +1,80 @@
+{
+  "info": {
+    "build_version": "2026.10.16-tmp-dev",
+    "complete_ledgers": "13293254-13465945",
+    "complete_ledgers_pinned": "empty",
+    "hostid": "BONY",
+    "initial_sync_duration_us": "13110945",
+    "io_latency_ms": 1,
+    "jq_trans_overflow": "0",
+    "last_close": {
+      "converge_time_s": 2.003,
+      "proposers": 3
+    },
+    "load_factor": 1,
+    "network_id": 21338,
+    "peer_disconnects": "10",
+    "peer_disconnects_resources": "0",
+    "peers": 5,
+    "ports": [
+      {
+        "port": "21338",
+        "protocol": [
+          "peer"
+        ]
+      },
+      {
+        "port": "16006",
+        "protocol": [
+          "ws"
+        ]
+      },
+      {
+        "port": "16007",
+        "protocol": [
+          "http"
+        ]
+      }
+    ],
+    "pubkey_node": "n9KQqEyxgVbRio93cgAAXGBxJo8RdYRwdYXV6Re1A1Kn8AfkEayv",
+    "server_state": "full",
+    "server_state_duration_us": "518627294490",
+    "state_accounting": {
+      "connected": {
+        "duration_us": "6024355",
+        "transitions": "1"
+      },
+      "disconnected": {
+        "duration_us": "2069267",
+        "transitions": "1"
+      },
+      "full": {
+        "duration_us": "518627294490",
+        "transitions": "1"
+      },
+      "syncing": {
+        "duration_us": "5017208",
+        "transitions": "1"
+      },
+      "tracking": {
+        "duration_us": "114",
+        "transitions": "1"
+      }
+    },
+    "time": "2026-Oct-25 00:34:57.194856 UTC",
+    "uptime": 518640,
+    "validated_ledger": {
+      "age": 1,
+      "base_fee_native": 0.00001,
+      "base_fee_xrp": 0.00001,
+      "hash": "BF0B6B26F79265939FE5CCD80DA6D3C65B04A858E1A08AF21E0205602CD2E235",
+      "reserve_base_native": 1,
+      "reserve_base_xrp": 1,
+      "reserve_inc_native": 0.2,
+      "reserve_inc_xrp": 0.2,
+      "seq": 13465945
+    },
+    "validation_quorum": 2
+  },
+  "native_currency_code": "XAH"
+}

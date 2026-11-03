@@ -60,6 +60,30 @@ export function senderAccount(tx: Readonly<Record<string, unknown>>): string | u
   return account === '' ? ACCOUNT_ZERO : account;
 }
 
+/**
+ * The transaction's `Delegate`, the account that signed it for its `Account` (and pays its fee): undefined when it names none
+ * (no field, an empty string or a value that is not a string).
+ */
+export function delegateOf(tx: Readonly<Record<string, unknown>>): string | undefined {
+  const delegate = tx.Delegate;
+  return typeof delegate === 'string' && delegate !== '' ? delegate : undefined;
+}
+
+/**
+ * Who pays the transaction's fee: its `Delegate` when it names one (`delegateOf`), else `senderAccount(tx)`. An account that
+ * sends a transaction for a delegator pays the fee, not the delegator whose `Account` it is.
+ */
+export function feePayer(tx: Readonly<Record<string, unknown>>): string | undefined {
+  return delegateOf(tx) ?? senderAccount(tx);
+}
+
+/**
+ * The three keys under which `meta.AffectedNodes` wraps a node, and what each did to the ledger entry. The one list of them
+ * for the parsers that walk the metadata node by node (`changedAccountRoots`, `changedTrustLines`).
+ */
+export const NODE_OPS = ['CreatedNode', 'ModifiedNode', 'DeletedNode'] as const;
+export type NodeOp = (typeof NODE_OPS)[number];
+
 export function toParserTx(raw: RawTransaction, header: LedgerHeader, client: string | null): ParserTx {
   return {
     hash: raw.hash,

@@ -1,8 +1,13 @@
 import {
   AccountAmmLiquidityRow,
+  AccountDomainsRow,
   AccountExchangesRow,
+  AccountNftEventsRow,
+  AccountObjectChangesRow,
+  AccountPathPaymentsRow,
   AccountPaymentsRow,
   AccountsCreatedRow,
+  AccountStatesRow,
   AccountTransactionsRow,
   AccountTxBySequenceRow,
   AmmGovernanceRow,
@@ -10,26 +15,52 @@ import {
   AmmPoolStatesRow,
   AmmPoolTouchesRow,
   BalanceChangesRow,
+  CollectionNftEventsRow,
   CountMap,
   ExchangesRow,
+  GenesisMintsRow,
+  ImportsRow,
   LedgerByHashRow,
   LedgersRow,
+  MptHolderStatesRow,
+  MptIssuanceStatesRow,
+  MptIssuanceTransfersRow,
+  MptTouchesRow,
+  MptTransfersRow,
+  NftEventsRow,
+  NftSalesRow,
+  NftTouchesRow,
+  ObjectChangesRow,
   PARSER_VERSION,
+  PathPaymentsRow,
   PaymentsByCurrencyRow,
   PaymentsRow,
+  RewardClaimsRow,
+  StateTouchesRow,
   TransactionsRow,
+  TrustLineStatesRow,
   TxByHashRow,
   TxByTypeRow,
 } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
+import { AccountDomainsParser, accountDomainVersion } from '../parsers/account-domains.parser';
+import { AccountStatesParser } from '../parsers/account-states.parser';
 import { AccountsCreatedParser } from '../parsers/accounts-created.parser';
 import { AffectedAccountsParser } from '../parsers/affected-accounts.parser';
 import { AmmParser } from '../parsers/amm.parser';
 import { BalanceChangesParser } from '../parsers/balance-changes.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
+import { ImportParser } from '../parsers/import.parser';
+import { MptParser } from '../parsers/mpt.parser';
+import { NftParser, rolesOf } from '../parsers/nft.parser';
+import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
+import { PathPaymentParser } from '../parsers/path-payments.parser';
 import { PaymentParser } from '../parsers/payment.parser';
+import { RewardsParser } from '../parsers/rewards.parser';
+import { StateTouchesParser } from '../parsers/state-touches.parser';
+import { TrustLineStatesParser } from '../parsers/trust-line-states.parser';
 import { RawLedger } from './raw-ledger';
 
 /** Every row one ledger writes, one array per table. `ledger` is the commit marker and is written last. */
@@ -54,6 +85,65 @@ export interface LedgerRows {
   ammLiquidity: AmmLiquidityRow[];
   accountAmmLiquidity: AccountAmmLiquidityRow[];
   ammGovernance: AmmGovernanceRow[];
+  /** The state of every account root after each transaction that changed it (parser version 3, ADR-0015). */
+  accountStates: AccountStatesRow[];
+  /** The state of each side of every trust line after each transaction that changed it (parser version 3, ADR-0015). */
+  trustLineStates: TrustLineStatesRow[];
+  /** Every successful Payment whose delivery used someone else's liquidity, a payment to oneself included. */
+  pathPayments: PathPaymentsRow[];
+  /** The index of `pathPayments` by account: the source and the destination, one row for a payment to oneself. */
+  accountPathPayments: AccountPathPaymentsRow[];
+  /** Every NFT and URIToken event (migration 011, parser version 5: `NFT_PARSER_VERSION`). */
+  nftEvents: NftEventsRow[];
+  /** A copy of each event per account it involves, with the account's roles in it. */
+  accountNftEvents: AccountNftEventsRow[];
+  /** A copy of every event by collection. */
+  collectionNftEvents: CollectionNftEventsRow[];
+  /** A copy of the sale events, in ledger order. */
+  nftSales: NftSalesRow[];
+  /** One per NFT a transaction had an event of: the ledger-ordered index the aggregator scans. */
+  nftTouches: NftTouchesRow[];
+  /**
+   * The Domain of each account root a transaction changed that has or had one (migration 012, parser version 6:
+   * `DOMAIN_PARSER_VERSION`). Ordered by account in the table, so unlike every other list it can repeat an account (the
+   * `version` is unique).
+   */
+  accountDomains: AccountDomainsRow[];
+  /**
+   * Each created, modified or deleted Escrow, Check, PayChannel or Delegate node of a transaction (migration 013): the
+   * object's state after it and the event it was.
+   */
+  objectChanges: ObjectChangesRow[];
+  /** The index of `objectChanges` by account: a row for the owner and one for the counterparty of each. */
+  accountObjectChanges: AccountObjectChangesRow[];
+  /**
+   * The trust lines and issuers whose token state a transaction changed (migration 014, parser version 8:
+   * `TOKEN_PARSER_VERSION`): the ledger-ordered index the tokens job scans. Whatever the transaction's result, as its
+   * metadata says.
+   */
+  stateTouches: StateTouchesRow[];
+  /**
+   * The native entries of a successful `GenesisMint` (migration 015, parser version 9: `MINT_PARSER_VERSION`), one row per entry.
+   * Empty on XRPL, which has no such transaction.
+   */
+  genesisMints: GenesisMintsRow[];
+  /** The successful `Import`s with the drops each minted (migration 015). Empty on XRPL, as `genesisMints`. */
+  imports: ImportsRow[];
+  /** Every `ClaimReward`, whatever its result (migration 015). Empty on XRPL, as `genesisMints`. */
+  rewardClaims: RewardClaimsRow[];
+  /**
+   * The state of an issuance after each transaction that changed its `MPTokenIssuance` node (migration 017, parser version 10:
+   * `MPT_PARSER_VERSION`), whatever the result. Empty on Xahau, as every MPT array.
+   */
+  mptIssuanceStates: MptIssuanceStatesRow[];
+  /** The state of a holder's balance after each transaction that changed its `MPToken` node (migration 017). */
+  mptHolderStates: MptHolderStatesRow[];
+  /** Which issuances and holders a transaction touched (migration 017), once each per transaction. */
+  mptTouches: MptTouchesRow[];
+  /** What a successful transaction moved, clawed back, locked or unlocked (migration 017). */
+  mptTransfers: MptTransfersRow[];
+  /** The same rows as `mptTransfers`, for the copy ordered by issuance (migration 017). */
+  mptIssuanceTransfers: MptIssuanceTransfersRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -65,6 +155,33 @@ export interface LedgerDiagnostics {
    * could not tell (spec §2.3), summed over the ledger's transactions: `syncer_amm_unclassified_total`.
    */
   ammUnclassified: number;
+  /**
+   * NFT events the NFT parser dropped because their amount is an MPT (or is not an amount at all), summed over the ledger's
+   * transactions (spec §2.5): `syncer_nft_skipped_total`.
+   */
+  nftSkipped: number;
+  /**
+   * Account roots whose Domain is not a string of hex digits (written as `''`), summed over the ledger's transactions
+   * (display names spec 3.1). A ledger cannot hold one, so a count above 0 means a parser bug or a node that serves
+   * something else; the build only counts it and never throws.
+   */
+  invalidDomains: number;
+  /**
+   * Created, modified or deleted escrow, check, payment channel and delegation nodes that no event of the object history
+   * expects (the rows of event `update`, spec §2.2), summed over the ledger's transactions: `syncer_objects_unclassified_total`.
+   */
+  objectsUnclassified: number;
+  /**
+   * Successful `Import`s whose minted drops came out below 0 and were stored as 0 (spec §2; the network cannot produce one, F5),
+   * summed over the ledger's transactions: `syncer_parser_anomalies_total{kind="import_minted_negative"}`.
+   */
+  importMintedNegative: number;
+  /**
+   * What the MPT parser could not read of a node or a transaction and a ledger cannot hold, stored in a safe form: an amount that is
+   * not a `UInt64` read as 0, and a node skipped because its ID cannot be made, summed over the ledger's transactions:
+   * `syncer_parser_anomalies_total{kind="mpt_unreadable"}`.
+   */
+  mptAnomalies: number;
 }
 
 /**
@@ -76,7 +193,9 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
 /**
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
- * They are the 12 tables of the Ripple v2 data and the 5 AMM ledger tables.
+ * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
+ * and their index by account, the 5 NFT tables, the account domains, the object changes and their index by account, the
+ * state touches, the 3 Xahau mint tables, and the 5 MPT ledger tables.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -96,13 +215,44 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.AmmLiquidity, 'ammLiquidity'],
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
+  [Table.AccountStates, 'accountStates'],
+  [Table.TrustLineStates, 'trustLineStates'],
+  [Table.PathPayments, 'pathPayments'],
+  [Table.AccountPathPayments, 'accountPathPayments'],
+  [Table.NftEvents, 'nftEvents'],
+  [Table.AccountNftEvents, 'accountNftEvents'],
+  [Table.CollectionNftEvents, 'collectionNftEvents'],
+  [Table.NftSales, 'nftSales'],
+  [Table.NftTouches, 'nftTouches'],
+  [Table.AccountDomains, 'accountDomains'],
+  [Table.ObjectChanges, 'objectChanges'],
+  [Table.AccountObjectChanges, 'accountObjectChanges'],
+  [Table.StateTouches, 'stateTouches'],
+  [Table.GenesisMints, 'genesisMints'],
+  [Table.Imports, 'imports'],
+  [Table.RewardClaims, 'rewardClaims'],
+  [Table.MptIssuanceStates, 'mptIssuanceStates'],
+  [Table.MptHolderStates, 'mptHolderStates'],
+  [Table.MptTouches, 'mptTouches'],
+  [Table.MptTransfers, 'mptTransfers'],
+  [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
 ];
 
 const paymentParser = new PaymentParser();
+const pathPaymentParser = new PathPaymentParser();
 const exchangeParser = new ExchangeParser();
 const balanceChangesParser = new BalanceChangesParser();
 const accountsCreatedParser = new AccountsCreatedParser();
+const accountStatesParser = new AccountStatesParser();
+const accountDomainsParser = new AccountDomainsParser();
+const trustLineStatesParser = new TrustLineStatesParser();
+const stateTouchesParser = new StateTouchesParser();
+const rewardsParser = new RewardsParser();
+const importParser = new ImportParser();
+const mptParser = new MptParser();
 const ammParser = new AmmParser();
+const nftParser = new NftParser();
+const objectChangesParser = new ObjectChangesParser();
 const affectedAccountsParser = new AffectedAccountsParser();
 const fromClientParser = new FromClientParser();
 
@@ -208,7 +358,35 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     ammLiquidity: [],
     accountAmmLiquidity: [],
     ammGovernance: [],
-    diagnostics: { ammUnclassified: 0 },
+    accountStates: [],
+    trustLineStates: [],
+    pathPayments: [],
+    accountPathPayments: [],
+    nftEvents: [],
+    accountNftEvents: [],
+    collectionNftEvents: [],
+    nftSales: [],
+    nftTouches: [],
+    accountDomains: [],
+    objectChanges: [],
+    accountObjectChanges: [],
+    stateTouches: [],
+    genesisMints: [],
+    imports: [],
+    rewardClaims: [],
+    mptIssuanceStates: [],
+    mptHolderStates: [],
+    mptTouches: [],
+    mptTransfers: [],
+    mptIssuanceTransfers: [],
+    diagnostics: {
+      ammUnclassified: 0,
+      nftSkipped: 0,
+      invalidDomains: 0,
+      objectsUnclassified: 0,
+      importMintedNegative: 0,
+      mptAnomalies: 0,
+    },
   };
 
   const typeCounts = new Map<string, number>();
@@ -322,6 +500,32 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         { account: payment.source, direction: 'sent', counterparty: payment.destination, ...shared },
         { account: payment.destination, direction: 'received', counterparty: payment.source, ...shared },
       );
+    }
+
+    // Every successful Payment, a payment to oneself too (an arbitrage loop), which `paymentParser` leaves out.
+    const path = pathPaymentParser.parse(t, ctx);
+    if (path) {
+      rows.pathPayments.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        source: path.source,
+        destination: path.destination,
+        delivered_amount: path.delivered_amount,
+        currency: path.currency,
+        issuer: path.issuer ?? '',
+        source_amount: path.source_amount,
+        source_currency: path.source_currency,
+        source_issuer: path.source_issuer ?? '',
+        offers_crossed: path.offers_crossed,
+        amm_pools: path.amm_pools,
+        rippled_through: path.rippled_through,
+      });
+      // The source and the destination each find it; a payment to oneself is one row for that account, not two.
+      const key = { ledger_index: header.ledger_index, tx_index: txIndex };
+      rows.accountPathPayments.push({ account: path.source, ...key });
+      if (path.destination !== path.source) rows.accountPathPayments.push({ account: path.destination, ...key });
     }
 
     // Both parties see the exchange; a trade with oneself is one row for that account, not two.
@@ -473,6 +677,104 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
       });
     }
 
+    const nft = nftParser.parse(t, ctx);
+    rows.diagnostics.nftSkipped += nft.skipped;
+    // One touch per NFT of the transaction, whatever its number of events.
+    const touched = new Set<string>();
+    for (const event of nft.events) {
+      const row: NftEventsRow = {
+        nft_id: event.nft_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        event_index: event.event_index,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        kind: event.kind,
+        event: event.event,
+        issuer: event.issuer,
+        taxon: event.taxon,
+        taxon_key: event.taxon_key,
+        serial: event.serial,
+        nft_flags: event.nft_flags,
+        transfer_fee: event.transfer_fee,
+        uri: event.uri,
+        digest: event.digest,
+        account: event.account,
+        from_account: event.from_account,
+        to_account: event.to_account,
+        offer_id: event.offer_id,
+        is_sell_offer: event.is_sell_offer,
+        amount: event.amount,
+        // An event without an amount has the empty string for it, and 0 for its shadow.
+        amount_f: event.amount === '' ? 0 : float(event.amount),
+        currency: event.currency,
+        amount_issuer: event.amount_issuer,
+        destination: event.destination,
+        expiration: event.expiration,
+        broker: event.broker,
+        broker_fee: event.broker_fee,
+        royalty_est: event.royalty_est,
+        removed_by: event.removed_by,
+      };
+      rows.nftEvents.push(row);
+      // The copies hold the same columns in objects of their own.
+      rows.collectionNftEvents.push({ ...row });
+      if (event.event === 'sale') rows.nftSales.push({ ...row });
+
+      // Each account the event involves finds it, once, with its roles; `actor` is the account that did it.
+      for (const [holder, roles] of rolesOf(event)) {
+        rows.accountNftEvents.push({
+          account: holder,
+          nft_id: row.nft_id,
+          ledger_index: row.ledger_index,
+          tx_index: row.tx_index,
+          event_index: row.event_index,
+          tx_hash: row.tx_hash,
+          tx_type: row.tx_type,
+          close_time: row.close_time,
+          kind: row.kind,
+          event: row.event,
+          issuer: row.issuer,
+          taxon: row.taxon,
+          taxon_key: row.taxon_key,
+          serial: row.serial,
+          nft_flags: row.nft_flags,
+          transfer_fee: row.transfer_fee,
+          uri: row.uri,
+          digest: row.digest,
+          actor: row.account,
+          from_account: row.from_account,
+          to_account: row.to_account,
+          offer_id: row.offer_id,
+          is_sell_offer: row.is_sell_offer,
+          amount: row.amount,
+          amount_f: row.amount_f,
+          currency: row.currency,
+          amount_issuer: row.amount_issuer,
+          destination: row.destination,
+          expiration: row.expiration,
+          broker: row.broker,
+          broker_fee: row.broker_fee,
+          royalty_est: row.royalty_est,
+          removed_by: row.removed_by,
+          roles: [...roles],
+        });
+      }
+
+      if (!touched.has(event.nft_id)) {
+        touched.add(event.nft_id);
+        rows.nftTouches.push({
+          ledger_index: header.ledger_index,
+          tx_index: txIndex,
+          nft_id: event.nft_id,
+          issuer: event.issuer,
+          taxon_key: event.taxon_key,
+          serial: event.serial,
+        });
+      }
+    }
+
     for (const change of balanceChangesParser.parse(t, ctx)) {
       rows.balanceChanges.push({
         account: change.account,
@@ -509,6 +811,225 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         inception: closeTime,
         genesis_balance: null,
         genesis_index: null,
+      });
+    }
+
+    for (const state of accountStatesParser.parse(t, ctx)) {
+      rows.accountStates.push({
+        account: state.account,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: state.node_index,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        balance: state.balance,
+        flags: state.flags,
+        sequence: state.sequence,
+        owner_count: state.owner_count,
+        fields: JSON.stringify(state.fields),
+        deleted: state.deleted ? 1 : 0,
+      });
+    }
+
+    for (const domain of accountDomainsParser.parse(t, ctx)) {
+      if (domain.invalid) rows.diagnostics.invalidDomains += 1;
+      rows.accountDomains.push({
+        account: domain.account,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: domain.node_index,
+        version: accountDomainVersion(header.ledger_index, txIndex, domain.node_index),
+        domain_hex: domain.domain_hex,
+        deleted: domain.deleted ? 1 : 0,
+      });
+    }
+
+    // The object and the account index rows of each change: the owner's, and the counterparty's unless it has none (two
+    // rows, one per role, when they are the same account).
+    const delegate = typeof t.tx.Delegate === 'string' ? t.tx.Delegate : '';
+    for (const change of objectChangesParser.parse(t, ctx)) {
+      if (change.event === 'update') rows.diagnostics.objectsUnclassified += 1;
+      rows.objectChanges.push({
+        object_type: change.object_type,
+        object_id: change.object_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        tx_type: txType,
+        result,
+        sender,
+        delegate,
+        action: change.action,
+        event: change.event,
+        owner: change.owner,
+        counterparty: change.counterparty,
+        fields: change.fields,
+        previous: change.previous,
+        event_fields: change.event_fields,
+      });
+      const indexRow = (account: string, role: AccountObjectChangesRow['role']): AccountObjectChangesRow => ({
+        account,
+        object_type: change.object_type,
+        role,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        object_id: change.object_id,
+        action: change.action,
+      });
+      rows.accountObjectChanges.push(indexRow(change.owner, 'owner'));
+      if (change.counterparty !== '') rows.accountObjectChanges.push(indexRow(change.counterparty, 'counterparty'));
+    }
+
+    for (const line of trustLineStatesParser.parse(t, ctx)) {
+      rows.trustLineStates.push({
+        account: line.account,
+        counterparty: line.counterparty,
+        currency: line.currency,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: line.node_index,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        balance: line.balance,
+        limit: line.limit,
+        limit_peer: line.limit_peer,
+        no_ripple: line.no_ripple ? 1 : 0,
+        no_ripple_peer: line.no_ripple_peer ? 1 : 0,
+        authorized: line.authorized ? 1 : 0,
+        peer_authorized: line.peer_authorized ? 1 : 0,
+        freeze: line.freeze ? 1 : 0,
+        peer_freeze: line.peer_freeze ? 1 : 0,
+        quality_in: line.quality_in,
+        quality_out: line.quality_out,
+        flags: line.flags,
+        deleted: line.deleted ? 1 : 0,
+      });
+    }
+
+    // A narrow row per line or issuer the transaction changed, the key range the tokens job reads by ledger.
+    for (const touch of stateTouchesParser.parse(t, ctx)) {
+      rows.stateTouches.push({ ledger_index: header.ledger_index, tx_index: txIndex, ...touch });
+    }
+
+    // Xahau's mints (migration 015): the claim of a ClaimReward whatever its result, one row per native entry of a successful
+    // GenesisMint, and the drops a successful Import minted. Neither parser throws (a throw here halts the ingest): a field a
+    // ledger cannot hold reads as empty or 0, and the XRPL, which has none of the three types, gets no row.
+    const rewards = rewardsParser.parse(t, ctx);
+    if (rewards.claim) {
+      rows.rewardClaims.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        account: rewards.claim.account,
+        issuer: rewards.claim.issuer,
+        opt_out: rewards.claim.opt_out ? 1 : 0,
+      });
+    }
+    for (const mint of rewards.mints) {
+      rows.genesisMints.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        mint_index: mint.mint_index,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        destination: mint.destination,
+        amount: mint.amount,
+        parent_tx_hash: mint.parent_tx_hash,
+        emit_hook_hash: mint.emit_hook_hash,
+      });
+    }
+    const imported = importParser.parse(t, ctx);
+    if (imported) {
+      if (imported.negative) rows.diagnostics.importMintedNegative += 1;
+      rows.imports.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        account: imported.account,
+        minted: imported.minted,
+        account_created: imported.account_created ? 1 : 0,
+      });
+    }
+
+    // The MPT rows (migration 017): the states of the nodes the transaction changed, whatever its result, and its transfer. The
+    // parser never throws (a throw here halts the ingest): what a ledger cannot hold reads as a default and is counted.
+    const mpt = mptParser.parse(t, ctx);
+    rows.diagnostics.mptAnomalies += mpt.anomalies;
+    const mptTouched = new Set<string>();
+    const touchMpt = (mpt_issuance_id: string, holder: string): void => {
+      const key = `${mpt_issuance_id}|${holder}`;
+      if (mptTouched.has(key)) return;
+      mptTouched.add(key);
+      rows.mptTouches.push({ ledger_index: header.ledger_index, tx_index: txIndex, mpt_issuance_id, holder });
+    };
+    for (const state of mpt.issuanceStates) {
+      rows.mptIssuanceStates.push({
+        mpt_issuance_id: state.mpt_issuance_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: state.node_index,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        issuer: state.issuer,
+        sequence: state.sequence,
+        flags: state.flags,
+        asset_scale: state.asset_scale,
+        maximum_amount: state.maximum_amount,
+        outstanding_amount: state.outstanding_amount,
+        escrowed_amount: state.escrowed_amount,
+        transfer_fee: state.transfer_fee,
+        metadata_hex: state.metadata_hex,
+        deleted: state.deleted ? 1 : 0,
+      });
+      touchMpt(state.mpt_issuance_id, '');
+    }
+    for (const state of mpt.holderStates) {
+      rows.mptHolderStates.push({
+        holder: state.holder,
+        mpt_issuance_id: state.mpt_issuance_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: state.node_index,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        amount: state.amount,
+        escrowed_amount: state.escrowed_amount,
+        flags: state.flags,
+        deleted: state.deleted ? 1 : 0,
+      });
+      touchMpt(state.mpt_issuance_id, state.holder);
+    }
+    for (const transfer of mpt.transfers) {
+      rows.mptTransfers.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        mpt_issuance_id: transfer.mpt_issuance_id,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        kind: transfer.kind,
+        source: transfer.source,
+        destination: transfer.destination,
+        amount: transfer.amount,
+        fee: transfer.fee,
+      });
+      rows.mptIssuanceTransfers.push({
+        mpt_issuance_id: transfer.mpt_issuance_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        kind: transfer.kind,
+        source: transfer.source,
+        destination: transfer.destination,
+        amount: transfer.amount,
+        fee: transfer.fee,
       });
     }
   }

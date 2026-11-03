@@ -71,6 +71,20 @@ export class LedgerRangeResolver {
     return this.one(`SELECT ledger_index FROM ${Table.Ledgers} ORDER BY ledger_index DESC LIMIT 1`);
   }
 
+  /**
+   * The highest committed ledger and when it closed (unix seconds), `undefined` on an empty database: the point an answer is as
+   * of, in one read. Never cached, like `latest`.
+   */
+  async latestWithTime(): Promise<{ ledger_index: number; close_time: number } | undefined> {
+    const [row] = await this.ch.query<{ ledger_index: number | string; close_time: number | string }>(
+      `SELECT ledger_index, toUnixTimestamp(close_time) AS close_time FROM ${Table.Ledgers}
+        ORDER BY ledger_index DESC LIMIT 1`,
+    );
+    return row === undefined
+      ? undefined
+      : { ledger_index: Number(row.ledger_index), close_time: Number(row.close_time) };
+  }
+
   private firstLedger(): Promise<number | undefined> {
     return this.one(`SELECT ledger_index FROM ${Table.Ledgers} ORDER BY ledger_index ASC LIMIT 1`);
   }

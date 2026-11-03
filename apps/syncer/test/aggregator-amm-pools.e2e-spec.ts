@@ -57,7 +57,7 @@ describe('AggregatorService amm_pools job (e2e)', () => {
 
   afterAll(async () => {
     for (const svc of aggregators) await svc.stop();
-    for (const svc of services) await svc.onModuleDestroy();
+    for (const svc of services) await svc.close();
     await container?.container.stop();
   });
 

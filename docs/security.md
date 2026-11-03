@@ -16,7 +16,7 @@ terminates TLS, then through the stack's **nginx**, which routes by host name. C
    client ──HTTPS──▶ front proxy (TLS, edge) ──HTTP, X-Forwarded-For──▶ nginx ──▶ api-xrpl / api-xahau ──▶ ClickHouse
    ═══════════ untrusted ═════════════════════ │ ═══════════════ internal network ═════════════════════════════
                                                 ClickHouse ◀── syncer-xrpl / syncer-xahau ──▶ XRPL / Xahau node (WSS, outbound)
-                                                                      └─HTTPS─▶ UNL publishers, validator domains (public hosts, outbound; §9)
+                                                                      └─HTTPS─▶ UNL publishers, validator domains, account domains (public hosts, outbound; §9)
 ```
 
 The API authenticates clients (API keys) and rate-limits them, but relies on the proxy chain to terminate TLS and to hand it a
@@ -24,7 +24,9 @@ correct client address (§4).
 
 The syncer is the one component that connects to hosts nobody on the team chose: the `validators` worker fetches the lists of the
 configured UNL publishers and the TOML file of every domain that a validator claims in its signed manifest, and a validator's operator
-picks that domain. Those requests are untrusted-URL requests and are made only through the `SafeFetcher` (§9).
+picks that domain; the `tomls` worker fetches the TOML file of **every domain that any account names in its `Domain` field**, tens of
+thousands of hosts, and whoever sets a Domain picks the host. Those requests are untrusted-URL requests and are made only through the
+`SafeFetcher` (§9).
 
 | Threat | Control |
 | --- | --- |
@@ -34,7 +36,10 @@ picks that domain. Those requests are untrusted-URL requests and are made only t
 | Information disclosure through errors | Ripple-shaped errors, 5xx causes only in the log (§7) |
 | Client-address spoofing (rate-limit evasion) | nginx trusts `X-Forwarded-For` only from `TRUSTED_PROXIES` and sets exactly one address (§4) |
 | Secret leakage | Env-only secrets, git/docker-ignored env files, BuildKit secret for the npm token, per-service env (§8) |
-| Server-side request forgery through a fetched URL (a validator's domain, a publisher, a redirect, a DNS name that points inward) | Every outbound HTTP request of the syncer goes through `SafeFetcher`: HTTPS on port 443 to public addresses only, every resolved address checked and the connection pinned to it, redirects checked again, bounded time and size (§9) |
+| Server-side request forgery through a fetched URL (a validator's domain, a domain an account names, a publisher, a redirect, a DNS name that points inward) | Every outbound HTTP request of the syncer goes through `SafeFetcher`: HTTPS on port 443 to public addresses only, every resolved address checked and the connection pinned to it, redirects checked again, bounded time and size (§9) |
+| Personal data in a toml (a principal's email, social handles, servers, the organization, an entry's contact keys) | The `tomls` worker and the validators' domain checker read a principal's **name only**; emails and handles, `[[SERVERS]]` and `[ORGANIZATION]` are never read, stored, logged or served. Of a currency or validator entry, a key that names an email or a social account (`contact_email`, `twitter`, `x`, `telegram`, `support_handle`, ...) and a text that holds an `@` are never stored in its `fields`, and an `[[ACCOUNTS]]` `desc` with an `@` is no name (tests feed files with them and look for their text in the row, the logs and the answer) |
+| Impersonation through a toml (a `desc` that claims a name; a name that renders as another's) | A `verified` name is whatever the domain's owner wrote, so the answer always pairs it with the `domain`, which the explorer shows; a `desc` over 64 characters is not a name; every text of a toml loses its control and bidirectional characters (§9) |
+| A validator's toml claiming too much (a country, a network, a list) | Only a file that verified the pair is read for a validator's facts. Countries are checked against a fixed set of codes, a `network` holding `@` is not served, and `unl` is text served as data: nothing fetches or follows it, or a currency's issuer. The claims are not checked and are served as the toml's. A principal's name is the domain's own publication, served as the toml says it, never as GateHub's word |
 | Direct ClickHouse access | Not published (§9) |
 | Exposure of internals | `/internal/` and `/liveliness/` blocked at the edge for the public (§9) |
 
@@ -126,11 +131,18 @@ address.
   `query_params` with typed placeholders (`{currency:String}`, `{limit:UInt32}`), never by string interpolation. Pagination and
   `IN (...)` clauses emit placeholders too. The only interpolated parts are table names (from the `Table` enum, enforced by a unit test),
   column lists and sort keys, all hard-coded; interval expressions come from a fixed whitelist.
+- **Search and the tokens.** The search `q` of `GET /v2/tokens` (1 to 64 characters) is a bound parameter used with `positionCaseInsensitiveUTF8` and `startsWith`, never a `LIKE` pattern, so `%` and `_` match
+  themselves; the path of a token is parsed into a currency and a classic address before any read. What the toml of an issuer says of a token (`toml` of the detail: names, descriptions, a URL) is the text
+  an issuer chose, served as data in a fixed set of keys and never fetched; the job and the api never request a toml ([ADR-0019](adr/0019-issued-tokens-from-state-history.md)). The search of `kind=mpt` is bound in the same way, and the ID on a route is checked for 48 hex digits before any read. The metadata of an MPT issuance is what its issuer wrote on the ledger: at most 1024 bytes, decoded by the job into a fixed set of keys and served as data, its URLs as written and never fetched ([ADR-0020](adr/0020-mpt-data.md)).
 - **Resource guards:** every SELECT carries `max_execution_time` and `max_memory_usage` (`GH_CLICKHOUSE_MAX_EXECUTION_TIME`,
   `GH_CLICKHOUSE_MAX_QUERY_MEMORY`), and endpoints bound their own work (`limit` maxima, the 200-day report window, capped candle pages,
   node timeouts for live lookups).
 - **Output hygiene:** the CSV file name is built from the request and stripped of characters a header cannot carry. A known nit: the
   payments CSV file name echoes an unvalidated currency text (the header is made safe, the name is not restricted further).
+- **What an issuer wrote, in a CSV:** anyone can create an MPT issuance, so its `ticker` and `name` are an outsider's text. In the CSVs of
+  `kind=mpt` and of an account's MPT holdings, exports too, each has a leading `'` when it starts with `=`, `+`, `-`, `@`, a tab or a CR,
+  and `'` for each `"`, so that a spreadsheet does not run it and a reader keeps the columns after it. The JSON answers serve them as
+  written, and a client treats them as untrusted. The other CSVs are unchanged.
 - **The live-node proxy** only forwards fixed commands (`account_info`, `account_lines`, `account_offers`, plus `server_info` / `server_definitions` at boot) with validated
   addresses and ledger selectors; node errors are mapped to Ripple messages, never passed through.
 
@@ -153,9 +165,9 @@ render another shape).
 Secrets: `GH_API_KEYS`, `GH_RATE_LIMIT_KEYS` (it holds API keys), `GH_CLICKHOUSE_PASSWORD`, node URLs with credentials, and the build-time
 `NPM_TOKEN`.
 
-- All runtime secrets are environment variables. `.env` and `.env.*` are git-ignored (only `*.env.example` and `deploy/.env.prod.example`
-  are committed) and excluded from the Docker build context (`.dockerignore` excludes all `**/.env*`). In production inject them from a
-  secrets manager; `deploy/.env.prod` should be rendered from it, not stored.
+- All runtime secrets are environment variables. `.env` and `.env.*` are git-ignored (only `*.env.example`, `deploy/.env.prod.example`
+  and `deploy/.env.sandbox.example` are committed) and excluded from the Docker build context (`.dockerignore` excludes all `**/.env*`). In production inject them from a
+  secrets manager; `deploy/.env.prod` (and the sandbox's `deploy/.env.sandbox`) should be rendered from it, not stored.
 - **Least privilege per service.** The production compose does not hand `deploy/.env.prod` to containers; each service lists the
   variables it needs, so the syncers never see `GH_API_KEYS` or the CORS and rate-limit settings
   ([which service gets what](configuration.md#which-service-gets-which-variables-production-compose)).
@@ -181,13 +193,17 @@ Production compose (`docker-compose.prod.yaml`):
 - **Load-test override.** `docker-compose.prod.override.yaml` publishes ClickHouse on the host for seeding; never use it in production.
 - **Dev compose:** everything is published on `127.0.0.1` only, and the dev API key is `dev-api-key`.
 - **ClickHouse users:** a dedicated `data_api` user (access management enabled), not `default`. The api and the syncers share it
-  (full access); a read-only user for the api would be better.
+  (full access); a read-only user for the api would be better. **A narrower user for the syncer still needs `ALTER DELETE` on `token_lines` and `tokens`** (the privilege that `ALTER TABLE ... DROP PARTITION` asks for): the `tokens` job drops the
+  partitions of a retired generation (the number is made by the job and checked as an integer, the one statement that takes no bound parameter; [clickhouse](clickhouse.md), [syncer](syncer.md#the-tokens-job)), and on `mpt_holders` and `mpt_issuances` for the `DELETE` of the `mpt_state` job, whose values are bound.
 
 ### Outbound HTTPS to arbitrary public hosts (syncer)
 
-The only HTTP requests to hosts outside the stack are those of the syncer's `validators` worker: the validator lists of the
+The only HTTP requests to hosts outside the stack are those of the syncer's `validators` and `tomls` workers: the validator lists of the
 publishers in `GH_UNL_PUBLISHERS` and, unless `GH_DOMAIN_VERIFICATION=false`, the `/.well-known/` TOML file of each domain a
-validator claims. The URL is data from outside (a validator's operator chooses its domain), so the rules of
+validator claims and of **each domain an account's `Domain` field names** (`tomls`, [syncer](syncer.md#8a-the-tomls-worker); the domain comes from
+the ledger, where anyone can set one on their own account, and is judged by rippled's `isProperlyFormedTomlDomain` before any DNS query: a URL, a path, a
+port, an IP address or a single label names no domain). The URL is data from outside (a validator's operator or an account's owner chooses its
+domain), so the rules of
 `apps/syncer/src/validators/safe-fetch.ts` are fixed in code and no environment variable loosens any of them:
 
 - **URL:** `https:` only, port 443 only, no user name or password, and a host that is a domain name (4 to 128 characters, an alphabetic
@@ -211,12 +227,17 @@ validator claims. The URL is data from outside (a validator's operator chooses i
 - **Limits:** one timeout for the whole fetch, redirects included (20 s for a list, `GH_DOMAIN_FETCH_TIMEOUT_MS` for a TOML file); the
   body is capped at 1 MiB for a list and 256 KiB for a TOML file, counted while it is read, and a `Content-Length` above the cap is
   refused before a byte is read; only status 200 is accepted; no cookies are kept, no `Accept-Encoding` is sent and nothing is
-  decompressed; the `User-Agent` is the fixed `gatehub-data-api/<version> (validators)`.
+  decompressed; the `User-Agent` is the fixed `gatehub-data-api/<version> (validators)`, or `(tomls)` for the tomls worker (each worker has a
+  fetcher of its own).
 - **No environment agent:** `HTTP_PROXY` and `HTTPS_PROXY` are ignored. Only the tests can replace the resolver, the address policy
   and the CA, through a constructor argument.
 
 Residual: the syncer can be made to send a `GET` to any public host on port 443 (the path is the fixed TOML path, or the configured
-publisher URL), and its address is the source of that request. [Deployment](deployment.md#outbound-network-access) says what egress
+publisher URL), and its address is the source of that request. For the `tomls` worker that is **tens of thousands of hosts and no allowlist**: anyone can
+set a Domain on an account they own, and the worker then sends that host one `GET` of the fixed path a day (a failed one on its own schedule: an hour while
+its last content is carried, else 1, 2, 4, 7 days), 16 at a time at most. It can be made to send more only by setting more Domains. What a fetched toml says is
+stored per domain and outlives the Domain that brought it in (the store keeps every domain ever checked, so it grows with Domain churn on disk); the api reads
+it by key for the domains of each request only, so no amount of stored tomls grows the api's memory. [Deployment](deployment.md#outbound-network-access) says what egress
 to allow and recommends blocking the private ranges at the network as well.
 
 ## 10. Security checklist
@@ -236,7 +257,7 @@ to allow and recommends blocking the private ranges at the network as well.
 - [x] Secrets via environment; env files git- and docker-ignored; per-service env in compose.
 - [x] The npm token is a BuildKit secret, in no layer.
 - [x] Containers run as non-root; ClickHouse, Keeper, syncers and metrics are not published; `/internal/` and `/liveliness/` blocked at the edge.
-- [x] Outbound HTTPS to arbitrary public hosts (UNL lists, validator TOML files) only through `SafeFetcher`: https on 443 without
+- [x] Outbound HTTPS to arbitrary public hosts (UNL lists, validator and account-domain TOML files) only through `SafeFetcher`: https on 443 without
   credentials, every resolved address checked against the non-public ranges, the connection pinned to a checked address, redirects
   checked again from the top, one timeout and a body cap enforced while reading, no environment proxy, no environment switch (§9).
 
@@ -251,5 +272,5 @@ to allow and recommends blocking the private ranges at the network as well.
 - [ ] **Secret scanning and dependency/base-image vulnerability scanning in CI.**
 - [ ] **Audit logging** (which key called which endpoint).
 - [ ] **Egress policy at the network for the syncer** (deny the private ranges and the metadata address as a second line behind
-  `SafeFetcher`; a hostname allowlist is not possible, the validator domains are open-ended).
+  `SafeFetcher`; a hostname allowlist is not possible, the validator and account domains are open-ended).
 - [ ] **Narrow the nginx trust defaults** by shipping no default for `TRUSTED_PROXIES` (today: private ranges).

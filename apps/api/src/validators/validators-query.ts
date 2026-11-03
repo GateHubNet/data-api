@@ -1,3 +1,4 @@
+import { countryCodeOf } from '@gatehub/data-api-shared';
 import { badRequest } from '../common/errors';
 import { decodeMarker, KeysetKey, KeyValue, paginate } from '../common/pagination';
 import { first, limitParam, Query } from '../common/params';
@@ -34,6 +35,8 @@ export interface ListRequest {
   amendment?: string;
   /** The search, in lower case. */
   q?: string;
+  /** An upper-case country code, or `unknown`: the validators without a server country. */
+  country?: string;
   marker?: ListMarker;
   limit: number;
 }
@@ -46,14 +49,29 @@ export interface ListPage {
 
 const AMENDMENT_ID = /^[0-9a-f]{64}$/i;
 
+/** What `country` takes besides a code: the validators without a server country. */
+const UNKNOWN_COUNTRY = 'unknown';
+
 /** The text of a parameter, an empty one being as good as none. */
 function text(query: Query, name: string): string | undefined {
   const value = first(query, name);
   return value === '' ? undefined : value;
 }
 
+/** The scope a request asks for: `unl` by default; anything else but `all` is 400 `invalid scope`. */
+export function parseScope(query: Query): Scope {
+  const scope = text(query, 'scope') ?? 'unl';
+  if (!(SCOPES as readonly string[]).includes(scope)) throw badRequest('invalid scope');
+  return scope as Scope;
+}
+
+/** Whether a validator is within a scope: on the trusted UNL, or for `all` also seen in the last 24 hours. */
+export function inScope(entry: Pick<DirectoryEntry, 'unl' | 'seen24h'>, scope: Scope): boolean {
+  return entry.unl || (scope === 'all' && entry.seen24h);
+}
+
 /**
- * The parameters of the list, checked in the order of the specification: `scope`, `publisher`, `amendment`, `q`, `marker`,
+ * The parameters of the list, checked in the order of the specification: `scope`, `publisher`, `amendment`, `q`, `country`, `marker`,
  * `limit` (which never fails). An empty parameter is a missing one; parameters that are not known are ignored.
  *
  * `amendmentId` gives the ID of a name the amendments know, `undefined` for one they do not. A 64-digit hex string is an ID
@@ -64,8 +82,7 @@ export function parseListQuery(
   directory: Pick<Directory, 'publishers'>,
   amendmentId: (name: string) => string | undefined,
 ): ListRequest {
-  const scope = text(query, 'scope') ?? 'unl';
-  if (!(SCOPES as readonly string[]).includes(scope)) throw badRequest('invalid scope');
+  const scope = parseScope(query);
 
   const publisher = text(query, 'publisher');
   if (publisher !== undefined && !directory.publishers.some((each) => each.id === publisher)) {
@@ -84,14 +101,24 @@ export function parseListQuery(
   const search = text(query, 'q');
   if (search !== undefined && [...search].length > MAX_SEARCH_LENGTH) throw badRequest('invalid search');
 
+  const countryRef = text(query, 'country');
+  const country =
+    countryRef === undefined
+      ? undefined
+      : countryRef.trim().toLowerCase() === UNKNOWN_COUNTRY
+        ? UNKNOWN_COUNTRY
+        : countryCodeOf(countryRef);
+  if (countryRef !== undefined && country === undefined) throw badRequest('invalid country');
+
   const values = decodeMarker(first(query, 'marker'), MARKER_KEYS);
   const marker = values === undefined ? undefined : checkedMarker(values);
 
   return {
-    scope: scope as Scope,
+    scope,
     ...(publisher !== undefined && { publisher }),
     ...(amendment !== undefined && { amendment }),
     ...(search !== undefined && { q: search.toLowerCase() }),
+    ...(country !== undefined && { country }),
     ...(marker !== undefined && { marker }),
     limit: limitParam(query, { def: DEFAULT_LIMIT, max: MAX_LIMIT }),
   };
@@ -121,7 +148,7 @@ export function comparePlaces(a: ListMarker, b: ListMarker): number {
 
 /** Whether the entry is within the scope and passes every filter of the request (not the marker). */
 function selected(entry: DirectoryEntry, request: ListRequest): boolean {
-  if (!(entry.unl || (request.scope === 'all' && entry.seen24h))) return false;
+  if (!inScope(entry, request.scope)) return false;
   if (request.publisher !== undefined && !entry.unlLists.includes(request.publisher)) return false;
   if (request.amendment !== undefined) {
     const wanted = request.amendment;
@@ -133,6 +160,13 @@ function selected(entry: DirectoryEntry, request: ListRequest): boolean {
       (field) => field !== undefined && field.toLowerCase().includes(needle),
     );
     if (!found) return false;
+  }
+  if (request.country !== undefined) {
+    if (
+      request.country === UNKNOWN_COUNTRY ? entry.serverCountry !== undefined : entry.serverCountry !== request.country
+    ) {
+      return false;
+    }
   }
   return true;
 }

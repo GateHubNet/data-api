@@ -1,0 +1,6 @@
+# validator-details.xahau.toml: hand-written test data (D8), not recorded from any real domain.
+[[VALIDATORS]]
+public_key = "__KEY_1__"
+network = 21337
+server_country = "fi"
+owner_country = "EE"

@@ -4,16 +4,41 @@ Raw ledgers used by parser, ledger-writer and API tests. Load a directory with `
 (`src/ingest/fixture-ledger-source.ts`); it reads `<index>.json`, `<index>-<label>.json` and `<index>.json.gz` files and
 ignores everything else in the directory (`manifest.json`, `server_info.json`, `README.md`, ...).
 
-| Directory              | Contents                                                                                |
-| ---------------------- | --------------------------------------------------------------------------------------- |
-| `xrpl/ripple-mock/`    | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.     |
-| `xrpl/recorded/`       | Mainnet ledgers recorded from a public node (see below).                                |
-| `xrpl/amm/`            | Mainnet AMM transactions, one ledger per named case (see below).                        |
-| `xahau/recorded/`      | Xahau mainnet ledgers recorded from a public node (see below).                          |
-| `xrpl/unl/`            | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
-| `xahau/unl/`           | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
-| `xrpl/network-state/`  | Answers of an XRPL node for the validators worker's ledger state (see "Network state"). |
-| `xahau/network-state/` | The same from a Xahau node (see "Network state").                                       |
+| Directory                      | Contents                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `xrpl/ripple-mock/`            | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.              |
+| `xrpl/recorded/`               | Mainnet ledgers recorded from a public node (see below).                                         |
+| `xrpl/amm/`                    | Mainnet AMM transactions, one ledger per named case (see below).                                 |
+| `xrpl/account-state/`          | Mainnet changes of account flags, trust line settings and an AccountDelete.                      |
+| `xrpl/account-domains/`        | Mainnet AccountSets that set and change a Domain (see "Account domains").                        |
+| `xrpl/state-touches/`          | Mainnet AccountSets (TransferRate, AllowTrustLineClawback) and a Clawback (see "State touches"). |
+| `xrpl/nft/`                    | Mainnet NFToken transactions, one ledger per named case (see below).                             |
+| `xrpl/mpt/`                    | Mainnet MPT transactions, one ledger per named case, and the enable ledgers (see below).         |
+| `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).                    |
+| `xrpl/objects/`                | Mainnet escrow, check, payment channel and delegation cases (see below).                         |
+| `xahau/objects/`               | Xahau escrow, check and payment channel cases (see below).                                       |
+| `xahau/mint/`                  | Xahau Imports with their parent ledgers, and two hand-made mint ledgers (see "Xahau minting").   |
+| `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                                   |
+| `xrpl-testnet/recorded/`       | XRPL Testnet ledgers recorded from a public testnet node (see below).                            |
+| `xrpl-testnet/mpt/`            | XRPL Testnet: MPT escrow cases mainnet does not have: a cancel, a fee (see "XRPL MPT cases").    |
+| `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                           |
+| `xrpl/unl/`                    | Validator lists of the XRPL default publishers, as served (see "UNL lists").                     |
+| `xahau/unl/`                   | The validator list of the Xahau default publisher, as served (see "UNL lists").                  |
+| `xrpl-testnet/unl/`            | The validator list of the XRPL Testnet default publisher, as served (see "UNL lists").           |
+| `xrpl/network-state/`          | Answers of an XRPL node for the validators worker's ledger state (see "Network state").          |
+| `xahau/network-state/`         | The same from a Xahau node (see "Network state").                                                |
+| `xahau-testnet/network-state/` | The same from a Xahau Testnet node (see "Network state").                                        |
+| `tomls/`                       | Hand-written validator tomls, for no real domain (see "Toml files").                             |
+
+## Toml files
+
+Written by hand for D8, not recorded: a real domain's file changes. Domains are `*.example`. The syncer's e2e suite puts its master keys in
+place of `__KEY_1__` and `__KEY_2__`.
+
+| File                                      | Holds                                                                                                                                                                                                                                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tomls/validator-details.xrp-ledger.toml` | `modified` as a local date; a principal with an email, one whose name holds `@`, and one plain; key 1 with a lower-case code, a code with spaces, a `unl` and a `server_location`; key 2 with `network`, `UK`, `Germany` and an `http:` `unl`; an account and a currency. |
+| `tomls/validator-details.xahau.toml`      | Key 1 with a bare `network = 21337`, a lower-case code and `EE`.                                                                                                                                                                                                          |
 
 ## Recorded fixtures
 
@@ -26,13 +51,13 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
-  `{ledger, type, result}`). `xrpl/amm/` also has a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
+  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/`, `xrpl/account-domains/`, `xrpl/objects/`, `xahau/objects/`, `xahau/mint/`, `xrpl/state-touches/`, `xrpl/mpt/` and `xrpl-testnet/mpt/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
 ```bash
 pnpm --filter @gatehub/data-api-shared exec ts-node scripts/record-fixtures.ts \
-  --network xrpl|xahau --endpoint <wss url> --out test/fixtures/<network>/recorded \
+  --network xrpl|xahau|xrpl-testnet|xahau-testnet --endpoint <wss url> --out test/fixtures/<network>/recorded \
   [--ledgers 1,2,3] [--txs HASH,HASH] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]
 ```
 
@@ -163,6 +188,173 @@ transaction `75F52BB86416717288999523063D54E24290EFEA2E99DF78E80A12BD1C8FAC99`; 
 object (`7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4`) at the flag-adjacent ledgers (sequence 256k + 1)
 between 2024-03-12 and 2024-03-30: 54 enabled amendments without AMM at ledger 86795009, 55 with it at 86795265. 20 requests.
 
+### XRPL account state cases (`xrpl/account-state/`)
+
+Recorded 2026-10-24 from `wss://s2.ripple.com` (validated head 107873207) with `--txs` and `--delay-ms 500`: 7 ledgers (893 KB
+gzipped, largest 305 KB). The API's account state history tests (`apps/api/test/account-flags.e2e-spec.ts`, seed
+`xrpl-account-state`) read them: each change comes with a ledger in which the same account changed before, so a test sees the
+flags before and after it. The hashes were found with `account_tx` on each account; the `cases` of `manifest.json` name them.
+
+| Case                                | Ledger    | Transaction                                                        | What the account root does                                                                  |
+| ----------------------------------- | --------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `account_created`                   | 93663329  | `4DCBF02D75CF484B385F667B75A8871B843E6C9E8C8D483248693A5A6E75F0A2` | A Payment creates `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV`, no flags                            |
+| `accountset_sets_flag`              | 93663330  | `25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10` | AccountSet `SetFlag` 8: DefaultRipple (0 to 0x800000)                                       |
+| `setregularkey_then_disable_master` | 93663334  | `DD0B4FC1AA4D8A4E0FBEDFD591828A932FE6111F87FD5DA71CC25214075FCF42` | SetRegularKey sets PasswordSpent, then AccountSet `387FDEDC…` sets DisableMaster (0x910000) |
+| `password_spent_before`             | 107872956 | `F96ADF5D4D59B6BA82E9FA85EF266948FBE461A5220B2CB1C889A36F4837DBB4` | A Batch of `rheEvN3wAWbnPwnnsisiJzUqqKqoUC14tw`, which has PasswordSpent (0x10000)          |
+| `payment_clears_password_spent`     | 107872958 | `53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D` | A Payment of XRP to it clears PasswordSpent (0x10000 to 0): a flag changed by another type  |
+| `before_account_delete`             | 107670694 | `EE8547C7070DFB9C2249EAF693B77C1253858317F5132F058EEE267199F8828C` | The last change of `r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC` before it is deleted                |
+| `account_delete`                    | 107671593 | `8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D` | AccountDelete: the account root is a `DeletedNode` (the ledger is also in `xrpl/recorded/`) |
+
+Flag changes are rare: of the 1500 ledgers before the head (107871708 to 107873207), five Payments cleared PasswordSpent and one
+account made the only four AccountSets that changed flags. The AccountSet case comes instead from the history of `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV`, an
+issuer whose flags change in ledger 93663334 of `xrpl/amm/`, where its creation and its first AccountSet are a few ledgers apart.
+
+Xahau's account flags are tested on `xahau/recorded/`: its account roots carry flags only Xahau has (URITokenIssuer 0x40000000 on
+most of them, TshCollect on `rLqimfBcsc4x9Gy9jTfZUNktvJFLzTnv2n` in 26540711, DisallowIncomingRemit and DepositAuth on
+`rD74dUPRFNfgnY2NzrxxYRXN4BrfGSN6Mv` in 26540188), so no Xahau ledger was recorded for them.
+
+#### Trust line cases
+
+Added 2026-10-24 from `wss://s2.ripple.com` (validated head 107873595) with `--txs` and `--delay-ms 500`: 8 more ledgers (454
+KB gzipped, largest 142 KB). The trust line tests (`apps/api/test/account-trustlines.e2e-spec.ts`, same seed) read them, together
+with the TUJ lines of `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV` that its holders and its AMM pool create in 93663330 and 93663334.
+Freezes and authorizations were found with `account_lines` on issuers (`freeze`, `freeze_peer`, `authorized` set) and then
+`account_tx` with `tx_type: TrustSet` on the holders; no recorded set had a quality, a freeze or an authorization before.
+
+| Case                          | Ledger    | Transaction                                                        | What the trust line does                                                                                       |
+| ----------------------------- | --------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `trustset_qualities`          | 26922216  | `7AC4B79B90CDC9510BEC38B451ABAF877577731D55C0E0BFDA488BEAD42F2914` | `rKQxxMQxm6jHV82bq4BCwyfcxcGG9GPWiU` raises its LBR limit to 10000000; its side has QualityIn and QualityOut 1 |
+| `trustset_freeze`             | 26926380  | `40574C8990CD1EAD6D9831D6A32CBE16E3412CE0BDE48F5B86750A8BD8156CAD` | The same holder freezes the line (HighFreeze) and clears its qualities                                         |
+| `trustset_unfreeze`           | 26926383  | `5F852D7E42E707A0F142EE525F4A427B3DDA8775BB724D6B9FA7E12A15CF25EC` | It clears the freeze again                                                                                     |
+| `trustset_preauthorizes`      | 104477592 | `7CD6BB1BEAFB159C576910B8A442FCD86FA92B2E8454CF8BE6190299AC9609EA` | The USDV issuer `rfffsukWALJB1PXYk7H8xkR6UJUDT8nMJE` creates a holder's line, authorized, at zero              |
+| `ammcreate_unauthorized_line` | 104478769 | `93605E3991FED4AED241A9A0274975394332E552BD38C15D7050F262F49DC9C9` | AMMCreate gives the pool `rPZZja3wKFEmAGGteziXYLT9Ne6SnT7H66` a USDV line of 700000, not authorized            |
+| `trustset_authorizes`         | 104479125 | `C36AC10B9FA6AD15E2254477DFEF057D08589E39CA0102871D93622191D03D96` | The USDV issuer authorizes the pool's line                                                                     |
+| `trustline_created_at_zero`   | 104566877 | `19B5C0FB6295872FCECCE7491806E3CE4A54067F4C43BC898BD1387EBC0D9DAB` | `rsMeJ5p6qzVARADTYhvZbHqwkfyN18U2XH` creates a USDV line with a zero balance                                   |
+| `trustline_deleted`           | 104566926 | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | It sets the limit back to 0: the line is a `DeletedNode`                                                       |
+
+### XRPL path payments (`xrpl/path-payments/`)
+
+Recorded 2026-10-24 from `wss://xrplcluster.com` (validated head 107873475) with `--txs`, for the path payments of spec #4
+(GLOSSARY.md: a successful payment whose delivery used someone else's liquidity): 7 ledgers, 0.5 MB gzipped (largest 254 KB).
+`manifest.json` names each case under `cases.<name>` as `{ledger, hash, type, note}`; the api e2e spec
+`apps/api/test/path-payments.e2e-spec.ts` (seed `xrpl-path-payments`) checks every one against values read off the metadata by
+hand. The hashes were found by walking validated ledgers of several eras with a throwaway script that looked at the Offer,
+AccountRoot (`AMMID`), lsfAMMNode and RippleState nodes of each successful Payment, and checked by hand.
+
+| Case                          | Ledger    | Transaction                                                        |
+| ----------------------------- | --------- | ------------------------------------------------------------------ |
+| `through_the_book`            | 107872476 | `2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3` |
+| `through_a_pool`              | 107873024 | `8AFED3CFAFC890BF399AC789450A0122BB01293F4982C4CA67A25F33A776B6C9` |
+| `through_a_market_maker`      | 11999941  | `E362675D8230B1A615C9BF53BC0B288F3AAA36CDF8D4D3E3EE8A681966BE8397` |
+| `round_trip_to_oneself_out`   | 107873048 | `4FA4CA051B7AADE70B5139570BEF9A7BE97659B6B6F670609E45AC11CD30F991` |
+| `round_trip_to_oneself_back`  | 107873048 | `04D90AD7ABB8FCED1FD5C6B4092EA534904BEEF2990D21A101DD6C661FD013B8` |
+| `to_oneself_across_issuers`   | 37999837  | `91F75EC97B9BD4AA72E5E45C75AEBDA3251839C85F0BAE5736FF88B4F8B134B7` |
+| `not_only_through_the_issuer` | 107873045 | `5EA84EE8462DCCE5FEB0D9ED59A0B7D3C7EE6D532307ED12865DB28F0D78D3D4` |
+| `not_unused_paths`            | 13999940  | `1761720BE5F12AE7E26992241E82A521AB3ED1B370C53C8971980E49501AEB10` |
+
+The ledgers hold 24 path payments in all, 20 of them payments to oneself (mostly conversions through pools); the spec lists them
+all and checks the named ones row by row.
+
+**Not found: a loop in one payment.** No successful Payment to oneself that spends and receives the same currency (for example
+USD through XRP back to USD) turned up in about 3,000 ledgers walked around ledgers 7,000,000 (2014), 12,000,000 and 14,000,000
+(2015), 38,000,000 (2018), 47,000,000 (2019), 60,000,000 (2021) and 107,870,000 (2026), nor in the last 6,000 `account_tx` rows of
+the XRP/RLUSD and XRP/USD (GateHub) pools and of the arbitrage account `rogue5HnPRSszD9CWGSUz8UGHMVwSSKF6`. A Payment cannot loop
+XRP to XRP (`temBAD_SEND_XRP_MAX`, `temBAD_SEND_XRP_PATHS`), and the payments to oneself seen were conversions. The arbitrage case is
+therefore the round trip `round_trip_to_oneself_*`: the same account buys WLV with XRP from a pool and sells it back in the next
+payments of the same ledger. A loop in one payment would be detected the same way (its source is its destination, and the pools
+and offers it crosses are in the metadata); record one with `--txs` when it is found.
+
+### XRPL NFT cases (`xrpl/nft/`)
+
+Recorded 2026-10-26 from `wss://s2.ripple.com` (rippled mainnet, network id 0; validated head 107918450) with `--txs` and
+`--delay-ms 75`, one request at a time: 11 ledgers, 0.90 MB gzipped (largest 218 KB, ledger 107874617). `manifest.json` has the cases
+under `cases.<name>` as `{ledger, hash, type, note}` (the note says what the metadata shows); `FINDINGS.md` has the facts the NFT parser tasks rely
+on, each with how it was checked. `src/ingest/nft-fixtures.spec.ts` pins what every case is for.
+
+`record-fixtures --want` keeps only the first hit of each type, so it cannot find a transaction that has to meet a condition (a `mint_on_behalf`,
+a brokered sale with a royalty, a burn that removes offers, ...). The hashes were found with a throwaway script (not in the repository) that walked
+validated ledgers back from the head (head 107886448 of 2026-10-25 down to 107866493: 19,955 ledgers, about 20 hours, 4.1 million transactions) with `ledger { transactions: true, expand: true }`, two requests in flight, kept
+every successful NFToken transaction and every transaction that touches an `NFTokenOffer` or `NFTokenPage` node, and tested the condition of each
+case on what it kept. The ledgers were then recorded with the command below, in two runs (the manifest merges them): the second run swapped the first run's
+`sale_by_sell_offer`, a sale by the NFT's own issuer that paid no royalty, for one with a third-party issuer, and the first run's ledger file was removed before it.
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint wss://s2.ripple.com \
+  --out test/fixtures/xrpl/nft --delay-ms 75 --txs 32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D,350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1,C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92,12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1,9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427,910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D,BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9,AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034,D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3,BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56,695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9,0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C,2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7,4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A,33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2
+```
+
+| Case                    | Ledger    | Transaction                                                        | What it shows                                                                                                                                                                                                                            |
+| ----------------------- | --------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mint`                  | 107878781 | `32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D` | Own mint, no `Issuer`, no `Amount`; one id added to an existing page                                                                                                                                                                     |
+| `mint_with_offer`       | 107886233 | `350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1` | Mint with `Amount` "0" and `Destination`: a created sell `NFTokenOffer`                                                                                                                                                                  |
+| `mint_on_behalf`        | 107883082 | `C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92` | `Issuer` is not the sender; the id lands on the minter's page                                                                                                                                                                            |
+| `burn`                  | 107883610 | `12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1` | Burn with no `NFTokenOffer` deleted                                                                                                                                                                                                      |
+| `burn_removes_offers`   | 107879890 | `9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427` | Burn that deletes the NFT's sell offer                                                                                                                                                                                                   |
+| `modify`                | 107886001 | `910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D` | `URI` of one NFT changed; same ids, same page                                                                                                                                                                                            |
+| `sell_offer_create`     | 107886233 | `BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9` | `Flags` 1: a sell offer of 19.98 XRP with `Destination`                                                                                                                                                                                  |
+| `buy_offer_create`      | 107886233 | `AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034` | No `Flags`: a buy offer of 8.11 XRP with `Destination` and `Expiration`                                                                                                                                                                  |
+| `offer_cancel`          | 107886163 | `D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3` | Cancels one buy offer (146.25 XRP)                                                                                                                                                                                                       |
+| `sale_by_sell_offer`    | 107874617 | `BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56` | One sell offer accepted, 10 XRP, fee 5%: the issuer, neither party, is paid 0.5 XRP                                                                                                                                                      |
+| `sale_by_buy_offer`     | 107878775 | `695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9` | One buy offer accepted, 1 drop; the seller is the issuer                                                                                                                                                                                 |
+| `brokered_sale_royalty` | 107879497 | `0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C` | Both offers, broker fee 2.3835 XRP, fee 3%, issuer paid 4.428495 XRP                                                                                                                                                                     |
+| `sale_issued_currency`  | 107881530 | `2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7` | Sell offer priced 100 of a 40-hex currency (XRPlay)                                                                                                                                                                                      |
+| `transfer_zero_amount`  | 107886163 | `4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A` | Accepted sell offer of `Amount` "0": the NFT moves, no payment                                                                                                                                                                           |
+| `page_split_with_mint`  | 107886233 | `33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2` | Mint on a full page: a created and a modified page of one owner, and a neighbour whose `NFTokens` did not change; the mint also creates a gift sell `NFTokenOffer` (`Amount` "0", `Destination`) and deletes the Ticket it was sent with |
+
+**Not found** (within the 19,955 ledgers scanned, fewer than the 50,000 the plan names): `offer_removed_other`. No transaction of a type other than NFTokenAcceptOffer, NFTokenBurn and NFTokenCancelOffer deleted an `NFTokenOffer` in them (an AccountDelete of an offer's owner is the only other type expected to), and the 290 accounts that owned offers in the first part of the scan all still existed when checked with `account_info`. The scan was stopped there because the node answered "You are placing too much load on the server" to it. Task 4 needs a `synthetic-…` transaction for `offer_removed_other`.
+
+### XRPL ledger object cases (`xrpl/objects/`)
+
+Recorded 2026-10-29 from `wss://s2.ripple.com` (rippled mainnet, network id 0; validated head 107973016) with `--txs` and `--delay-ms 150`, one
+request at a time: 22 ledgers, 2.02 MB gzipped (largest 428 KB, ledger 107972102). `manifest.json` has the 19 cases found under `cases.<name>` as
+`{ledger, hash, type, note}` (the note says what the metadata shows) and the 22 transactions under `txs`; three of them are supporting, not cases: the
+token cashes `3ABD7BA6…` (ledger 107703707) and `A075E757…` (107711512) for the `DeliveredAmount` finding and the creation of the channel of `channel_claim`,
+`E8A8466A…` (107624182). `FINDINGS.md` answers the eight questions of the plan's Task 1, each with the ledger and hash that show it.
+`src/test-utils/object-cases.ts` (`OBJECT_CASES`, `objectCase`, `objectLedgers`; test-only) is how later tests read them, and
+`src/ingest/object-fixtures.spec.ts` pins what every case is for.
+
+Escrow, channel and delegation transactions are rare, so `--want` could not find them. The hashes came from three sources, none of them in the repository:
+a throwaway script that walked 4,998 validated ledgers back from the head (107972126 down to 107967129, about 5 hours) with
+`ledger { transactions: true, expand: true }` and kept every escrow, check, channel and DelegateSet transaction and every transaction with a `Delegate` (it
+found checks in plenty and almost nothing else); `account_tx` of the busy accounts it and the older fixtures named (a channel destination, a bot that finishes
+escrows, four token-escrow testers, a timed-escrow user, the one delegator); and the Escrow nodes of the finishes it read, whose `PreviousTxnID` names the
+`EscrowCreate`. `escrow_finish_timed`, `check_create_token`, `check_cash_amount` and `delegated_batch_inner` were recorded before (`xrpl/recorded`, `xrpl/amm`) and are recorded
+again here so that the object cases live in one directory. Recorded with:
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint wss://s2.ripple.com \
+  --out test/fixtures/xrpl/objects --delay-ms 150 --txs BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53,7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954,92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046,852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198,3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C,375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA,DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E,CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326,A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE,3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330,A075E757D0E6E283ABB6CD7ED751A412D4B1DC14C6F5DE616819C7D6579EC63C,BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77,04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7,E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127,0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE,886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790,29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB,42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75,FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8,9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9,4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66,8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8
+```
+
+| Case                        | Ledger    | Transaction                                                        | What it shows                                                                                       |
+| --------------------------- | --------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `escrow_create_timed`       | 107897249 | `BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53` | XRP escrow with `FinishAfter` and `CancelAfter`, no `Condition`                                     |
+| `escrow_create_conditional` | 106268539 | `7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954` | `Condition`, `FinishAfter`, `CancelAfter`; 4258 of an issued token (a token-escrow test)            |
+| `escrow_finish_timed`       | 107670360 | `92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046` | No `Fulfillment`; a 50 XRP escrow created in ledger 59388170                                        |
+| `escrow_cancel`             | 106179366 | `852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198` | Cancel by a third party (`Account` is not `Owner`) after `CancelAfter`; token escrow                |
+| `escrow_create_token`       | 107945438 | `3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C` | 75000 XRB, `FinishAfter` only: the sender's trust line moves                                        |
+| `escrow_finish_token`       | 107967068 | `375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA` | Finish of that escrow, sent by a bot with a ticket: the destination's trust line moves              |
+| `check_create_xrp`          | 107972102 | `DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E` | `SendMax` 1000 XRP, no `Expiration`                                                                 |
+| `check_create_token`        | 107698980 | `CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326` | 1 RLUSD with `InvoiceID` and `Expiration`                                                           |
+| `check_cash_amount`         | 107671568 | `A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE` | `Amount` 933.622827 XRP; a Batch inner; no `DeliveredAmount`                                        |
+| `check_cancel_source`       | 107968411 | `BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77` | Cancel by the check's own source                                                                    |
+| `channel_create`            | 106970128 | `04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7` | 10000 drops with `CancelAfter` and `SettleDelay` 1209600; no `Balance` in `NewFields`               |
+| `channel_fund_expiration`   | 107220098 | `0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE` | Fund of 1 drop with `Expiration`                                                                    |
+| `channel_claim`             | 107641123 | `886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790` | The first claim of a channel: `PreviousFields.Balance` "0"                                          |
+| `channel_close_request`     | 107107437 | `29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB` | `tfClose` by the source with the balance below the amount: the channel stays and gains `Expiration` |
+| `channel_close_destination` | 107296498 | `42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75` | `tfClose` by the destination: the channel is deleted at once                                        |
+| `channel_renew`             | 107218583 | `FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8` | `tfRenew`: the `Expiration` of the close request is removed                                         |
+| `channel_close_expired`     | 102145584 | `9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9` | A claim on a channel whose `Expiration` has passed deletes it                                       |
+| `delegate_set_create`       | 107558036 | `4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66` | `OfferCreate` and `OfferCancel` permissions: a created `Delegate`                                   |
+| `delegated_batch_inner`     | 107699656 | `8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8` | `Delegate` set, `Fee` "0", `tfInnerBatchTxn`: an inner transaction of a Batch                       |
+
+**Not found** (within the ledgers scanned and the histories read; each is built synthetically in the test that needs it): `escrow_create_ticket`,
+`escrow_finish_fulfillment` (every conditional escrow seen is a token escrow that its testers cancelled), `escrow_create_mpt` (no MPT amount in any of the
+12,880 escrow transactions read), `check_cash_deliver_min` (none of the 7,501 CheckCash of the scan has a `DeliverMin`; the recorded 107671568 has none either,
+and a real one is in `xahau/objects`), `check_cancel_third_party_expired` (all 1,801 CheckCancel of the scan are by the check's own source),
+`delegate_set_replace`, `delegate_set_empty`, `delegated_payment` and `delegated_tec` (one delegation exists, an offer bot's: its only DelegateSet is
+`delegate_set_create`, and every delegated transaction is a successful OfferCreate or OfferCancel).
+
 ### Xahau (`xahau/recorded/`)
 
 Recorded 2026-10-15 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337): validated head
@@ -181,7 +373,327 @@ Recorded 2026-10-15 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, 
 
 **Not found** within the 5000-ledger window (no successful transaction of that type): `Import`, `SetHook`.
 
-### UNL lists (`xrpl/unl/`, `xahau/unl/`)
+### Xahau URIToken cases (`xahau/uritoken/`)
+
+Recorded 2026-10-26 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337; validated head 26811706) with `--txs`
+and `--delay-ms 75`, in three runs (the manifest merges them): 9 ledgers, 93 KB gzipped (largest 26 KB, ledger 26765431). `manifest.json` has the
+cases as `{ledger, hash, type, note}`; `uritoken_remint` also has `burn: {ledger, hash}`, the earlier burn of the same id (its ledger is recorded too).
+`FINDINGS.md` has the facts checked (the `URITokenBuy` price against the seller's balance change, `Remit`'s owner change, Xahau's first ledger).
+
+Almost all URIToken traffic on Xahau is Evernode's lease tokens (mint, sell offer in EVR, buy, burn, in bursts of 150 to 200 transactions per ledger), so
+the cases with a condition were found two ways: a throwaway script (not in the repository) walked validated ledgers back from the head
+(26777346 of 2026-10-25) down to 26727347: 49,999 ledgers, of which the 17,072 with more than 60 transactions (the Evernode bursts) were counted from their transaction hashes only and not read, and `account_tx` on the accounts of the non-Evernode marketplaces it met (`r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS`, whose tokens are issued by
+`rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb`, and a few others) found the cancel and more `Remit` cases (the scan met 251 `Remit`s with URIToken nodes and no `URITokenCancelSellOffer`). The node throttles by units (10,000,000 per hour), which an expanded ledger of
+a burst costs most of; the script therefore skipped the ledgers of more than 60 transactions after a hashes-only request. Recorded with:
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endpoint wss://xahau.network \
+  --out test/fixtures/xahau/uritoken --delay-ms 75 --txs 8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B,CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169,1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D,01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C,9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E,B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01,3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426,4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B,A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B
+```
+
+| Case                         | Ledger   | Transaction                                                        | What it shows                                                                |
+| ---------------------------- | -------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| `uritoken_mint`              | 26774724 | `8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B` | Mint without `Amount` (an Evernode lease token), Flags 1                     |
+| `uritoken_sell_offer_create` | 26765431 | `CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169` | Sell offer of 2200 XAH; the entry gains `Amount`                             |
+| `uritoken_sell_offer_cancel` | 26533927 | `1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D` | Cancel: the entry loses `Amount` (1800 XAH)                                  |
+| `uritoken_buy_above_ask`     | 26763778 | `01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C` | A buy at exactly the ask (4200 XAH); the seller gains the `Amount`           |
+| `uritoken_burn_with_offer`   | 26768773 | `9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E` | Burn of a token with a standing 0.0001 EVR sell offer                        |
+| `remit_transfer`             | 26771798 | `B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01` | `Remit` with one `URITokenIDs`: the owner changes, the sell offer is cleared |
+| `remit_mint`                 | 26689211 | `3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426` | `Remit` with `MintURIToken`: a token for the destination                     |
+| `uritoken_remint`            | 26763629 | `4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B` | Mint of an id that an earlier burn deleted (the burn is in `burn`)           |
+| (its burn)                   | 26763618 | `A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B` | The `URITokenBurn` that deleted the id                                       |
+
+**Not found** (within those ledgers and the account histories): `uritoken_mint_with_offer`. No `URITokenMint` carries an `Amount` (or a `Destination`) among the 14,211 mints seen in the 32,927 ledgers read, nor among the mints in the `account_tx` of the marketplace accounts looked at. Task 5 needs a `synthetic-…` transaction for `uritoken_mint_with_offer`.
+**`uritoken_buy_above_ask` is the fallback the plan allows**: no `URITokenBuy` paid more than the ask in any buy met, so the case is a buy at exactly the ask (its note says so).
+
+### Xahau ledger object cases (`xahau/objects/`)
+
+Recorded 2026-10-29 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337; validated head 26873124) with `--txs` and `--delay-ms 1000`,
+one request at a time: 12 ledgers, 1.36 MB gzipped (largest 321 KB, ledger 20555633). `manifest.json` has the 11 cases under `cases.<name>` as
+`{ledger, hash, type, note}`; the twelfth transaction, the token cash `2615DA09…` (ledger 26399329), is supporting. `FINDINGS.md` has Xahau's escrow fields, the
+`EscrowFinish` with `EscrowID`, the first ledger and the amendments; `src/test-utils/object-cases.ts` and `src/ingest/object-fixtures.spec.ts` are the same as for XRPL.
+
+The node throttles by units, and a scan of ledgers is its costliest request, so the hashes were not found by scanning alone. A throwaway script (not in the repository) read
+999 validated ledgers back from 26872090 (hash lists first, then the transactions of the 604 ledgers of at most 80 transactions; the 348 Evernode bursts above that were not read)
+and met no Escrow, Check or PaymentChannel transaction. A walk of the whole state at ledger 26872617 with `ledger_data` (binary, 393 pages of 2048 entries, 1 s apart; 804,801
+entries) then listed every live Escrow (198), PayChannel (13) and Check (6) entry, and `account_tx` of the 83 accounts they name (two pages each at most) gave the creating,
+claiming, finishing and cashing transactions. Recorded with:
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endpoint wss://xahau.network \
+  --out test/fixtures/xahau/objects --delay-ms 1000 --txs 3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676,E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF,D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA,868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A,D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086,2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916,11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C,2615DA09A9FB5E0F919EE108066407A518771B63541BCA51DEB10B96D9FFA026,7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6,D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA,658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC,8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037
+```
+
+| Case                      | Ledger   | Transaction                                                        | What it shows                                                                                |
+| ------------------------- | -------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `escrow_create`           | 14634228 | `3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676` | 200 XAH to itself, `FinishAfter` only; `TransferRate` in `NewFields`                         |
+| `escrow_finish`           | 20555633 | `E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF` | `Owner` and `OfferSequence`; carries `PreviousTxnID`                                         |
+| `escrow_finish_escrow_id` | 10090323 | `D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA` | `EscrowID`, no `OfferSequence`; `Owner` is the escrow's destination                          |
+| `escrow_cancel`           | 20449602 | `868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A` | Cancel by a third party (`Account` is not `Owner`)                                           |
+| `escrow_create_token`     | 25229443 | `D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086` | 80875 CLV: the trust line gains `LockCount` and `LockedBalance`, its `Balance` does not move |
+| `check_create`            | 12064511 | `2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916` | `SendMax` 1 XAH                                                                              |
+| `check_cash`              | 12064524 | `11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C` | `DeliverMin` "1000000", no `Amount`; `DeliveredAmount` in the metadata                       |
+| `channel_create`          | 8852809  | `7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6` | 300000 drops; `Balance` "0" and `TransferRate` in `NewFields`                                |
+| `channel_claim`           | 8863640  | `D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA` | The first claim of that channel: `PreviousFields.Balance` "0"                                |
+| `channel_create_token`    | 11056548 | `658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC` | 1 DHA: `Amount` and `Balance` are token amounts; the creator's line is locked                |
+| `channel_claim_token`     | 11083603 | `8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037` | The first claim of that channel: two trust lines move                                        |
+
+Every case of the set was found. Xahau has no conditional escrow among its 198 live ones (none has a `Condition`), no MPT and no `Delegate`, so the set has none.
+
+### Xahau minting (`xahau/mint/`)
+
+For the supply parsers (`genesis_mints`, `imports`, `reward_claims`) and the invariant of the supply spec (F2: per ledger, Σ minted = Δ`total_coins` + `fee_total`, which needs
+a ledger and its parent). Recorded 2026-10-30 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337; validated head 26905635) with `--txs` and
+`--ledgers` and `--delay-ms 1000`, one request at a time, and no `--want` scan (`scanned` 0): 4 ledgers, 345 KB gzipped (largest 191 KB, ledger 24508587). Two hand-made ledgers
+sit beside them. `manifest.json` has the four cases under `cases.<name>` as `{ledger, hash, type, note}` (the hand-made two also name their `file`); `FINDINGS.md` has the opt-out bit,
+Xahau's first ledger, what `Import.cpp` credits, and the hand check of the invariant on each Import.
+
+The scans that exist (5,000 ledgers of `xahau/recorded`, 5,000 more in the account domains search) found no `Import`, and at about 5,000 ledgers a day a deeper scan is not an option, so the two Imports
+were found through accounts. In the other `xahau/` directories, 41 accounts have an `AccountRoot` with `ImportSequence` in some transaction's metadata (only an account that
+imported has the field). `account_tx` with `forward: true` and `limit: 3` on each of the 41: 40 start with an `Import` that creates the account, the 41st
+(`rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`) with a `Payment`, then an `Import` into the existing account. `tx` confirmed the two chosen ones. 55 requests in all (47 by hand: 41 `account_tx`, 2 `tx`, 3
+`ledger_entry` and a `server_info`; the recorder's 8), one in flight at a time, mine 1.1 s apart and the recorder's with a pause of 1 s after each ledger and `tx` (its `server_info` and `server_definitions` at the start follow each other directly), none throttled. Recorded with:
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endpoint wss://xahau.network \
+  --out test/fixtures/xahau/mint --delay-ms 1000 \
+  --txs A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843,3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE \
+  --ledgers 24508586,2609052
+```
+
+| Case                                  | Ledger   | Transaction                                                        | What it shows                                                                                                                                                                                                                                                   |
+| ------------------------------------- | -------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `import-creates-account`              | 24508587 | `A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843` | The first `Import` of `rBPKXGERk7KrzZDGXscchv4eQoS2k6nV6M`: `Fee` 0, a `CreatedNode` `AccountRoot` with `Balance` 2000000 (the starting bonus)                                                                                                                  |
+| (its parent)                          | 24508586 |                                                                    | For the invariant: 127 transactions in the child, one of them the `Import`                                                                                                                                                                                      |
+| `import-existing-account`             | 2609053  | `3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE` | An `Import` of `rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`, which exists: `Fee` 100, `Balance` 1000000 to 999911 (minted 11)                                                                                                                                            |
+| (its parent)                          | 2609052  |                                                                    | For the invariant                                                                                                                                                                                                                                               |
+| `claim-opt-out` (hand-made)           | 26540187 | `3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C` | `26540187-opt-out.json`: the recorded ledger of `xahau/recorded` with the `ClaimReward`'s `Flags` set from 0 to 1 and its `Issuer` removed (an opt-out has none, xahaud `ClaimReward.cpp:124-129`)                                                              |
+| `genesis-mint-governance` (hand-made) | 26540188 | `E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D` | `26540188-governance.json`: the recorded ledger with the `GenesisMint`'s `EmitDetails.EmitParentTxnID` set to the recorded `Invoke` `DE1FEAEA69ABF97EA8D95341A6C9B79094746CD8F35C0557583BB986867BB48D` (ledger 26540711 of `xahau/recorded`), which is no claim |
+
+The hand-made files are copies of ledgers that `xahau/recorded` holds for real, with the edits named above (one for the governance mint, two for the opt-out claim) and nothing else changed (the ledger hash and the transaction hashes are those of the real
+ledger, not recomputed); their `note` in the manifest starts "hand-made:". They load beside the recorded ledgers (a file `<index>-<label>.json` is a ledger) and the directory has no recorded
+26540187 or 26540188, which would be a duplicate index; a test of the invariant that must not use them leaves them out by file name (the manifest's `cases.<name>.file`).
+
+**Not found** (nothing was searched for them under the bounds of one
+request at a time): a recorded `ClaimReward` with `tfOptOut`, a `GenesisMint` whose parent is no claim, an `Import` whose inner XRPL transaction is a `tec`, an `Import` that creates an account with a burn credit above 0 (`ZeroB2M` is on at 24508587, so its credit is 0), and an `AccountDelete` on Xahau
+(its case was dropped, no task reads it); `FINDINGS.md` lists them.
+
+### Account domains (`xrpl/account-domains/`)
+
+For the display names: the `account_domains` rows the parser writes (version 6) are checked against what the networks wrote
+(`test/account-domains.e2e-spec.ts`). Recorded 2026-10-27 from `wss://s2.ripple.com` (validated head 107943170) with `--txs`: 2 ledgers
+(329 KB gzipped, largest 281 KB), each whole. `manifest.json` has the cases as `{ledger, hash, type, note}`; the note names the account and
+the Domain before and after.
+
+The hashes came from a throwaway scan (not in the repository). It walked back from the validated head one expanded `ledger` request at a time
+(one request in flight, 75 ms between requests, a throttle answer waited out), at most 5,000 ledgers per network, and kept the first transaction
+that fitted each case. `failed_tx_with_domain` was not searched: it and the two Payments below are read in place.
+
+| Case                        | Ledger    | Transaction                                                        | What it shows                                                                                |
+| --------------------------- | --------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `accountset_sets_domain`    | 107939675 | `7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F` | `rM8kmmnz5qPMg7V3r7SHYXgDGvm8PhzLvM` sets `lumitrades.io` (none before)                      |
+| `accountset_changes_domain` | 107938710 | `894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98` | `rPo76joT4HVuvyomAqnapVcX3tYvmAxhHT` changes a Domain of 32 bytes to another one of 32 bytes |
+
+**Read in place** (the ledgers are in other directories and not copied; the test loads them by index):
+
+| Case                                                 | Ledger    | Transaction                                                        | What it shows                                                                                                                                                                                                                     |
+| ---------------------------------------------------- | --------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `payment_to_account_with_domain` (`xrpl/recorded/`)  | 107671317 | `B244AF0904E22964D1AF89FD213AA8502ADF65FEED95185C6B62961DB9DC2571` | A `Payment` to `rf82s1CDagppvM6ATqc1nSrL6GackzHJrm`, Domain `test.com` (its root is node 0, only `Balance` changes)                                                                                                               |
+| `failed_tx_with_domain` (`xrpl/amm/`)                | 106084525 | `1531CDE5DA5E231C54B7A697FD7C1C51151E8AB2AD3D1FB5174A571E63C2E280` | `Payment` `tecPATH_PARTIAL` by `r428GGG2F1vgn9BUtuiCiEmzrh5oAnhyj7`, Domain `https://www.smartplaystudio.com/`: the fee and `Sequence` change the root                                                                            |
+| `failed_tx_with_domain` (`xrpl/path-payments/`)      | 37999837  | `B28614B78D1D90B34081F74B6EC5A76C6898800A51B69ED19280F918B743A50E` | `OfferCreate` `tecUNFUNDED_OFFER` by `r9Gps6fB9YLuZ87rWx7M9TgLAGK2zsz5s6`, Domain `mduo13.com`; the last of three transactions of the ledger that change its root                                                                 |
+| `payment_by_account_with_domain` (`xahau/recorded/`) | 26540187  | `00F5098EB67BB5E4E177D02F5B492DD5BF215DFF1677EFBD8542394387EBC866` | A `Payment` **sent by** `rGsbGtyrXoPSocAWcngrQZqm6AaQmocw5B` (the sender's root: `Sequence` is in its `PreviousFields`), Domain `n1737.bisdaknode1701-1750.ovh`; the recipient `rHktfGUbjqzU4GsYCMc1pDjdHXb5CJamto` has no Domain |
+| (14 AccountSets) (`xahau/recorded/`)                 | 26540711  |                                                                    | 14 successful `AccountSet`s (Evernode hosts) whose sender's root has a Domain before and another one after; each of the 14 accounts has one root node with a Domain in the ledger                                                 |
+
+**Not found** within the 5,000 ledgers of the scan, so not recorded (the hand-made unit cases of `account-domains.parser.spec.ts` stay their only test):
+
+- XRPL, ledgers 107942518 down to 107937519: `accountset_clears_domain`, `account_delete_with_domain`. `failed_tx_with_domain` was not searched (read in place).
+- Xahau, `wss://xahau.network`, ledgers 26839869 down to 26834870: `accountset_sets_domain` (an `AccountSet` that gives a root its first Domain) and `import`.
+  Nothing of Xahau was recorded, so there is no `xahau/account-domains/`. In those ledgers the scan met about 11,000 `AccountSet`s that change a Domain
+  and none that gives a root its first one. The node answers `tooBusy` above 50,000 units per 10 s and above 10,000,000 per 3,600 s, and an expanded ledger
+  of a busy stretch (150 to 200 transactions, 1.5 MB of JSON and more) used 10,000 units or more, so the scan took about a day; it was resumed from its saved
+  position after lost connections, and the ledgers it read are contiguous. The earlier scan of `xahau/recorded` (5,000 ledgers, 2026-10-15) found no `Import` either.
+
+Facts the ledgers show:
+
+- A Domain set for the first time and one set again to the same value look alike in the metadata (`FinalFields.Domain`, no `Domain` in `PreviousFields`).
+  `accountset_sets_domain` was therefore checked with `account_info` at ledger 107939674: the root has no `Domain` there.
+- `meta.TransactionIndex` is not the position of a transaction in the expanded `ledger.transactions` (the sets case is at position 235 of the list and has
+  `TransactionIndex` 27). The `version` of a row uses `meta.TransactionIndex`.
+- A Domain is whatever bytes the account wrote: a name (`lumitrades.io`), a URL, 32 bytes that are not text, or, from Evernode hosts, 86 ASCII characters that start with
+  `ED` (a public key spelled in hex, with a suffix). The row holds the hex as served.
+- Ledger 107938710 also holds a failed transaction of a sender with a Domain: `Payment` `tecUNFUNDED_PAYMENT`, `08F632249F15DD5E93003EC0EE2BDE1BAFC670E8478732C8956A1C5833A33E2A`, by `rhygvDyyaNSfPdsN8UzGTENBYXJyxy4eKw`, Domain `ladycafe.io`.
+
+The e2e test writes the ledgers of each network through `LedgerWriter` (the new directory and the read-in-place ledgers) into a real ClickHouse and compares the newest row of
+each account (`argMax(…, version)`, never row counts: the table collapses by account) with the Domain in the metadata and the `version` of its transaction. It deletes the newest case ledger (`deleteLedgerRange`) and writes it again: the rows come back the same.
+
+### State touches (`xrpl/state-touches/`)
+
+For the issued tokens: the `state_touches` rows the parser writes (version 8, `StateTouchesParser`) are checked against the metadata of these ledgers
+(`src/parsers/state-touches.parser.spec.ts`, and the `build-rows` unit and e2e suites). Recorded 2026-10-30 from `wss://s2.ripple.com` (rippled mainnet,
+network id 0; validated head 107991428) with `--txs` and `--delay-ms 500`: 3 ledgers (101 KB gzipped, largest 61 KB). `manifest.json` has the cases under
+`cases.<name>` as `{ledger, hash, type, note}`; `FINDINGS.md` says how they were found and what their metadata shows. Nothing was scanned (`--want` was not used),
+and nothing of Xahau was requested: its cases are read in place.
+
+The hashes came from `account_tx` of known issuers, one request at a time (a throwaway script, not in the repository): the GateHub issuer
+`rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq` (the AccountSets of its first rows) and the RLUSD issuer `rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De` (the same). The
+Clawback came from a page of a third-party explorer that lists it, and was then checked with `tx` on the node: validated, `tesSUCCESS`, in the ledger below.
+
+| Case                        | Ledger   | Transaction                                                        | What it shows                                                                                                                                                                                                                                                    |
+| --------------------------- | -------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accountset_transfer_rate`  | 11738848 | `E9CFA70630C46E4E6E539C5FA840487974A241A9A9E75EE6FB3555711144D746` | The GateHub issuer sets `TransferRate` 1002000000 for the first time. Its account root is the only node and its `PreviousFields` hold `Balance` and `Sequence` alone: the touch comes from the rule for the sender of an `AccountSet`                            |
+| `accountset_allow_clawback` | 89925780 | `9B1042DD30188C9BAE7F81C5B3DB91F9C121669A359F4124FBB88531F8BAADA2` | The RLUSD issuer sets `SetFlag` 16 (`asfAllowTrustLineClawback`). Its account root is the only node and its `PreviousFields` hold `Balance`, `Flags` and `Sequence`                                                                                              |
+| `clawback`                  | 85885429 | `C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8` | `rYNKrtQaf3vUVWVK5sw9rJdPGDLbxZu89` claws back 1 unit of `594F494E4B000000000000000000000000000000` from `rYNK7JFGbJhkX8HhT4zw1LJ1Yiu3aa9Mp`. Two nodes: the issuer's root (`Balance` and `Sequence`: no touch) and the trust line (`Balance`: one `line` touch) |
+
+**Read in place** (the ledgers are in other directories and not copied; the test loads them by their hash, and names each case as below):
+
+| Case                             | Directory, ledger                 | Transaction                                                        | What it shows                                                                                                                                        |
+| -------------------------------- | --------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accountset_domain` (changed)    | `xrpl/account-domains/` 107938710 | `894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98` | `Domain` is among the `PreviousFields` of the sender's root                                                                                          |
+| `accountset_domain` (set first)  | `xrpl/account-domains/` 107939675 | `7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F` | `Domain` is in `FinalFields` alone; only `Balance` and `Sequence` are in the `PreviousFields`: the sender rule is the only way to the touch          |
+| `payment_ripples_through_issuer` | `xrpl/account-state/` 104477592   | `33B40BE22F00E669023312A6F7192EC20748CA5111DA180B81E5D6458DCDA06B` | A Payment through the issuer `rBitcoiNXev8VoVxV7pwoQx1sSfonVP9i3`: four trust lines move, no account root changes more than `Balance` and `Sequence` |
+| `offercreate_two_issued_lines`   | `xrpl/account-state/` 104477592   | `E75F47B22075C3554C321E125F127F71E2C440B03770A350886C943995690FA5` | An OfferCreate that crosses two offers: four trust lines, two of the currency `XAH` and two of RLUSD (`524C5553…`)                                   |
+| `ammdeposit_lp_line`             | `xrpl/account-state/` 107872956   | `45E37A13EEEA300014BEBBD81F915ECBE338481732B6E409579D7422B5BC684D` | An AMMDeposit: the depositor's LP line (`03D2DE40…`), written like any other line                                                                    |
+| `trustset_preauthorizes`         | `xrpl/account-state/` 104477592   | `7CD6BB1BEAFB159C576910B8A442FCD86FA92B2E8454CF8BE6190299AC9609EA` | `tfSetfAuth`: the USDV issuer creates the line; its own root changes `Balance`, `OwnerCount` and `Sequence`: no touch                                |
+| `trustline_deleted`              | `xrpl/account-state/` 104566926   | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | The line is a `DeletedNode`                                                                                                                          |
+| `trustset_freeze`                | `xrpl/account-state/` 26926380    | `40574C8990CD1EAD6D9831D6A32CBE16E3412CE0BDE48F5B86750A8BD8156CAD` | The line is modified (HighFreeze)                                                                                                                    |
+| `trustset` (Xahau)               | `xahau/objects/` 11056548         | `2A1E6EADE207AB90023A2F050ED1766A7932C53776AF0A2287C90FF7B2A0F6FB` | A TrustSet that changes the limit of a USD line                                                                                                      |
+| `payment_issued` (Xahau, EVR)    | `xahau/objects/` 11056548         | `1A8BE06C9600311F0A908AC263C4643BA4F90A904F01AE374B1F7F3018C28EBE` | A Payment of EVR: two trust lines of the issuer `rEvernodee8dJLaFsujS6q1EiXvZYmHXr8`                                                                 |
+| `remit_issued` (Xahau)           | `xahau/recorded/` 26540613        | `8C50C44787A12B785AA62377D0AFA6C4711E8E07EF68BA6E83DC286F7EE79AAF` | A Remit of issued tokens: six trust lines, and five account roots that change `Balance`, `TouchCount` and the like (no touch)                        |
+
+Every case of the plan was found. Facts the ledgers show:
+
+- A `TransferRate`, a `Domain` or a flag that an account sets for the first time is not always in the `PreviousFields`: `accountset_transfer_rate` and the Domain set first have
+  `Balance` and `Sequence` alone, so the touch of the sender of an `AccountSet` does not wait for them (the rule is in `StateTouchesParser`).
+- The AMM pool's own account root (`ammdeposit_lp_line`) changes `Balance` only, and the `AMM` node is not an account root: neither is a touch.
+- `meta.TransactionIndex` is the `tx_index` of a touch, not the position of the transaction in the expanded list (the Clawback is the 123rd of the 157 transactions of its
+  ledger's list and has `TransactionIndex` 80).
+
+### XRPL MPT cases (`xrpl/mpt/`, `xrpl-testnet/mpt/`)
+
+Recorded 2026-10-31 from `wss://s2.ripple.com` (rippled mainnet, Clio 2.8.0, network id 0; validated head 108026259) with `--ledgers`, then `--txs`, and `--delay-ms 3000`, one request in flight:
+27 ledgers, 1.25 MB gzipped (largest 90 KB, ledger 106427568). `manifest.json` has the 22 cases found under `cases.<name>` as `{ledger, hash, type, note}` (the note says what the metadata shows) and the 25
+transactions under `txs`. Three of them are supporting, not cases: `B406BE4A…` (ledger 99558158, unlocks what `issuance_set_lock_all` locked), `56133344…` (107211747, a second escrow) and `CDA244FD…` (107211751, the last finish, where
+`LockedAmount` leaves `FinalFields`). `xrpl/mpt/FINDINGS.md` answers the facts of spec §1, each with its case, field and value. `src/parsers/mpt-fixtures.spec.ts` pins what every case is for and the shape of an added field.
+
+MPT is rare, so `--want` was not used and nothing of mainnet's state was walked. The issuers came from a public listing (`api.xrpscan.com`, 113 issuers), used for addresses only; the hashes from `account_tx` of those issuers (a throwaway script, not in the repository), 3,796 MPT transactions in all. The node answered `slowDown` three times during that search; each run stopped there and resumed minutes later, 8 s apart at the end. Recorded with (in batches of eight or nine, about 90 s apart):
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint wss://s2.ripple.com \
+  --out test/fixtures/xrpl/mpt --delay-ms 3000 --ledgers 99226369,101852417,102204929
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint wss://s2.ripple.com \
+  --out test/fixtures/xrpl/mpt --delay-ms 3000 --txs 68D137B937AE7C6EF558DBDDC307B3BC6FADEB3C2F038DDAA3D36BF93C1FDF9E,B95BDC99AF0F038B7B60FC60BE5C70BCD87F5182C68E6BF97F996739E6CEAEA1,542F24F494DF60DA2A5929897FE852221045C0FB6CB028B9D15CCE01BB6AA1FC,3CE646A68D56F2CC959D0207815E368FA7E122A5E61B3810703ADAD8A058AC68,C166A16A2188E5BBD9EE2D73BEE9798515027FF894F5FBA91FA01BE5819F8EC3,90094A7658143819679C7D81FC282F4BD47C2F64FDDAA6D03B40A02002E36EB5,5DB41F975E3AC04DD4AE9E93764AFBBABB0E4C7322B2D6F2E84B253FAA170BF3,9E8E4942CB82D3BAF55E3873D297C5B2241ED251AFE8B186DB9FDA42279D4A8B,B9DEF907D9D931A316C89EAB3278EC8C55AFFF86BDBFF475188A537AE1426530,D3DD0FD6F6CB18411950864C79BD3EA6EBE976D2A303C206F9D45A84862B15EF,7ED410EEF5D92F11831E41A464203F78945EF632B687928129E74FCA24F155EE,B0180041927546FF6673C8A678289647CD461557F7B956848F33FEED0F799D0F,4D9BB2A0B0289D36A995B10AB17D5BE9B19E961B777AFDE29D84CC59384E74F6,21B46565FD7B5D609EF6C1B36598608C4F3809E5F9774C2F34C403E305A8295A,80C74925827B059CA14F2C7C4E01F8DE37C5502648CE20DE90B35827E73D503E,9219729CC7AF29AB5BC67EF94BAA9A818A4F0D60711E50BC06E11919C0DE7C58,F7B0BE5AA088F02BCC6F15BF3B58D37153FB041D8C5E5A29F126BBB1738DD87D,01D099632560B0D854D1843A064E61148AD5A131A4866279D0AB8CF9ACF71D6B,5F279C8E57CEA1A0F3E017155E7C4EBFDBC8B458F68E35BE93CAD122FF82035E,4DFC30E6EE88AF6CE5718368A5F599158809E05584AF86C2E8E8101229A50523,40D8B7B72377D423DFB41756AD619C15CEC2B61CE7F56A7FD6405F7F8BE080E1,B406BE4AB3CABF8C76FD2653D4C83311FEB2F950D02906A95D2B3F3A818AFE50,56133344D8A327F2602CF9A86EEB327B10FA16F7EFBD7805B6F759EE74E78FB4,CDA244FDA8F78E6EAB40EA6E6879DB0DA0E0C22208F6791D10D5AA4FFD74A118,C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8
+```
+
+| Case                           | Ledger    | Transaction                                                        | What it shows                                                                                                       |
+| ------------------------------ | --------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `issuance_create`              | 99337721  | `68D137B937AE7C6EF558DBDDC307B3BC6FADEB3C2F038DDAA3D36BF93C1FDF9E` | Every field: `TransferFee` 192, `AssetScale` 4, `MaximumAmount`, flags 126; XLS-89 long keys in the metadata        |
+| `issuance_create_short_keys`   | 106427568 | `B95BDC99AF0F038B7B60FC60BE5C70BCD87F5182C68E6BF97F996739E6CEAEA1` | XLS-89 short keys (`t`, `n`, `d`, `i`, `ac`, `in`, `us`); `TransferFee` 5000                                        |
+| `issuance_create_raw_metadata` | 103864099 | `542F24F494DF60DA2A5929897FE852221045C0FB6CB028B9D15CCE01BB6AA1FC` | `MPTokenMetadata` is a URL as text, not JSON                                                                        |
+| `issuance_create_no_max`       | 100825095 | `3CE646A68D56F2CC959D0207815E368FA7E122A5E61B3810703ADAD8A058AC68` | No `MaximumAmount`, in the transaction or in `NewFields`                                                            |
+| `issuance_set_lock_holder`     | 107211753 | `C166A16A2188E5BBD9EE2D73BEE9798515027FF894F5FBA91FA01BE5819F8EC3` | One holder: `MPToken` `Flags` 2 to 3, nothing else listed                                                           |
+| `issuance_set_unlock_holder`   | 107211755 | `90094A7658143819679C7D81FC282F4BD47C2F64FDDAA6D03B40A02002E36EB5` | The same holder, `Flags` 3 to 2                                                                                     |
+| `issuance_set_lock_all`        | 99557866  | `5DB41F975E3AC04DD4AE9E93764AFBBABB0E4C7322B2D6F2E84B253FAA170BF3` | No `Holder`: `MPTokenIssuance` `Flags` 122 to 123 is the only MPT node                                              |
+| `issuance_destroy`             | 105916049 | `9E8E4942CB82D3BAF55E3873D297C5B2241ED251AFE8B186DB9FDA42279D4A8B` | `DeletedNode` with `FinalFields`, `OutstandingAmount` "0"; sent with a ticket                                       |
+| `authorize_holder`             | 105827852 | `B9DEF907D9D931A316C89EAB3278EC8C55AFFF86BDBFF475188A537AE1426530` | `CreatedNode` `MPToken` with `Account` and `MPTokenIssuanceID` alone                                                |
+| `authorize_by_issuer`          | 105827859 | `D3DD0FD6F6CB18411950864C79BD3EA6EBE976D2A303C206F9D45A84862B15EF` | `Holder` set: `MPToken` `Flags` 0 to 2                                                                              |
+| `unauthorize_holder`           | 105916049 | `7ED410EEF5D92F11831E41A464203F78945EF632B687928129E74FCA24F155EE` | `tfMPTUnauthorize`: `DeletedNode` `MPToken` with `FinalFields`, no `MPTAmount`                                      |
+| `payment_holder_to_holder`     | 104794908 | `B0180041927546FF6673C8A678289647CD461557F7B956848F33FEED0F799D0F` | No fee: two `MPToken` nodes, no `MPTokenIssuance` node                                                              |
+| `payment_mint`                 | 105827909 | `4D9BB2A0B0289D36A995B10AB17D5BE9B19E961B777AFDE29D84CC59384E74F6` | First credit: `MPToken` `PreviousFields` `{}`, `FinalFields.MPTAmount` "1"; `OutstandingAmount` "0" to "1"          |
+| `payment_redeem`               | 104261693 | `21B46565FD7B5D609EF6C1B36598608C4F3809E5F9774C2F34C403E305A8295A` | To the issuer: `OutstandingAmount` "1" to "0"; `MPTAmount` listed, absent after                                     |
+| `payment_transfer_fee`         | 99251687  | `80C74925827B059CA14F2C7C4E01F8DE37C5502648CE20DE90B35827E73D503E` | `TransferFee` 589, `SendMax` 1062500: sender -1005890, destination +1000000, `OutstandingAmount` -5890              |
+| `payment_before_delivered_fix` | 101491684 | `9219729CC7AF29AB5BC67EF94BAA9A818A4F0D60711E50BC06E11919C0DE7C58` | Below 101852417: no `DeliveredAmount`; the node serves `delivered_amount` all the same                              |
+| `payment_failed`               | 105827538 | `F7B0BE5AA088F02BCC6F15BF3B58D37153FB041D8C5E5A29F126BBB1738DD87D` | `tecNO_AUTH`: no MPT node, no `delivered_amount`                                                                    |
+| `clawback_full`                | 105916048 | `01D099632560B0D854D1843A064E61148AD5A131A4866279D0AB8CF9ACF71D6B` | Takes 1 of 1: `MPTAmount` listed, absent after; `OutstandingAmount` "1" to "0"                                      |
+| `clawback_partial`             | 107541378 | `5F279C8E57CEA1A0F3E017155E7C4EBFDBC8B458F68E35BE93CAD122FF82035E` | Takes 1000000 of 4000000; a Batch inner transaction                                                                 |
+| `clawback_issued`              | 85885429  | `C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8` | An issued-token `Clawback` (recorded again from `xrpl/state-touches`)                                               |
+| `escrow_create`                | 107211745 | `4DFC30E6EE88AF6CE5718368A5F599158809E05584AF86C2E8E8101229A50523` | First escrow: `MPToken` lists `MPTAmount` alone, `MPTokenIssuance` lists `{}`; `LockedAmount` only in `FinalFields` |
+| `escrow_finish`                | 107211749 | `40D8B7B72377D423DFB41756AD619C15CEC2B61CE7F56A7FD6405F7F8BE080E1` | Of `escrow_create`: both `LockedAmount`s 318073 to 41000, the destination's first credit (`{}`), no fee             |
+
+| Enable ledger | Closed               | Size  | Amendments of this plan                                        |
+| ------------- | -------------------- | ----- | -------------------------------------------------------------- |
+| 99226369      | 2025-10-01T13:13:10Z | 57 KB | `MPTokensV1`                                                   |
+| 101852417     | 2026-01-27T22:20:10Z | 71 KB | `fixMPTDeliveredAmount`, `fixTokenEscrowV1` (and three others) |
+| 102204929     | 2026-02-12T21:24:40Z | 60 KB | `TokenEscrow`                                                  |
+
+**XRPL Testnet** (`xrpl-testnet/mpt/`): no mainnet escrow read has a `TransferRate`, so the fee of `EscrowFinish` and `escrow_cancel` were searched there. Recorded 2026-10-31 from `wss://clio.altnet.rippletest.net:51233` (Clio 2.8.0, network id 1; validated head 21966420): 5 ledgers, 22 KB gzipped. The accounts came from a bounded sample of `ledger_data` on the testnet (453 pages, a small part of its state), then `account_tx`, 1,978 MPT transactions in all. Its `manifest.json` has `escrow_cancel`, three cases the plan did not name, and one supporting transaction, the create of `escrow_cancel` (`E4C5B994…`, ledger 19636036).
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl-testnet --endpoint wss://clio.altnet.rippletest.net:51233 \
+  --out test/fixtures/xrpl-testnet/mpt --delay-ms 3000 --txs 4245906360EA53103ADCC3CD8992244F37D5BF5961113AFD3C92CF2774CB0EDA,23DC3FC19583A603E197270E12B732A77488B54AD9C99F69596DB70F747734B5,55B4703F0EFC57A8A2E0B762CD03E6BEF65012D83F116A30B8DECC0E1A64DAE4,E4C5B9949E1883FB5DF1264F798F1D832B024884C82ABEA31557F1C9628100A2,765CA5103C059312A300F2D25EC81F3DB83E4F156203F4C4DE0473C2B5BD3656
+```
+
+| Case                          | Ledger   | Transaction                                                        | What it shows                                                                                                                  |
+| ----------------------------- | -------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `escrow_cancel`               | 19636048 | `55B4703F0EFC57A8A2E0B762CD03E6BEF65012D83F116A30B8DECC0E1A64DAE4` | Not on mainnet. The owner had put in all it held: `PreviousFields` `{ LockedAmount }` alone, `MPTAmount` only in `FinalFields` |
+| `escrow_create_transfer_fee`  | 19500962 | `4245906360EA53103ADCC3CD8992244F37D5BF5961113AFD3C92CF2774CB0EDA` | Of an issuance with `TransferFee` 100: `Amount` 10000, the `Escrow` has `TransferRate` 1001000000                              |
+| `escrow_finish_transfer_fee`  | 19500967 | `23DC3FC19583A603E197270E12B732A77488B54AD9C99F69596DB70F747734B5` | The destination gets 9990 of 10000; both `LockedAmount`s fall by 10000; `OutstandingAmount` 100000 to 99990                    |
+| `escrow_finish_creates_token` | 15923872 | `765CA5103C059312A300F2D25EC81F3DB83E4F156203F4C4DE0473C2B5BD3656` | The destination has no `MPToken` yet: `CreatedNode` with `MPTAmount` "9990" in `NewFields`                                     |
+
+Every case of the plan was found: 22 on mainnet and `escrow_cancel` on XRPL Testnet only. On mainnet no MPT escrow read was cancelled: of the 59, 5 are finished and 54 alive, and 38 of those cannot be cancelled before 2027. Nothing read shows a stored `DeliveredAmount` on an MPT payment, a fee payment after fixMPTDeliveredAmount, or a clawback that took less than it asked (see `FINDINGS.md`, section "Not found").
+
+Both directories join every test that walks a network's directories at this commit: `balance-changes.parser.spec.ts` and `object-changes.parser.spec.ts` read them by themselves (none of their ledgers holds a delegated transaction, so that count stays 8), and `state-touches.parser.spec.ts` has them in `SETS`.
+
+### XRPL Testnet (`xrpl-testnet/recorded/`)
+
+Recorded 2026-10-24 (23:52 UTC) from `wss://s.altnet.rippletest.net:51233` (rippled 3.4.1, network id 1): validated head 21799336, 3
+ledgers kept (13 KB gzipped, largest 8 KB), 22 transactions. The ledgers were chosen by hand, in two steps:
+
+1. The first search, `--want Payment,OfferCreate,AMMDeposit,AMMWithdraw --scan 400`, found `Payment` and `OfferCreate` in the head
+   (21799215), `AMMDeposit` in 21799045 and no `AMMWithdraw`. But every `Payment` of the head is of an issued currency, and the tests
+   need a payment of XRP (`payments.issuer` empty, booked in the network's native currency), so the ledgers around it were no use.
+2. A throwaway script listed the types of each ledger and its XRP payments for 150 ledgers (21799179 to 21799298 and 21799031 to
+   21799060; fewer than a third of them hold an XRP payment); 21799042 to 21799044 hold XRP payments, `OfferCreate`, `AMMDeposit`
+   and `Batch`.
+
+`--ledgers 21799042,21799043,21799044 --delay-ms 500`. The Testnet is busy: the three recorded ledgers hold 3, 14 and 5
+transactions, many of them `OracleSet` from the same few accounts, `Batch` and `OfferCreate`. The node answered every request, no
+throttling.
+
+| TransactionType | Ledger   | Transaction                                                        |
+| --------------- | -------- | ------------------------------------------------------------------ |
+| Payment (XRP)   | 21799042 | `E6EA9BF9D0666C12195CB9D0966FE5696E26F5C6D6D371EFF22E8C22FC6D795F` |
+| Payment (USDT)  | 21799042 | `1980E646B5976831AC1F405626812C012D5DE368F64A5E204B1BE9BAFC318FB9` |
+| OfferCreate     | 21799042 | `CD5E0A6B9D0C5C888FB6B8EDAD4CFED0CF8579AD885297A722A6B050844A97B0` |
+| AMMDeposit      | 21799043 | `D568B878EA85F5361558EFD070EB46DB6E6D5C8598529CBBB6409EF87E523B44` |
+| Payment (XRP)   | 21799043 | `2C6BD91F52F2B113D96683F240F9BCAC0779D342DF6CF389F9D23A0818847E8B` |
+| Batch           | 21799043 | `95B889A7C00705E98172F8DC5EFBEC0BBC697D10C18A7FD2834CEC34BEB95F0F` |
+| Batch           | 21799044 | `38BCE4D22406D6C75FE537135E0D3C42ECFB7961D98A568400623D8C8BF99FC0` |
+
+The ledgers also hold 10 `OracleSet`, 4 more `OfferCreate` and 1 more `Payment` of an issued currency; every
+transaction is `tesSUCCESS`. **Not found** within the 400 ledgers of the search: `AMMWithdraw`.
+
+`server_definitions.json` is bundled as `config/definitions/xrpl-testnet.json`. Today it is byte for byte the file of
+`config/definitions/xrpl.json` (the same rippled 3.4.1 serves both), so XRPL Testnet reads the same account flags and transaction
+types as the XRP Ledger; the two files are separate because a testnet runs newer builds first and will differ when one does.
+
+### Xahau Testnet (`xahau-testnet/recorded/`)
+
+Recorded 2026-10-25 (00:01 UTC) from `wss://xahau-test.net` (xahaud 2026.10.16-tmp-dev, network id 21338): validated head 13465283, 3
+ledgers kept (6 KB gzipped, largest 3 KB), 14 transactions. `--ledgers 13464678,13464679,13464680 --delay-ms 500`, chosen after
+`--want Payment,SetHook,URITokenMint --scan 400` (run first) found only a `Payment` (in 13465104) and a second search
+of 3000 ledgers (it stopped after 658, with all three found: `Payment` 13465149, `SetHook` 13464573, `URITokenMint` 13464676) located
+the others. The testnet is quiet: most ledgers hold nothing but the 4 `Entropy` pseudo-transactions every ledger has, and a payment
+of XAH is rare (about one ledger in a hundred). No XAH payment is within three ledgers of the `URITokenMint` (the first payment after
+it is in 13464680) or of the `SetHook` (none within 8 ledgers of it), and a test needs a payment of XAH, so the three recorded hold
+the `Payment` and a `URITokenCreateSellOffer` two ledgers after the mint.
+
+| TransactionType         | Ledger   | Transaction                                                        |
+| ----------------------- | -------- | ------------------------------------------------------------------ |
+| URITokenCreateSellOffer | 13464678 | `1E3CAA1AE58D371A599119C225FDC39EFD1D47DF742A1890AF7F3914F4DD1FCE` |
+| Payment (XAH)           | 13464680 | `5183BEE4655CDC7E26866CD48A284D6DAA9CB5888B065AFF857E365EE3D9A38A` |
+
+Besides these, each ledger holds 4 `Entropy` transactions (12 in all): a pseudo-transaction of this build with `Account: ""`, `Fee`
+0, `LedgerSequence`, `PublicKey`, `RandomData` and `NextRandomDigest`, which `server_definitions` names (type 89, in `xahau.json` too). The API shows
+its `Account` as `""`, like the node. Every transaction is `tesSUCCESS`. **Not within the three ledgers** (the searches found them
+at): `URITokenMint` 13464676 (`B45A629E64C94E8BDAC8347CCE1B7B8B8C5005CC8070DD64A73A703B3D2A8D34`), `SetHook` 13464573
+(`5770024E6ADFA34AB3E3D6BC4FE88981C910BB03C51DACE7FC0271CE697F8D1F`); record them with `--ledgers` when a test needs them.
+
+`server_definitions.json` is bundled as `config/definitions/xahau-testnet.json`. It differs from `config/definitions/xahau.json`
+only in the amendment state of its `features` (votes, `enabled`) and so in its `hash`; its types, fields and result codes are the same, and like
+xahaud's mainnet file it has no `LEDGER_ENTRY_FLAGS`, so Xahau Testnet's account flags are the hand list of Xahau
+(`src/network/account-flags.ts`).
+
+### UNL lists (`xrpl/unl/`, `xahau/unl/`, `xrpl-testnet/unl/`)
 
 Not ledgers: the validator lists the default publishers of each network profile serve (`defaultUnlPublishers`), saved
 byte for byte as served, one file per publisher (`<publisher id>.json`). `FixtureLedgerSource` does not read these
@@ -197,22 +709,33 @@ Recorded 2026-10-19 (06:42 UTC) with `record:fixtures -- --unl` (below). All thr
 | `xrpl/unl/unl.xrplf.org.json` | `https://unl.xrplf.org` | 2026070302 | 35         | 2027-07-03T00:00:00Z | 20255 |
 | `xahau/unl/vl.xahau.org.json` | `https://vl.xahau.org`  | 2026092401 | 19         | 2027-09-25T00:00:00Z | 11232 |
 
-Every validator entry in the three lists carries its manifest (35 + 35 + 19 manifests); each decodes, re-encodes
-identically and verifies. The specs assert these sequences and counts, so after re-recording they have to be updated to
-what the new lists say. The specs take the time from the data (expiration minus one second, and so on), never from the
+`xrpl-testnet/unl/vl.altnet.rippletest.net.json` was recorded 2026-10-25 (01:11 UTC) the same way
+(`record:fixtures -- --unl --network xrpl-testnet`): a version 1 list with one blob, no `effective` time and no
+`refresh_interval`, like the three above.
+
+| Publisher (file)                                 | Source URL                         | Sequence | Validators | Expires (blob)       | Bytes |
+| ------------------------------------------------ | ---------------------------------- | -------- | ---------- | -------------------- | ----- |
+| `xrpl-testnet/unl/vl.altnet.rippletest.net.json` | `https://vl.altnet.rippletest.net` | 59       | 6          | 2027-08-07T17:31:06Z | 3790  |
+
+It verifies with the key of the `xrpl-testnet` profile (`ED264807…5860`), and the three specs above read it like the other lists.
+Xahau Testnet has no publisher, so there is no list to record for it: its four validators are `defaultUnlValidators`.
+
+Every validator entry in the four lists carries its manifest (35 + 35 + 19 + 6 manifests); each decodes, re-encodes identically
+and verifies. The specs assert these sequences and counts, so after
+re-recording they have to be updated to what the new lists say. The specs take the time from the data (expiration minus one second, and so on), never from the
 clock, so the lists expiring does not break them.
 
 #### Re-recording
 
 ```bash
-pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl --network xrpl|xahau [--out <dir>]
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl --network xrpl|xahau|xrpl-testnet [--out <dir>]
 ```
 
-`--unl` needs no `--endpoint` and takes none of the ledger options; `--out` defaults to `test/fixtures/<network>/unl`. It
-GETs the URL of each default publisher of the network profile (Node `https`, at most 3 redirects, 20 s, 1 MiB) and
+(`xahau-testnet` is accepted and records nothing: it has no publisher.) `--unl` needs no `--endpoint` and takes none of the
+ledger options; `--out` defaults to `test/fixtures/<network>/unl`. It GETs the URL of each default publisher of the network profile (Node `https`, at most 3 redirects, 20 s, 1 MiB) and
 writes the body unchanged. Do not run a formatter over these files.
 
-### Network state (`xrpl/network-state/`, `xahau/network-state/`)
+### Network state (`xrpl/network-state/`, `xahau/network-state/`, `xahau-testnet/network-state/`)
 
 Not ledgers either: what the validators worker asks the node for (`NetworkStatePoller`), saved as the node answered, one file per
 request (the `result` of the answer; for an error, the error message the node served):
@@ -253,15 +776,32 @@ too, because the one validator that had been disabled was re-enabled between led
 - `server_info` and `feature` are of the time of recording, not of ledger 26633715: `validation_quorum` is 0 (xahaud reports 0), and
   `feature` has 114 amendments, all named and supported, two of which carry a `majority`.
 
-No recorded answer is in the legacy FeeSettings form (`BaseFee` in hex, `ReserveBase`, `ReserveIncrement`), none has a
-`ValidatorToDisable` or `ValidatorToReEnable`, and no `feature` entry lacks a name: the specs that cover those say that their input is
-hand-written.
+**Xahau Testnet**, recorded 2026-10-25 (00:34 UTC) from `wss://xahau-test.net` (xahaud 2026.10.16-tmp-dev, network id 21338) at
+validated ledger **13465944** (`86BE78CC…DEFA0`), with no `--ledger`:
+
+- 91 enabled amendments and no `Majorities` field. The ID `AB6612F1…FD1EE` is among them: `feature` names it `fixXahauTestnetGenesis` (its
+  SHA-512Half is the ID), and `config/amendments/xahau.json` carries it from the `XRPL_FIX (XahauTestnetGenesis, …)` line of `features.macro`
+  on the `testnet` and `tmp-dev` branches of `Xahau/xahaud` (added 2026-10-16 by "testnet genesis fix", commented "Xahau testnet
+  (NetworkID 21338) only"). The `dev` branch lacks the line because the testnet runs a build of its own, and no release carries it, so the
+  entry has no `introduced`.
+- **NegativeUNL with three disabled validators** (`FirstLedgerSequence` 1280, 1536 and 1792, as served); no `ValidatorToDisable` or
+  `ValidatorToReEnable`.
+- **FeeSettings in the legacy form**: `BaseFee` `"a"` (hex), `ReserveBase` 1000000, `ReserveIncrement` 200000 and `ReferenceFeeUnits` 10,
+  no `BaseFeeDrops`; the object also has `NetworkID` 21338 and `AccountCount`.
+- `server_info`: `validation_quorum` 2, `complete_ledgers` 13293254-13465945.
+- `feature`: 117 amendments, all named, 115 supported and 2 not (`HookOnV2` and `AMMClawback`, which the ledger lists as enabled all the
+  same), 91 of them enabled and none with a `majority`.
+
+Besides the Xahau Testnet answers, no recorded answer is in the legacy FeeSettings form, none has a `ValidatorToDisable` or
+`ValidatorToReEnable`, and no `feature` entry lacks a name: the specs that cover those say that their input is hand-written. The Xahau
+Testnet files are the data behind the Xahau Testnet case of `apps/api/test/amendments.e2e-spec.ts`, which seeds the ledger state with the
+IDs of `node.Amendments`.
 
 #### Re-recording
 
 ```bash
-pnpm --filter @gatehub/data-api-shared record:fixtures -- --network-state --network xrpl|xahau --endpoint <wss url> \
-  [--out <dir>] [--ledger <n>]
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network-state --network xrpl|xahau|xrpl-testnet|xahau-testnet \
+  --endpoint <wss url> [--out <dir>] [--ledger <n>]
 ```
 
 `--out` defaults to `test/fixtures/<network>/network-state`. The script asks for the Amendments object at the validated ledger (or at

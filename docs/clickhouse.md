@@ -9,8 +9,11 @@ The workload is append-only, ledger-ordered data read two ways: selective lookup
 and aggregates (candles, rates, volumes, stats). That is columnar-OLAP territory and what the previous design (a search engine
 used for aggregations) was weakest at ([ADR-0001](adr/0001-use-clickhouse.md)).
 
-One ClickHouse **server** holds one **database per network** (`xrpl`, `xahau`), each with the same 49 tables
-([ADR-0009](adr/0009-one-deployment-per-network.md)). The image is pinned to `clickhouse/clickhouse-server:26.8.14.3` (the schema
+One ClickHouse **server** holds one **database per network**, each with the same 85 tables
+([ADR-0009](adr/0009-one-deployment-per-network.md)). The names are the profiles': `xrpl`, `xahau`, `xrpl_testnet` and `xahau_testnet`. Production's
+server holds `xrpl` and `xahau`, the sandbox's own server `xrpl_testnet` and `xahau_testnet`, and both have the `shared` database (account names and labels).
+The SQL on this page names `xrpl`; on a testnet write its database in its place. A testnet is never on the production server: the sandbox is a stack of
+its own ([deployment](deployment.md#environments)). The image is pinned to `clickhouse/clickhouse-server:26.8.14.3` (the schema
 and the syncer's recovery rely on partition-scoped lightweight `DELETE` and on `async_insert=0`, both verified on that version);
 `clickhouse-keeper` is pinned to the same version.
 
@@ -26,9 +29,10 @@ views ([ADR-0008](adr/0008-no-aggregate-materialized-views.md)) and no projectio
 
 ## The `FINAL` rule
 
-The ledger tables are `ReplacingMergeTree` ordered by their natural unique key. That is only a **safety net**: duplicates collapse
-on background merges, but readers never rely on that, and the syncer's recovery deletes a partition range before rewriting it
-instead of relying on merges.
+The ledger tables are `ReplacingMergeTree` ordered by their natural unique key (`account_domains` is ordered by `account` instead, so
+that merges keep its newest row of an account: [data-model](data-model.md#account_domains-p7-order-by-account-migration-012)). That is only a
+**safety net**: duplicates collapse on background merges, but readers never rely on that, and the syncer's recovery deletes a partition range
+before rewriting it instead of relying on merges.
 
 `... FINAL` merges at query time across all parts. Cheap for a single-row lookup, ruinous for a scan: under load, 80 concurrent
 `FROM payments FINAL ORDER BY ... LIMIT 200` queries drove the old design to `Memory limit (total) exceeded` (p95 about 30 s, 30 %
@@ -143,6 +147,10 @@ reduce windows, and filtered `balance_changes`. They are bounded by the guards a
 
 The API and the syncer use the **same ClickHouse user** (`data_api`, a full-access user that the compose creates); a read-only
 user for the API would be better and is a known hardening gap ([security](security.md#10-security-checklist)).
+**If the syncer's access is ever narrowed, it needs `ALTER DELETE` on `token_lines` and `tokens`** (the privilege that `ALTER TABLE ... DROP PARTITION` asks for) (and, for the ledger tables' recovery and retention, the privileges it has today): the `tokens` job swaps the issued tokens
+in whole generations, each a partition (`PARTITION BY generation`), and drops a retired generation's partitions 15 minutes after it was replaced ([syncer](syncer.md#the-tokens-job), [ADR-0019](adr/0019-issued-tokens-from-state-history.md)).
+Without the privilege the drop fails (a wait that doubles up to an hour), the retired partitions stay and the disk grows by one generation at each rebuild; nothing else is affected.
+It also needs `ALTER DELETE` on `mpt_holders` and `mpt_issuances`: the `mpt_state` job deletes, with a lightweight `DELETE`, a pair or an issuance that a re-ingest left with no state row ([syncer](syncer.md#the-mpt_state-job)). Without it the rebuild of such an issuance fails and the issuance is set aside.
 
 ## High availability and replication
 
@@ -158,7 +166,7 @@ The production compose already runs **ClickHouse Keeper** and wires the server t
 defines `<zookeeper>`, `<macros>` and a one-shard cluster). To make it highly available:
 
 1. Switch the engines to `ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}'[, version])` in a **new
-   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the 14 ledger-derived tables
+   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the 40 ledger-derived tables
    **and** on `validator_validations` and `validator_seen` (migration 002: the collector's retried inserts carry a deduplication token, and
    those two tables have a window of 100; the nine tables of migration 003 have none, a set of theirs is idempotent by its `version`).
    `{shard}` and `{replica}` come from the `<macros>`.
@@ -187,19 +195,20 @@ Do not run production without a tested restore:
 
 ## Retention and TTL
 
-`transactions.tx_json` + `meta_json` are the bulk of the data and are already `ZSTD(3)`-compressed. Partitions make retention cheap, but **a ledger lives in 19
+`transactions.tx_json` + `meta_json` are the bulk of the data and are already `ZSTD(3)`-compressed. Partitions make retention cheap, but **a ledger lives in 40
 tables that must agree**, so retention is never per table:
 
 - The `ledgers` row is the commit marker. `range-ingest` **skips every ledger that has one** (it believes the ledger is complete), and the live syncer does not look
   behind its checkpoint, so a half-dropped ledger is not repaired by re-ingesting its range.
 - A ledger with a `ledgers` row but fewer stored transactions than its `tx_count` answers **500** on `/v2/ledgers/{id}`; payments, exchanges and balance changes
   whose tables were dropped just vanish from lists.
-- Partition sizes differ: `ledgers`, `transactions`, `payments` and `amm_pool_touches` are partitioned per **1,000,000** ledgers (P6), the other fourteen ledger-keyed tables per **10,000,000** (P7),
+- Partition sizes differ: `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`, `state_touches`, `genesis_mints`, `imports`, `reward_claims`, `mpt_touches` and `mpt_transfers` are partitioned per **1,000,000** ledgers (P6), the other twenty-six ledger-keyed tables per **10,000,000** (P7),
   and `accounts_created` is not partitioned.
 
-The safe procedure drops **one 10,000,000-ledger block from all 19 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`, `amm_pool_touches`
-(`ledgers` first, the commit marker), partition `k` of the fourteen P7 tables, and a `DELETE ... WHERE ledger_index BETWEEN ...` on `accounts_created`; the exact commands are in
-[operations](operations.md#retention). To restore a block run `range-ingest` over the same range (no `ledgers` rows are left, so it ingests everything); to repair
+The safe procedure drops **one 10,000,000-ledger block from 39 of the 40 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`, `state_touches`, `genesis_mints`, `imports`, `reward_claims`, `mpt_touches`, `mpt_transfers`
+(`ledgers` first, the commit marker), partition `k` of twenty-five of the twenty-six P7 tables, and a `DELETE ... WHERE ledger_index BETWEEN ...` on `accounts_created`. `account_domains` is kept:
+it holds about one row per account and partition, and dropping a partition would forget the domain of every account unchanged since that block, which the seed
+cannot bring back (its block of `account_states` is dropped too). The exact commands are in [operations](operations.md#retention). To restore a block run `range-ingest` over the same range (no `ledgers` rows are left, so it ingests everything); to repair
 a partial loss use `range-ingest --reprocess` over exactly the damaged range. Dropping a block makes lists in that window empty.
 
 Five tables expire by TTL, none of them a ledger table, so no ledger retention touches them:

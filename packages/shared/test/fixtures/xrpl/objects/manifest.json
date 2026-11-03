@@ -1,0 +1,354 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://s2.ripple.com",
+  "recorded_at": "2026-10-29T04:51:57.628Z",
+  "validated_head": 107973016,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53": {
+      "ledger": 107897249,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954": {
+      "ledger": 106268539,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046": {
+      "ledger": 107670360,
+      "type": "EscrowFinish",
+      "result": "tesSUCCESS"
+    },
+    "852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198": {
+      "ledger": 106179366,
+      "type": "EscrowCancel",
+      "result": "tesSUCCESS"
+    },
+    "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C": {
+      "ledger": 107945438,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA": {
+      "ledger": 107967068,
+      "type": "EscrowFinish",
+      "result": "tesSUCCESS"
+    },
+    "DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E": {
+      "ledger": 107972102,
+      "type": "CheckCreate",
+      "result": "tesSUCCESS"
+    },
+    "CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326": {
+      "ledger": 107698980,
+      "type": "CheckCreate",
+      "result": "tesSUCCESS"
+    },
+    "A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE": {
+      "ledger": 107671568,
+      "type": "CheckCash",
+      "result": "tesSUCCESS"
+    },
+    "3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330": {
+      "ledger": 107703707,
+      "type": "CheckCash",
+      "result": "tesSUCCESS"
+    },
+    "A075E757D0E6E283ABB6CD7ED751A412D4B1DC14C6F5DE616819C7D6579EC63C": {
+      "ledger": 107711512,
+      "type": "CheckCash",
+      "result": "tesSUCCESS"
+    },
+    "BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77": {
+      "ledger": 107968411,
+      "type": "CheckCancel",
+      "result": "tesSUCCESS"
+    },
+    "04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7": {
+      "ledger": 106970128,
+      "type": "PaymentChannelCreate",
+      "result": "tesSUCCESS"
+    },
+    "E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127": {
+      "ledger": 107624182,
+      "type": "PaymentChannelCreate",
+      "result": "tesSUCCESS"
+    },
+    "0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE": {
+      "ledger": 107220098,
+      "type": "PaymentChannelFund",
+      "result": "tesSUCCESS"
+    },
+    "886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790": {
+      "ledger": 107641123,
+      "type": "PaymentChannelClaim",
+      "result": "tesSUCCESS"
+    },
+    "29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB": {
+      "ledger": 107107437,
+      "type": "PaymentChannelClaim",
+      "result": "tesSUCCESS"
+    },
+    "42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75": {
+      "ledger": 107296498,
+      "type": "PaymentChannelClaim",
+      "result": "tesSUCCESS"
+    },
+    "FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8": {
+      "ledger": 107218583,
+      "type": "PaymentChannelClaim",
+      "result": "tesSUCCESS"
+    },
+    "9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9": {
+      "ledger": 102145584,
+      "type": "PaymentChannelClaim",
+      "result": "tesSUCCESS"
+    },
+    "4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66": {
+      "ledger": 107558036,
+      "type": "DelegateSet",
+      "result": "tesSUCCESS"
+    },
+    "8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8": {
+      "ledger": 107699656,
+      "type": "OfferCreate",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "escrow_create_timed": {
+      "ledger": 107897249,
+      "hash": "BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53",
+      "type": "EscrowCreate",
+      "note": "EscrowCreate of 500000 drops from rNeJW71pMjKy42j5jn7vnWZAbmuU6SKs6V to rGtW2dWHmHQ3f65pfbjYF5PbFbdZwgwuqW with FinishAfter 846262201 and CancelAfter 846265741 (the ledger closed at 846262160) and no Condition: one CreatedNode Escrow (Sequence 107896555, SourceTag 2610250016)."
+    },
+    "escrow_create_conditional": {
+      "ledger": 106268539,
+      "hash": "7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954",
+      "type": "EscrowCreate",
+      "note": "EscrowCreate with a Condition (A0258020B3A5…), FinishAfter 839949392 and CancelAfter 839949407, of 4258 of the issued token whose hex code is 5852504C (XRPL) from rsQYjimpnfyYuebLYDhkCfaMExqESap8jL to the finisher bot rPw6JAdM9BGwH4y4LxJQBDybaGNhFLCspU. A token-escrow test of the first weeks of TokenEscrow; no conditional XRP escrow and no Fulfillment was found (FINDINGS.md)."
+    },
+    "escrow_finish_timed": {
+      "ledger": 107670360,
+      "hash": "92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046",
+      "type": "EscrowFinish",
+      "note": "EscrowFinish with no Fulfillment, sent by rDjzmUuSPJp9Evb2C7Ea8D2eTYyA5eApFP for the 50 XRP escrow of r3pzUULRxwRF1m5DjBWMk6FMEMwViRMCN5 (OfferSequence 57978925, FinishAfter 845373600, created in ledger 59388170); the same ledger holds three EscrowFinish of that escrow that failed with tecNO_TARGET. The transaction of xrpl/recorded/107670360, recorded again here."
+    },
+    "escrow_cancel": {
+      "ledger": 106179366,
+      "hash": "852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198",
+      "type": "EscrowCancel",
+      "note": "EscrowCancel by a third party: rstasiBka2D7UCpwPx7oJ51wrazuvu8sSR (Account) cancels the escrow of rwEPtzveRSB2eb7Yp1PPxSPLFyrcp2oa4j (Owner, OfferSequence 106124446) after its CancelAfter 839415540 (the ledger closed at 839602890). A conditional escrow of 1620 of an issued token: the owner's trust line gets the amount back, no other line moves."
+    },
+    "escrow_create_token": {
+      "ledger": 107945438,
+      "hash": "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C",
+      "type": "EscrowCreate",
+      "note": "EscrowCreate of 75000 XRB (issuer rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa) from rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm to rHiwfnKJCwNePaTj8HmEYCx8G5NCsSEJSt, FinishAfter 846540887 only: one CreatedNode Escrow and one ModifiedNode RippleState, the sender's line (it is the low side; Balance 10000000 to 9925000 from the low side: the sender's holding falls by 75000); the issuer's AccountRoot is not in the metadata. Finished by escrow_finish_token."
+    },
+    "escrow_finish_token": {
+      "ledger": 107967068,
+      "hash": "375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA",
+      "type": "EscrowFinish",
+      "note": "EscrowFinish (OfferSequence 107945427, Owner rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm) of the escrow of escrow_create_token, sent by the finisher bot rPw6JAdM9BGwH4y4LxJQBDybaGNhFLCspU with a ticket (Sequence 0, TicketSequence 103238882): one DeletedNode Escrow and one ModifiedNode RippleState, the destination's line (rHiwfnKJ… is the high side; Balance -248700.70388715 to -323700.70388715 from the issuer side)."
+    },
+    "check_create_xrp": {
+      "ledger": 107972102,
+      "hash": "DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E",
+      "type": "CheckCreate",
+      "note": "CheckCreate with SendMax \"1000000000\" (1000 XRP) from rfv3Z8pqTzWdB6L6EV6bRpgsUGeSfCjS1N to rNWDKX2qk6ZiFvJD3aTkLDmqE681PVvMAM, no Expiration and no InvoiceID: one CreatedNode Check. The only check, escrow or channel transaction of a ledger of 1014 transactions."
+    },
+    "check_create_token": {
+      "ledger": 107698980,
+      "hash": "CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326",
+      "type": "CheckCreate",
+      "note": "CheckCreate of 1 RLUSD (issuer rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De) from r9CaVb4X1JVQoi6Q8Gw5cznAMRFARJDWyN to rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ with InvoiceID AB9E9A32… and Expiration 845488191 (the ledger closed at 845484602); SourceTag 804681468. The transaction of xrpl/amm/107698980, recorded again here."
+    },
+    "check_cash_amount": {
+      "ledger": 107671568,
+      "hash": "A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE",
+      "type": "CheckCash",
+      "note": "CheckCash with Amount \"933622827\" drops by rrsgF9au2zTjsB6HsK8LS9B3aUjDHQKAZ6 for the check of r4PboXNDNese3YLhc8tgzzKNhjGeEaxqfc (SendMax 1901893028, created in ledger 107617930); Fee \"0\" and Flags 1073741824: a Batch inner transaction. The metadata has delivered_amount and no DeliveredAmount (FINDINGS.md, 1). The transaction of xrpl/recorded/107671568, recorded again here."
+    },
+    "check_cancel_source": {
+      "ledger": 107968411,
+      "hash": "BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77",
+      "type": "CheckCancel",
+      "note": "CheckCancel by rPP3R33zpehB5hTy2jSYZek5ntq3HQym68, the check's own source, of a check to rJNAZcLDDGgVoQxDeANvUHZCDs6T6P3kzk (SendMax 135584318.6204475 of an issued token, no Expiration): one DeletedNode Check. This account cancelled 1801 checks in the ledgers scanned."
+    },
+    "channel_create": {
+      "ledger": 106970128,
+      "hash": "04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7",
+      "type": "PaymentChannelCreate",
+      "note": "PaymentChannelCreate of 10000 drops from rUQqjyFbrzwaEFyKywS1xeWWWseJMch4jm to rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR with CancelAfter 843879905 and SettleDelay 1209600 (14 days): one CreatedNode PayChannel whose NewFields have no Balance."
+    },
+    "channel_fund_expiration": {
+      "ledger": 107220098,
+      "hash": "0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE",
+      "type": "PaymentChannelFund",
+      "note": "PaymentChannelFund of 1 drop by the source rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu with Expiration 844841098: the channel's Amount goes from 5000001 to 5000002 (PreviousFields) and it gains Expiration (an added field is not in PreviousFields)."
+    },
+    "channel_claim": {
+      "ledger": 107641123,
+      "hash": "886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790",
+      "type": "PaymentChannelClaim",
+      "note": "The first claim of a channel: PaymentChannelClaim by the destination rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR with Balance \"32185\" on the 1 XRP channel E22CCE8F… of rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM; the channel's PreviousFields.Balance is \"0\" (its creation, E8A8466A… in ledger 107624182, is recorded too, and has no Balance)."
+    },
+    "channel_close_request": {
+      "ledger": 107107437,
+      "hash": "29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB",
+      "type": "PaymentChannelClaim",
+      "note": "tfClose (131072) by the source rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu while the channel's Balance 2469 is below its Amount 5000000: the channel stays (ModifiedNode, PreviousFields empty) and gains Expiration 844406430, the SettleDelay 1209600 after the ledger's parent_close_time 843196830 (the time a transaction sees; the ledger closed at 843196831)."
+    },
+    "channel_close_destination": {
+      "ledger": 107296498,
+      "hash": "42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75",
+      "type": "PaymentChannelClaim",
+      "note": "tfClose by the destination rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR with Balance \"154393\" of the 10 XRP channel of rMLwBUc2HZjfwvJLabFinEnCYEpdn9PAYF: the channel is a DeletedNode at once (PreviousFields.Balance \"154373\"), no Expiration, no SettleDelay wait."
+    },
+    "channel_renew": {
+      "ledger": 107218583,
+      "hash": "FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8",
+      "type": "PaymentChannelClaim",
+      "note": "tfRenew (65536) by the source rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu on the channel that carries the Expiration 844406430 of channel_close_request: ModifiedNode PayChannel whose PreviousFields hold that Expiration and whose FinalFields have none."
+    },
+    "channel_close_expired": {
+      "ledger": 102145584,
+      "hash": "9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9",
+      "type": "PaymentChannelClaim",
+      "note": "PaymentChannelClaim with tfRenew by the source rBJmvoyhs9Z7tmXTuViYvpPBDTw9hGJGfz on a channel whose Expiration 823998390 (set by the close request 8A5A47A31BC2A516F1FD9D123928B40806BB64733C721E1F32DB2251BA713E94 of ledger 101832262, not recorded) had passed (the ledger closed at 824014881): the claim closes it, DeletedNode PayChannel, tesSUCCESS."
+    },
+    "delegate_set_create": {
+      "ledger": 107558036,
+      "hash": "4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66",
+      "type": "DelegateSet",
+      "note": "DelegateSet by rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL authorizing rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK for OfferCreate and OfferCancel (Memo type novadex/mm): one CreatedNode Delegate whose NewFields are Account, Authorize and Permissions. The only DelegateSet found; that Delegate still stands."
+    },
+    "delegated_batch_inner": {
+      "ledger": 107699656,
+      "hash": "8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8",
+      "type": "OfferCreate",
+      "note": "OfferCreate of rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL with Delegate rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK, Fee \"0\" and Flags 1073807360 (tfInnerBatchTxn and tfPassive): an inner transaction of the Batch 26BDDAD0… sent by the delegate in the same ledger; the delegate is not in the metadata. The transaction of xrpl/amm/107699656, recorded again here."
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 102145584,
+      "bytes": 363320,
+      "gzipBytes": 80358
+    },
+    {
+      "ledger": 106179366,
+      "bytes": 1146319,
+      "gzipBytes": 204554
+    },
+    {
+      "ledger": 106268539,
+      "bytes": 289667,
+      "gzipBytes": 47012
+    },
+    {
+      "ledger": 106970128,
+      "bytes": 119098,
+      "gzipBytes": 26568
+    },
+    {
+      "ledger": 107107437,
+      "bytes": 247327,
+      "gzipBytes": 43280
+    },
+    {
+      "ledger": 107218583,
+      "bytes": 303143,
+      "gzipBytes": 53305
+    },
+    {
+      "ledger": 107220098,
+      "bytes": 243012,
+      "gzipBytes": 42568
+    },
+    {
+      "ledger": 107296498,
+      "bytes": 390626,
+      "gzipBytes": 76454
+    },
+    {
+      "ledger": 107558036,
+      "bytes": 238083,
+      "gzipBytes": 47508
+    },
+    {
+      "ledger": 107624182,
+      "bytes": 255661,
+      "gzipBytes": 50301
+    },
+    {
+      "ledger": 107641123,
+      "bytes": 165243,
+      "gzipBytes": 31310
+    },
+    {
+      "ledger": 107670360,
+      "bytes": 283342,
+      "gzipBytes": 55709
+    },
+    {
+      "ledger": 107671568,
+      "bytes": 1360928,
+      "gzipBytes": 316237
+    },
+    {
+      "ledger": 107698980,
+      "bytes": 166744,
+      "gzipBytes": 36761
+    },
+    {
+      "ledger": 107699656,
+      "bytes": 345407,
+      "gzipBytes": 77477
+    },
+    {
+      "ledger": 107703707,
+      "bytes": 180706,
+      "gzipBytes": 31714
+    },
+    {
+      "ledger": 107711512,
+      "bytes": 214106,
+      "gzipBytes": 39504
+    },
+    {
+      "ledger": 107897249,
+      "bytes": 177141,
+      "gzipBytes": 33031
+    },
+    {
+      "ledger": 107945438,
+      "bytes": 433742,
+      "gzipBytes": 104754
+    },
+    {
+      "ledger": 107967068,
+      "bytes": 640498,
+      "gzipBytes": 130631
+    },
+    {
+      "ledger": 107968411,
+      "bytes": 333919,
+      "gzipBytes": 62028
+    },
+    {
+      "ledger": 107972102,
+      "bytes": 1905446,
+      "gzipBytes": 427816
+    }
+  ]
+}

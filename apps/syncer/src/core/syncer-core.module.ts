@@ -14,14 +14,24 @@ import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { WorkerModule } from '../worker-registry';
 import { migrateOnBoot } from './migrate-on-boot';
 import { createNodeClient } from './node-client.provider';
-import { assertValidatorsSchema } from './schema-check';
+import {
+  assertIssuedTokensSchema,
+  assertMptSchema,
+  assertSupplySchema,
+  assertTomlsSchema,
+  assertValidatorsSchema,
+  assertValidatorTomlSchema,
+} from './schema-check';
 
 /**
  * Token of the async provider that applies the boot-time migrations and then checks that the schema of
- * `002_validators_amendments.sql` is there when a worker that writes it is enabled (`assertValidatorsSchema`). Nest awaits
- * async providers before it calls any lifecycle hook, so workers (which start in their hooks) always find the migrated
- * schema, and a database without 002 fails the boot instead of every write of the validations and validators workers;
- * nothing injects this.
+ * `002_validators_amendments.sql` is there when a worker that writes it is enabled (`assertValidatorsSchema`), that of
+ * `012_display_names.sql` when the tomls worker is (`assertTomlsSchema`), that of `014_issued_tokens.sql` when the ingest or
+ * the aggregator is (`assertIssuedTokensSchema`), that of `015_supply.sql` when the ingest or the aggregator is
+ * (`assertSupplySchema`), that of `016_validator_toml_details.sql` when the validators worker is (`assertValidatorTomlSchema`) and
+ * that of `017_mpt.sql` when the ingest or the aggregator is (`assertMptSchema`). Nest awaits async providers before it calls any lifecycle hook, so
+ * workers (which start in their hooks) always find the migrated schema, and a database without 002, 012, 014, 015, 016 or 017 fails
+ * the boot instead of every write of the workers that need it; nothing injects this.
  */
 const SCHEMA_READY = Symbol('SCHEMA_READY');
 
@@ -88,6 +98,11 @@ export class SyncerCoreModule {
           useFactory: async (ch: ClickHouseService) => {
             const migrated = await migrateOnBoot(config, clickHouse, logger);
             await assertValidatorsSchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            await assertTomlsSchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            await assertIssuedTokensSchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            await assertSupplySchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            await assertValidatorTomlSchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            await assertMptSchema(ch, enabledWorkers(config), clickHouse.database, logger);
             return migrated;
           },
           inject: [ClickHouseService],

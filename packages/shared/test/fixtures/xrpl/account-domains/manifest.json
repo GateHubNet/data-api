@@ -1,0 +1,52 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://s2.ripple.com",
+  "recorded_at": "2026-10-27T19:42:59.816Z",
+  "validated_head": 107943170,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F": {
+      "ledger": 107939675,
+      "type": "AccountSet",
+      "result": "tesSUCCESS"
+    },
+    "894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98": {
+      "ledger": 107938710,
+      "type": "AccountSet",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "accountset_sets_domain": {
+      "ledger": 107939675,
+      "hash": "7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F",
+      "type": "AccountSet",
+      "note": "AccountSet by rM8kmmnz5qPMg7V3r7SHYXgDGvm8PhzLvM sets its Domain: none -> 6C756D697472616465732E696F (\"lumitrades.io\"). Its account root is the only node (ModifiedNode, FinalFields.Domain, PreviousFields Balance and Sequence); account_info at ledger 107939674 has no Domain. No other transaction of the ledger changes its account root."
+    },
+    "accountset_changes_domain": {
+      "ledger": 107938710,
+      "hash": "894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98",
+      "type": "AccountSet",
+      "note": "AccountSet by rPo76joT4HVuvyomAqnapVcX3tYvmAxhHT changes its Domain: 9437D5204E1F5CAF200A26E3862B86DC560E84EDB7D5EC2679225E723802BAE5 -> 339D2BF5E0AEE68CACBE6BE3DAF3F96F4B9BC3FE208699286AD5B4C746FE2DEF (32 bytes each, not names). Its account root is the only node (FinalFields.Domain, PreviousFields Balance, Domain and Sequence). No other transaction of the ledger changes its account root."
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 107938710,
+      "bytes": 238189,
+      "gzipBytes": 49588
+    },
+    {
+      "ledger": 107939675,
+      "bytes": 1239216,
+      "gzipBytes": 287463
+    }
+  ]
+}

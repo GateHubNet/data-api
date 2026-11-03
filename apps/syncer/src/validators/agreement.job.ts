@@ -156,7 +156,7 @@ export class AgreementJob implements ComputeJob {
 
   constructor(
     @Inject(ClickHouseService) private readonly ch: Pick<ClickHouseService, 'query' | 'queryOne' | 'insert'>,
-    @Inject(SyncerConfig) private readonly cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlThreshold'>,
+    @Inject(SyncerConfig) private readonly cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlValidators' | 'unlThreshold'>,
     @Inject(PrometheusService) private readonly metrics: Pick<PrometheusService, 'validatorsAgreementLagSeconds'>,
     @Optional() @Inject(VALIDATORS_WORKER_OPTIONS) options: ValidatorsWorkerOptions = {},
   ) {

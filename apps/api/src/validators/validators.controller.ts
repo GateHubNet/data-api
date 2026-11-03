@@ -1,4 +1,5 @@
-import { Get, Param, Query, Req, Res } from '@nestjs/common';
+import { NetworkProfile } from '@gatehub/data-api-shared';
+import { Get, Inject, Param, Query, Req, Res } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // `import type`: the decorated parameters below would otherwise make Nest's metadata `require('express')`, which is not
 // a dependency of this app (only its types are)
@@ -7,7 +8,8 @@ import { Csv } from '../common/csv.interceptor';
 import { setLinkHeader } from '../common/pagination';
 import { first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
-import { ApiConfig } from '../config/api.config';
+import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
+import { DomainTomlsService } from '../names/domain-tomls.service';
 import { AmendmentsService } from './amendments.service';
 import {
   routeCacheControl,
@@ -15,21 +17,23 @@ import {
   VALIDATIONS_MARKER_CACHE_CONTROL,
   VALIDATORS_CACHE_CONTROL,
 } from './cache-control';
+import { buildCountries, CountriesBody } from './countries-object';
+import { domainTomlFactsOf } from './domain-toml-facts';
 import { buildSummary, ValidatorsSummary } from './summary-object';
 import { buildValidationsBody, ValidationsBody } from './validation-row-object';
 import { ValidatorDirectoryService } from './validator-directory.service';
 import { parseValidatorKey, resolveValidator } from './validator-key';
 import { buildValidatorsBody, validatorDetail, ValidatorDetail, ValidatorsBody } from './validator-object';
 import { ValidatorValidationsService } from './validator-validations.service';
-import { listValidators, parseListQuery } from './validators-query';
+import { listValidators, parseListQuery, parseScope } from './validators-query';
 
 /** The message of the routes of the validators when something other than a Ripple 4xx goes wrong. */
 const FAILURE = 'unable to retrieve validator(s)';
 
 /**
- * `GET /v2/network/validators/summary`, `GET /v2/network/validators`, `GET /v2/network/validators/{key}` and
- * `GET /v2/network/validators/{key}/validations` (spec 3.1 to 3.4). The routes with a validator key come after `summary` in
- * this controller, so that `summary` is never read as a key.
+ * `GET /v2/network/validators/summary`, `GET /v2/network/validators/countries`, `GET /v2/network/validators`,
+ * `GET /v2/network/validators/{key}` and `GET /v2/network/validators/{key}/validations` (spec 3.1 to 3.4; D8 4.4). The routes
+ * with a validator key come after `summary` and `countries` in this controller, so that neither is ever read as a key.
  *
  * The list and the validator are built on the assembly of the amendments (which holds the directory it was built on): their
  * votes name the amendments they vote for, and the detail lists the ones still being decided. One request, one directory.
@@ -41,6 +45,8 @@ export class ValidatorsController {
     private readonly amendments: AmendmentsService,
     private readonly validations: ValidatorValidationsService,
     private readonly config: ApiConfig,
+    private readonly tomls: DomainTomlsService,
+    @Inject(NETWORK_PROFILE) private readonly profile: Pick<NetworkProfile, 'tomlNetworkNames'>,
   ) {}
 
   @Get('summary')
@@ -56,6 +62,25 @@ export class ValidatorsController {
     const summary = buildSummary(await this.directory.get());
     this.setCacheControl(res);
     return summary;
+  }
+
+  @Get('countries')
+  @RippleRoute(FAILURE)
+  @ApiOperation({
+    summary: 'Get the validators of the network per server country',
+    description:
+      'How many validators of a scope name each country as the server_country of their verified toml, and how many of them are ' +
+      'on the trusted UNL; those without one count as unknown. Every count is what the list gives with the same scope and ' +
+      'country. JSON only.',
+  })
+  @ApiQuery({ name: 'scope', required: false, enum: ['unl', 'all'], description: 'Default: unl.' })
+  async countries(@Query() query: QueryParams, @Res({ passthrough: true }) res: Response): Promise<CountriesBody> {
+    const scope = parseScope(query);
+    // the directory of the list, so that the route and the list agree within the window the assembly is cached
+    const { directory } = await this.amendments.get();
+    const body = buildCountries(directory, scope);
+    this.setCacheControl(res);
+    return body;
   }
 
   @Get()
@@ -85,6 +110,12 @@ export class ValidatorsController {
     required: false,
     description: 'A part of the domain, the master key or the signing key (at most 100 characters).',
   })
+  @ApiQuery({
+    name: 'country',
+    required: false,
+    description:
+      "An ISO 3166-1 alpha-2 code, any case (uk is GB): the validators whose toml's server_country is it. unknown, any case: those without one.",
+  })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
   @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
   @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
@@ -94,7 +125,7 @@ export class ValidatorsController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<ValidatorsBody> {
     const assembly = await this.amendments.get();
-    // the checks come in the order of the specification: scope, publisher, amendment, q, marker, limit
+    // the checks come in the order of the specification: scope, publisher, amendment, q, country, marker, limit
     const request = parseListQuery(query, assembly.directory, (name) => this.amendments.find(assembly, name)?.id);
     const page = listValidators(assembly.directory, request);
     const body = buildValidatorsBody(page.rows, page.marker, assembly);
@@ -110,7 +141,8 @@ export class ValidatorsController {
     summary: 'Get a validator of the network',
     description:
       'One validator by its master key, its signing key or 66 hex digits: the row of the list, its vote on every amendment ' +
-      'being decided, its manifest and its agreement of each of the last 30 days. JSON only.',
+      'being decided, the facts of its verified toml with those of its domain (principals, last modified, accounts, currencies), ' +
+      'its manifest and its agreement of each of the last 30 days. JSON only.',
   })
   @ApiParam({
     name: 'key',
@@ -119,7 +151,13 @@ export class ValidatorsController {
   async detail(@Param('key') raw: string, @Res({ passthrough: true }) res: Response): Promise<ValidatorDetail> {
     const key = parseValidatorKey(raw);
     const assembly = await this.amendments.get();
-    const body = validatorDetail(resolveValidator(assembly.directory, key), assembly);
+    const entry = resolveValidator(assembly.directory, key);
+    // only a row with toml has a file that verified; a store read that fails is a failure of the route
+    const facts =
+      entry.toml === undefined || entry.domain === undefined
+        ? undefined
+        : domainTomlFactsOf(await this.tomls.get(entry.domain.toLowerCase()), this.profile);
+    const body = validatorDetail(entry, assembly, facts);
     this.setCacheControl(res);
     return body;
   }

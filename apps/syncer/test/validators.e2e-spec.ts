@@ -8,9 +8,11 @@ import {
   NEGATIVE_UNL_OBJECT_INDEX,
   NetworkStateRow,
   parseContextFor,
+  readStoredTomls,
   Table,
   ValidationsRow,
 } from '@gatehub/data-api-shared';
+import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { encodeAccountID } from 'ripple-address-codec';
@@ -426,6 +428,111 @@ describe('the validators worker (e2e)', () => {
     expect(await publisherRow(ID)).toMatchObject({ status: 'ok', error: '' });
   });
 
+  describe('the fixed list (GH_UNL_VALIDATORS)', () => {
+    /** The four keys of Xahau Testnet's [validators] section (the profile's default fixed list). */
+    const FIXED = getNetworkProfile('xahau-testnet').defaultUnlValidators.split(',');
+    let testnetNode: FakeNode;
+
+    beforeAll(async () => {
+      testnetNode = await startFakeNode({
+        server_info: { info: { complete_ledgers: '1-100', validated_ledger: { seq: 100 }, network_id: 21338 } },
+      });
+    });
+
+    afterAll(async () => {
+      await testnetNode?.stop();
+    });
+
+    /** The worker of Xahau Testnet, which has no publisher: its trusted keys are the fixed list. */
+    async function bootTestnet(unlValidators: string): Promise<ValidatorsApp> {
+      const app = await startValidatorsApp({
+        clickhouse: db.config,
+        node: testnetNode,
+        web,
+        profile: getNetworkProfile('xahau-testnet'),
+        config: { unlPublishers: '', unlValidators },
+        // the domain loop would check the four keys, and the app is closed with that pass on its way
+        worker: { start: { state: false, domains: false } },
+      });
+      apps.push(app);
+      return app;
+    }
+
+    /** Stops the worker (a restart is another one). */
+    async function stopAll(): Promise<void> {
+      const running = apps;
+      apps = [];
+      for (const app of running) await app.stop();
+    }
+
+    it('Xahau Testnet: registers the fixed list as the publisher local, and a restart with the same keys writes no list', async () => {
+      expect(FIXED).toHaveLength(4);
+      const sorted = [...FIXED].sort();
+      const before = Date.now();
+      await bootTestnet(FIXED.join(','));
+      const after = Date.now();
+
+      expect(await publisherRows()).toEqual([
+        {
+          publisher: 'local',
+          url: '',
+          publisher_key: '',
+          configured: 1,
+          threshold: 1,
+          status: 'ok',
+          error: '',
+          last_ok_ms: expect.anything(),
+        },
+      ]);
+      expect(Number((await publisherRow('local'))?.last_ok_ms)).toBeGreaterThanOrEqual(before);
+      expect(Number((await publisherRow('local'))?.last_ok_ms)).toBeLessThanOrEqual(after);
+      const rows = await storedLists();
+      expect(rows).toEqual([
+        {
+          publisher: 'local',
+          publisher_key: '',
+          sequence: '1',
+          version: 1,
+          effective: expect.any(Number),
+          expiration: 4_294_967_295,
+          validators: sorted,
+          blob_sha256: createHash('sha256').update(sorted.join('\n')).digest('hex').toUpperCase(),
+          fetched_ms: expect.anything(),
+          response: JSON.stringify({ validators: sorted }),
+        },
+      ]);
+      expect(rows[0].effective).toBeGreaterThanOrEqual(Math.floor(before / 1000));
+      expect(rows[0].effective).toBeLessThanOrEqual(Math.floor(after / 1000));
+      // the list in use never expires, and it is read like a publisher's
+      const inUse = listInUse(await readStoredLists(db.ch, ['local']), 'local', nowSeconds());
+      expect(inUse?.expired).toBe(false);
+      expect(inUse?.list.validators).toEqual(sorted);
+      expect(web.requests).toEqual([]); // local is never fetched
+
+      // a restart with the keys in another order is the same list
+      await stopAll();
+      await bootTestnet([...FIXED].reverse().join(','));
+      expect(await storedLists()).toEqual(rows);
+      expect(await publisherRows()).toHaveLength(1);
+    });
+
+    it('Xahau Testnet: writes the next sequence when the keys changed, and marks local no longer configured when none is left', async () => {
+      await bootTestnet(FIXED.join(','));
+      await stopAll();
+      await bootTestnet(FIXED.slice(0, 3).join(','));
+      expect((await storedLists()).map((r) => [r.sequence, r.validators.length])).toEqual([
+        ['1', 4],
+        ['2', 3],
+      ]);
+
+      // the fixed list is emptied: its history stays, and local is no longer configured
+      await stopAll();
+      await bootTestnet('');
+      expect((await storedLists()).map((r) => r.sequence)).toEqual(['1', '2']);
+      expect(await publisherRow('local')).toMatchObject({ configured: 0, status: 'ok', error: '' });
+    });
+  });
+
   describe('a replay of an older publisher manifest', () => {
     // sequence 2 of the manifest moved the publisher to SIGNING_2; a body that brings back sequence 1 is signed by the old key
     const current = (sequence: number) => list({ sequence, manifestSequence: 2, signing: SIGNING_2 });
@@ -673,7 +780,7 @@ describe('the validators worker (e2e)', () => {
                 argMax(status, checked_at) AS status, argMax(reason, checked_at) AS reason,
                 argMax(status_code, checked_at) AS status_code, argMax(toml_url, checked_at) AS toml_url,
                 toUnixTimestamp64Milli(max(checked_at)) AS checked_ms,
-                toUnixTimestamp64Milli(argMax(verified_at, checked_at)) AS verified_ms,
+                toUnixTimestamp64Milli(tupleElement(argMax(tuple(verified_at), checked_at), 1)) AS verified_ms,
                 toUnixTimestamp(argMax(next_check_at, checked_at)) AS next_check,
                 argMax(accounts, checked_at) AS accounts
            FROM ${Table.ValidatorDomains}
@@ -758,7 +865,208 @@ describe('the validators worker (e2e)', () => {
       clock.ms = Math.floor(Date.now() / 1000) * 1000;
       node.requests.length = 0;
       delete node.answers.manifest;
-      for (const table of [Table.ValidatorDomains, Table.ValidatorSeen]) await db.ch.command(`TRUNCATE TABLE ${table}`);
+      for (const table of [Table.ValidatorDomains, Table.ValidatorSeen, Table.DomainTomls]) {
+        await db.ch.command(`TRUNCATE TABLE ${table}`);
+      }
+    });
+
+    describe('toml details (D8)', () => {
+      const TOMLS = join(__dirname, '../../../packages/shared/test/fixtures/tomls');
+      const fixture = (name: string, keys: string[]): string =>
+        keys.reduce(
+          (text, key, i) => text.replaceAll(`__KEY_${i + 1}__`, key),
+          readFileSync(join(TOMLS, `validator-details.${name}.toml`), 'utf8'),
+        );
+      interface FactsRow {
+        key: string;
+        pair_domain: string;
+        owner: string;
+        server: string;
+        toml_net: string;
+        unl: string;
+        version: number;
+      }
+      const facts = () =>
+        db.ch.query<FactsRow>(
+          `SELECT validation_public_key AS key, domain AS pair_domain,
+                  argMax(owner_country, checked_at) AS owner,
+                  argMax(server_country, checked_at) AS server,
+                  argMax(toml_network, checked_at) AS toml_net,
+                  argMax(toml_unl, checked_at) AS unl,
+                  argMax(toml_version, checked_at) AS version
+             FROM ${Table.ValidatorDomains}
+            GROUP BY validation_public_key, domain
+            ORDER BY validation_public_key, domain`,
+        );
+
+      it('reads the hand-written files of both networks', async () => {
+        const [one, two] = [val(1), val(2)];
+        const keys = [one.master.base58, two.master.base58];
+        await putManifest(one, { domain: NORTHPEAK });
+        await putManifest(two, { domain: NORTHPEAK });
+        await putList(keys);
+        web.serveToml(NORTHPEAK, TOML_PATH, fixture('xrp-ledger', keys));
+        const xrpl = await bootDomains();
+        expect(await xrpl.domains.pass()).toBe(2);
+        const row = (rows: FactsRow[], key: string, domain: string) =>
+          rows.find((r) => r.key === key && r.pair_domain === domain);
+        const first = await facts();
+        expect(row(first, keys[0], NORTHPEAK)).toMatchObject({
+          owner: 'NO',
+          server: 'DE',
+          toml_net: '',
+          unl: 'https://vl.ripple.com',
+          version: 1,
+        });
+        expect(row(first, keys[1], NORTHPEAK)).toMatchObject({
+          owner: 'GB',
+          server: '',
+          toml_net: 'main',
+          unl: '',
+          version: 1,
+        });
+
+        await putManifest(one, { domain: 'b.example', seq: 2 });
+        web.serveToml('b.example', '/.well-known/xahau.toml', fixture('xahau', [keys[0]]));
+        const xahauNode = await startFakeNode({
+          server_info: { info: { complete_ledgers: '1-100', validated_ledger: { seq: 100 }, network_id: 21337 } },
+        });
+        try {
+          const xahau = await bootDomains({ node: xahauNode, profile: getNetworkProfile('xahau') });
+          expect(await xahau.domains.pass()).toBe(1);
+          expect(row(await facts(), keys[0], 'b.example')).toMatchObject({
+            owner: 'EE',
+            server: 'FI',
+            toml_net: '21337',
+            unl: '',
+            version: 1,
+          });
+          await xahau.stop();
+        } finally {
+          await xahauNode.stop();
+        }
+      });
+
+      it('checks a pair verified before D8 again in the next pass', async () => {
+        const v = val(1);
+        const key = v.master.base58;
+        await putManifest(v, { domain: NORTHPEAK });
+        await putList([key]);
+        const at = clock.ms / 1000;
+        await db.ch.insert(Table.ValidatorDomains, [
+          {
+            validation_public_key: key,
+            domain: NORTHPEAK,
+            status: 'verified',
+            reason: '',
+            status_code: 0,
+            toml_url: `https://${NORTHPEAK}${TOML_PATH}`,
+            checked_at: at - 7200,
+            verified_at: at - 7200,
+            next_check_at: at + 4 * 3600,
+            accounts: [],
+            owner_country: '',
+            server_country: '',
+            toml_network: '',
+            toml_unl: '',
+            toml_version: 0,
+          },
+        ]);
+        web.serveToml(NORTHPEAK, TOML_PATH, fixture('xrp-ledger', [key, val(2).master.base58]));
+        const app = await bootDomains();
+        expect(await app.domains.pass()).toBe(1);
+        expect(await facts()).toEqual([expect.objectContaining({ key, server: 'DE', version: 1 })]);
+        // and it is not due again
+        expect(await app.domains.pass()).toBe(0);
+      });
+
+      it('writes the store row of a domain only a validator names, and its failed row once the file is gone', async () => {
+        const v = val(1);
+        const key = v.master.base58;
+        await putManifest(v, { domain: 'a.example' });
+        await putList([key]);
+        web.serveToml('a.example', TOML_PATH, fixture('xrp-ledger', [key, val(2).master.base58]));
+        const app = await bootDomains();
+        expect(await app.domains.pass()).toBe(1);
+        const stored = (await readStoredTomls(db.ch, ['a.example'])).get('a.example');
+        expect(stored).toMatchObject({
+          status: 'ok',
+          fetched_at: clock.ms / 1000,
+          principals: ['Mara Lindqvist', 'Tomas Okafor'],
+          modified: Date.parse('2026-10-02T00:00:00Z') / 1000,
+        });
+
+        web.serveToml('a.example', TOML_PATH, 'gone', 404);
+        clock.ms += 7 * 3_600_000;
+        expect(await app.domains.pass()).toBe(1);
+        expect((await readStoredTomls(db.ch, ['a.example'])).get('a.example')).toMatchObject({
+          status: 'failed',
+          reason: 'http_status',
+          status_code: 404,
+          fetched_at: null,
+          principals: [],
+        });
+        expect((await app.metrics.validatorsTomlStoreWritesTotal.get()).values).toEqual(
+          expect.arrayContaining([expect.objectContaining({ labels: { outcome: 'ok' }, value: 2 })]),
+        );
+      });
+
+      it('stores no email and no name with @', async () => {
+        const [one, two] = [val(1), val(2)];
+        const keys = [one.master.base58, two.master.base58];
+        await putManifest(one, { domain: NORTHPEAK });
+        await putManifest(two, { domain: NORTHPEAK });
+        await putList(keys);
+        web.serveToml(NORTHPEAK, TOML_PATH, fixture('xrp-ledger', keys));
+        const lines: string[] = [];
+        const keep = (line: string) => void lines.push(line);
+        const app = await bootDomains({ worker: { logger: { log: keep, warn: keep, error: keep } } });
+        expect(await app.domains.pass()).toBe(2);
+        expect(lines.length).toBeGreaterThan(0);
+        const everything = [
+          ...(await db.ch.query(`SELECT * FROM ${Table.ValidatorDomains}`)),
+          ...(await db.ch.query(`SELECT * FROM ${Table.DomainTomls}`)),
+        ];
+        expect(everything.length).toBeGreaterThanOrEqual(3);
+        expect(JSON.stringify(everything)).not.toContain('@');
+        expect(lines.join('\n')).not.toContain('@');
+      });
+    });
+
+    it('reads a newer row without verified_at as no last success', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putList([v.master.base58]);
+      const at = clock.ms / 1000;
+      const row = {
+        validation_public_key: v.master.base58,
+        domain: NORTHPEAK,
+        status: 'verified',
+        reason: '',
+        status_code: 0,
+        toml_url: `https://${NORTHPEAK}${TOML_PATH}`,
+        accounts: [],
+        owner_country: '',
+        server_country: '',
+        toml_network: '',
+        toml_unl: '',
+        toml_version: 1,
+      };
+      // two inserts: within one insert the engine keeps the newest row alone, and argMax has no older value to skip to
+      await db.ch.insert(Table.ValidatorDomains, [
+        { ...row, checked_at: at - 7200, verified_at: at - 7200, next_check_at: at - 3600 },
+      ]);
+      await db.ch.insert(Table.ValidatorDomains, [
+        { ...row, checked_at: at - 3600, verified_at: null, next_check_at: at - 1 },
+      ]);
+      web.serveToml(NORTHPEAK, TOML_PATH, 'this is not TOML');
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(1);
+
+      // the definite failure carries the last success of the newest row: none
+      const [newest] = await domainRows();
+      expect(newest).toMatchObject({ status: 'unverified', reason: 'toml_invalid', verified_ms: null });
     });
 
     it('verifies a domain whose hand-written TOML lists the key, and stores the accounts it names', async () => {
@@ -1857,7 +2165,7 @@ describe('the validators worker (e2e)', () => {
 
     /** A job of its own over the database of the test (a restart is another one). */
     function makeJob(now?: () => number): RoundsJob {
-      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS });
+      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS, unlValidators: '' });
       const logger = { log: () => undefined, warn: (line: string) => void warnings.push(line), error: () => undefined };
       return new RoundsJob(db.ch, cfg, new PrometheusService(), { now, logger });
     }
@@ -3445,7 +3753,7 @@ describe('the validators worker (e2e)', () => {
 
     /** A job of its own over the database of the test (a restart is another one). */
     function makeJob(now?: () => number): AgreementJob {
-      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS });
+      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS, unlValidators: '' });
       const logger = {
         log: (line: string) => void lines.push(line),
         warn: (line: string) => void lines.push(line),

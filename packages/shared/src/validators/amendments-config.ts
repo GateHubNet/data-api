@@ -16,15 +16,22 @@ export interface AmendmentMeta {
   xls_url?: string;
   /** One line, at most 200 characters. */
   description?: string;
-  /** For an amendment enabled before the indexed history; an indexed `EnableAmendment` wins over it. */
+  /**
+   * For an amendment enabled before the indexed history; an indexed `EnableAmendment` wins over it. A testnet that reads its
+   * family's file has none: they record mainnet's ledgers and dates.
+   */
   enabled?: { ledger_index?: number; date?: string };
   /** The amendment can no longer be voted in by current software. */
   obsolete?: true;
-  /** Xahau only: behaviour that is always on although the ledger does not list the amendment. */
+  /**
+   * Behaviour that is always on although a ledger begun after the amendment's retirement does not list it: rippled's
+   * `XRPL_RETIRE` list on XRPL, xahaud's retired list on Xahau.
+   */
   retired?: true;
 }
 
 export interface AmendmentsConfig {
+  /** The network of the profile that read the file: a testnet that reads its family's file is `xrpl-testnet`, not `xrpl`. */
   network: NetworkName;
   /** `YYYY-MM-DD`: when the file was last brought up to date. */
   updated: string;
@@ -115,7 +122,8 @@ function parseEnabled(value: unknown, where: string): NonNullable<AmendmentMeta[
   return enabled;
 }
 
-function parseEntry(raw: unknown, index: number, profile: NetworkProfile): AmendmentMeta {
+/** `keepEnabled`: whether the entry's `enabled` is the network's own (it is checked either way, and dropped when it is not). */
+function parseEntry(raw: unknown, index: number, profile: NetworkProfile, keepEnabled: boolean): AmendmentMeta {
   const named = isObject(raw) && typeof raw.name === 'string' ? ` (${raw.name})` : '';
   const where = `amendments[${index}]${named}`;
   if (!isObject(raw)) return refuse(where, 'expected an object');
@@ -158,14 +166,16 @@ function parseEntry(raw: unknown, index: number, profile: NetworkProfile): Amend
     }
     entry.description = text;
   }
-  if (raw.enabled !== undefined) entry.enabled = parseEnabled(raw.enabled, where);
+  if (raw.enabled !== undefined) {
+    const enabled = parseEnabled(raw.enabled, where);
+    if (keepEnabled) entry.enabled = enabled;
+  }
   if (raw.obsolete !== undefined) {
     if (raw.obsolete !== true) return refuse(where, 'obsolete: can only be true');
     entry.obsolete = true;
   }
   if (raw.retired !== undefined) {
     if (raw.retired !== true) return refuse(where, 'retired: can only be true');
-    if (profile.software !== 'xahaud') return refuse(where, 'retired: is for Xahau only');
     entry.retired = true;
   }
   return entry;
@@ -174,6 +184,10 @@ function parseEntry(raw: unknown, index: number, profile: NetworkProfile): Amend
 /**
  * Check a metadata file (spec 2.6) for `profile` and index it. Throws `Error('Invalid amendments config: <where>: <why>')`
  * where `<where>` is the top-level key or `amendments[<i>] (<name>)`.
+ *
+ * The file's `network` is the profile's name or its family: a testnet reads the file of its family (names, versions,
+ * standards, descriptions, `obsolete` and `retired`) and drops its `enabled` entries, which are mainnet's ledgers and
+ * dates; a file written for the testnet itself keeps them. The result is the profile's network either way.
  */
 export function parseAmendmentsConfig(raw: unknown, profile: NetworkProfile): AmendmentsConfig {
   if (!isObject(raw)) return refuse('top level', 'expected an object');
@@ -181,9 +195,10 @@ export function parseAmendmentsConfig(raw: unknown, profile: NetworkProfile): Am
     if (!TOP_KEYS.includes(key)) return refuse(key, 'unknown key');
   }
   if (raw.network === undefined) return refuse('network', 'required');
-  if (raw.network !== profile.name) {
+  if (raw.network !== profile.name && raw.network !== profile.family) {
     return refuse('network', `"${String(raw.network)}" is not the network of this deployment, "${profile.name}"`);
   }
+  const keepEnabled = raw.network === profile.name;
   if (raw.updated === undefined) return refuse('updated', 'required');
   if (!isDay(raw.updated)) return refuse('updated', 'must be a day, YYYY-MM-DD');
   if (raw.amendments === undefined) return refuse('amendments', 'required');
@@ -194,7 +209,7 @@ export function parseAmendmentsConfig(raw: unknown, profile: NetworkProfile): Am
   const byName = new Map<string, AmendmentMeta>();
   const positions = new Map<string, number>();
   raw.amendments.forEach((item: unknown, index: number) => {
-    const entry = parseEntry(item, index, profile);
+    const entry = parseEntry(item, index, profile, keepEnabled);
     const first = positions.get(entry.name);
     if (first !== undefined)
       return refuse(`amendments[${index}] (${entry.name})`, `name: duplicate of amendments[${first}]`);
@@ -208,11 +223,11 @@ export function parseAmendmentsConfig(raw: unknown, profile: NetworkProfile): Am
 
 /**
  * Load the amendment metadata of a network. An absent, empty or blank path (`GH_AMENDMENTS_CONFIG` left empty, which both
- * config classes hand over as `''`) is the bundled `config/amendments/<network>.json`, next to `config/markets`. An invalid
- * file throws with its path and the entry at fault.
+ * config classes hand over as `''`) is the bundled `config/amendments/<family>.json`, next to `config/markets`: a testnet
+ * reads its family's file. An invalid file throws with its path and the entry at fault.
  */
 export function loadAmendmentsConfig(profile: NetworkProfile, path?: string): AmendmentsConfig {
-  const file = path === undefined || path.trim() === '' ? join(DEFAULT_AMENDMENTS_DIR, `${profile.name}.json`) : path;
+  const file = path === undefined || path.trim() === '' ? join(DEFAULT_AMENDMENTS_DIR, `${profile.family}.json`) : path;
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(file, 'utf8'));

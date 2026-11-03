@@ -20,6 +20,14 @@ describe('PrometheusService', () => {
     service.aggregatorErrorsTotal.inc({ job: 'stats_dirty' }, 4);
     service.aggregatorStatsLagSeconds.set(86_400);
     service.ammUnclassifiedTotal.inc(3);
+    service.nftSkippedTotal.inc(2);
+    service.objectsUnclassifiedTotal.inc(4);
+    service.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, 2);
+    service.nftStateLagLedgers.set(12);
+    service.nftDirtyLedgers.set(34);
+    service.nftCollectionsPending.set(5);
+    service.escrowsLagLedgers.set(6);
+    service.escrowsOpen.set(7);
 
     const text = await service.getMetrics();
     expect(text).toMatch(/^# TYPE syncer_checkpoint_ledger gauge$/m);
@@ -40,6 +48,50 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_aggregator_stats_lag_seconds 86400$/m);
     expect(text).toMatch(/^# TYPE syncer_amm_unclassified_total counter$/m);
     expect(text).toMatch(/^syncer_amm_unclassified_total 3$/m);
+    expect(text).toMatch(/^# TYPE syncer_nft_skipped_total counter$/m);
+    expect(text).toMatch(/^syncer_nft_skipped_total 2$/m);
+    expect(text).toMatch(/^# TYPE syncer_objects_unclassified_total counter$/m);
+    expect(text).toContain(
+      '# HELP syncer_objects_unclassified_total Changes of an escrow, check, payment channel or delegation that no event of ' +
+        'the object history expects (the event update, spec section 2.2), over the ledgers written by the live ingest and ' +
+        'by range-ingest runs of this process.\n# TYPE syncer_objects_unclassified_total counter\n',
+    );
+    expect(text).toMatch(/^syncer_objects_unclassified_total 4$/m);
+    expect(text).toMatch(/^# TYPE syncer_parser_anomalies_total counter$/m);
+    expect(text).toContain(
+      '# HELP syncer_parser_anomalies_total Things a parser found in a ledger that the network cannot produce and stored in a ' +
+        'safe form, by kind (import_minted_negative: a Xahau Import whose minted drops came out below 0 and were stored as 0; ' +
+        'mpt_unreadable: an MPT amount that is not a UInt64, stored as 0, or a node skipped because its ID cannot be made), ' +
+        'over the ledgers written by the live ingest and by range-ingest runs of this process.\n' +
+        '# TYPE syncer_parser_anomalies_total counter\n',
+    );
+    expect(text).toMatch(/^syncer_parser_anomalies_total\{kind="import_minted_negative"\} 2$/m);
+    expect(text).toMatch(/^# TYPE syncer_nft_state_lag_ledgers gauge$/m);
+    expect(text).toMatch(/^syncer_nft_state_lag_ledgers 12$/m);
+    expect(text).toMatch(/^# TYPE syncer_nft_dirty_ledgers gauge$/m);
+    expect(text).toMatch(/^syncer_nft_dirty_ledgers 34$/m);
+    expect(text).toMatch(/^# TYPE syncer_nft_collections_pending gauge$/m);
+    expect(text).toMatch(/^syncer_nft_collections_pending 5$/m);
+    expect(text).toMatch(/^# TYPE syncer_escrows_lag_ledgers gauge$/m);
+    expect(text).toMatch(/^syncer_escrows_lag_ledgers 6$/m);
+    expect(text).toMatch(/^# TYPE syncer_escrows_open gauge$/m);
+    expect(text).toMatch(/^syncer_escrows_open 7$/m);
+  });
+
+  it('shows the series of syncer_parser_anomalies_total{kind="import_minted_negative"} at 0 before any clamp, so that an alert on its increase fires on the first one', async () => {
+    // A fresh copy of the module: the counters are process-wide, and the other cases of this file have incremented this one.
+    let text = '';
+    await jest.isolateModulesAsync(async () => {
+      const { PrometheusService: Fresh } = await import('./prometheus.service');
+      const service = new Fresh();
+      service.onModuleInit();
+      text = await service.getMetrics();
+    });
+    expect(text).toMatch(/^syncer_parser_anomalies_total\{kind="import_minted_negative"\} 0$/m);
+    expect(text).toMatch(/^syncer_parser_anomalies_total\{kind="mpt_unreadable"\} 0$/m);
+    // the unlabelled siblings start at 0 the same way
+    expect(text).toMatch(/^syncer_objects_unclassified_total 0$/m);
+    expect(text).toMatch(/^syncer_nft_skipped_total 0$/m);
   });
 
   it('exposes the metrics of the validators worker, by name, type and label set', async () => {
@@ -143,6 +195,131 @@ describe('PrometheusService', () => {
     }
   });
 
+  it('exposes the gauge of the mpt_state job, label-less, at 0 until a run sets it', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.mptStateLagLedgers.set(0);
+    expect(await service.getMetrics()).toMatch(/^syncer_mpt_state_lag_ledgers 0$/m);
+    service.mptStateLagLedgers.set(42);
+    const text = await service.getMetrics();
+    expect(text).toMatch(
+      /^# HELP syncer_mpt_state_lag_ledgers Ledgers between the committed head and the mpt_state cursor$/m,
+    );
+    expect(text).toMatch(/^# TYPE syncer_mpt_state_lag_ledgers gauge$/m);
+    expect(text).toMatch(/^syncer_mpt_state_lag_ledgers 42$/m);
+  });
+
+  it('has the error series of the mpt_state job from the start, so that its first failure raises an increase()', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    const text = await service.getMetrics();
+    expect(text).toMatch(/^syncer_aggregator_errors_total\{job="mpt_state"\} \d+$/m);
+    expect(text).toMatch(/^syncer_aggregator_errors_total\{job="mpt_state_dirty"\} \d+$/m);
+  });
+
+  it('registers the four gauges of the tokens job with their names, types, label sets and help texts (spec section 3.8)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.tokensLive.set(1);
+    service.tokensLagLedgers.set(12);
+    service.tokensBuilding.set(1);
+    service.tokensRepairLedgers.set(340);
+
+    const text = await service.getMetrics();
+    const declared: [string, string, number][] = [
+      [
+        'syncer_tokens_live',
+        "1 when a live generation of the issued tokens exists, else 0. Gates the explorer's TOKENS switch.",
+        1,
+      ],
+      [
+        'syncer_tokens_lag_ledgers',
+        'Ledgers between the newest committed ledger and the through_ledger of the live generation of the issued tokens (0 without one).',
+        12,
+      ],
+      [
+        'syncer_tokens_building',
+        '1 while a generation of the issued tokens builds, else 0. The account cursor of its pass is logged at each batch.',
+        1,
+      ],
+      [
+        'syncer_tokens_repair_ledgers',
+        'through_ledger less repair_from of the live generation of the issued tokens: the ledgers its repair applies again, 0 without a repair.',
+        340,
+      ],
+    ];
+    for (const [name, help, value] of declared) {
+      expect(text).toContain(`# HELP ${name} ${help}\n# TYPE ${name} gauge\n`);
+      expect(text).toMatch(new RegExp(`^${name} ${value}$`, 'm'));
+      expect((service.registry.getSingleMetric(name) as unknown as { labelNames: string[] }).labelNames).toEqual([]);
+    }
+  });
+
+  it('registers the two counters of the toml details, with both outcomes of the store writes at 0 from the start', async () => {
+    const service = new PrometheusService();
+    const text = await service.getMetrics();
+    // the alert is an increase(): a series that first shows at its value would not raise it at the first failure
+    expect(text).toMatch(/^# TYPE syncer_validators_toml_store_writes_total counter$/m);
+    expect(text).toMatch(/^syncer_validators_toml_store_writes_total\{outcome="ok"\} \d+$/m);
+    expect(text).toMatch(/^syncer_validators_toml_store_writes_total\{outcome="error"\} \d+$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_toml_fields_total counter$/m);
+    service.validatorsTomlFieldsTotal.inc({ field: 'unl', outcome: 'read' });
+    expect(await service.getMetrics()).toMatch(
+      /^syncer_validators_toml_fields_total\{field="unl",outcome="read"\} \d+$/m,
+    );
+  });
+
+  it('registers the two gauges of the supply job with their names, types, label sets and help texts (spec section 4.6)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.supplySnapshotAgeSeconds.set(4210);
+    service.supplyCycleSeconds.set(187.5);
+
+    const text = await service.getMetrics();
+    const declared: [string, string, string][] = [
+      [
+        'syncer_supply_snapshot_age_seconds',
+        'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); no sample until it has seen one. Alert above 3 hours.',
+        '4210',
+      ],
+      [
+        'syncer_supply_cycle_seconds',
+        'Wall-clock seconds the last finished supply cycle took, from its start to the write of its snapshot row; no sample until the first one.',
+        '187\\.5',
+      ],
+    ];
+    for (const [name, help, value] of declared) {
+      expect(text).toContain(`# HELP ${name} ${help}\n# TYPE ${name} gauge\n`);
+      expect(text).toMatch(new RegExp(`^${name} ${value}$`, 'm'));
+      expect((service.registry.getSingleMetric(name) as unknown as { labelNames: string[] }).labelNames).toEqual([]);
+    }
+  });
+
+  it('has no sample of the two supply gauges before the supply job sets them, so that absent() can tell a job that never wrote a row, and has one after', async () => {
+    // a fresh module, so that no other test has set them in the registry the service shares
+    await jest.isolateModulesAsync(async () => {
+      const { PrometheusService: Fresh } = await import('./prometheus.service');
+      const service = new Fresh();
+      service.onModuleInit();
+      const names = ['syncer_supply_snapshot_age_seconds', 'syncer_supply_cycle_seconds'];
+
+      const before = await service.getMetrics();
+      for (const name of names) {
+        expect(before).toContain(`# HELP ${name} `);
+        expect(before).toContain(`# TYPE ${name} gauge\n`);
+        expect(before).not.toMatch(new RegExp(`^${name}[ {]`, 'm'));
+      }
+      // a gauge without labels that is not removed has a sample of 0 from the start: the other gauges of the job families do
+      expect(before).toMatch(/^syncer_tokens_live 0$/m);
+
+      service.supplySnapshotAgeSeconds.set(0);
+      service.supplyCycleSeconds.set(12.5);
+      const after = await service.getMetrics();
+      expect(after).toMatch(/^syncer_supply_snapshot_age_seconds 0$/m);
+      expect(after).toMatch(/^syncer_supply_cycle_seconds 12\.5$/m);
+    });
+  });
+
   describe('the declaration of the validators metrics', () => {
     // [name, type, declared label names (exactly), HELP text (spec section 6)]
     const declared: [string, string, string[], string][] = [
@@ -201,6 +378,62 @@ describe('PrometheusService', () => {
         ['table'],
         'Rows written to validator_validations and validator_seen, by table.',
       ],
+    ];
+
+    it.each(declared)('%s is a %s with the labels %j and its help text', async (name, type, labelNames, help) => {
+      const service = new PrometheusService();
+      // prom-client types `labelNames` only on the constructor options; the metric object keeps it.
+      const metric = service.registry.getSingleMetric(name) as unknown as { labelNames: string[] } | undefined;
+      expect(metric?.labelNames).toEqual(labelNames);
+      const exposed = (await service.registry.getMetricsAsJSON()).find((m) => m.name === name);
+      expect(exposed).toMatchObject({ type, help });
+      expect(await service.getMetrics()).toContain(`# HELP ${name} ${help}\n# TYPE ${name} ${type}\n`);
+    });
+  });
+
+  it('exposes the metrics of the tomls worker, by name, type and label set', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    // A labelled metric shows no series until a label set was observed, so each is observed once.
+    service.tomlsChecksTotal.inc({ outcome: 'ok' });
+    service.tomlsChecksTotal.inc({ outcome: 'timeout' }, 2);
+    service.tomlsDomains.set({ status: 'ok' }, 120);
+    service.tomlsDomains.set({ status: 'failed' }, 8);
+    service.tomlsDomains.set({ status: 'unchecked' }, 300);
+    service.tomlsDue.set(250);
+    service.tomlsDiscoverySeconds.set(1.5);
+
+    const text = await service.getMetrics();
+    expect(text).toMatch(/^# TYPE syncer_tomls_checks_total counter$/m);
+    expect(text).toMatch(/^syncer_tomls_checks_total\{outcome="ok"\} 1$/m);
+    expect(text).toMatch(/^syncer_tomls_checks_total\{outcome="timeout"\} 2$/m);
+    expect(text).toMatch(/^# TYPE syncer_tomls_domains gauge$/m);
+    expect(text).toMatch(/^syncer_tomls_domains\{status="ok"\} 120$/m);
+    expect(text).toMatch(/^syncer_tomls_domains\{status="failed"\} 8$/m);
+    expect(text).toMatch(/^syncer_tomls_domains\{status="unchecked"\} 300$/m);
+    expect(text).toMatch(/^# TYPE syncer_tomls_due gauge$/m);
+    expect(text).toMatch(/^syncer_tomls_due 250$/m);
+    expect(text).toMatch(/^# TYPE syncer_tomls_discovery_seconds gauge$/m);
+    expect(text).toMatch(/^syncer_tomls_discovery_seconds 1\.5$/m);
+  });
+
+  describe('the declaration of the tomls metrics', () => {
+    // [name, type, declared label names (exactly), HELP text (spec section 4.5)]
+    const declared: [string, string, string[], string][] = [
+      [
+        'syncer_tomls_checks_total',
+        'counter',
+        ['outcome'],
+        'Checks of the toml of a domain, by outcome (ok, or the reason code of the failure).',
+      ],
+      [
+        'syncer_tomls_domains',
+        'gauge',
+        ['status'],
+        'Domains accounts name, by the status of their toml after the last pass (ok, failed, unchecked).',
+      ],
+      ['syncer_tomls_due', 'gauge', [], 'Domains due and not checked yet at the end of the last pass.'],
+      ['syncer_tomls_discovery_seconds', 'gauge', [], 'Duration of the last discovery read, in seconds.'],
     ];
 
     it.each(declared)('%s is a %s with the labels %j and its help text', async (name, type, labelNames, help) => {

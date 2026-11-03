@@ -1,0 +1,32 @@
+{
+  "network": "xrpl-testnet",
+  "endpoint": "wss://s.altnet.rippletest.net:51233",
+  "recorded_at": "2026-10-24T23:52:46.420Z",
+  "validated_head": 21799336,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {},
+  "ledgers": [
+    {
+      "ledger": 21799042,
+      "bytes": 7646,
+      "gzipBytes": 2615
+    },
+    {
+      "ledger": 21799043,
+      "bytes": 34879,
+      "gzipBytes": 8054
+    },
+    {
+      "ledger": 21799044,
+      "bytes": 10379,
+      "gzipBytes": 3114
+    }
+  ]
+}

@@ -17,13 +17,17 @@ export interface LedgerKeyedTable {
 
 /**
  * Every table whose rows belong to one ledger: the 19 ledger-derived tables of the baseline schema (the 14 of the
- * Ripple v2 data and the 5 AMM ledger tables), the ones that carry a `ledger_index` column and a dedup window. Fee
- * stats, validations, manifests, aggregates (`amm_pools` and `amm_daily` among them) and the bookkeeping tables are not
- * in the list, because a ledger's rewrite must not touch them.
+ * Ripple v2 data and the 5 AMM ledger tables), `account_states` (migration 005), `trust_line_states` (006),
+ * `path_payments` (007), `account_path_payments` (008), the 5 NFT ledger tables (011), `account_domains` (012) and
+ * `object_changes` and `account_object_changes` (013), `state_touches` (014), `genesis_mints`, `imports` and
+ * `reward_claims` (015) and the 5 MPT ledger tables (017), the ones that carry a `ledger_index` column and a dedup window. Fee
+ * stats, validations, manifests, aggregates (`amm_pools`, `amm_daily`, the NFT aggregates, `escrows`, the token aggregates,
+ * `network_supply` and the MPT aggregates among them), `domain_tomls` and the bookkeeping tables are not in the list, because a
+ * ledger's rewrite must not touch them.
  *
  * The first entry is the commit marker (`ledgers`): a ledger is deleted by removing that row first, so a delete that
  * dies halfway leaves uncommitted rows behind, which recovery removes, and never a committed ledger with missing rows.
- * The partitioning mirrors `schema/001_baseline.sql`; the e2e suite compares the two.
+ * The partitioning mirrors the schema files; the e2e suite compares the two.
  */
 export const LEDGER_KEYED_TABLES: ReadonlyArray<LedgerKeyedTable> = [
   { table: Table.Ledgers, partitionSize: P6 },
@@ -45,6 +49,27 @@ export const LEDGER_KEYED_TABLES: ReadonlyArray<LedgerKeyedTable> = [
   { table: Table.AmmLiquidity, partitionSize: P7 },
   { table: Table.AccountAmmLiquidity, partitionSize: P7 },
   { table: Table.AmmGovernance, partitionSize: P7 },
+  { table: Table.AccountStates, partitionSize: P7 },
+  { table: Table.TrustLineStates, partitionSize: P7 },
+  { table: Table.PathPayments, partitionSize: P6 },
+  { table: Table.AccountPathPayments, partitionSize: P7 },
+  { table: Table.NftEvents, partitionSize: P7 },
+  { table: Table.AccountNftEvents, partitionSize: P7 },
+  { table: Table.CollectionNftEvents, partitionSize: P7 },
+  { table: Table.NftSales, partitionSize: P6 },
+  { table: Table.NftTouches, partitionSize: P6 },
+  { table: Table.AccountDomains, partitionSize: P7 },
+  { table: Table.ObjectChanges, partitionSize: P7 },
+  { table: Table.AccountObjectChanges, partitionSize: P7 },
+  { table: Table.StateTouches, partitionSize: P6 },
+  { table: Table.GenesisMints, partitionSize: P6 },
+  { table: Table.Imports, partitionSize: P6 },
+  { table: Table.RewardClaims, partitionSize: P6 },
+  { table: Table.MptIssuanceStates, partitionSize: P7 },
+  { table: Table.MptHolderStates, partitionSize: P7 },
+  { table: Table.MptTouches, partitionSize: P6 },
+  { table: Table.MptTransfers, partitionSize: P6 },
+  { table: Table.MptIssuanceTransfers, partitionSize: P7 },
 ];
 
 export interface DeleteOptions {
@@ -73,6 +98,14 @@ export async function committedCheckpoint(ch: ClickHouseService): Promise<number
     `SELECT maxOrNull(ledger_index) AS checkpoint FROM ${Table.Ledgers}`,
   );
   return row?.checkpoint == null ? undefined : Number(row.checkpoint);
+}
+
+/** The lowest ledger whose `ledgers` row exists; `undefined` when none is (`minOrNull(ledger_index)`). */
+export async function firstCommittedLedger(ch: ClickHouseService): Promise<number | undefined> {
+  const row = await ch.queryOne<{ first_ledger: number | string | null }>(
+    `SELECT minOrNull(ledger_index) AS first_ledger FROM ${Table.Ledgers}`,
+  );
+  return row?.first_ledger == null ? undefined : Number(row.first_ledger);
 }
 
 /** The hash stored for a committed ledger, or `undefined` when the ledger is not committed. */

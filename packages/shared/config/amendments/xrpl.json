@@ -1,6 +1,6 @@
 {
   "network": "xrpl",
-  "updated": "2026-10-19",
+  "updated": "2026-10-25",
   "amendments": [
     {
       "name": "AMM",
@@ -44,7 +44,8 @@
     {
       "name": "CryptoConditions",
       "introduced": "0.50.0",
-      "enabled": { "ledger_index": 26718721, "date": "2017-01-03" }
+      "enabled": { "ledger_index": 26718721, "date": "2017-01-03" },
+      "retired": true
     },
     { "name": "CryptoConditionsSuite", "introduced": "0.60.0", "obsolete": true },
     { "name": "DeepFreeze", "introduced": "2.4.0", "enabled": { "ledger_index": 95893505, "date": "2025-05-04" } },
@@ -66,23 +67,64 @@
     {
       "name": "EnforceInvariants",
       "introduced": "0.70.0",
-      "enabled": { "ledger_index": 31054081, "date": "2017-07-07" }
+      "enabled": { "ledger_index": 31054081, "date": "2017-07-07" },
+      "retired": true
     },
-    { "name": "Escrow", "introduced": "0.60.0", "enabled": { "ledger_index": 28685313, "date": "2017-03-31" } },
+    {
+      "name": "Escrow",
+      "introduced": "0.60.0",
+      "enabled": { "ledger_index": 28685313, "date": "2017-03-31" },
+      "retired": true
+    },
     {
       "name": "ExpandedSignerList",
       "introduced": "1.9.1",
       "enabled": { "ledger_index": 75035393, "date": "2022-10-13" }
     },
-    { "name": "FeeEscalation", "introduced": "0.31.0", "enabled": { "ledger_index": 21225473, "date": "2016-05-19" } },
-    { "name": "fix1201", "introduced": "0.80.0", "enabled": { "ledger_index": 34256897, "date": "2017-11-14" } },
-    { "name": "fix1368", "introduced": "0.60.0", "enabled": { "ledger_index": 28685313, "date": "2017-03-31" } },
-    { "name": "fix1373", "introduced": "0.70.0", "enabled": { "ledger_index": 31053825, "date": "2017-07-07" } },
-    { "name": "fix1512", "introduced": "0.80.0", "enabled": { "ledger_index": 34256897, "date": "2017-11-14" } },
+    {
+      "name": "FeeEscalation",
+      "introduced": "0.31.0",
+      "enabled": { "ledger_index": 21225473, "date": "2016-05-19" },
+      "retired": true
+    },
+    {
+      "name": "fix1201",
+      "introduced": "0.80.0",
+      "enabled": { "ledger_index": 34256897, "date": "2017-11-14" },
+      "retired": true
+    },
+    {
+      "name": "fix1368",
+      "introduced": "0.60.0",
+      "enabled": { "ledger_index": 28685313, "date": "2017-03-31" },
+      "retired": true
+    },
+    {
+      "name": "fix1373",
+      "introduced": "0.70.0",
+      "enabled": { "ledger_index": 31053825, "date": "2017-07-07" },
+      "retired": true
+    },
+    {
+      "name": "fix1512",
+      "introduced": "0.80.0",
+      "enabled": { "ledger_index": 34256897, "date": "2017-11-14" },
+      "retired": true
+    },
     { "name": "fix1513", "introduced": "0.90.0", "enabled": { "ledger_index": 37753345, "date": "2018-04-06" } },
     { "name": "fix1515", "introduced": "1.1.0", "enabled": { "ledger_index": 42114049, "date": "2018-10-09" } },
-    { "name": "fix1523", "introduced": "0.80.0", "enabled": { "ledger_index": 34256897, "date": "2017-11-14" } },
-    { "name": "fix1528", "introduced": "0.80.0", "enabled": { "ledger_index": 34256897, "date": "2017-11-14" } },
+    {
+      "name": "fix1523",
+      "introduced": "0.80.0",
+      "enabled": { "ledger_index": 34256897, "date": "2017-11-14" },
+      "retired": true
+    },
+    {
+      "name": "fix1528",
+      "introduced": "0.80.0",
+      "enabled": { "ledger_index": 34256897, "date": "2017-11-14" },
+      "retired": true
+    },
     { "name": "fix1543", "introduced": "1.0.0", "enabled": { "ledger_index": 39544065, "date": "2018-06-21" } },
     { "name": "fix1571", "introduced": "1.0.0", "enabled": { "ledger_index": 39498497, "date": "2018-06-19" } },
     { "name": "fix1578", "introduced": "1.2.0", "enabled": { "ledger_index": 46000641, "date": "2019-03-23" } },
@@ -306,7 +348,12 @@
     { "name": "LendingProtocolV1_2" },
     { "name": "MPTokensV1", "introduced": "2.3.0", "enabled": { "ledger_index": 99226369, "date": "2025-10-01" } },
     { "name": "MPTokensV2", "xls": "XLS-82" },
-    { "name": "MultiSign", "introduced": "0.31.0", "enabled": { "ledger_index": 22178817, "date": "2016-06-27" } },
+    {
+      "name": "MultiSign",
+      "introduced": "0.31.0",
+      "enabled": { "ledger_index": 22178817, "date": "2016-06-27" },
+      "retired": true
+    },
     {
       "name": "MultiSignReserve",
       "introduced": "1.2.0",
@@ -331,7 +378,12 @@
       "enabled": { "ledger_index": 75443457, "date": "2022-10-31" }
     },
     { "name": "OwnerPaysFee", "introduced": "0.33.0", "obsolete": true },
-    { "name": "PayChan", "introduced": "0.33.0", "enabled": { "ledger_index": 28685313, "date": "2017-03-31" } },
+    {
+      "name": "PayChan",
+      "introduced": "0.33.0",
+      "enabled": { "ledger_index": 28685313, "date": "2017-03-31" },
+      "retired": true
+    },
     { "name": "PermissionDelegation", "introduced": "2.5.0", "obsolete": true },
     {
       "name": "PermissionDelegationV1_1",
@@ -375,7 +427,8 @@
     {
       "name": "SortedDirectories",
       "introduced": "0.80.0",
-      "enabled": { "ledger_index": 34256897, "date": "2017-11-14" }
+      "enabled": { "ledger_index": 34256897, "date": "2017-11-14" },
+      "retired": true
     },
     { "name": "Sponsor", "introduced": "3.3.0", "xls": "XLS-68" },
     { "name": "SusPay", "introduced": "0.31.0", "obsolete": true },
@@ -387,14 +440,24 @@
       "enabled": { "ledger_index": 67785985, "date": "2021-11-18" }
     },
     { "name": "Tickets", "introduced": "0.30.1", "obsolete": true },
-    { "name": "TickSize", "introduced": "0.50.0", "enabled": { "ledger_index": 27841793, "date": "2017-02-21" } },
+    {
+      "name": "TickSize",
+      "introduced": "0.50.0",
+      "enabled": { "ledger_index": 27841793, "date": "2017-02-21" },
+      "retired": true
+    },
     {
       "name": "TokenEscrow",
       "introduced": "2.5.0",
       "xls": "XLS-85",
       "enabled": { "ledger_index": 102204929, "date": "2026-02-12" }
     },
-    { "name": "TrustSetAuth", "introduced": "0.30.0", "enabled": { "ledger_index": 22721281, "date": "2016-07-19" } },
+    {
+      "name": "TrustSetAuth",
+      "introduced": "0.30.0",
+      "enabled": { "ledger_index": 22721281, "date": "2016-07-19" },
+      "retired": true
+    },
     {
       "name": "XChainBridge",
       "introduced": "2.0.0",

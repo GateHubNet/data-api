@@ -1,6 +1,16 @@
-import { KEY_MAP_WITH, MANIFEST_MAP_SQL, mappedKey, RIPPLE_EPOCH_MS, Table } from '@gatehub/data-api-shared';
+import {
+  getNetworkProfile,
+  KEY_MAP_WITH,
+  MANIFEST_MAP_SQL,
+  mappedKey,
+  readStoredTomls,
+  RIPPLE_EPOCH_MS,
+  STORED_TOMLS_SQL,
+  Table,
+} from '@gatehub/data-api-shared';
 import { join } from 'node:path';
 import { makeManifest } from '../../../packages/shared/src/test-utils/validator-keys';
+import { COUNTRIES_KEYS } from '../src/validators/countries-object';
 import type { Directory } from '../src/validators/directory';
 import { PUBLISHER_KEYS, SUMMARY_KEYS } from '../src/validators/summary-object';
 import { VALIDATION_ROW_KEYS, VALIDATIONS_BODY_KEYS } from '../src/validators/validation-row-object';
@@ -19,6 +29,8 @@ import {
 } from '../src/validators/validator-object';
 import { ApiClient, Harness, HarnessOptions, NO_RATE_LIMIT, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
+import { failToml, putToml } from './support/names-seed';
+import { explain } from './support/plans';
 import { BULK_BASES, BULK_PER_PART, insertBulk, LoggedRead, markerOf, readsOf } from './support/read-rows';
 import {
   BOARD_IDS,
@@ -26,6 +38,7 @@ import {
   BoardScenario,
   DAY,
   fleet,
+  FleetMember,
   FleetScenario,
   HEAD_LEDGER,
   HOUR,
@@ -43,6 +56,7 @@ import {
   PUBLISHER_KEY,
   RC1,
   seedAmendmentBoard,
+  seedFixedList,
   seedFleet,
   serverVersion,
   VOTING_LEDGER,
@@ -1177,8 +1191,9 @@ describe('GET /v2/network/validators and /{key}: a fleet of 35 trusted validator
         if (row.fee_vote) expect(Object.keys(row.fee_vote)).toEqual([...FEE_VOTE_KEYS]);
         if (row.amendment_votes) expect(Object.keys(row.amendment_votes)).toEqual(['ledger_index', 'yes']);
       }
+      // the fleet's rows are from before D8: no toml
       expect(Object.keys(rowOf(unlList, s.unl[0].key))).toEqual(
-        [...VALIDATOR_ROW_KEYS].filter((key) => key !== 'version_build'),
+        [...VALIDATOR_ROW_KEYS].filter((key) => key !== 'version_build' && key !== 'toml'),
       );
       expect(JSON.stringify(unlList.body)).not.toContain('null');
     });
@@ -1540,8 +1555,9 @@ describe('GET /v2/network/validators and /{key}: a fleet of 35 trusted validator
     });
 
     it('lists its keys in the order of the row, then DETAIL_TAIL_KEYS', () => {
+      // the fleet's rows are from before D8: no toml
       expect(Object.keys(northpeak.body)).toEqual(
-        [...VALIDATOR_ROW_KEYS, ...DETAIL_TAIL_KEYS].filter((key) => key !== 'version_build'),
+        [...VALIDATOR_ROW_KEYS, ...DETAIL_TAIL_KEYS].filter((key) => key !== 'version_build' && key !== 'toml'),
       );
       expect(Object.keys(northpeak.body.amendment_votes)).toEqual([...DETAIL_AMENDMENT_VOTES_KEYS]);
       expect(Object.keys(northpeak.body.amendment_votes.votes[0])).toEqual(
@@ -2049,6 +2065,552 @@ describe('GET /v2/network/validators and /{key}: on Xahau', () => {
   it('answers a hex key on Xahau too', async () => {
     const res = await api.get(detailOf(members[1].master.publicKeyHex.toLowerCase()));
     expect(res.body.validation_public_key).toBe(members[1].key);
+  });
+});
+
+// ===================================================================================================================
+// Xahau Testnet: the fixed list
+// ===================================================================================================================
+
+const COUNTRIES = '/v2/network/validators/countries';
+
+/** Every count of `/countries` is what the list gives with the same scope and country. */
+async function expectCountriesToMatchTheList(api: ApiClient): Promise<void> {
+  for (const scope of ['unl', 'all']) {
+    const { body } = await api.get(`${COUNTRIES}?scope=${scope}`);
+    const listed = async (country?: string): Promise<{ unl: boolean }[]> =>
+      (await api.get(`${LIST}?scope=${scope}&limit=1000${country === undefined ? '' : `&country=${country}`}`)).body
+        .validators;
+    for (const { country, validators, unl } of body.countries) {
+      const rows = await listed(country);
+      expect([country, rows.length, rows.filter((row) => row.unl).length]).toEqual([country, validators, unl]);
+    }
+    const unknown = await listed('unknown');
+    expect([unknown.length, unknown.filter((row) => row.unl).length]).toEqual([
+      body.unknown.validators,
+      body.unknown.unl,
+    ]);
+    const all = await listed();
+    expect([all.length, all.filter((row) => row.unl).length]).toEqual([body.validators, body.unl]);
+    expect(body.located + body.unknown.validators).toBe(body.validators);
+    expect(body.count).toBe(body.countries.length);
+    expect(Object.keys(body)).toEqual([...COUNTRIES_KEYS]);
+  }
+}
+
+describe('toml on the validator rows', () => {
+  describe('an empty database', () => {
+    let h: Harness;
+    beforeAll(async () => {
+      h = await startHarness({ seed: 'none', env: NO_RATE_LIMIT });
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('answers an empty database: validators 0, no country', async () => {
+      const { status, body } = await (await h.api()).get(COUNTRIES);
+      expect(status).toBe(200);
+      expect(body).toMatchObject({
+        validators: 0,
+        unl: 0,
+        located: 0,
+        unknown: { validators: 0, unl: 0 },
+        count: 0,
+        countries: [],
+      });
+    });
+  });
+
+  describe('XRPL: a fleet whose domains were read by D8', () => {
+    let h: Harness;
+    let api: ApiClient;
+    let s: FleetScenario;
+    let list: Answer;
+    const rowOf = (answer: Answer, key: string): Record<string, any> =>
+      answer.body.validators.find((row: { validation_public_key: string }) => row.validation_public_key === key);
+
+    beforeAll(async () => {
+      h = (
+        await startWithDirectory({
+          seed: 'none',
+          network: 'xrpl',
+          env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xrpl },
+        })
+      ).h;
+      api = await h.api();
+      s = await seedFleet(h.ch, { activity: true });
+      const now = Date.now() / 1000;
+      await insertDomains(h.ch, [
+        {
+          validation_public_key: s.unl[0].key,
+          domain: 'northpeak.example',
+          checked_at: now - 10,
+          owner_country: 'NO',
+          server_country: 'DE',
+          toml_network: 'main',
+          toml_unl: 'https://vl.ripple.com',
+          toml_version: 1,
+        },
+        {
+          validation_public_key: s.unl[1].key,
+          domain: 'shoreline.example',
+          checked_at: now - 10,
+          toml_version: 1,
+        },
+      ]);
+      list = await api.get(`${LIST}?scope=all`);
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('serves toml on the rows: full, {}, and none for the others', () => {
+      expect(rowOf(list, s.unl[0].key).toml).toEqual({
+        owner_country: 'NO',
+        server_country: 'DE',
+        network: 'main',
+        unl: 'https://vl.ripple.com',
+      });
+      expect(Object.keys(rowOf(list, s.unl[0].key)).at(-1)).toBe('toml');
+      expect(rowOf(list, s.unl[1].key).toml).toEqual({});
+      expect(rowOf(list, s.unl[2].key)).not.toHaveProperty('toml');
+      expect(rowOf(list, s.others[1].key)).not.toHaveProperty('toml');
+    });
+
+    it('has toml on the detail too', async () => {
+      const detail = await api.get(detailOf(s.unl[0].key));
+      expect(detail.body.toml).toEqual(rowOf(list, s.unl[0].key).toml);
+    });
+
+    it('lists the validators of a country and those of unknown location', async () => {
+      const keysOf = (answer: Answer): string[] =>
+        answer.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key);
+      expect(keysOf(await api.get(`${LIST}?country=de`))).toEqual([s.unl[0].key]);
+      const unknown = keysOf(await api.get(`${LIST}?country=Unknown&limit=1000`));
+      expect(unknown).toHaveLength(34);
+      expect(unknown).toContain(s.unl[1].key);
+      expect(unknown).not.toContain(s.unl[0].key);
+    });
+
+    it('lists none for a code with no validator', async () => {
+      const answer = await api.get(`${LIST}?country=uk`);
+      expect([answer.status, answer.body.count, answer.body.validators]).toEqual([200, 0, []]);
+    });
+
+    it('answers 400 invalid country', async () => {
+      for (const country of ['ZZ', 'DEU', 'Germany']) {
+        const refused = await api.get(`${LIST}?country=${country}`);
+        expect([refused.status, refused.body]).toEqual([400, { result: 'error', message: 'invalid country' }]);
+      }
+    });
+
+    it('counts what the list lists, for every country and unknown, in both scopes', async () => {
+      await expectCountriesToMatchTheList(api);
+      const { body } = await api.get(COUNTRIES);
+      expect(body.countries).toEqual([{ country: 'DE', validators: 1, unl: 1 }]);
+      expect(body).toMatchObject({
+        scope: 'unl',
+        validators: 35,
+        unl: 35,
+        located: 1,
+        unknown: { validators: 34, unl: 34 },
+      });
+      // a verified pair read before D8 counts as unknown
+      expect(rowOf(list, s.others[1].key).domain_verification.status).toBe('verified');
+      const unknown = await api.get(`${LIST}?scope=all&country=unknown&limit=1000`);
+      expect(
+        unknown.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key),
+      ).toContain(s.others[1].key);
+    });
+
+    it('reads nothing beyond the directory', async () => {
+      await api.get(LIST);
+      const spy = jest.spyOn(h.ch, 'query');
+      try {
+        await api.get(COUNTRIES);
+        await api.get(`${LIST}?country=DE`);
+        expect(spy).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('defaults to unl, refuses another scope, ignores other parameters', async () => {
+      expect((await api.get(COUNTRIES)).body.scope).toBe('unl');
+      expect((await api.get(`${COUNTRIES}?country=DE&limit=1&q=x`)).body.scope).toBe('unl');
+      expect((await api.get(`${COUNTRIES}?scope=all`)).body.scope).toBe('all');
+      const refused = await api.get(`${COUNTRIES}?scope=x`);
+      expect([refused.status, refused.body]).toEqual([400, { result: 'error', message: 'invalid scope' }]);
+    });
+
+    it('is JSON with format=csv too', async () => {
+      const answer = await api.get(`${COUNTRIES}?format=csv`);
+      expect(answer.headers['content-type']).toMatch(/json/);
+      expect(answer.body.result).toBe('success');
+    });
+
+    it('sends Cache-Control: private, max-age=30', async () => {
+      expect((await api.get(COUNTRIES)).headers['cache-control']).toBe('private, max-age=30');
+    });
+
+    it('is not read as a validator key', async () => {
+      const answer = await api.get(COUNTRIES);
+      expect(answer.status).toBe(200);
+      expect(answer.body).toHaveProperty('countries');
+      expect(answer.body).not.toHaveProperty('validation_public_key');
+    });
+
+    it('writes the toml columns into the CSV', async () => {
+      const csv = await api.get(`${LIST}?format=csv`);
+      const header = csv.text
+        .split('\n')[0]
+        .split(',')
+        .map((cell) => cell.replace(/^"|"$/g, ''));
+      expect(header).toEqual(
+        expect.arrayContaining(['toml.owner_country', 'toml.server_country', 'toml.network', 'toml.unl']),
+      );
+    });
+  });
+
+  describe('Xahau', () => {
+    let h: Harness;
+    let api: ApiClient;
+    let list: Answer;
+    const members = fleet('xahau', 2);
+    const rowOf = (key: string): Record<string, any> =>
+      list.body.validators.find((row: { validation_public_key: string }) => row.validation_public_key === key);
+
+    beforeAll(async () => {
+      h = (
+        await startWithDirectory({
+          seed: 'none',
+          network: 'xahau',
+          env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xahau },
+        })
+      ).h;
+      api = await h.api();
+      const now = Math.floor(Date.now() / 1000);
+      await insertLists(h.ch, [
+        {
+          publisher: 'vl.xahau.org',
+          sequence: 2_026_092_401,
+          expiration: now + 86_400,
+          validators: members.map((m) => m.key),
+        },
+      ]);
+      await insertPublishers(h.ch, [{ publisher: 'vl.xahau.org', checked_at: now - 10 }]);
+      await insertManifests(h.ch, [
+        { ephemeral_key: members[0].ephemeral, master_key: members[0].key, seq: 1, domain: 'north.example' },
+        { ephemeral_key: members[1].ephemeral, master_key: members[1].key, seq: 1, domain: 'south.example' },
+      ]);
+      await insertDomains(h.ch, [
+        {
+          validation_public_key: members[0].key,
+          domain: 'north.example',
+          checked_at: now - 10,
+          server_country: 'FI',
+          toml_network: '21337',
+          toml_version: 1,
+        },
+      ]);
+      await insertDomains(h.ch, [
+        {
+          validation_public_key: members[1].key,
+          domain: 'south.example',
+          checked_at: now - 100,
+          verified_at: now - 100,
+        },
+      ]);
+      await insertDomains(h.ch, [
+        { validation_public_key: members[1].key, domain: 'south.example', checked_at: now - 10, verified_at: null },
+      ]);
+      list = await api.get(LIST);
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('serves a Xahau network ID as text', () => {
+      expect(rowOf(members[0].key).toml).toEqual({ server_country: 'FI', network: '21337' });
+    });
+
+    it('counts what the list lists, for every country and unknown, in both scopes', async () => {
+      await expectCountriesToMatchTheList(api);
+      expect((await api.get(COUNTRIES)).body).toMatchObject({
+        validators: 2,
+        located: 1,
+        countries: [{ country: 'FI', validators: 1, unl: 1 }],
+        unknown: { validators: 1, unl: 1 },
+      });
+    });
+
+    // two inserts: within one insert the engine keeps the newest row alone
+    it('reads a newer row without verified_at as no last success', () => {
+      expect(rowOf(members[1].key).domain_verification.status).toBe('verified');
+      expect(rowOf(members[1].key).domain_verification).not.toHaveProperty('verified');
+    });
+  });
+});
+
+describe("the validator detail's toml: the domain's facts from the toml store (XRPL)", () => {
+  const XRPL = getNetworkProfile('xrpl');
+  const ISSUER = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+  const FETCHED_AT = Math.floor(Date.now() / 1000) - 3_600;
+  /** Hand-written test data, for no real domain. */
+  const FILE = `# Hand-written test data (D8).
+[METADATA]
+modified = 2026-10-02
+
+[[PRINCIPALS]]
+name = "Mara Lindqvist"
+email = "mara@northpeak.example"
+
+[[PRINCIPALS]]
+name = "Tomas Okafor"
+
+[[ACCOUNTS]]
+address = "${ISSUER}"
+
+[[ACCOUNTS]]
+address = "rrrrrrrrrrrrrrrrrrrrrhoLvTp"
+
+[[ACCOUNTS]]
+address = "rrrrrrrrrrrrrrrrrrrrBZbvji"
+network = "testnet"
+
+[[CURRENCIES]]
+code = "USD"
+issuer = "${ISSUER}"
+
+[[CURRENCIES]]
+code = "EUR"
+network = "main"
+
+[[CURRENCIES]]
+code = "TST"
+issuer = "${ISSUER}"
+network = "testnet"
+`;
+  let h: Harness;
+  let api: ApiClient;
+  let s: FleetScenario;
+
+  beforeAll(async () => {
+    h = (
+      await startWithDirectory({
+        seed: 'none',
+        network: 'xrpl',
+        env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xrpl },
+      })
+    ).h;
+    api = await h.api();
+    s = await seedFleet(h.ch, { activity: true });
+    const now = Date.now() / 1000;
+    const read = (key: string, domain: string, o: Record<string, unknown> = {}) => ({
+      validation_public_key: key,
+      domain,
+      checked_at: now - 10,
+      toml_version: 1,
+      ...o,
+    });
+    const named = [
+      [s.unl[2], 'kept.example'],
+      [s.unl[3], 'failing.example'],
+      [s.unl[4], 'atsign.example'],
+      [s.unl[5], 'same.example'],
+    ] as const;
+    await insertManifests(
+      h.ch,
+      named.map(([member, domain]) => ({
+        ephemeral_key: member.ephemeral,
+        master_key: member.key,
+        seq: 9,
+        domain,
+      })),
+    );
+    await insertDomains(h.ch, [
+      read(s.unl[0].key, 'northpeak.example', {
+        owner_country: 'NO',
+        server_country: 'DE',
+        toml_network: 'main',
+        toml_unl: 'https://vl.ripple.com',
+      }),
+      read(s.unl[1].key, 'shoreline.example'),
+      read(s.others[1].key, 'tidewater.example'),
+      ...named.map(([member, domain]) =>
+        read(member.key, domain, domain === 'same.example' ? { server_country: 'DE' } : {}),
+      ),
+    ]);
+    await putToml(h, XRPL, 'northpeak.example', FILE, FETCHED_AT);
+    await putToml(h, XRPL, 'kept.example', FILE, FETCHED_AT);
+    await putToml(
+      h,
+      XRPL,
+      'same.example',
+      `# Hand-written test data (D8).\n[[VALIDATORS]]\npublic_key = "${s.unl[5].key}"\nserver_country = "de"\n`,
+      FETCHED_AT,
+    );
+    await putToml(h, XRPL, 'failing.example', FILE, FETCHED_AT);
+    // the same clock as failToml's, so that the failure is the newer row
+    await putToml(h, XRPL, 'tidewater.example', FILE);
+    await failToml(h, 'tidewater.example');
+    const stored = (await readStoredTomls(h.ch, ['northpeak.example'])).get('northpeak.example')!;
+    await h.ch.insert(Table.DomainTomls, [
+      {
+        ...stored,
+        domain: 'atsign.example',
+        principals: ['Mara Lindqvist', 'ops@northpeak.example'],
+        currencies: [{ code: 'a@b', issuer: '', network: '', fields: '{}' }],
+      },
+    ]);
+  });
+  afterAll(async () => {
+    jest.restoreAllMocks();
+    await h?.close();
+  });
+
+  it("serves the store's facts on the detail", async () => {
+    const answer = await api.get(detailOf(s.unl[0].key));
+    expect(answer.status).toBe(200);
+    expect(answer.body.toml).toEqual({
+      owner_country: 'NO',
+      server_country: 'DE',
+      network: 'main',
+      unl: 'https://vl.ripple.com',
+      principals: ['Mara Lindqvist', 'Tomas Okafor'],
+      modified: '2026-10-02T00:00:00Z',
+      accounts_listed: 3,
+      currencies: [{ code: 'USD', issuer: ISSUER }, { code: 'EUR' }],
+      currencies_listed: 2,
+      fetched: new Date(FETCHED_AT * 1000).toISOString(),
+    });
+  });
+
+  it("keeps the list to the row's toml", async () => {
+    const list = await api.get(`${LIST}?q=northpeak.example`);
+    expect(Object.keys(list.body.validators[0].toml)).toEqual(['owner_country', 'server_country', 'network', 'unl']);
+  });
+
+  it("has the row's toml alone without a store row and after a definite failure", async () => {
+    expect((await api.get(detailOf(s.unl[1].key))).body.toml).toEqual({});
+    expect((await api.get(detailOf(s.others[1].key))).body.toml).toEqual({});
+  });
+
+  it('reads no store for a row without toml', async () => {
+    const reads = await readsOf(h, Table.DomainTomls, () => api.get(detailOf(s.dormant.key)));
+    expect(reads).toEqual([]);
+  });
+
+  it('answers 500 when the store read fails', async () => {
+    const real = h.ch.query.bind(h.ch);
+    const spy = jest
+      .spyOn(h.ch, 'query')
+      .mockImplementation(((sql: string, ...rest: unknown[]) =>
+        sql.includes(Table.DomainTomls)
+          ? Promise.reject(new Error('Code: 241. Memory limit exceeded'))
+          : (real as (...args: unknown[]) => Promise<unknown>)(sql, ...rest)) as never);
+    try {
+      const failed = await api.get(detailOf(s.unl[3].key));
+      expect([failed.status, failed.body]).toEqual([
+        500,
+        { result: 'error', message: 'unable to retrieve validator(s)' },
+      ]);
+      expect(failed.headers['cache-control']).toBe('no-store');
+    } finally {
+      spy.mockRestore();
+    }
+    // the failure is not kept
+    expect((await api.get(detailOf(s.unl[3].key))).body.toml.principals).toEqual(['Mara Lindqvist', 'Tomas Okafor']);
+  });
+
+  it('reads the store once by key and keeps it 60 s', async () => {
+    const reads = await readsOf(h, Table.DomainTomls, async () => {
+      await api.get(detailOf(s.unl[2].key));
+      await api.get(detailOf(s.unl[2].key));
+    });
+    expect(reads).toHaveLength(1);
+    const plan = await explain(h, 'indexes = 1', STORED_TOMLS_SQL, { domains: ['kept.example'] });
+    expect(plan).toContain('domain');
+    expect(plan).toMatch(/PrimaryKey[\s\S]*Keys:[\s\S]*domain/);
+  });
+
+  it('gives a validator the same countries as the validator routes', async () => {
+    const toml = await api.get('/v2/toml/same.example');
+    expect(toml.body.toml.validators).toEqual([{ public_key: s.unl[5].key, server_country: 'DE' }]);
+    expect((await api.get(detailOf(s.unl[5].key))).body.toml.server_country).toBe('DE');
+  });
+
+  it('serves no @ anywhere in the detail', async () => {
+    const answer = await api.get(detailOf(s.unl[4].key));
+    expect(answer.body.toml.principals).toEqual(['Mara Lindqvist']);
+    expect(answer.body.toml).not.toHaveProperty('currencies');
+    expect(JSON.stringify(answer.body)).not.toContain('@');
+  });
+});
+
+describe('Xahau Testnet: the fixed list', () => {
+  let h: Harness;
+  let api: ApiClient;
+  let members: FleetMember[];
+  let now: number;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', network: 'xahau-testnet', env: NO_RATE_LIMIT });
+    api = await h.api();
+    now = Math.floor(Date.now() / 1000);
+    members = await seedFixedList(h.ch, now);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the summary trusts the four at threshold 1 and lists local', async () => {
+    const res = await api.get(SUMMARY);
+    expect(res.status).toBe(200);
+    expect(res.body.unl).toEqual({
+      trusted: 4,
+      threshold: 1,
+      publishers: [
+        {
+          id: 'local',
+          url: '',
+          public_key: '',
+          status: 'ok',
+          sequence: 1,
+          version: 1,
+          fetched: instant(now - HOUR),
+          validators: 4,
+          seen_24h: 4,
+        },
+      ],
+    });
+    // a fixed list does not expire: no expiration, though the stored list carries the DateTime maximum
+    const [publisher] = res.body.unl.publishers;
+    expect(publisher).not.toHaveProperty('expiration');
+    expect(Object.keys(publisher)).toEqual(PUBLISHER_KEYS.filter((key) => key in publisher));
+    expect(res.body.validators).toEqual({ seen_24h: 4, unl_seen_24h: 4, others_seen_24h: 0, all: 4 });
+    expect(res.body.quorum).toEqual({ value: 4, unl_size: 4, negative_unl: 0 });
+  });
+
+  it('a listed validator is on the UNL by the list local', async () => {
+    const list = await api.get(`${LIST}?scope=unl`);
+    expect(list.status).toBe(200);
+    expect(list.body.count).toBe(4);
+    expect(list.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key)).toEqual(
+      members.map((member) => member.key).sort(),
+    );
+    for (const row of list.body.validators) expect(row).toMatchObject({ unl: true, unl_lists: ['local'] });
+
+    const detail = await api.get(detailOf(members[2].key));
+    expect(detail.status).toBe(200);
+    expect(detail.body).toMatchObject({ validation_public_key: members[2].key, unl: true, unl_lists: ['local'] });
+  });
+
+  it('takes local as the publisher of a filter', async () => {
+    const list = await api.get(`${LIST}?publisher=local`);
+    expect(list.status).toBe(200);
+    expect(list.body.count).toBe(4);
   });
 });
 

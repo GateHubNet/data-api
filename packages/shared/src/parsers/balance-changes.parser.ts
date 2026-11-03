@@ -1,6 +1,8 @@
 import { BigNumber } from 'bignumber.js';
 import { dropsToNative } from '../util/amount';
-import { ParseContext, ParserTx } from './parser.interface';
+import { mptIssuerOf } from '../util/mpt';
+import { mptAmountIssuance, MptDeltas, mptDeltas } from './mpt-deltas';
+import { feePayer, ParseContext, ParserTx } from './parser.interface';
 
 export interface ParsedBalanceChange {
   account: string;
@@ -15,8 +17,8 @@ export interface ParsedBalanceChange {
   node_index: number;
   /**
    * `'transaction_cost'`, `'payment_source'`, `'payment_destination'`, `'exchange'`, `'intermediary'`,
-   * `'escrow_create'`, `'escrow_cancel'`, `'escrow_finish'`, `'paychannel_fund'` or `'paychannel_payout'`; `''` when the
-   * change has none of them.
+   * `'escrow_create'`, `'escrow_cancel'`, `'escrow_finish'`, `'paychannel_fund'`, `'paychannel_payout'` or `'clawback'`; `''`
+   * when the change has none of them.
    */
   change_type: string;
   escrow_counterparty?: string;
@@ -32,6 +34,11 @@ type Json = Readonly<Record<string, any>>;
 
 const ZERO = new BigNumber(0);
 
+/** The currency of an amount as a row holds it: an issued one's code, an MPT's issuance ID; `undefined` for a native amount. */
+function currencyOf(amount: unknown): string | undefined {
+  return (amount as Json | undefined)?.currency ?? mptAmountIssuance(amount);
+}
+
 /** The value of an escrowed amount in whole units: drops converted, an issued currency or token as it is. */
 function escrowValue(amount: unknown): BigNumber {
   if (typeof amount === 'object' && amount !== null) return new BigNumber((amount as Json).value);
@@ -42,19 +49,22 @@ export class BalanceChangesParser {
   /**
    * Every balance change a transaction made, in the order of `meta.AffectedNodes`. Matches
    * `ledgerParser/balanceChanges.js` of the Ripple Data API, so a `tesSUCCESS` or `tec` transaction gives:
-   * - for each changed `AccountRoot`, in the native currency: if it is the sender's, a `transaction_cost` row at node
-   *   -1 whose `final_balance` is the balance after the fee and before the transaction's other effect on it; then a
-   *   row for that other effect if there is one;
+   * - for each changed `AccountRoot`, in the native currency: if it is the fee payer's (`feePayer`: the transaction's
+   *   `Delegate` when it has one, else its sender), a `transaction_cost` row at node -1 whose `final_balance` is the
+   *   balance after the fee and before the transaction's other effect on it; then a row for that other effect if there
+   *   is one. A delegated transaction's sender did not pay the fee, so its row is its whole change;
    * - for each trustline whose balance changed, one row for the low and one for the high side, from each side's point
-   *   of view.
-   * `change_type` is the reference's `findType` for a Payment or OfferCreate, `''` for every other transaction type;
-   * rows of an account that is a party to an `Escrow` or `PayChannel` the transaction touched, and have no type yet, become
+   *   of view;
+   * - for each `MPToken` whose `MPTAmount` changed, the holder's row and then the issuer's mirror, as for a trustline, from
+   *   `mptDeltas` (the issuer holds no `MPToken`). A created token with nothing on it is no change.
+   * `change_type` is the reference's `findType` for a Payment or OfferCreate, `'clawback'` for every row of a Clawback but its
+   * transaction cost, `''` for every other transaction type; rows of an account that is a party to an `Escrow` or `PayChannel` the transaction touched, and have no type yet, become
    * `escrow_*` or `paychannel_*` rows. Differences from the reference:
    * - the native currency is `ctx.nativeCurrency`, and a row is native because it comes from an `AccountRoot`, not
    *   because its currency is called `XRP`;
    * - trustline rows come from every transaction type, not only Payment and OfferCreate (AMM, check, Remit, ... also
    *   move tokens);
-   * - amounts are exact decimal strings with no Number in between, and escrow amounts may be tokens;
+   * - amounts are exact decimal strings with no Number in between, and escrow and payment channel amounts may be tokens;
    * - a fee of 0 (an inner transaction of a Batch) leaves no `transaction_cost` row, and a created account without a
    *   `Balance` (an AMM pseudo-account that holds no XRP) leaves no row at all, instead of a `NaN` change. A created
    *   AMM account that does hold XRP gets its row, so native changes still add up.
@@ -70,6 +80,7 @@ export class BalanceChangesParser {
     const rows: ParsedBalanceChange[] = [];
     const escrows = new Map<string, Json>();
     const channels = new Map<string, Json>();
+    let mpt: MptDeltas | undefined;
 
     const nodes: readonly Json[] = meta.AffectedNodes ?? [];
     for (let index = 0; index < nodes.length; index++) {
@@ -83,6 +94,10 @@ export class BalanceChangesParser {
           break;
         case 'RippleState':
           rows.push(...this.rippleState(t, node, index));
+          break;
+        case 'MPToken':
+          mpt ??= mptDeltas(t.tx, meta);
+          rows.push(...this.mptToken(t, mpt, index));
           break;
         case 'Escrow': {
           const fields: Json | undefined = node.NewFields || node.FinalFields;
@@ -135,7 +150,7 @@ export class BalanceChangesParser {
     const change = balance.minus(previous);
     let amount: BigNumber;
 
-    if (t.tx.Account === account) {
+    if (feePayer(t.tx) === account) {
       const fee = new BigNumber(t.tx.Fee ?? 0).negated();
       amount = change.minus(fee);
       if (!fee.isZero()) {
@@ -221,19 +236,54 @@ export class BalanceChangesParser {
   }
 
   /**
-   * What a Payment or OfferCreate balance change was, as the reference's `findType` decides it; `''` for any other
-   * transaction. The order of the tests matters. `native` says the row is of the native currency, which the reference
+   * The two rows of an `MPToken` whose `MPTAmount` changed, at its `node_index`: the holder's, and the issuer's mirror with both
+   * figures negated, each from its own point of view, as for a trustline. `mptDeltas` has left out a node that was only threaded
+   * and one whose ID cannot be made.
+   */
+  private mptToken(t: ParserTx, mpt: MptDeltas, nodeIndex: number): ParsedBalanceChange[] {
+    const delta = mpt.holders.find((h) => h.node_index === nodeIndex);
+    if (delta === undefined || delta.amount_after === delta.amount_before) return [];
+
+    const issuer = mptIssuerOf(delta.mpt_issuance_id);
+    const change = delta.amount_after - delta.amount_before;
+    const holder: ParsedBalanceChange = {
+      account: delta.holder,
+      counterparty: issuer,
+      currency: delta.mpt_issuance_id,
+      amount_change: String(change),
+      final_balance: String(delta.amount_after),
+      node_index: nodeIndex,
+      change_type: '',
+    };
+    const mirror: ParsedBalanceChange = {
+      account: issuer,
+      counterparty: delta.holder,
+      currency: delta.mpt_issuance_id,
+      amount_change: String(-change),
+      final_balance: String(-delta.amount_after),
+      node_index: nodeIndex,
+      change_type: '',
+    };
+    holder.change_type = this.changeType(t.tx, holder, false);
+    mirror.change_type = this.changeType(t.tx, mirror, false);
+    return [holder, mirror];
+  }
+
+  /**
+   * What a Payment or OfferCreate balance change was, as the reference's `findType` decides it; `'clawback'` for a Clawback; `''` for
+   * any other transaction. The order of the tests matters. `native` says the row is of the native currency, which the reference
    * knew by the currency being called `XRP`.
    */
   private changeType(tx: Json, row: ParsedBalanceChange, native: boolean): string {
     const owes = new BigNumber(row.final_balance).lt(0);
 
+    if (tx.TransactionType === 'Clawback') return 'clawback';
     if (tx.TransactionType === 'OfferCreate') return owes ? 'intermediary' : 'exchange';
     if (tx.TransactionType !== 'Payment') return '';
 
-    const amountCurrency: string | undefined = tx.Amount?.currency;
+    const amountCurrency = currencyOf(tx.Amount ?? tx.DeliverMax);
     const sendMax: Json | string | undefined = tx.SendMax;
-    const sendMaxCurrency: string | undefined = typeof sendMax === 'object' ? sendMax?.currency : undefined;
+    const sendMaxCurrency = currencyOf(sendMax);
     // An issued amount in this row's currency; a native row is never one, whatever the currency is called.
     const issuedMatch = (currency: string | undefined) => !native && !!currency && currency === row.currency;
 
@@ -268,19 +318,24 @@ export class BalanceChangesParser {
     }
   }
 
-  /** An untyped change of a party to a payment channel is the channel being funded or paid out. Native units. */
+  /**
+   * An untyped change of a party to a payment channel is the channel being funded or paid out. Whole units of the
+   * channel's currency: drops converted, and on Xahau (`PaychanAndEscrowForTokens`) a token as it is. The four channel
+   * columns are written as plain decimals, where the ledger writes a very large or very small token amount with an exponent
+   * (a change below 1e-7 too: the text of a native change, drops being at least 1e-6, is the same either way).
+   */
   private channel(row: ParsedBalanceChange, channel: Json): void {
-    const fund = dropsToNative(channel.Amount ?? 0);
-    const paid = dropsToNative(channel.Balance ?? 0);
+    const fund = escrowValue(channel.Amount ?? '0').toFixed();
+    const paid = escrowValue(channel.Balance ?? '0').toFixed();
 
     if (row.account === channel.Account) {
       row.change_type = 'paychannel_fund';
       row.paychannel_counterparty = channel.Destination;
-      row.paychannel_fund_change = ZERO.minus(row.amount_change).toString();
+      row.paychannel_fund_change = ZERO.minus(row.amount_change).toFixed();
     } else {
       row.change_type = 'paychannel_payout';
       row.paychannel_counterparty = channel.Account;
-      row.paychannel_balance_change = ZERO.minus(row.amount_change).toString();
+      row.paychannel_balance_change = ZERO.minus(row.amount_change).toFixed();
     }
     row.paychannel_fund_final_balance = fund;
     row.paychannel_final_balance = paid;

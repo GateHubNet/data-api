@@ -1,47 +1,62 @@
 # The syncer (ingestion service)
 
 `apps/syncer` (`@gatehub/data-syncer`) fills the ClickHouse database of **one network** with everything the
-[API](api-reference.md) serves. It is a NestJS process that runs up to five **workers** and exposes a liveliness probe
+[API](api-reference.md) serves. It is a NestJS process that runs up to six **workers** and exposes a liveliness probe
 (`GET /liveliness/healthz`, port 3002) and Prometheus metrics (`GET /metricz`, port 3000). Run **exactly one syncer per network
 and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer); metrics: [observability](observability.md).
 
 ```
                       GH_NODE_ENDPOINTS (rippled / xahaud, websocket)
                                   │  NodeClient: failover, watchdog, re-subscribe
-   ┌──────────────┬───────────────┼────────────────┬─────────────────┬──────────────────┐
-   │ ingest       │ validations   │ fee_stats      │ aggregator      │ validators       │   <- GH_WORKERS
-   │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats, volumes, │ lists, domains,  │
-   │              │               │                │ AMM pools,      │ state, rounds,   │
-   │              │               │                │ rates, markets, │ agreement        │
-   │              │               │                │ account rollups │                  │
-   └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴─────────┬────────┘
-          ▼               ▼               ▼                 ▼                  ▼
-   19 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
-   (ledgers = commit  validator_     (every 5 s)      volume_live,       validator_domains,
-    marker)           manifests,                      volume_daily,      validator_manifests (rpc),
-                      validator_                      amm_pools,         network_state,
-                      validations,                    amm_daily,         amendment_features,
-                      validator_seen                  + 9 tables of 003  validator_votes,
-                                                      (read the ledger   amendment_tallies,
-                                                      tables)            validator_agreement_hourly
+   ┌──────────────┬───────────────┼────────────────┬─────────────────┬──────────────────┬──────────────────┐
+   │ ingest       │ validations   │ fee_stats      │ aggregator      │ validators       │ tomls            │   <- GH_WORKERS
+   │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats, volumes, │ lists, domains,  │ account domains, │
+   │              │               │                │ AMM pools, NFTs,│ state, rounds,   │ tomls over HTTPS │
+   │              │               │                │ rates, markets, │ agreement        │ (no node)        │
+   │              │               │                │ account rollups │                  │                  │
+   └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴────────┬─────────┴────────┬─────────┘
+          ▼               ▼               ▼                 ▼                 ▼                  ▼
+   40 ledger      validations,    fee_stats        stats_hourly,     unl_lists,         domain_tomls
+   tables         validator_      (every 5 s)      volume_live,      unl_publishers,    (reads
+   (ledgers =     manifests,                       volume_daily,     validator_         account_
+   commit         validator_                       amm_pools, nfts,  domains,           domains)
+   marker)        validations,                     nft_collections,  validator_
+                  validator_seen                   amm_daily, + 9    manifests (rpc),
+                                                   of 003 (read the  network_state,
+                                                   ledger tables)    amendment_
+                                                   + escrows (reads  features,
+                                                   object_changes)   validator_votes,
+                                                   + tokens (reads   amendment_
+                                                   state tables)     tallies,
+                                                   + supply (reads   validator_
+                                                   state, ledgers)   agreement_hourly
                           ClickHouse, database = the network name
 ```
 
 Besides the node, the fifth worker, `validators` ([section 8](#8-the-validators-worker)), fetches the validator lists of the UNL publishers and
 the TOML files of the validators' domains over HTTPS, and reads the ledgers and validations the other workers stored.
+The sixth, `tomls` ([section 8a](#8a-the-tomls-worker)), needs no node: it reads which domains accounts name from `account_domains` and fetches
+their tomls over HTTPS.
 
 ## 1. Boot
 
 `main.ts` loads and validates the configuration (the process exits with a message naming the bad variable), builds the app from
-the **enabled workers** only (`GH_WORKERS`, default all five), and starts the toolbox bootstrap (probe + metrics ports).
+the **enabled workers** only (`GH_WORKERS`, default all six), and starts the toolbox bootstrap (probe + metrics ports).
 Then, in order:
 
 1. If `GH_RUN_MIGRATIONS_ON_BOOT=true`, the schema is applied (the compose stacks leave this off: the `migrate-<network>` job
    owns it). Then, with the `validations` or `validators` worker enabled, the schema of `002_validators_amendments.sql` is checked
    (`system.columns`): a database without it refuses the boot with a message that names the file and what is missing (a check
-   that cannot reach ClickHouse is logged and the boot goes on).
+   that cannot reach ClickHouse is logged and the boot goes on). With the `tomls` worker enabled, the two tables of
+   `012_display_names.sql` (`account_domains`, `domain_tomls`) are checked the same way, and a database without them refuses the boot.
+   With the `ingest` or the `aggregator` worker enabled, the tables of `014_issued_tokens.sql` they need are checked the same way (the ingest `state_touches`, the
+   aggregator all four: `lacks the schema of 014_issued_tokens.sql`), and the tables of `015_supply.sql` the same way (the ingest the three mint tables `genesis_mints`, `imports`,
+   `reward_claims`; the aggregator those and `network_supply`: `lacks the schema of 015_supply.sql`), on every network, since the schema is one (on Xahau an insert into a missing mint table fails the batch
+   and the `supply` job reads them, while it writes `network_supply` on both networks). The check of 015 runs after the one of 014.
+   With the `validators` worker enabled, the five columns of `016_validator_toml_details.sql` on `validator_domains` are checked after those (`system.columns`: `lacks the schema of 016_validator_toml_details.sql`).
+   With the `ingest` or the `aggregator` worker enabled, the tables of `017_mpt.sql` are checked after that (the ingest the five ledger tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers`, `mpt_issuance_transfers`; the aggregator `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches` and the two aggregates `mpt_issuances`, `mpt_holders`), on every network, since the schema is one (on XRPL and XRPL Testnet an insert into a missing MPT table fails the batch, and the `mpt_state` job and its hook would fail at every run: `lacks the schema of 017_mpt.sql`).
 2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
-   (`server_info.network_id`: XRPL reports 0 or nothing, Xahau 21337/21338). A node of another network refuses the boot.
+   (`server_info.network_id` must be one of the profile's `acceptedNodeNetworkIds`: `xrpl` 0 or nothing, `xahau` 21337, `xrpl-testnet` 1, `xahau-testnet` 21338, and no other). A node of another network refuses the boot.
 3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,
    the node client stops) within 10 s; the compose `stop_grace_period` is 30 s.
 
@@ -71,16 +86,46 @@ The single writer of the ledger tables. It follows the validated chain, one ledg
 
 ### Writing a ledger: `buildLedgerRows` and `LedgerWriter`
 
-For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 19
+For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 40
 **ledger-derived tables** (`ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`,
 `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
 `balance_changes`, `accounts_created`, and the AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`,
-`account_amm_liquidity`, `amm_governance`; see [data-model](data-model.md)). The parsers never mutate their input and take the
+`account_amm_liquidity`, `amm_governance`, the state history `account_states` and `trust_line_states`, `path_payments` and its index by account `account_path_payments`,
+the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011, filled from
+parser version 5: a ledger written by an older parser has no rows in them), the Domain of an account `account_domains` (migration 012, filled from
+parser version 6 and ordered by account), the history of the tracked ledger objects `object_changes` and its index by account
+`account_object_changes` (migration 013, filled from parser version 7: a ledger written by an older parser has no rows in them), the index of the trust
+lines and issuers whose token state a transaction changed `state_touches` (migration 014, filled from parser version 8: a ledger written by an older parser
+has no rows in it, and the tokens job never applies a window that holds one), the three Xahau mint tables `genesis_mints`, `imports` and
+`reward_claims` (migration 015, filled from parser version 9: a Xahau ledger written by an older parser has no rows in them, and XRPL has none of the three
+transaction types, so they stay empty there), and the five MPT tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and
+`mpt_issuance_transfers` (migration 017, filled from parser version 10: a ledger written by an older parser has no rows in them, and Xahau has no MPT, so they stay empty there);
+see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`
 copies), and a pool the parser touches gets a state row, plus a liquidity or governance row for the `AMM*` transactions. A pool or a
 reserve line it cannot turn into rows is counted in `syncer_amm_unclassified_total` (live ingest and range ingest, once per committed
 write; the range-ingest log names the total of its run).
+The mint parsers read Xahau's `GenesisMint`, `Import` and `ClaimReward` transactions into `genesis_mints`, `imports` and `reward_claims`. An `Import` whose minted drops come out below 0, which the network cannot produce,
+is stored as 0 and counted in `syncer_parser_anomalies_total{kind}`. The parsers are pure, so the count travels through `LedgerDiagnostics` as the AMM one does, and is counted once per committed write (live ingest and range ingest; the range-ingest log warns with the count of its run).
+The path payments parser reads every successful Payment, a payment to oneself included (the payments parser drops those): a
+payment whose delivery crossed an offer, changed an AMM pool or rippled through a third account's trust lines becomes a
+`path_payments` row ([data-model](data-model.md#path_payments-p6-order-by-ledger_index-tx_index-migration-007)), and an
+`account_path_payments` row for its source and one for its destination, one for a payment to oneself
+([data-model](data-model.md#account_path_payments-p7-order-by-account-ledger_index-tx_index-migration-008)).
+The object changes parser reads the metadata of every transaction for the nodes of four types, `Escrow`, `Check`, `PayChannel` and `Delegate`
+(`TRACKED_OBJECT_TYPES`), whatever the transaction's result: a created, modified or deleted node is one `object_changes` row with the object's fields after the transaction, what
+changed (`PreviousFields`) and the event it was (`create`, `finish`, `cancel`, `cash`, `fund`, `claim`, `close_request`, `renew`, `close`, `set`, `delete`, or `removed` when a
+transaction of another type deleted it), and its owner and its counterparty get one `account_object_changes` row each; a node that was only threaded has none. A change that no event
+expects is event `update` and is counted in `syncer_objects_unclassified_total` (once per committed write; the range-ingest log names the total of its run). Three more things
+come with parser version 7: the transaction's `Delegate` is listed in `account_transactions` (`is_initiator = 0`, also when the metadata names none of its accounts), the fee of a
+delegated transaction is booked to the delegate (`feePayer`: the `transaction_cost` row of `balance_changes`, and the source columns of `payments` and `path_payments`), and the
+payment channels that hold an issued token (Xahau) are typed with token amounts instead of throwing ([ADR-0018](adr/0018-ledger-object-history.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md)
+items 90 to 92).
+The state touches parser reads the metadata of every transaction, whatever its result, for the nodes the token aggregate depends on: each created, modified (with
+`PreviousFields`) or deleted `RippleState` is one `line` row (the low account, the high account and the currency, an LP currency too), and each created or deleted
+`AccountRoot`, each one modified with `Flags`, `TransferRate` or `Domain` among its `PreviousFields`, and the root of the sender of an `AccountSet` (a field set for the first time is
+not in `PreviousFields`; the sender is `senderAccount`, never the delegate that paid the fee) is one `account` row. A balance or sequence change of any other transaction makes none.
 `LedgerWriter.write()` then inserts, in this order:
 
 1. all child tables, in parallel (each insert is chunked at 50,000 rows),
@@ -103,7 +148,8 @@ half-written ledger is invisible; recovery removes it.
   (`lease lost to <holder>`), writes nothing more and the probe goes 503. Releasing the lease inserts a newer row with an empty
   holder.
 - **Verify.** The node must confirm the hash stored for the checkpoint, else the runner halts (data and node disagree about
-  history; only an operator can tell which is wrong).
+  history; only an operator can tell which is wrong). A node whose validated head is below the checkpoint has no checkpoint to
+  confirm, so that case is told apart first: [A head below the checkpoint](#a-head-below-the-checkpoint).
 - **Clean the tail.** Rows above the checkpoint are rows of ledgers that never committed. They are deleted with partition-scoped
   lightweight `DELETE`s (the `ledgers` row first) and the runner waits for the deletes (`lightweight_deletes_sync=2`).
 - **First boot** (no checkpoint): the start is `GH_SYNC_START_LEDGER` (default: the validated head). The start is recorded as a
@@ -126,6 +172,8 @@ half-written ledger is invisible; recovery removes it.
   it asks (see [Rate limits](#rate-limits)). A fetched ledger is accepted only if the node says it is `validated`.
   Accepted ledgers are reordered and chained in index order: each `parent_hash` must be the hash of the ledger before it. A break
   commits the verified prefix and **halts** the runner (probe 503).
+- **A head below the checkpoint** (a testnet that was reset, or a node that is behind) is compared with what is stored, and halts the
+  runner when it is another chain: [below](#a-head-below-the-checkpoint).
 - **A ledger the parser rejects** (`Cannot parse ledger <index>: <reason>`) is not retried: parsing is pure and would fail the
   same way after any recovery. The ledgers of the batch before it are committed, then the runner **halts** like on a chain break
   (probe 503 with the error, `syncer_ingest_halts_total{reason="parse_error"}`). It needs a parser fix; after the restart the
@@ -137,6 +185,33 @@ half-written ledger is invisible; recovery removes it.
 - **Shutdown.** A write in progress finishes, a partial batch is dropped and refetched next time, the lease is released.
 
 States (probe and `syncer_*` metrics): `starting`, `catching_up`, `live`, `halted`. Lag = validated head − committed checkpoint.
+
+### A head below the checkpoint
+
+A testnet can be reset: its ledger indexes start again, under other hashes. The head never goes down, so a node whose validated head
+falls below the committed checkpoint would leave the runner waiting for ledgers it will never get, healthy by every probe (and a
+restart would retry the fetch of a checkpoint the node does not have). The runner tells a reset from a node that is only behind.
+
+- **The head below.** A head the node reports (a hint or a poll) below the committed checkpoint is recorded apart; the runner's `head`
+  still never goes down. The loop compares the node's ledger at that head with the stored one (`storedLedgerHash(head)` against one
+  `fetch(head)`) when that head is not the last one checked and `HEAD_BELOW_CHECK_MS` (60 s) have passed since the last check (the first
+  at once): once per distinct head, at most once a minute. A fetch that fails is a warning, and the next due check tries again.
+- **At boot**, with a checkpoint, the runner asks for the validated head first and runs the same check when it is below the checkpoint,
+  before it fetches the checkpoint (which then waits for a node that is behind, as it always did). A head that cannot be read is a
+  warning for each failed try, as in the loop; a failure of the comparison itself (the stored hash, or the one `fetch(head)`) is an
+  error that the boot retries with backoff, with `recovering` in the probe details.
+- **Another hash** at that index: two hashes at one index can only be two chains, so the runner **halts** with
+  `The node's validated ledger <head> has hash <h1>, but ledger <head> is stored with hash <h2>: the network was reset, or the node is of another chain`.
+  This holds on **every network, mainnet included**, and changes mainnet behaviour on purpose: before it, a mainnet syncer
+  pointed at a node of another chain, with a head below its checkpoint, waited forever too.
+- **The same hash**: the node is behind (a failover to a slower node). The runner logs one warning per head, `The node's validated head <head> is
+  below the checkpoint <checkpoint>, with the stored hash: waiting for it to catch up`, and waits.
+- **No stored ledger** at that head: on a **testnet**, when the head is below the first indexed ledger (`firstCommittedLedger`), the runner
+  halts with `The node's validated head <head> is below the first indexed ledger <first>: the network was reset`. On a mainnet, or when the
+  head falls in a gap between stored ledgers, it waits.
+
+Both halts are a `ChainBreakError`, so they halt as a chain break does: `state=halted`, the probe is 503 with the message,
+`syncer_ingest_halts_total{reason="chain_break"}`. What to do: [A testnet was reset](operations.md#a-testnet-was-reset).
 
 ### Rate limits
 
@@ -278,23 +353,29 @@ most 2 s for the sample in flight.
 
 ## 7. The aggregator
 
-Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs eleven jobs **in priority order**; a job
+Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs seventeen jobs **in priority order**; a job
 gets what the earlier ones left and has a budget of its own so that a long sweep never starves the live work. The budgets are
-constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment variables, and so is the cadence of `amm_daily`:
+constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment variables, and so are the cadences of `amm_daily` and `nft_collections`:
 
 | # | Job | Budget | What |
 | --- | --- | --- | --- |
-| 1 | `volume_live` | 5 s | The twelve live volume sets (trade volume and AMM volume for hour, day, 3day, 7day, 30day; payment volume for hour, day), each recomputed whole under one version; the `amm_volume` set of the period `day` also carries the pools' fee estimates ([the AMM jobs](#the-amm-jobs)). **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
-| 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), all three metrics, stalest first. |
+| 1 | `volume_live` | 5 s | The fifteen live volume sets (trade volume and AMM volume for hour, day, 3day, 7day, 30day; payment volume for hour, day; NFT volume for day, 7day, 30day), each recomputed whole under one version; the `amm_volume` set of the period `day` also carries the pools' fee estimates ([the AMM jobs](#the-amm-jobs)). **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
+| 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), all four metrics (eight sets), stalest first. |
 | 3 | `amm_pools` | 3 s | Rebuilds the `amm_pools` row of every AMM pool with state rows that its row has not seen yet, 200 pools at a time ([the AMM jobs](#the-amm-jobs)). |
-| 4 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
-| 5 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
-| 6 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
-| 7 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, and runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)). |
-| 8 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
-| 9 | `rates_daily` | 8 s | The rate of every asset against the native currency for each closed, final UTC day (`native_rates_daily`), newest first. See [7.1](#71-rates_daily). |
-| 10 | `account_rollups` | 8 s | The discovery of heavy accounts and their daily rollups: the increment of each new day and the promotion of the days before. Off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0`. See [7.4](#74-account_rollups). |
-| 11 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config, **newest first**, all three metrics. |
+| 4 | `nft_state` | 3 s | Rebuilds the `nfts` row and the `account_nfts` rows of every NFT with an event its row has not seen yet, 500 NFTs at a time, and then the NFTs of the oldest range of `nft_dirty` that a re-ingest marked ([the NFT jobs](#the-nft-jobs)). |
+| 5 | `escrows` | 2 s | The current state of every escrow (`escrows`) and the **sentinel** row that holds the escrowed total and the ledger it is as of, which D7's supply reads. **At every tick**, the watermark of the sentinel follows the head; the first fill goes in steps of 1,000,000 ledgers, and a step is never cut by the budget ([the escrows job](#the-escrows-job)). |
+| 6 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
+| 7 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
+| 8 | `tokens` | 4 s | The generations of the issued tokens (`token_generations`, `token_lines`, `tokens`): the touches of the live generation, its repair after a re-ingest, every tenth run the housekeeping (the rebuild check, the distinct holders, the toml sweep), the account pass and the touches of the generation that builds, its promotion, and the drop of the generations retired. Its state is in the generation rows, so a restart goes on where it was ([the tokens job](#the-tokens-job)). |
+| 9 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
+| 10 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)), marks the slice's ledgers in `nft_dirty` for `nft_state` ([the NFT jobs](#the-nft-jobs)), recomputes the escrows of the slice's ledgers ([the escrows job](#the-escrows-job)), marks the slice for the repair of the issued-token generations, and, last, rebuilds the issuances the slice names ([the mpt_state job](#the-mpt_state-job)). |
+| 11 | `mpt_state` | 3 s | Rebuilds the `mpt_issuances` row of every issuance with a touch that its row has not seen yet, and the `mpt_holders` rows of the pairs touched, 200 issuances at a time ([the mpt_state job](#the-mpt_state-job)). After the stats, so that the jobs before `stats_live` keep to their 27 of the 30 s; during a stats catch-up it gets nothing, and a new issuance waits. |
+| 12 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
+| 13 | `nft_collections` | 3 s, **every 5th tick** | Computes the `nft_collections` row and the holders of every collection whose NFTs `nft_state` rebuilt, 50 collections at a time, oldest first ([the NFT jobs](#the-nft-jobs)). |
+| 14 | `rates_daily` | 8 s | The rate of every asset against the native currency for each closed, final UTC day (`native_rates_daily`), newest first. See [7.1](#71-rates_daily). |
+| 15 | `account_rollups` | 8 s | The discovery of heavy accounts and their daily rollups: the increment of each new day and the promotion of the days before. Off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0`. See [7.4](#74-account_rollups). |
+| 16 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config (the NFT volume's is its own), **newest first**, all four metrics. |
+| 17 | `supply` | 5 s | The hourly snapshot of the native supply (`network_supply`): total coins, burned, escrowed, the AMM pools' drops, the accounts and their reserves, and on Xahau the minted drops. A cycle is spread over ticks, a step at a time, and the first step of a run is taken whatever is left of the tick ([the supply job](#the-supply-job)). |
 
 Properties that matter operationally:
 
@@ -315,6 +396,11 @@ Properties that matter operationally:
 - **No overlap, graceful stop** (a tick still running is skipped; shutdown aborts the slice in flight and waits at most 2 s).
 - The AMM jobs run on both networks, whenever the aggregator does. Xahau has no AMM: `amm_pools` finds no pool, and the AMM sets
   (`amm_daily`, the `amm_volume` volume sets) hold only their sentinel.
+- The NFT jobs (`nft_state`, `nft_collections`) run on both networks too: XRPL NFTokens and Xahau URITokens are the same job and the same tables.
+  An aggregator started on a database with no NFT events finds nothing to do.
+- The `escrows` job runs on both networks too (XAH escrows on Xahau), and **at every tick**: an aggregator started on a database with no escrow rows writes a sentinel with a
+  total of 0 and keeps its watermark at the head. The jobs before `stats_live` have 27 of the 30 s of a tick when each uses its whole budget, so `stats_live` gets the 3 s that are
+  left in the worst tick, and `stats_dirty`, which runs the hooks of the `agg_dirty` slices, nothing if `stats_live` takes them (`aggregator.schedule.spec.ts` pins it).
 - Volume jobs need the **markets config** (`config/markets/<network>.json` or `GH_MARKETS_CONFIG`): without markets there is
   nothing to compute. (The shipped Xahau list, version 3, was derived from a small sample, about 3,800 ledgers spread over three days,
   and is short: one trade market (`EVR`/`XAH`) and three payment currencies; `XXX`, a test token whose ISO code means "no
@@ -432,10 +518,10 @@ The writer's version is the largest over all four rollup tables, so a retry neve
 
 ### 7.5 Runners, registration and failures
 
-Each job is a **runner** in a file of its own in `apps/syncer/src/aggregator/` (`rates-daily`, `pair-hourly`, `markets-live` and `account-rollups` `.job-runner.ts`). A runner keeps its own state (cursors, waits, announcements,
+Each job is a **runner** in a file of its own in `apps/syncer/src/aggregator/` (`rates-daily`, `pair-hourly`, `markets-live` and `account-rollups` `.job-runner.ts`, and `supply.job-runner.ts`, [the supply job](#the-supply-job)). A runner keeps its own state (cursors, waits, announcements,
 the run counter of `markets_live`) and gets what it needs of the service through one small interface of its own, **`AggregateJobDeps`** (`aggregate-job-deps.ts`): the `ClickHouseService`, the logger, the metrics, the clock, `closing()`,
 `failed(job, err, where?)` and the job's budget. A runner imports only the shared package, that file and the types of `aggregator.service.ts` (`AggregatorTick`, `AggregatorJob`); its constructor takes the deps, the shared options
-(`AggregatorAggregates`: the `RatesService` and the minimum of rows) and, for tests, the functions of the shared package to replace. A runner's `job()` is its entry in the jobs list, and three of them have an `ofSlice(start, end, tick)` hook.
+(`AggregatorAggregates`: the `RatesService` and the minimum of rows) and, for tests, the functions of the shared package to replace. A runner's `job()` is its entry in the jobs list, and three of them have an `ofSlice(start, end, tick)` hook (the `supply` runner takes the same deps, with its own options, and has no hook).
 
 The **registration** is all that changes in the service: the four names in `AggregatorJobName`, four budget constants (`AGGREGATOR_PAIR_HOURLY_BUDGET_MS`, `AGGREGATOR_MARKETS_LIVE_BUDGET_MS`, `AGGREGATOR_RATES_DAILY_BUDGET_MS`,
 `AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS`), the option `aggregates` (without it the four jobs and their hooks do not exist, as in the unit tests of the volume jobs), the four entries of the jobs list at the places of the table above, and one
@@ -448,7 +534,7 @@ in a tick; a shutdown aborts the set in flight before it writes (`AggregateSetAb
 
 ### 7.6 The `agg_dirty` hooks
 
-A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order**:
+A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order** (and then the fourth, of `nft_state`, the fifth, of `escrows`, the sixth, of `tokens`, and the seventh, of `mpt_state`, which do not depend on the other three):
 
 1. `rates_daily`: a slice that touches the days X..Y marks the days X..Y+14 **stale** (the rate of a day reads the trades of the 14 days before it): for each of them that has a valid set, a new sentinel with `stale = 1` and no rows. The back-fill then computes them again, newest first; until it has, the readers value those days on read.
 2. `pair_hourly`: the hours of the slice that lie in the last 31 days are recomputed, a call for each UTC day.
@@ -456,7 +542,15 @@ A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `sta
    marked for the next discovery to recount. With `GH_ACCOUNT_ROLLUP_MIN_ROWS=0` the job is off but the slice **still recomputes the covered days** (the API still uses that coverage, so a re-ingest must not leave it stale) and marks no partition.
    A re-ingested day comes as many ranges (one per chunk of ledgers, about an hour), so the hook is given the mark of the range (`agg_dirty.created_at`) and remembers in memory, across ticks, which days it rolled and when each roll began (at most 1000 days). A day that was rolled by a roll that began at or after the mark is not rolled again, as the daily volume sets are not; a range marked after the roll began rolls the day again, and a roll that failed is not remembered.
 
-A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
+4. `nft_state`: the ledgers that closed in the slice are appended to `nft_dirty` as one range (a new row, idempotent: the same range twice is one), for the dirty sweep of `nft_state` to rebuild. The hook rebuilds nothing itself, so a day of 2022's busiest NFT ledgers cannot hold a tick. It runs **with or without** the `aggregates` option (an aggregator without the account and market jobs still marks the ledgers). The slice's daily `nft_volume` sets are recomputed with the other metrics as always.
+
+5. `escrows`: the escrows of the ledgers that closed in the slice are recomputed **as of the watermark of the `escrows` job** (the `through_ledger` of its sentinel: a slice above it is the live steps' to read, and a job that has written no sentinel yet has its first steps read the rows the slice rewrote, so the hook does nothing), and the total is read again, with the sentinel rewritten at the same watermark, if an escrow was written or removed. **After a step of the tick that failed** it reads nothing and fails the slice (`the escrows step of this tick failed`): that step may have written some of its rows without its sentinel, and a total read then would not be the state at the watermark. It runs with the `escrows` option, with or without the others. When it fails the slice stays in `agg_dirty`, the hook of `tokens` after it is skipped for the tick, and the earlier hooks of the slice run again at the next tick, with no backoff ([the escrows job](#the-escrows-job)).
+
+6. `tokens`: every generation of the issued tokens that is live or builds, and whose `through_ledger` reaches the first ledger of the slice, gets its `repair_from` lowered to that ledger (no lower than its `coverage_from`: a slice below it is left to the rebuild check), one generation row each; the next run of the `tokens` job applies the touches of `[repair_from, through_ledger]` again. The hook applies nothing itself, and writes nothing when `repair_from` would not change. It throws before it reads while the job has not read its version floor yet (before its first run) or when the reads that open its last run failed, so that the slice fails and its range stays in `agg_dirty`; a step of the job that failed does not stop it. It runs with the `tokens` option, with or without the others. When it fails the slice stays in `agg_dirty`, the hook of `mpt_state` after it waits, and the earlier hooks of the slice run again at the next tick, with no backoff.
+
+7. `mpt_state`, the last hook: the issuances the slice names are rebuilt at the head read then, 200 at a time: those with a touch in the slice's ledgers, with the holders touched there; those whose newest `mpt_issuances` row last saw one of its ledgers; and every pair, of any issuance, whose newest `mpt_holders` row last saw one, so that a pair a re-ingest dropped is deleted although its issuance was last seen elsewhere. An issuance that fails on its own is set aside, not the slice, and its retry keeps what the slice named. It runs with the `mptState` option, with or without the others ([the mpt_state job](#the-mpt_state-job)).
+
+A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`, `tokens_dirty`, `mpt_state_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
 because the range is not changed after it. Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`).
 
 ### 7.7 The back-fills
@@ -542,6 +636,306 @@ the component's own volumes, which are the dust-filtered sums). It is NULL when 
 fee is above 0 while its volume is not; the sentinel and every row of the other sets have NULL (the longer periods would read up to 30 days of swaps every tick). The set is still one insert, with
 the column in it; a set written before migration 004 reads as not known until the next tick. The cost is the swaps of 24 hours once a tick, as `amm_daily` reads a day.
 
+### The NFT jobs
+
+The NFT aggregates (`nfts`, `account_nfts`, `nft_collections`, `nft_collection_holders`: [data-model](data-model.md#nft-aggregates-migration-011)) are
+rebuilt from the append-only NFT ledger tables and never written by ingest, so a recovery delete cannot lose a state
+([ADR-0016](adr/0016-nft-and-uritoken-data.md)). Both jobs read **committed ledgers only** (every scan is capped at the newest `ledgers` row),
+write version sets (a version is the ClickHouse clock in milliseconds, above the key's newest), and are runners in files of their own
+(`nft-state.job-runner.ts`, `nft-collections.job-runner.ts`) behind `AggregatorJobContext`, registered with the `nfts` option, which
+`aggregator.module.ts` builds from the one `RatesService` the volume jobs share. `nft_collections` also needs the daily rates (`DailyRates`).
+
+**`nft_state`** (budget 3 s, every tick, right after `amm_pools`; `nft_state` of [data-model](data-model.md#nft-aggregates-migration-011)):
+- **Cursor.** A ledger index kept in memory and found again when the process starts (`nftStateWatermark`: the ledger before the oldest
+  `nft_touches` row that its NFT's newest `nfts` row has not seen; the committed head when there is none; 0 for a database with no ledger
+  yet). The read is a join of every touch with the NFTs: it may take as long as the time limit of a query, so it **starts at the first run
+  without being waited for**, and the live part starts at the first run after it answered (the retries and the dirty part do not need it, and
+  the jobs after this one keep their share of the tick). A read that fails is counted and logged as `nft_state` and tried again after 5
+  minutes, doubling up to an hour; a stop does not cancel it. So a restart delays the live part by at least one tick, **and by at least five
+  minutes when that read fails**; a watermark that never fits `GH_CLICKHOUSE_MAX_EXECUTION_TIME` keeps the live cursor from starting at all,
+  counted each time it is tried again (every 5 to 60 minutes).
+- **Placing the cursor.** In the same read, after the watermark: when it is more than `NFT_LIVE_STEP_LEDGERS` (10,000) ledgers behind the
+  committed head (a restart while a re-ingest is being digested: the NFTs it wrote that have no row yet are stale, back to the oldest of them),
+  it is lifted to the ledger before the first committed one (`firstCommittedLedger`; a watermark read just before the first ledgers came is 0),
+  and if it is still that far behind, the ledgers after it up to the head are marked in `nft_dirty` (`markNftDirty`), and only then is the
+  cursor set, at the head: the dirty sweep, which digests a re-ingest anyway, carries that backlog, and the live part keeps following the
+  chain instead of crossing the backlog with the whole budget. A crash between the mark and the cursor finds the same stale touches at the
+  next start and marks them again; a mark that fails fails the read (counted, tried again after the wait). A cursor read from a database with
+  no ledger (0) is placed at the ledger before the first committed one once there is one: the live window never starts below it.
+- **Each tick** `nftsChangedSince` returns at most 500 NFTs (`NFT_STATE_BATCH`) that have a touch above what their newest `nfts` row has
+  seen, oldest first, in a window of `NFT_LIVE_STEP_LEDGERS` (10,000) ledgers after the cursor, so that a cursor far behind the head crosses a
+  stretch with nothing in it window by window, while the budget lasts. Each NFT is rebuilt whole from its own `nft_events` (a prefix read) by
+  `foldNftEvents` and written under one version: its `nfts` row, and an `account_nfts` row for every account that ever owned it (`held` 1 for
+  the current owner). The cursor moves past a batch once it is written. An answer of more than 500 (all the stale NFTs of one ledger, which
+  `nftsChangedSince` returns whole) is rebuilt 500 at a time, the budget checked between the batches; the cursor passes the ledger once the last
+  batch is written, and a tick that ran out of budget goes on with the next batch at the next tick.
+- **A batch that fails is halved**, as in `amm_pools`: at most three NFTs of a batch may fail on their own (`MAX_ISOLATED_NFTS_PER_BATCH`);
+  they are set aside in memory, each counted as an error, and tried again after 5 minutes, doubling up to an hour (`NFT_RETRY_MS`,
+  `NFT_MAX_RETRY_MS`), while the cursor and the other NFTs go on. More than three means the cause is not the NFTs (the database, a limit) and
+  the batch is the failure of the job. A restart forgets the set; the NFT is stale in the tables, so the new process finds it again.
+- **Dirty ranges.** In what is left of the budget the oldest range of `nft_dirty` (ledgers that a re-ingest rewrote behind the job, marked by
+  the hook below): the NFTs with a touch in its first `NFT_DIRTY_STEP_LEDGERS` (10,000) ledgers, and those whose `nfts` row's `first_ledger` or
+  `last_ledger` lies there, are rebuilt in batches, an NFT with no event left is removed from `nfts` with a lightweight `DELETE` (and its
+  `account_nfts` rows get `held = 0`), and the range is replaced by its remainder (inserted first, then the old row deleted), so progress
+  survives a restart. An NFT that fails on its own in a step is counted and its ledgers of the step are marked again (from its first to its
+  last touch there, one read of `nft_touches`: `nftTouchLedgers`; the whole step for an NFT found by its row, with no touch there), before the
+  range is narrowed or deleted. A range marked again waits, in memory, before it is taken again (`NFT_RETRY_MS`, doubling up to
+  `NFT_MAX_RETRY_MS` each time it is marked again): `oldestNftDirty` skips it meanwhile, so the ranges marked after it are worked on, and an NFT
+  that keeps failing (a query that runs into the time limit takes a tick) does not take the tick from the jobs after `nft_state` run after run.
+  A restart forgets the waits (the marks are in the table).
+- **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), error label `nft_state_dirty`. Dirty-sweep and gauge-read failures count
+  as `nft_state`; only the hook is `nft_state_dirty`.
+- **Collections due.** The collection keys (issuer, taxon) of every rebuilt NFT are handed to the queue of `nft_collections`.
+- **Gauges.** `syncer_nft_state_lag_ledgers` is the newest committed ledger minus the live cursor, set at the end of every run (0 while no
+  ledger is stored); **while the cursor is being placed (after every start, until its read has answered and placed it; after the first
+  ledgers of a new database, until it is placed at the first one) its lag is not known and the gauge is not set**: it keeps its value (0 in a
+  new process) and never reads the whole head ([observability](observability.md#4-metrics-syncer)). A read that keeps failing shows as
+  errors of `nft_state`, not in the gauge.
+  `syncer_nft_dirty_ledgers` is the ledgers the ranges of `nft_dirty` hold (the sum over the newest row of each range): 0 when no re-ingest is
+  being digested.
+- **A first boot** (no ledger at the first read) places the cursor at the ledger before the first committed one, once there is one, so the
+  job never crosses the empty history before it. A restart while a re-ingest is digested (the cursor read far behind the head) leaves the
+  stretch to `nft_dirty` (above): `syncer_nft_dirty_ledgers` rises by it, and each such restart adds it once more ([operations](operations.md#the-nft-data)).
+
+**`nft_collections`** (budget 3 s, **at the first tick and then every 5th tick**, `NFT_COLLECTIONS_EVERY_TICKS`; `nft_collections` and
+`nft_collection_holders` of [data-model](data-model.md#nft-aggregates-migration-011)):
+- **Queue.** In memory, each collection once, oldest first: `nft_state` adds the collections of the NFTs it rebuilt, and at the first run a read of
+  the tables (`collectionsBehind`: the collections whose newest NFT version is above their row's, and the rows of collections with no NFT left;
+  one grouped read of `nfts`, not waited for, tried again after 5 minutes, doubling up to an hour, when it fails) adds what they say is behind.
+  `syncer_nft_collections_pending` is the queue, the batch under way and the collections set aside (a collection can be counted twice for a while
+  when it is both in the batch and queued again: gauge noise).
+- **A run** takes 50 collections at a time (`NFT_COLLECTIONS_BATCH`) while the budget lasts, then the collections whose wait after a failure is
+  over. A recompute reads the collection's `nfts` prefix (the newest row of each NFT: supply, holders and each holder's count) and its
+  `collection_nft_events` (the mints and burns, the first and last mint, and the sales with their converted prices), and writes the
+  `nft_collection_holders` rows (a `held = 0` row for each holder of the newest set who is gone) and the `nft_collections` row under one
+  version. A collection with no NFT left is deleted from both tables. A batch that fails is halved, and a collection that fails on its own is
+  counted, set aside and retried exactly as an NFT of `nft_state` is.
+- **Prices.** The sales are converted once, by `nftSalesNativeSql`, at the rate of the sale's UTC day ([ADR-0016](adr/0016-nft-and-uritoken-data.md)).
+  A collection's `volume_native` is as of its last recompute: it uses the rates known then (the partial rate of today's issued-currency sales) and
+  is refreshed whenever the collection changes, so a quiet collection's figure does not follow a rate settling; the daily `nft_volume` sets are
+  the settled figures.
+- **The first fill is slow.** After a rollout the queue holds every collection of the history, and it is worked first in, first out, one 3 s run
+  every fifth tick in batches of 50: the planning figure is about 150 collections every five minutes for XRPL's large collections (a batch of 50
+  that takes a second), and small ones go thousands to a run (a live check on Xahau cleared 2,089 in one). Collections that change meanwhile wait
+  behind it, so the collection pages of the API update slowly until the fill has drained, days on XRPL
+  ([backfill](backfill.md#nft-re-ingest)).
+
+**`nft_volume`** is a fourth metric of `volume_live` (the sets for `day`, `7day` and `30day`), `volume_daily` and `volume_backfill`, not a job
+of its own. A component is a collection (`<issuer>` on Xahau, `<issuer>/<taxon>` on XRPL), read from `nft_sales` by the committed ledger range of
+the window and priced by `nftSalesNativeSql`; its `amount` is the converted volume of the sales with a rate and its `count` those sales, and the
+set's sentinel counts every sale of the window. Its sets carry `NFT_VOLUME_CONFIG_VERSION` (1), not the markets config's version: a change of the
+markets list does not recompute them. The fifteen live sets are scheduled as before, stalest first, and `aggregator.schedule.spec.ts` shows they
+are not starved with `nft_state` and `nft_collections` registered.
+
+**Metrics.** `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending` (above), the counter
+`syncer_nft_skipped_total` (the NFT events the parser dropped for an amount that is an MPT amount, in a batch that was committed; the live ingest
+and the range-ingest runs of the process count them, the latter log a warning when it is not 0 and always say `J skipped NFT events` in their last line, which ends with `L unclassified object changes`), and
+`syncer_aggregator_runs_total` / `syncer_aggregator_errors_total` with the labels `nft_state`, `nft_state_dirty` and `nft_collections`
+([observability](observability.md#4-metrics-syncer)). A job that keeps failing logs `Aggregator job nft_state: ...` / `Aggregator job
+nft_collections: ...` warnings and errors, and `nft_state: NFT <id> is rebuilt again` / `nft_collections: collection <id> is computed again` when a
+set-aside one works again.
+
+### The escrows job
+
+The aggregate `escrows` ([data-model](data-model.md#escrows-migration-013)) keeps the current state of every escrow the index has seen and one **sentinel** row (`escrow_id = ''`)
+that holds the escrowed total: the open count, the sum of the native drops in them and `through_ledger`, the ledger the job has processed up to (its watermark). D7's supply reads
+it with `readEscrowed`; it is the only aggregate of the ledger objects ([ADR-0018](adr/0018-ledger-object-history.md): everything else about an object is read from `object_changes`
+at query time). Like the NFT jobs it reads **committed ledgers only**, is a runner in a file of its own (`escrows.job-runner.ts`, behind `AggregatorJobContext`, registered with the
+`escrows` option that `aggregator.module.ts` builds from the one `RatesService` the volume jobs share and the network's native currency), and writes version sets (a version is the
+ClickHouse clock in milliseconds, above the key's newest).
+
+**`escrows`** (budget 2 s, **every tick**, fifth in the tick, right after `nft_state`; `runEscrowsStep` in `packages/shared/src/aggregate/escrows.job.ts`):
+- **A step.** The watermark `W` is the sentinel's `through_ledger` (with no sentinel, the ledger before the first committed one) and `H` the newest committed ledger; a step takes
+  the window `(W, U]`, `U = max(W, min(H, W + ESCROWS_STEP_LEDGERS))` with `ESCROWS_STEP_LEDGERS = 1,000,000` (a watermark above the head, which a reprocess can leave
+  behind it, stays where it is). It reads the distinct escrow IDs with an `object_changes` row in the window
+  (partition pruning on `ledger_index` and the `object_type = 'Escrow'` prefix of the key), recomputes them `ESCROWS_CHUNK = 500` at a time (the newest row of each at or before
+  `U` and its creation, mapped to an `escrows` row and written under one version per chunk; an ID with no row left gets a lightweight `DELETE`), reads the total again if anything
+  was written or removed, and writes the sentinel **last**: `through_ledger = U` and the total (the new one, or the previous one when nothing changed).
+- **The sentinel is the commit marker, at every run.** It is written after every step, whether or not an escrow changed, so that its watermark follows the head (D7 takes the ledger of
+  its snapshot from it). A step that fails before it leaves the old sentinel, whose total and watermark agree, and the next run does the same window again, which rewrites the same rows.
+- **The budget is checked before a step and never inside one.** The first step of a run is always taken (unless the shutdown has begun); more follow while the watermark is below the
+  head and the 2 s last. A step cannot resume partway (its sentinel is its last write), so it is not given a signal that the budget aborts, only the shutdown's (`EscrowsAborted`, neither
+  logged nor counted). A first fill over all history (about 108 steps on the XRP Ledger from ledger 32,569: about 28 cheap ones below the Escrow amendment's 28,685,313, then about 80
+  that can hold escrows) therefore goes on where it stopped at each tick, and a heavy step runs past the budget.
+- **An escrow that cannot be mapped is set aside** (a text that is not JSON, an amount of no shape the ledger has, drops that are not a whole number, an MPT ID that is not one:
+  unreachable from ledger data): the step commits without it, its old row stays (and the total counts that row), and it is counted and logged as a failure of `escrows` by its ID,
+  with the reason.
+- **A step that fails is the failure of the job** (counted as `escrows`, logged, the jobs after it still run). The gauges are then set from the head and the sentinel, read outside the
+  job's budget, so a watermark that is stuck shows as a lag that grows with the head.
+- **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), item 5, error label `escrows_dirty`. It recomputes the escrows touched in the slice's ledgers, and those whose
+  `last_ledger` falls in them (an escrow whose rows a reprocess made vanish), as of the watermark, then rewrites the sentinel with the same `through_ledger`. After a step of the tick
+  that failed (it may have written rows as of its window and no sentinel) it reads nothing and fails the slice, `the escrows step of this tick failed`, so that every sentinel's total
+  is the state at its watermark; the slice is done at the next tick, after a step that commits.
+- **Gauges.** `syncer_escrows_lag_ledgers` is the newest committed ledger the step saw less the watermark it wrote, `syncer_escrows_open` the sentinel's open count
+  ([observability](observability.md#4-metrics-syncer)). The alert is `syncer_escrows_lag_ledgers > 1000` for 15 minutes, paired with `rate(syncer_aggregator_errors_total{job="escrows"}[15m])`
+  ([observability](observability.md#recommended-alerts)).
+- **The cost** is one narrow row per escrow ever seen, read only by a run that changed something (a few hundred thousand on the XRP Ledger: tens of milliseconds).
+
+**Metrics.** `syncer_escrows_lag_ledgers`, `syncer_escrows_open` (above), the counter `syncer_objects_unclassified_total` (the changes of a tracked object that no event of its type
+expects, stored as event `update`; counted by the live ingest and the range-ingest runs of the process, once per committed write), and `syncer_aggregator_runs_total` /
+`syncer_aggregator_errors_total` with the labels `escrows` and `escrows_dirty`. A job that keeps failing logs `Aggregator job escrows failed...: ...` and, for an escrow set aside,
+`Aggregator job escrows failed for escrow <id>, set aside: ...`.
+
+### The tokens job
+
+The aggregates `token_generations`, `token_lines` and `tokens` ([data-model](data-model.md#issued-tokens-migration-014)) keep the issued tokens of the network: for every token its holders,
+its trust lines and its exact supply, the settings of its issuer and what the issuer's toml says of it, and the state of every trust line that counts (what the api's token list, detail and
+holders serve; [ADR-0019](adr/0019-issued-tokens-from-state-history.md), [spec](superpowers/specs/2026-10-24-issued-tokens-design.md)). They are built from the state tables
+(`trust_line_states`, `account_states`), kept current from the ledger-ordered index of what changed (`state_touches`, written by the ingest from parser version 8), and read by **generation**:
+a generation is one build, written beside the live one and swapped in whole. Like the other jobs it reads **committed ledgers only**, is a runner in a file of its own
+(`tokens.job-runner.ts`, behind `AggregatorJobContext`, registered with the `tokens` option that `aggregator.module.ts` builds from the network's profile and the one `RatesService`), and writes
+version sets (a version is the runner's clock in milliseconds, above any version stored: the job reads the floor at its first run). It runs on both networks, and on a database whose
+state tables are empty it waits for a ledger.
+
+**`tokens`** (budget `AGGREGATOR_TOKENS_BUDGET_MS` = 4 s, **every tick**, eighth in the tick: after `markets_live`, before `stats_live` and `stats_dirty`, so that even the first tick's `agg_dirty` slices find
+the version floor the hook needs; the shared work is `packages/shared/src/aggregate/tokens.job.ts`). The constants are those of `tokens.job.ts`: `TOKENS_CONFIG_VERSION` (1; a bump builds a new
+generation), `TOKENS_PASS_ACCOUNTS` (500 accounts a batch of the pass), `TOKENS_TOUCH_WINDOW` (500 ledgers, halved while a window holds more than `TOKENS_TOUCH_WINDOW_MAX_LINES` = 20,000
+distinct lines), `TOKENS_STATE_CHUNK` (2,000 keys a read: they travel as query parameters in the URL, and ClickHouse refuses one over 128 KiB), `TOKENS_TOML_DOMAINS_CHUNK` (500),
+`TOKENS_HOUSEKEEPING_EVERY_TICKS` (10), `TOKENS_RETIRED_KEEP_MS` (15 minutes) and `TOKENS_PROMOTE_NEAR_HEAD` (10 ledgers). A run does, in order, each part while the budget lasts (a step is
+never cut inside, so the last one of a run can end past the budget) and the parts after one that failed still run:
+
+1. **The opening reads**: the generations (`token_generations`, the newest row of each), the head (the newest committed ledger) and, the first time, the version floor.
+2. **The live generation's touches.** The window `(through_ledger, +500]` (up to the head): its distinct line touches from `state_touches` (a key range; LP currencies dropped) and the accounts of its `account`
+   touches. Every ledger in the window must have been written by parser version 8 or later (`min(parser_version)` of the `ledgers` rows): an older one means touches are missing, and the
+   generation is **marked stale** and moves no more (it keeps serving until a new one replaces it). Otherwise the newest state of each line is read at the window's end, both orientations are
+   compared with the newest stored `token_lines` row and a row (or a tombstone) is written where they differ, then **every token of the window's lines and every token of each touched issuer is
+   recomputed** (changed or not, so that a crash between the steps is repaired by doing the window again), and last the generation row with the new `through_ledger`: the cursor moves after the
+   rows are written.
+3. **The repair**, when `repair_from` is set (the hook below): the windows of `[repair_from, through_ledger]` again, read at `through_ledger` (a line changed in the window and again later keeps its
+   later state), each followed by a row that moves `repair_from` up; it takes at most half the budget, so that the program's reprocess cannot keep the rest from running. A window that meets a ledger of
+   an older parser **ends the repair and marks a rebuild** while the live touches go on.
+4. **Housekeeping**, at the first run with a ledger and then at every `TOKENS_HOUSEKEEPING_EVERY_TICKS`-th run (about every ten minutes): the **rebuild check**, the **distinct holders** and the **toml sweep**
+   (the first housekeeping does only the check). The check starts a new generation when there is no live one and none builds, or the live one is stale: its `config_version` is not
+   `TOKENS_CONFIG_VERSION`, its `coverage_from` is not the state coverage start (the history was filled further back, or a range was written again by an older parser), or its touches or its repair met
+   a ledger of an older parser. A building generation that is stale for the same reasons is retired first. The holders are `uniqExact(holder)` over the live generation's newest live lines with a balance
+   above 0, written into the generation row with `holders_ledger` = its `through_ledger` (the list leaves `totals.holders` out while it is 0). The sweep compares every live token's listing
+   (`domain`, `listed`, `name`, `toml`) with the issuer's current account domain and D4's store of tomls, and rewrites the rows that differ, in **resumable steps** of `TOKENS_STATE_CHUNK` tokens
+   from a cursor kept in memory (a sweep the budget cut goes on at the next housekeeping, and one that read the last token starts over): a toml change shows within **tens of minutes** on the XRP
+   Ledger, after the `tomls` worker has read it, not within ten (derived from the housekeeping cadence and the step size, not measured; the cost of a sweep step was not measured). The check also **retires a building
+   generation whose `coverage_from` is no longer the state coverage start and starts another**, at every housekeeping: a start that keeps moving (a history fill below the oldest stored ledger under way) restarts the build
+   every ten minutes, and a first build never ends under it ([operations](operations.md#issued-tokens)).
+5. **The generation that builds**, one at a time: a row `building` with `head_ledger` = the head, then the **account pass** (`nextPassAccounts`: the next 500 accounts of `trust_line_states` in key order, by a `GROUP BY` read that
+   stops after the batch; `writePassLines`: one server-side `INSERT … SELECT` of the newest row of each line of those accounts at or before `head_ledger`, from the account's side as the issuer; then the
+   `tokens` rows of those issuers, matched with the tomls), the cursor (`account_cursor`) moving after each batch; then the touches after `head_ledger` as in 2; then its **promotion** once the pass is
+   done and its `through_ledger` is at least the live one's (within 10 ledgers of the head when there is none): a row `live` for it, then a row `retired` for the old one. A generation that
+   went stale while it built is retired.
+6. **The drop**: the partitions of every generation retired more than 15 minutes ago (`ALTER TABLE … DROP PARTITION` on `token_lines` and `tokens`; once per generation and process).
+
+- **A step that fails is the failure of the job** (counted as `tokens`, logged, the parts after it still run), is tried again at the next run, and waits when it keeps failing: a step of a generation
+  (a window, a batch of the pass, a repair), the rebuild check and a drop that fail twice in a row wait 5 minutes, doubling up to an hour (`NFT_RETRY_MS`, `NFT_MAX_RETRY_MS`, the rule of the NFTs that fail on their own), while
+  the other parts go on; a drop that fails for lack of the privilege cannot stall anything else. The gauges are set **after a failed run too**, from a read of the generations and the head, so a window that
+  is stuck shows as a lag that grows with the head.
+- **A window the touches made too big is halved** (a ledger is applied whole), and the halved window is kept for the next one; a window that keeps failing is not made smaller than a ledger.
+- **A restart goes on where it was**: the state is in the generation rows. What is in memory is only what a restart finds again or does without (the housekeeping count, the version floor, the halved windows,
+  the sweep's cursor, the backoffs, the generations marked for a rebuild: the mark of a rebuild is found again by the same window).
+- **Shutdown** aborts a step before its next write (`TokensAborted`, neither logged nor counted).
+- **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), item 6, error label `tokens_dirty`. Only the hook of `mpt_state` comes after it, and it only lowers `repair_from` of every generation that is
+  live or builds and whose `through_ledger` reaches the slice (no lower than its `coverage_from`: a slice below it is left to the rebuild check), writing one generation row each; the next run of the job
+  applies the repair. It throws before it reads while the job has not read its version floor yet (before its first run) or when the reads that open its last run failed, so that the slice fails and
+  its range stays in `agg_dirty` (a mark is never lost). **A job that cannot read its tables therefore keeps `agg_dirty` from draining for every job**, and that is why the syncer refuses to boot
+  without migration 014 (`lacks the schema of 014_issued_tokens.sql`, [operations](operations.md#apply-a-schema-migration)); what is left is ClickHouse failing the opening reads of the job, as in a
+  persistent `tokens_dirty` ([operations](operations.md#a-persistent-tokens_dirty)).
+- **Gauges.** `syncer_tokens_live` (1 when a live generation exists), `syncer_tokens_lag_ledgers` (the head less the live generation's `through_ledger`), `syncer_tokens_building` (1 while a generation builds; its
+  progress, the account cursor, is logged at each batch) and `syncer_tokens_repair_ledgers` (`through_ledger` less `repair_from`, 0 without a repair)
+  ([observability](observability.md#4-metrics-syncer)). The alert is `syncer_tokens_lag_ledgers > 300` for 15 minutes, paired with `rate(syncer_aggregator_errors_total{job="tokens"}[15m])`
+  ([observability](observability.md#recommended-alerts)); `syncer_tokens_live` gates the explorer's `TOKENS` switch.
+- **The cost.** A pass batch of 500 accounts is a key range of `trust_line_states` and a server-side insert, tens of milliseconds on a table of a million lines; an issuer with millions of lines is one statement of
+  seconds that the pass does not split; a window of a minute of the XRP Ledger (about 15 ledgers, about 500 touches at the 33 a ledger measured on the recorded ledgers) is a few hundred lines and tokens. The figures measured on synthetic data, and the estimate of the first
+  build on the XRP Ledger, are in [operations](operations.md#issued-tokens).
+
+**Metrics.** The four gauges above, and `syncer_aggregator_runs_total` / `syncer_aggregator_errors_total` with the labels `tokens` and `tokens_dirty`. A job that keeps failing logs `Aggregator job tokens failed...: ...`; the
+job logs `tokens: generation N started at ledger L (config C, state coverage from F[, replacing generation M])`, `... the account pass is at <account> (A account(s), T token(s))`, `... is live (through ledger L)`,
+`... is retired` and `the partitions of retired generation N are dropped`, and warns `tokens: ledgers A - B (touches|repair of generation N) were written by a parser older than 8; ... the generation is replaced by
+a new one built from the state tables` once.
+
+### The supply job
+
+The aggregate `network_supply` ([data-model](data-model.md#supply-migration-015)) keeps one row per snapshot of the native supply, about one an hour: the total coins, the burned, the escrowed, the drops in
+the AMM pools, the existing accounts and their owner counts (from which the api works out the reserves), and on Xahau the minted drops by source ([spec](superpowers/specs/2026-10-24-supply-design.md)). The api
+serves the newest row. Like the other jobs it reads **committed ledgers only**, is a runner in a file of its own (`supply.job-runner.ts`, behind `AggregateJobDeps`, registered with the `supply` option that
+`aggregator.module.ts` builds from the network's profile), and runs on both networks. It has no `agg_dirty` hook. It needs migration 015: a syncer with the
+`aggregator` worker refuses to boot without the four tables of the file ([operations](operations.md#apply-a-schema-migration)).
+
+**`supply`** (budget `AGGREGATOR_SUPPLY_BUDGET_MS` = 5 s, **every tick**, seventeenth and last in the tick: after `volume_backfill`, so the jobs before `stats_live` still have their 27 of the 30 s and the job only gets what the live
+work left; the shared work is `packages/shared/src/aggregate/supply.job.ts`). The constants are `SUPPLY_INTERVAL_MS` (3,600,000), `SUPPLY_START_WAIT_TICKS` (10), `SUPPLY_MAX_LAG_LEDGERS` (1,000),
+`SUPPLY_PREFIXES_PER_READ` (32) and `SUPPLY_MINT_SLICE_LEDGERS` (1,000,000). The state of a **cycle** (one snapshot at one ledger L: its partial sums and the steps still to run) is in memory; a restart forgets it and the next
+run starts a fresh one. A run does, in order:
+
+1. **The cadence.** With no cycle in progress and no wait running (below), the newest snapshot is read (two reads of the end of the key of `network_supply`). If its `started_at` is less than an hour ago the run is over; with no snapshot,
+   or one that started an hour ago, a cycle is started. The read is made once a run and never while a cycle is under way.
+2. **The start**, which takes the reads that must be made at the tick L is chosen. **L is the `through_ledger` of the escrows sentinel** ([the escrows job](#the-escrows-job)), and a cycle starts at it only when the sentinel exists with a
+   `through_ledger` above 0, the newest committed ledger is no more than 1,000 ledgers ahead of it, and the `ledgers` row of L is stored. During a first fill or a rebuild of the `escrows` job L is millions of ledgers behind the head, and
+   the start answers that it **waits** for it. The start reads L's close time and `total_coins`, the escrowed total and count of the sentinel, the reserve values in force at L (the newest `network_state` row at or before L, else the
+   newest `SetFee`, else none: the api then leaves the reserves out), on XRPL the first part of the AMM (below), on Xahau where the burned and minted slices start, and plans the steps. A start that waits counts a **waiting
+   tick**; the 10th in a row logs the warning `supply: waiting for escrows/amm_pools to reach the head` once, and the count begins again when a cycle starts.
+3. **The steps**, in this order: the **account ranges** (106 reads, each of up to 32 two-character prefixes of the account IDs: the existing accounts at L and their owner counts, the AMM pool accounts left out), on XRPL the **AMM
+   fill-forwards** (200 pools a step), on Xahau the **burned** slices (the fees of the ledgers, one read of one partition of `ledgers` each) and the **minted** slices (the mint tables, one read of one partition each, from the
+   oldest ledger they can hold: the one after the newest ledger written by an older parser, else the oldest stored; [data-model](data-model.md#supply-migration-015)). The sums of each step are added to the cycle. On XRPL burned
+   is `10^17` less `total_coins`, with no read.
+4. **The write**, when no step is left: one insert of the row (`version` above the clock and above any version of that ledger), then the gauges and one line of the log.
+
+- **The budget, and the first step.** Steps run while the clock is before the deadline of the tick (the job's 5 s, or what is left of the tick) and the stop has not begun. **The first step of a run is always taken**, whatever is left
+  of the tick, so that a cycle moves at every tick even when the jobs before it use the whole of it; the run that **starts** a cycle takes the start as its one such unit, and no step follows it past the deadline. **A step is
+  never cut by the budget** (it only reads, and takes no signal): the job can run as long as one step past it, and a step that takes longer than the budget is warned about, `supply: a step took <ms> ms, over its budget of 5000 ms`,
+  once for as long as the steps keep being slow: it is said again after a step that came in time, so a cycle whose steps straddle the budget can log it more than once. The write is not a step that needs time: it is made as soon as the last step is done. `aggregator.schedule.spec.ts` pins the order, and that a tick of the live jobs that use their whole budgets
+  ends within the tick budget, the set in flight and one step of this job.
+- **The AMM (XRPL).** The start does not wait for the AMM job to be up to date: the service **lends** it the cursor of the `amm_pools` runner and the pools that runner has set aside (`AmmPoolsJobRunner.sight`, read when a start
+  is attempted, after job 3 of the same tick). The newest `amm_pools` row of every pool is read; a pool is **stale at L** when it has a touch at or below L that its row has not seen, which can only be a pool touched after the cursor or a pool
+  set aside, and the stale pools (with those whose row is past L) are **filled forward at L** from `amm_pool_states`, 200 a step. So the sum is exact except for a **set-aside pool**, which is counted at its stored row, and
+  named in one warning when the cycle starts (`supply: N AMM pool(s) set aside by the amm_pools job are counted at their stored row, and not as of ledger L: ...`, the first ten listed). A pool whose native reserve is NULL or
+  not a whole number of drops counts as 0 and does not stall the cycle; the pools so counted are named in one warning at the write, when the amm steps have run. With the `amm_pools` job off in the process, or before
+  it has read its cursor (the first run after a start), the start waits (`amm_pools`) and the warning above is what says so; on Xahau there is no AMM and no sight is asked for.
+- **Re-ingests.** Every step reads ledgers at or below L, and the current-state tables are read at the tick L is chosen, so a snapshot is the state of one ledger. A `--reprocess` or range-ingest that rewrites ledgers at or below L
+  while a cycle runs can leave that cycle's figures off for the accounts or mints it rewrote (a range read between the delete and the rewrite), and a pool that a re-ingest made stale below the cursor counts at its stored row until
+  `agg_dirty` rebuilds it; the next cycle, an hour later, is right again. There is nothing incremental to repair, so there is no hook.
+- **Failures.** A step that fails (a step of the cycle, a start that throws, the read of the newest snapshot, the write) is logged and counted (`syncer_aggregator_errors_total{job="supply"}`), **ends the run** and stays first: it is
+  tried again at the **next** tick, not at once. Its failures are counted across runs: a run that does not attempt it (the stop began, a wait is running) neither counts nor clears the streak, and only a step that works (or a start that answers,
+  even that it waits, or a read of the newest snapshot that answers that no cycle is due) clears it. **The third failure in a row drops the cycle** and starts a wait before the next start: 5 minutes, doubling up to an hour (`AGGREGATE_RETRY_MS`, `AGGREGATE_MAX_RETRY_MS`), which **a written row resets**.
+  The waits are in memory: a restart starts again. A failure that comes of the shutdown does not count toward the streak (an abort is neither logged nor counted, a plain read error during the stop is both).
+- **Shutdown** starts no step after it, and the write is given the signal of the tick, so a row is not written after it (`AggregateSetAborted`, neither logged nor counted). A step in flight when the stop begins takes no signal (it only
+  reads): it runs out unobserved, its result is dropped, and the stop waits for the tick for at most 2 s.
+- **Gauges and the log.** `syncer_supply_snapshot_age_seconds` is the time since the close time of the newest snapshot the process has seen, read or written, **set at every run, also after a failed read or a failed step** (from the last one it
+  knew). **It has no sample until the process has seen a snapshot**: the 0 that prom-client gives a gauge when it is registered is removed, so that `absent()` tells a job that never wrote a row (a 0 would read as one written just now).
+  `syncer_supply_cycle_seconds` is the wall time of the last finished cycle, from its start to its write, and has no sample before the first ([observability](observability.md#4-metrics-syncer)). The alerts are the snapshot age above
+  3 hours (outside a catch-up: it assumes a cycle under an hour and a half), `absent()` of it for 6 hours, and `increase(syncer_aggregator_errors_total{job="supply"}[4h]) > 0` ([observability](observability.md#recommended-alerts)); the job backs off, so its errors
+  come in bursts up to an hour apart. Each finished cycle logs one line, `supply: ledger <L>, <N> steps, <S> s, in drops: total ..., burned ...,
+  escrowed ..., amm ..., reserves ..., minted ...` (N is the number of steps the plan had), and a cycle that is dropped logs `supply: the cycle at ledger <L> was dropped after 3 failures in a row of the <kind> step; the next start waits <m> min`.
+- **The cost.** Each cycle reads every row of `account_states` up to L once, in 106 reads of a key range (four narrow columns and the key, never the wide `fields`), a plain `GROUP BY` with the AMM pool accounts left out. The
+  plan estimated some billions of rows on the XRP Ledger, about a minute or two of reads, so 20 to 40 ticks of 5 s (an estimate, not measured on a full history). In a catch-up the cycle gets one step a tick, which is 106 ticks on the XRP Ledger and about 160 on Xahau, and the age alert can then fire without a fault ([observability](observability.md#recommended-alerts)). A cycle that takes more than an hour just runs back to back with the next, and the
+  snapshot says its own ledger and time. **The memory of such a read** is that of the hash aggregation of the accounts in its range, and does not grow with the rows: measured on ClickHouse 26.8.14.3 with merges stopped, the peak was 384 MiB (65,000 accounts in
+  29.9 million rows and 88 parts) to 1.07 GiB (200,000 accounts in 60 million rows and 92 parts) at 16 threads, and less with fewer. The in-order aggregation the plan first had needed 2.2 to 7 GiB and was dropped (the spec's
+  amendment of 2026-10-30, section 4.3). **The syncer sets no memory limit per query as deployed (0)**, so a read is limited by the server's memory alone, and in time by `GH_CLICKHOUSE_MAX_EXECUTION_TIME` and `GH_CLICKHOUSE_REQUEST_TIMEOUT` (30 s each):
+  a range that does not fit in them is a poison step, which fails at every attempt until the third failure drops the cycle, and the waits grow to an hour; the guard of the api (`max_memory_usage`) does not apply to the syncer's connection.
+  A run that has nothing to do costs the two reads of the newest snapshot.
+
+**Metrics.** The two gauges above, and `syncer_aggregator_runs_total` / `syncer_aggregator_errors_total` with the label `supply`. A job that keeps failing logs `Aggregator job supply failed in the <kind> step: ...` (`... in the start`,
+`... reading the newest snapshot`, `... writing the snapshot`).
+
+### The mpt_state job
+
+The aggregates `mpt_issuances` and `mpt_holders` ([data-model](data-model.md#mpt-aggregates-migration-017)) keep the current state of every issuance and of every holder of one, rebuilt from the state rows the ingest writes
+(`mpt_issuance_states`, `mpt_holder_states`) for the MPT routes of the api ([spec](superpowers/specs/2026-10-17-mpt-data-design.md)). Like the other jobs it reads **committed ledgers only**, is a runner in a
+file of its own (`mpt-state.job-runner.ts`, behind `AggregatorJobContext`, registered with the `mptState` option), and runs on every network: on Xahau its tables are empty, and each tick reads empty tables. It needs migration 017: a syncer with the `aggregator` worker refuses to boot without the tables it reads and writes ([operations](operations.md#apply-a-schema-migration)).
+
+**`mpt_state`** (budget `AGGREGATOR_MPT_STATE_BUDGET_MS` = 3 s, **every tick**, eleventh in the tick: right after `stats_dirty`, so that the jobs before `stats_live` keep to their 27 of the 30 s and `stats_live` has
+its time in the worst tick; the shared work is `packages/shared/src/aggregate/mpt-state.job.ts`). **So during a stats catch-up it gets nothing, and a brand-new issuance answers 404 until the catch-up leaves it time.** The
+constants are `MPT_STATE_BATCH` (200 issuances), `MPT_HOLDERS_CHUNK` (5,000 rows an insert) and `MPT_HOLDERS_READ_CHUNK` (2,000 pairs a read and a delete: they travel as query parameters in the URL, sorted, as two arrays the
+server zips back, and ClickHouse refuses one over 128 KiB).
+
+- **What is stale.** A touch (`mpt_touches`) whose ledger is above what the issuance's newest row has seen (`last_ledger`; 0 without a row). The cursor is a ledger in memory, found again at a start from the tables
+  (`mptStateWatermark`: the ledger before the oldest stale touch, else the head), and each run works up to one head read at its start. Oldest touch first, stale issuances only: a batch's cursor is the ledger the answer is complete up to.
+- **A rebuild** writes the holders first and the issuance last, so that a reader never sees a count ahead of the rows it counts. A holder's row is the newest `mpt_holder_states` row of the pair at or below the head; a pair with no state
+  row left is deleted. An issuance's row is its newest state row, whole, or `state_known` 0 with the state columns at their defaults; its creation (the oldest `MPTokenIssuanceCreate` row); its counts from its newest `mpt_holders` rows; its
+  decoded metadata; and `last_ledger`, the greater of the newest state row's ledger and the highest `last_ledger` of its holders. An issuance with neither a state row nor a holder row left is deleted from both tables.
+- **What `last_ledger` claims.** Every pair touched below it was rebuilt, or that touch would stop being stale and `/holders` would stay wrong until the pair's next touch. So a rebuild first reads, for its issuances, every pair touched above each
+  `last_ledger` up to the head (one key range of `mpt_touches`, from the lowest of them), and unions it with what it was handed. A retry of an issuance set aside by the live sweep holds only the ID; the hook at a newer head and the read of one crowded ledger need nothing special.
+  What a slice of `agg_dirty` names may be below `last_ledger` (a pair a re-ingest rewrote or dropped), so an issuance set aside there keeps what the slice named for its retry, and a slice that names one already waiting adds to it.
+- **Failures** are those of `amm_pools`: a batch that fails is halved, the issuances that fail alone are set aside (at most 3 of a batch) and tried again after 5 minutes, doubling to an hour, while the cursor goes on; a batch that fails as a whole is the failure of
+  the job, the cursor stays, and the same batch failing again is what sets its issuances aside. That repeat is against the last run that **attempted** a batch: a run with no budget, which is the usual run during a catch-up at this place in the tick, forgets nothing, so a lone poison issuance is still set aside.
+
+**Metrics.** `syncer_mpt_state_lag_ledgers`, the head a run read less the cursor, set at the end of **every** run, also one that failed or had no budget (a label-less gauge: 0 until the first run that has a cursor; a failing read of the head leaves the head before it). An issuance set aside moves no
+cursor, so it does not show in the gauge: its errors do. `syncer_aggregator_runs_total` and `syncer_aggregator_errors_total` have the labels `mpt_state` and `mpt_state_dirty`, the second from the start. A job that keeps failing logs `Aggregator job mpt_state failed for issuance <id>, set aside to be tried again: ...`.
+
 ## 8. The validators worker
 
 The `validators` worker (`apps/syncer/src/validators/`) keeps the data behind the validators and amendments endpoints current:
@@ -570,7 +964,17 @@ fetcher (HTTPS only, no private, loopback or reserved address, no redirect to on
 
 `UnlFetcher` fetches the validator list of every publisher of `GH_UNL_PUBLISHERS` (`url=publicKeyHex` pairs; a publisher's id is its
 URL without the scheme and the trailing slash, `vl.ripple.com`) and stores the ones that verify. `GH_UNL_THRESHOLD` (0 = rippled's
-rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists must name a validator for it to be trusted.
+rule: 1 below three lists, else ⌊n / 2⌋ + 1, over the publishers and the fixed list below) is how many current lists must name a validator for it to be trusted.
+
+- **The fixed list (`GH_UNL_VALIDATORS`).** Xahau Testnet has no publisher: its nodes trust four keys of their own configuration, which the profile
+  holds as `defaultUnlValidators`. `registerPublishers()` stores such a list as the list of the reserved publisher `local` (no URL, no key,
+  `configured` 1, `status` `ok`, the threshold in force): a `unl_lists` row with the next sequence (1 first), `version` 1,
+  `expiration` 4294967295 (it does not expire), the keys sorted and the upper-case hex SHA-256 of the sorted keys joined by newlines as
+  `blob_sha256`, written only when the keys differ from the newest stored `local` list (a restart with the same keys writes nothing, and a
+  past round reads the list that was in force). An emptied `GH_UNL_VALIDATORS` sets `configured = 0` on a stored `local`. `local` is never fetched: no
+  timer, no fetch, no metric, and `fetchOnce('local')` rejects like any unconfigured id. `loadListContext` reads it with the publishers, so
+  the tally, the agreement and the directory trust its keys at threshold 1 with no branch of their own
+  ([ADR-0012](adr/0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
 
 - **Schedule.** One timer per publisher, never two fetches of one publisher at a time. A fetch at start, then one after
   `GH_UNL_REFRESH_MS` (5 min), or after the `refresh_interval` of the last list (minutes) when the list gives one; either wait is
@@ -633,7 +1037,8 @@ one ended, never two at a time) while `GH_DOMAIN_VERIFICATION` is `true`; a pass
 and the next one is made on time.
 
 - **Which validators.** The masters on the list in use of each configured publisher (only the lists stored under the key configured
-  for it: a list of an earlier key of the same URL counts for nothing), and those in `validator_seen` with `last_seen` in the last 30
+  for it: a list of an earlier key of the same URL counts for nothing), the keys of the fixed list (`GH_UNL_VALIDATORS`, from the
+  configuration: `local`'s empty key never matches a publisher's), and those in `validator_seen` with `last_seen` in the last 30
   days. A key seen under a signing key is mapped to its master through the manifest map first (per `ephemeral_key`, the
   `master_key` of the highest `seq`), as every read that aggregates by validator does: the map is computed inside the statement
   (`KEY_MAP_WITH` and `mappedKey` of `packages/shared`), never sent with it as parameters, which the client would put in the URL
@@ -645,18 +1050,22 @@ and the next one is made on time.
   the node (`manifest` with the master key; 5 s, no retry) at most once in 10 minutes per key, at most 100 keys and 4 requests at a
   time in a pass, and the answer is stored with `source = 'rpc'` and checked in a later pass like any manifest. No domain: no check
   and no row.
-- **Which pairs are due.** A (validator, domain) pair with no stored row, or with `next_check_at` passed; a changed domain is a new
-  pair, checked in the next pass. Never-checked pairs first, then the oldest `next_check_at`, at most 100 a pass.
+- **Which pairs are due.** A (validator, domain) pair with no stored row, or with `next_check_at` passed (a changed domain is a new
+  pair, checked in the next pass), or `verified` with a `toml_version` below `TOML_DETAILS_VERSION` and checked at least an hour ago, so
+  that details appear within minutes of a deploy that reads more of a file. The hour keeps a pair whose re-check met a transient failure from being
+  fetched every minute: within the grace it keeps its old version. Unverified pairs keep their schedule, as nothing would be read of their files. Never-checked
+  pairs and those below the version first, then the oldest `next_check_at`, at most 100 a pass.
 - **The checks.** A domain that is not properly formed (rippled's `isProperlyFormedTomlDomain`: no IP literal, port, path or single
   label) is `domain_invalid` before any DNS query. Otherwise the file `https://{domain}/.well-known/xrp-ledger.toml` (Xahau:
   `/.well-known/xahau.toml`; no fall-back to the other name) is fetched through the safe fetcher (`GH_DOMAIN_FETCH_TIMEOUT_MS`, 256
   KiB, 3 redirects, each checked like the first URL): **one fetch per domain per pass**, shared by the validators that name it, at
   most **4 in flight**. The rows of a domain are written as soon as it is done.
-- **What is read of the file.** It is parsed (`smol-toml`), never evaluated. The key is listed when a `[[VALIDATORS]]` entry has it as
-  `public_key` (trimmed). Only then are the `[[ACCOUNTS]]` read: the `address` of each entry (trimmed), kept when it is a classic
-  address with a valid checksum (an X-address, a bad checksum, a missing or non-text address is skipped), once each, sorted, the first
-  10. Every other field is ignored, and nothing in the file is fetched or followed. A byte order mark at the start of the file is ignored. A file that
+- **What is read of the file.** It is read with `readToml` (`smol-toml`, never evaluated; every text cleaned). The key is listed when a `[[VALIDATORS]]` entry has it as
+  `public_key`; at most 100 entries are kept, so a key past the 100th is not listed. Only then are the `[[ACCOUNTS]]` taken: the classic
+  addresses with a valid checksum (an X-address, a bad checksum, a missing or non-text address is skipped), once each, sorted, the first
+  10; and the four facts of the first entry that lists the key (a second one is ignored, and no other entry is read): `owner_country`, `server_country`, `network` and `unl`, by the rules of `validatorTomlEntryOf` ([api-reference](api-reference.md#get-v2networkvalidators)). A value the rules refuse counts as not given: the metric counts it at every check, and the line a pair logs (below) quotes it. Nothing in the file is fetched or followed. A byte order mark at the start of the file is ignored. A file that
   is not TOML is `toml_invalid`, and its error says nothing of its content.
+- **The write to the store.** After the rows of a domain's validators, every file fetched is written once to `domain_tomls`: `recordToml` for a file read as TOML, whatever its verdicts, and `nextTomlRow` over the stored row (one keyed read) for a fetch failure or `toml_invalid`. `domain_invalid` and `manifest_unverified` make no fetch and write nothing. So a domain only a validator names is in the store and loses its content when its file goes, and a domain named by both a validator and an account has one current row, the newest check whoever made it. A row is stamped with the time its file arrived. A failed store write is counted and logged by the name of the error, and does not fail the pass: the verdicts are written, and the next check writes the store again.
 - **The result of a pair.**
 
   | Result | Reason | Next check |
@@ -665,12 +1074,12 @@ and the next one is made on time.
   | `unverified` | `not_listed`, `toml_invalid`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid`, `manifest_unverified`, `http_status` with a 4xx other than 429 (`status_code` is the status) | 6 h |
   | `unverified` | transient: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | 1 h |
 
-  A transient failure within 24 h of the last success keeps `verified` (with `verified_at` and `accounts` unchanged), so that a website
-  that blips does not flap the badge; after 24 h of failures it is `unverified` with the transient reason and no accounts. A definite
-  failure takes the badge at once and keeps `verified_at`, the time of the last success.
+  A transient failure within 24 h of the last success keeps `verified` (with `verified_at`, `accounts`, the four facts and `toml_version` unchanged), so that a website
+  that blips does not flap the badge; after 24 h of failures it is `unverified` with the transient reason, no accounts and no facts. A definite
+  failure takes the badge and the facts at once and keeps `verified_at`, the time of the last success.
 - **Observability.** `syncer_validators_domain_checks_total{outcome}` counts every check as `verified` or the reason (also a
-  transient failure that left the domain `verified`). The result of a pair is logged when it changes (the validator, the domain
-  quoted, the status, the reason and the status code); a fetch refused by the address policy is logged at `warn` every time, with the
+  transient failure that left the domain `verified`), `syncer_validators_toml_fields_total{field,outcome}` what the entry of a verified check gave (`read`, `absent`, `invalid`), and `syncer_validators_toml_store_writes_total{outcome}` the writes to the store. The result of a pair is logged when it or one of its facts changes, or when the pair is first read at a new `toml_version` (the validator, the domain
+  quoted, the status, the reason and the status code, the server country, and the values the file gave that were ignored, quoted and cut to 16 characters; never a principal); a fetch refused by the address policy is logged at `warn` every time, with the
   domain and the blocked range (`addressClass`). Once a pass, one `warn` says how many manifest lookups the node
   could not answer (and the first message) and how many it answered with an error (their codes, only the codes), and one how many
   fetches failed with an error that is not the safe fetcher's own (the names of the errors, recorded as `connect_error`). A log line
@@ -829,6 +1238,114 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
   hour stored back, 720 hours (a range of the key) at a time, the next range only when one has none, and no further than the 400 days
   the table keeps: a run reads the sentinels of one range, not of the table.
 
+## 8a. The tomls worker
+
+The `tomls` worker (`apps/syncer/src/tomls/`) reads the toml of every domain an account names into `domain_tomls`, so that the API can say which accounts a
+domain vouches for (`verified` names, [api-reference](api-reference.md#account-names-and-tomls)) and what it says of itself (`GET /v2/toml/{domain}`).
+Its design is in the [display names spec](superpowers/specs/2026-10-24-display-names-design.md), section 4, and the decision in
+[ADR-0017](adr/0017-display-names.md). It needs ClickHouse and outbound HTTPS, **not the node** (`NODE_CLIENT_WORKERS` does not list it), and is switched on
+and off with `GH_WORKERS` (the default has it). With `GH_DOMAIN_VERIFICATION=false` it starts and logs once `Toml checks are off (GH_DOMAIN_VERIFICATION=false):
+no toml is read`; it reads nothing, and `domain_tomls` stays as it is. On a new deployment it is empty, and every domain shows as kind `domain`; **after the
+worker has run, the stored rows stay and the api keeps verifying names from them, without limit** (a reader uses the content as it is): to withdraw the
+verified names, `TRUNCATE TABLE domain_tomls` ([operations](operations.md#the-display-names)). A boot without migration `012_display_names.sql`
+fails with a message that names the file ([section 1](#1-boot)).
+
+**Two loops**, each a `PassLoop` that waits for a pass to end before it starts the next:
+
+- **Discovery**, at start and then every `TOML_DISCOVERY_INTERVAL_MS` (5 minutes) after the previous one ended: one read of the current domain of every
+  account.
+- **Checks**, a pass at start and then 60 s after the previous one ended. A pass waits for the first discovery, and none is made while no discovery has
+  worked: a worker that cannot read `account_domains` shows its failure (a `warn` per discovery) and not an empty store that looks up to date.
+
+A stop (SIGTERM, SIGINT, shutdown of the app) ends both loops and waits for them for at most 2 s (`TOMLS_STOP_WAIT_MS`); the check loop's stop starts no fetch,
+waits for the fetches under way and writes the rows that are done. **That budget is shorter than a fetch's 10 s timeout**, so a stop during slow fetches may
+leave the pass's finished rows unwritten (the domains are checked again, which costs a fetch and no data); ClickHouse is closed after the workers, so the
+final write has a client.
+
+### Discovery: which domains
+
+```sql
+SELECT top_hex AS domain_hex, count() AS accounts
+  FROM (SELECT account, argMax(domain_hex, version) AS top_hex, argMax(deleted, version) AS gone
+          FROM account_domains GROUP BY account)
+ WHERE top_hex != '' AND gone = 0
+ GROUP BY top_hex
+```
+
+The newest row of an account is its current domain (`argMax` by `version`, never `FINAL`: rows collapse only when parts merge); a deleted account and an
+account without a Domain name none. Each `domain_hex` goes through `accountDomainOf` ([api-reference](api-reference.md#account-names-and-tomls)): a value that
+is no domain is dropped and counted (`Discovery dropped N Domain value(s) that name no domain`, logged only when above 0, never the values), and the spellings of
+one domain (`Example.com`, `example.com`) add up. The result is `domain -> accounts`, **the domains the worker checks and no others**: a stored domain no account
+names any more, or one the validators' checker stored, is not fetched by this worker.
+
+A domain named by **more accounts than at the previous discovery** is **named anew** until it is checked: it is re-checked soon, at most hourly, since an
+account that has just set its Domain should not wait a day to be verified. The first discovery after a start has nothing to compare with, so no domain is named
+anew then (counting them all would re-check every domain at each restart). The set is in memory, and loses the domains no account names any more.
+The read is bounded (the whole of `account_domains`, four columns, under 2 s and 1 GiB), and `syncer_tomls_discovery_seconds` records its duration, **also
+when it fails** (a read that outgrows its limits fails rather than slows).
+
+### The pass
+
+1. Read the **schedule** of every stored domain: `domain`, the `next_check_at` and `failures` of its newest row (the largest `checked_at`) and when it was
+   last checked. Take the discovered domains that are **due**: no row at all; or named anew and last checked more than an hour ago; or `next_check_at`
+   passed. Order: never checked, then named anew, then the oldest `next_check_at`, then the domain. At most `TOML_PASS_LIMIT` = **300** a pass.
+2. Read the newest row in full of those domains (a bound array, by key), which the new row carries its content over from.
+3. **Fetch** `https://{domain}{tomlPath}` of each (`/.well-known/xrp-ledger.toml`, on Xahau and Xahau Testnet `/.well-known/xahau.toml`; no fall-back to the other
+   name), **16 at a time** (`TOML_FETCH_CONCURRENCY`), one fetch per domain, through the safe fetcher with `GH_DOMAIN_FETCH_TIMEOUT_MS` (10 s) overall, 256 KiB, 3
+   redirects each checked again, https and port 443 only, and its own `User-Agent`, `gatehub-data-api/<version> (tomls)`. A file that arrives is read with
+   `readToml` ([the reference](api-reference.md#get-v2tomldomain) says what is kept). An error of the fetcher is its reason; a file that is not TOML is
+   `toml_invalid`; anything else that is thrown counts as `connect_error`.
+4. **Write** the rows in batches of `TOML_WRITE_BATCH` = **50** and at the end of the pass (300 tiny inserts a minute would make parts). A check whose row was
+   not written is still due.
+
+A **first sweep** after the deploy is the backlog: about 300 domains a minute, slower when many hosts time out (when every one does, a pass of 300 takes
+16 lanes of 10 s, about 190 s, and the next starts 60 s after it: about **72 a minute**). `syncer_tomls_due` shows it; on a mainnet, with tens of thousands of
+domains, it stays above the alert's 2,000 for hours ([observability](observability.md#recommended-alerts)): silence that alert during the first sweep.
+
+### The row of a check
+
+One row per check (`ReplacingMergeTree(checked_at)`): the newest row of a domain is its current word, and what its toml says *in effect* is in that row.
+
+| Check | `status`, `reason` | Content, `fetched_at` | `failures` | `next_check_at` |
+| --- | --- | --- | --- | --- |
+| Read as TOML | `ok`, `''` | from the file, now | 0 | now + `GH_TOML_RECHECK_MS` (24 h) |
+| **Transient**: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | `failed`, the reason (and the status code) | the previous row's, when it was fetched at most `GH_TOML_RECHECK_MS` and 24 h ago (`DOMAIN_VERIFIED_GRACE_S`), else none and `fetched_at` NULL | previous + 1 | while the content is carried, now + 1 h; else as a definite failure, 1, 2, 4, then 7 days, counted from the first failure that carried none |
+| **Definite**: any other `http_status` (4xx), `toml_invalid`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid` | `failed`, the reason (and the status code) | none, `fetched_at` NULL | previous + 1 | now + min(24 h x 2^(failures - 1), 7 days): 1, 2, 4, then 7 days |
+
+`failures` counts the failed checks in a row, up to 65,535 (a UInt16), and is 0 exactly when the newest row is `ok`: it is how `syncer_tomls_domains` tells `ok`
+from `failed` without another column. The 24 hours are the grace of the validators' domain checks, counted **from the re-read the failure missed**: an `ok`
+row is read again `GH_TOML_RECHECK_MS` after its read, so a website that blips at that re-read keeps its names for 24 hours more (48 hours after the read
+at the default recheck). **A transient failure backs off once it carries nothing**: hourly while the content is carried, then 1, 2, 4 and 7 days, as a
+definite failure (the wait of the row before tells the step, since `failures` also counts the hourly checks); a domain never read that fails waits a day
+too. A host that never resolves or never answers so costs a lane of the 16 once a week, not once an hour; a domain named anew is still checked at most
+hourly, and one that comes back after a long outage is read again up to 7 days later.
+
+### What is never done
+
+- A domain is fetched only because an account's ledger Domain names it, never because a request asked (the API never fetches). Nothing a file holds is fetched
+  or followed (an icon, an attestation link, a `unl` URL), and a file is parsed, never evaluated, and never stored: only the content the reference lists.
+- A principal's email and social handles, `[[SERVERS]]` and `[ORGANIZATION]` are never read. A log line names a domain (quoted and cut at 128 characters, since
+  it comes from the ledger), a reason and a status code; **never a body, an error object, a principal or a description**. An error that stops a loop is logged by its
+  **name** (and, for ClickHouse, its type, `Error (UNKNOWN_TABLE)`), never its message: an insert's error can quote the row it could not write.
+- The worker writes `domain_tomls` and nothing else, and it reads only `account_domains` and `domain_tomls`.
+
+### Observability
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `syncer_tomls_checks_total` | Counter | `outcome` | `ok` or the reason of every check, counted when its row is written |
+| `syncer_tomls_domains` | Gauge | `status` | After each pass, the discovered domains that are `ok`, `failed` or `unchecked` |
+| `syncer_tomls_due` | Gauge | | Domains due and not checked yet at the end of a pass |
+| `syncer_tomls_discovery_seconds` | Gauge | | Duration of the last discovery read |
+
+The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `TomlsWorker`): `Tomls: <n> checked (<ok> ok, <failed> failed), <due> still due`
+(`log`, once per pass that checked something or has something still due; **an idle pass logs no line** and the gauges show it);
+`Tomls: <n> fetches blocked (blocked_address): "<domain>", ...` (`warn`, once per pass, the count and at most five domains in order);
+`Tomls: <n> checks failed with an error that is not the fetcher's or the parser's own (<name> x<count>, ...)` (`warn`, the names only);
+`Discovery dropped <n> Domain value(s) that name no domain`; and `Toml discovery: the pass failed: <name>` / `Toml checks: the pass failed: <name>`
+(`warn`; the check loop's pass failed to read or write, and what was not written is due again). The alerts are in
+[observability](observability.md#recommended-alerts).
+
 ## 9. What the syncer does not do
 
 - It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
@@ -842,6 +1359,8 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
 | Symptom | Cause | What happens |
 | --- | --- | --- |
 | Probe 503, `state=halted`, `error: ...parent_hash...` | Chain break: the node's history differs from what is stored | The verified prefix is committed, then nothing. Operator decision: see [operations](operations.md#syncer-halted). |
+| Probe 503, `state=halted`, `error: The node's validated ledger <head> has hash ...: the network was reset, or the node is of another chain` | The node's head is below the checkpoint and its ledger there has another hash than the stored one: a testnet was reset, or the node is of another chain | Nothing more is fetched or written. On a testnet: [A testnet was reset](operations.md#a-testnet-was-reset); otherwise fix `GH_NODE_ENDPOINTS`, see [operations](operations.md#syncer-halted). |
+| Probe 503, `state=halted`, `error: The node's validated head <head> is below the first indexed ledger <first>: the network was reset` | A testnet's head is below the lowest ledger stored, so there is nothing to compare it with | The same: [A testnet was reset](operations.md#a-testnet-was-reset). A mainnet waits instead. |
 | Probe 503, `state=halted`, `error: Cannot parse ledger <index>: ...` | The parser rejects a ledger (a transaction shape it does not know) | The ledgers before it are committed, then nothing; not retried. Needs a parser fix and a restart, see [operations](operations.md#syncer-halted). |
 | Probe 503, `lease lost to ...` | Another syncer took the lease | This one stopped writing. Find and stop the other one. |
 | Boot refuses: lease held | A previous syncer (or an old-stack container) is still running or died less than 30 s ago | Stop it; wait 30 s. |
@@ -861,6 +1380,25 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
 | `Seeding validator_seen failed: <message>; it is tried again at the next start` | ClickHouse refused a statement of the one-off seeding of `validator_seen` | The worker is booted and the compute loop runs. The partitions done stay; the next start seeds again until the oldest partition of `validations` is covered. |
 | `Skipping a compute tick: ...`, `Abandoning the compute tick in flight: ...` | A tick took longer than a minute, or did not end within 2 s of the shutdown | The tick was skipped, or was left to finish by itself (it was told to write nothing more). |
 | `amendment <ID> has no metadata entry` | The node, the ledger or the votes name an amendment that the amendment metadata lacks | Warned once per ID; `syncer_amendments_without_metadata` counts them. Add the entry (`amendments:check` lists them). |
+| `Tomls: <n> checked (<ok> ok, <failed> failed), <due> still due` | Information: a pass of the `tomls` worker wrote its checks | Nothing to do. `syncer_tomls_due` is the backlog and falls to 0 after the first sweep. |
+| `Tomls: <n> fetches blocked (blocked_address): "<domain>", ...` | A domain an account names resolves to a private, loopback or reserved address | Nothing is requested; the domain is `failed` with `blocked_address` and is checked again after 1, 2, 4, then 7 days. Anyone can set such a Domain; nothing is wrong. |
+| `Tomls: <n> checks failed with an error that is not the fetcher's or the parser's own (<name>, ...)` | A check threw something neither the safe fetcher nor the TOML parser throws | Each is stored as `connect_error`; the line names the errors, which are a bug to report. |
+| `Toml discovery: the pass failed: <name>` | ClickHouse refused the read of `account_domains` (the time limit, the memory cap, a missing table) | The domains of the last discovery stay in use, and `syncer_tomls_discovery_seconds` shows the time it took. No pass is made while no discovery has ever worked. Retried after 5 minutes. |
+| `Toml checks: the pass failed: <name> (<type>)` | ClickHouse refused the read of the schedule or the insert of the rows | The rows not written are due again at the next pass (a minute later). |
+| Boot refuses: `lacks the schema of 012_display_names.sql` | The migration was not applied before a syncer with the `tomls` worker | Apply it (`migrate-<network>`) and start the syncer again. |
+| Boot refuses: `lacks the schema of 014_issued_tokens.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs `state_touches`) or the `aggregator` worker (it needs all four tables of the file) | Apply it (`migrate-<network>`) and start the syncer again. |
+| Boot refuses: `lacks the schema of 015_supply.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the three mint tables `genesis_mints`, `imports` and `reward_claims`) or the `aggregator` worker (those and `network_supply`), on either network: the schema is one, on Xahau an insert into a missing mint table fails the batch and the `supply` job reads them, while it writes `network_supply` on both | Apply it (`migrate-<network>`) and start the syncer again. |
+| Boot refuses: `lacks the schema of 017_mpt.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the five MPT ledger tables) or the `aggregator` worker (it needs `mpt_touches`, the two state tables and the two aggregates) | Apply it (`migrate-<network>`) and start the syncer again. |
+| Boot refuses: `lacks the schema of 016_validator_toml_details.sql` | The migration was not applied before a syncer with the `validators` worker: the domain checker reads and writes the five columns on `validator_domains` | Apply the migrations (`pnpm ch:migrate`, or `GH_RUN_MIGRATIONS_ON_BOOT=true`) and start the syncer again |
+| `Aggregator job escrows failed: ...` and `syncer_escrows_lag_ledgers` grows with the head | A step of the `escrows` job failed (ClickHouse refusing a read or an insert, mostly) | The window `(watermark, head]` is done again at the next tick; the sentinel keeps its old total and watermark, which agree. The gauge follows the head. See [the escrows job](#the-escrows-job). |
+| `Aggregator job escrows failed for escrow <id>, set aside: <reason>` | The rows of one escrow cannot be mapped to an `escrows` row, for the reason given | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |
+| `Aggregator job escrows_dirty failed in <from> - <to>: ...` | The hook of an `agg_dirty` slice failed | The slice stays queued and its earlier hooks run again at each tick, until it works ([7.6](#76-the-agg_dirty-hooks)). |
+| `Aggregator job tokens failed: ...` and `syncer_tokens_lag_ledgers` grows with the head | A part of the `tokens` job failed (ClickHouse refusing a read or an insert, the `ALTER DELETE` privilege that `DROP PARTITION` asks for, a missing table) | The next run starts over from the rows (the cursors move after the writes); a step that fails twice waits 5 minutes, doubling to an hour, and the other parts go on. See [the tokens job](#the-tokens-job). |
+| `tokens: ledgers A - B (touches of generation N) were written by a parser older than 8; ...` | A window of the live or the building generation holds a ledger written before the touches existed | The generation is replaced by a new one built from the state tables; the live one keeps serving until then. After a reprocess it is the expected way. |
+| `Aggregator job tokens_dirty failed in <from> - <to>: ...` | The hook of an `agg_dirty` slice failed, or the tokens job has not read its generations (ClickHouse down at the first run; a database without migration 014 stops the syncer at boot) | The slice stays queued, `agg_dirty` does not drain for any job until the job reads its tables ([the tokens job](#the-tokens-job), [troubleshooting](troubleshooting.md#agg_dirty-does-not-drain-the-tokens-hook-fails)). |
+| `Aggregator job mpt_state_dirty failed in <from> - <to>: ...` | The hook of `mpt_state` in an `agg_dirty` slice failed: the read of what the slice names, or most of its issuances | The slice stays in `agg_dirty` and its earlier hooks run again at the next tick, with no backoff; the log says why |
+| `Aggregator job mpt_state failed for issuance <id>, set aside to be tried again: ...` | An issuance fails on its own: the others and the cursor go on | Tried again after 5 minutes, doubling to an hour; until then its row and its holders are stale ([the mpt_state job](#the-mpt_state-job)) |
+| `Cannot parse ledger <n>: ... dropsToNative: invalid value '[object Object]'` on a Xahau payment channel | A syncer older than parser version 7 met a payment channel that holds an issued token | Halted until a restart on this release, which types the channel's amounts ([troubleshooting](troubleshooting.md#the-xahau-syncer-is-halted-on-a-payment-channel-that-holds-an-issued-token)). |
 
 ## 11. Source map
 
@@ -871,11 +1409,19 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
 | `apps/syncer/src/cli/range-ingest.ts` | The range-ingest CLI and runner |
 | `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | Three more workers |
 | `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `compute-loop`, `rounds.job` and `tally` (the compute loop, the voting rounds and the pure tally), `agreement.job` and `agreement` (the hourly agreement and its pure counting), `seen-seed`, `stored-lists`, `safe-fetch` (the only outbound HTTP) |
+| `apps/syncer/src/tomls/*` | The tomls worker: `domain-discovery` (which domains accounts name), `toml-checker` (the pass: due order, the fetches, the batched writes), `toml-row` (`nextTomlRow`, the row of a check), `tomls-worker` (the two loops), `tomls.module` |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
-| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM |
+| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`), the Domain of an account (`account-domains.parser.ts`), the history of escrows, checks, payment channels and delegations (`object-changes.parser.ts`, with `permissions.ts` and `util/keylets.ts`) |
 | `packages/shared/src/aggregate/{stats,volume,amm-pools,amm-daily}.job.ts`, `aggregate/amm-reads.ts`, `query/rates.service.ts` | Aggregation and rates (`amm-reads.ts` holds the reads the AMM jobs share) |
 | `apps/syncer/src/aggregator/{rates-daily,pair-hourly,markets-live,account-rollups}.job-runner.ts`, `aggregate-job-deps.ts` | The four account and market jobs: the runners and `AggregateJobDeps` ([7.5](#75-runners-registration-and-failures)) |
+| `apps/syncer/src/aggregator/{nft-state,nft-collections}.job-runner.ts` | The two NFT jobs ([the NFT jobs](#the-nft-jobs)) |
+| `apps/syncer/src/aggregator/escrows.job-runner.ts`, `packages/shared/src/aggregate/escrows.job.ts` | The `escrows` job: the runner (steps, gauges, the `agg_dirty` hook) and what it reads and writes (`runEscrowsStep`, `recomputeEscrows`, `readEscrowed`) ([the escrows job](#the-escrows-job)) |
+| `apps/syncer/src/aggregator/supply.job-runner.ts`, `packages/shared/src/aggregate/{supply,supply.job}.ts`, `query/supply.ts` | The `supply` job: the runner (the cycle over ticks, the waits, the failures, the gauges), the start, the steps and the write, the arithmetic (account ranges, reserves, a pool's native side) and the reads the api shares (`newestSnapshot`, `mintSums`) ([the supply job](#the-supply-job)) |
+| `apps/syncer/src/aggregator/tokens.job-runner.ts`, `packages/shared/src/aggregate/{tokens.job,token-rules}.ts`, `util/currency-code.ts` | The `tokens` job: the runner (generations, touches, repair, housekeeping, the pass, the drop, gauges, the `agg_dirty` hook), what it reads and writes, and the pure rules (orientation of a line, the toml match, currency codes) ([the tokens job](#the-tokens-job)) |
+| `apps/syncer/src/aggregator/mpt-state.job-runner.ts`, `packages/shared/src/aggregate/mpt-state.job.ts`, `util/mpt-metadata.ts` | The `mpt_state` job: the runner (the cursor, the halving, the retries, the gauge, the `agg_dirty` hook) and what it reads and writes ([the mpt_state job](#the-mpt_state-job)) |
+| `packages/shared/src/aggregate/{nft-state,nft-state.job,nft-collections.job}.ts`, `query/nft-prices.ts` | The fold of an NFT, what the NFT jobs read and write, and the one conversion of a price |
 | `packages/shared/src/aggregate/{rates-daily,pair-hourly,markets-live,account-rollups}.job.ts`, `aggregate-sets.ts` | What the runners write: the sets, their versions and their readers |
 | `packages/shared/src/query/{daily-rates,account-day-groups,valuation}.ts` | What the API reads them with: `DailyRates`, the day groups (raw or rollup), the valuation rule |
+| `packages/shared/src/tomls/*` | What the API and the workers share about tomls: `readToml` (what is kept of a file), `cleanTomlText`, `accountDomainOf`, `countsOn`, the store (`recordToml`, `readStoredTomls`) and `ACCOUNT_DOMAINS_SEED_SQL` |
 | `packages/shared/src/xrpl/node-client.ts` | The node client |

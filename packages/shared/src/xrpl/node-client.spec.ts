@@ -304,26 +304,26 @@ describe('NodeClient', () => {
     expect(node.connections).toBe(1);
   });
 
-  it('assertNetwork rejects xahau node for xrpl profile', async () => {
-    const node = await mockNode();
-    node.info = { network_id: 21337, complete_ledgers: '1-2' };
-    const client = nodeClient([node.url]);
-    await client.start();
-    const info = await client.serverInfo();
-
-    expect(() => assertNetwork(info, getNetworkProfile('xrpl'))).toThrow(
-      'Node network_id 21337 does not match GH_NETWORK=xrpl',
-    );
-    expect(() => assertNetwork({}, getNetworkProfile('xahau'))).toThrow(
-      'Node network_id undefined does not match GH_NETWORK=xahau',
-    );
-    expect(() => assertNetwork({ network_id: 1 }, getNetworkProfile('xrpl'))).toThrow(
-      'Node network_id 1 does not match GH_NETWORK=xrpl',
-    );
-    expect(() => assertNetwork({}, getNetworkProfile('xrpl'))).not.toThrow();
-    expect(() => assertNetwork({ network_id: 0 }, getNetworkProfile('xrpl'))).not.toThrow();
-    expect(() => assertNetwork(info, getNetworkProfile('xahau'))).not.toThrow();
-    expect(() => assertNetwork({ network_id: 21338 }, getNetworkProfile('xahau'))).not.toThrow();
+  // The table of spec section 4: what each profile accepts, and the neighbours it refuses.
+  it.each([
+    ['xrpl', undefined, true],
+    ['xrpl', 0, true],
+    ['xrpl', 1, false],
+    ['xrpl', 21337, false],
+    ['xahau', 21337, true],
+    ['xahau', 21338, false],
+    ['xahau', 0, false],
+    ['xahau', undefined, false],
+    ['xrpl-testnet', 1, true],
+    ['xrpl-testnet', undefined, false],
+    ['xrpl-testnet', 0, false],
+    ['xrpl-testnet', 2, false],
+    ['xahau-testnet', 21338, true],
+    ['xahau-testnet', 21337, false],
+  ])('%s: a node reporting network_id %s is accepted: %s', (name, id, accepted) => {
+    const check = () => assertNetwork(id === undefined ? {} : { network_id: id }, getNetworkProfile(name));
+    if (accepted) expect(check).not.toThrow();
+    else expect(check).toThrow(`Node network_id ${String(id)} does not match GH_NETWORK=${name}`);
   });
 
   describe("a node's rate-limit answers (ruling R98)", () => {

@@ -1,8 +1,8 @@
 # Deployment
 
-How the GateHub Data API is packaged and deployed: **one deployment per network** (XRP Ledger and Xahau), the same images for
-both, on one ClickHouse server with one database per network. For day-2 work (scaling, backfill, incidents) see
-[operations](operations.md); every variable is in [configuration](configuration.md).
+How the GateHub Data API is packaged and deployed: **one deployment per network** (XRP Ledger and Xahau, and in the sandbox their
+testnets), the same images for all of them, on one ClickHouse server per environment with one database per network. For day-2 work
+(scaling, backfill, incidents) see [operations](operations.md); every variable is in [configuration](configuration.md).
 
 ## Topology
 
@@ -21,6 +21,9 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
                         (one server) ◀── syncer-xahau ──────▶ Xahau node(s)                xahau
                               ▲
                         migrate-xrpl, migrate-xahau   (one-shot: create the database, apply the schema)
+                        migrate-shared                (one-shot: the `shared` database both apis read, names and labels)
+                        exporter-xrpl, exporter-xahau (one per network, profile `exports`): queued export jobs ──▶ the
+                                                      network's api (the list's pages) ──▶ Google Cloud Storage bucket
 ```
 
 - **api-xrpl / api-xahau** are stateless and scale horizontally.
@@ -28,19 +31,96 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
   to scale it; keep the names, they are that mechanism) and by a lease in ClickHouse (a second syncer refuses to boot). The fixed
   names (`data-syncer-*`, `ch-keeper`, `ch-server`) also mean one prod stack per Docker host; the dev `docker-compose.yaml` fixes
   none and takes its host ports from variables, so it can run next to another stack. They expose only the probe and metrics.
+- **exporter-xrpl / exporter-xahau** make the [export](api-reference.md#exports) files (spec #4, ticket #15). Each is a singleton
+  like the syncer (`container_name` `data-exporter-*`): two exporters of one database would take the same job. It walks the lists
+  through its network's api (`GH_API_URL`, the `api-<network>` service) with its own API key (`EXPORTER_API_KEY`, which must be in
+  `GH_API_KEYS`, with a large budget in `GH_RATE_LIMIT_KEYS`), and uploads to the bucket of `GH_EXPORT_BUCKET` under
+  `<network>/`. They run with the compose profile `exports` (`--profile exports`); without a bucket they refuse to start and the
+  apis answer 503 on `/v2/exports`.
+- **The export bucket** (Google Cloud Storage) is one for every network. Give it a lifecycle rule that deletes an object 7 days
+  after it was created (the jobs expire from `export_jobs` at the same age). The apis and the exporters use the application default
+  credentials: mount a service account key and set `GOOGLE_APPLICATION_CREDENTIALS` to it (the commented volumes of the compose
+  files). The account needs `storage.objects.create` and `storage.objects.get` on the bucket (the exporters write, the apis sign
+  V4 links with the key; on GKE with Workload Identity, `iam.serviceAccounts.signBlob` on itself instead of a key).
 - **ClickHouse** and **Keeper** are internal: never publish them. **nginx** is the only service with a host port.
 - The API answers the same `/v2/...` paths on both hosts; the **host name** selects the network
   ([api-reference](api-reference.md#hosts-one-per-network)). Native currency per network: `XRP` / `XAH`.
 
+The diagram is production's. The sandbox is the same stack with the testnets in the same two slots: `api-xrpl` serves XRPL Testnet (database
+`xrpl_testnet`) and `api-xahau` Xahau Testnet (`xahau_testnet`), under the sandbox hosts ([Environments](#environments)). A slot keeps its
+name because it names the family (nginx routes `xrpl.data.*` to it); the network it runs is `XRPL_NETWORK` / `XAHAU_NETWORK` of the env file.
+
+## Environments
+
+Two environments run these images. **Each is a stack of its own, on a host of its own, with a ClickHouse server of its own** (decision 3 of
+the [testnet design](superpowers/specs/2026-10-24-testnet-profiles-design.md)); they share nothing but the images and the compose file.
+
+| | Production | Sandbox |
+| --- | --- | --- |
+| Networks | XRP Ledger (`xrpl`), Xahau (`xahau`) | XRPL Testnet (`xrpl-testnet`), Xahau Testnet (`xahau-testnet`) |
+| Hosts | `xrpl.data.gatehub.net`, `xahau.data.gatehub.net` | `xrpl.data.sandbox.gatehub.net`, `xahau.data.sandbox.gatehub.net` |
+| Env file | `deploy/.env.prod`, from `deploy/.env.prod.example` | `deploy/.env.sandbox`, from `deploy/.env.sandbox.example` |
+| Compose file | `docker-compose.prod.yaml` | the same file |
+| Databases (on its own server) | `xrpl`, `xahau`, `shared` | `xrpl_testnet`, `xahau_testnet`, `shared` |
+| Exports | on, with a bucket (`exports` profile) | off: no bucket |
+
+Why a host and a server each: the fixed container names (`ch-keeper`, `ch-server`, `data-syncer-*`) already allow one stack per Docker host,
+and the `shared` database (account names and labels) has the same name on every server, so a testnet on the production server would show
+its names and labels on mainnet. A testnet process pointed at the production server by mistake still writes beside the mainnet data, never
+into it: its database is `xrpl_testnet` or `xahau_testnet` (the profile's, which the compose file never overrides).
+
+The env file picks the network of each slot, and the compose file does the rest: `XRPL_NETWORK=xrpl-testnet` and `XAHAU_NETWORK=xahau-testnet`
+in the sandbox file, neither in production's. Blank node endpoints and `default` validator lists leave the testnets' defaults to the
+profiles (the public testnet servers, XRPL Testnet's list publisher, Xahau Testnet's four fixed validators); the sandbox file leaves
+`XRPL_VALIDATION_ENDPOINTS` and `XAHAU_VALIDATION_ENDPOINTS` empty too, because a mainnet value there fails the boot. GateHub sets the
+sandbox's own node endpoints in `deploy/.env.sandbox`. Every app logs `network=… kind=testnet` at boot and refuses a node of another
+network ([syncer](syncer.md)). Production's env file gets exactly what it gets today.
+
+The sandbox, on its host:
+
+```bash
+cp deploy/.env.sandbox.example deploy/.env.sandbox          # then fill in the secrets; the file is git-ignored
+export NPM_TOKEN=...
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox up -d --build
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox ps
+```
+
+Everything else of Option 1 below holds with `--env-file deploy/.env.sandbox` in place of `--env-file deploy/.env.prod`: the start order, the
+`--scale` flags (repeat them on every `up`), the backfill and migrate commands, and the runbooks of [operations](operations.md) (its `dc`
+function takes the env file of the host). The sandbox needs its own values for `GH_CLICKHOUSE_PASSWORD`, `TRUSTED_PROXIES` and the API keys.
+
+- **API keys.** The sandbox explorer has a key of its own, in the sandbox's `GH_API_KEYS` and with a budget in `GH_RATE_LIMIT_KEYS`; the explorer
+  holds it as its sandbox secret `DATA_API_KEY`. Production's keys are not used there.
+- **From the validated head.** The sandbox indexes from its first boot (`XRPL_SYNC_START_LEDGER` and `XAHAU_SYNC_START_LEDGER` empty): the
+  public testnet servers hold under a year (XRPL Testnet) and a few days (Xahau Testnet), and no testnet history is backfilled. Every list shows
+  its coverage notice. A testnet reset starts the database again: [A testnet was reset](operations.md#a-testnet-was-reset).
+- **Exports are off** unless the sandbox is given a bucket of its own: `GH_EXPORT_BUCKET` stays empty and the `exports` profile is not started
+  (the exporters refuse to start without a bucket, and the apis answer 503 on `/v2/exports`). Never give the sandbox production's bucket.
+- **Certificates.** TLS ends at the front proxy ([ADR-0006](adr/0006-reverse-proxy-tls.md)), and its certificates must name the four hosts. A
+  wildcard covers one label: `*.gatehub.net` covers none of `xrpl.data.gatehub.net`, `xahau.data.gatehub.net`,
+  `xrpl.data.sandbox.gatehub.net` and `xahau.data.sandbox.gatehub.net`. `*.data.gatehub.net` and `*.data.sandbox.gatehub.net` do, and so do the
+  four names.
+- **nginx** is the same template in both: `xrpl.data.*` and `xahau.data.*` match the sandbox hosts, and route them to the slots
+  ([the edge](#the-edge-nginx)).
+
 ## Outbound network access
 
-- **api-xrpl / api-xahau:** ClickHouse and the node(s) they forward live lookups to; nothing else.
-- **syncer-xrpl / syncer-xahau:** ClickHouse and its node(s) (WSS/HTTP), plus, for the `validators` worker, **outbound HTTPS (port 443)
+- **api-xrpl / api-xahau:** ClickHouse and the node(s) they forward live lookups to; nothing else (signing an export's link is
+  local, with the key).
+- **exporter-xrpl / exporter-xahau:** ClickHouse, their network's api, and `storage.googleapis.com` (HTTPS) for the uploads.
+- **syncer-xrpl / syncer-xahau:** ClickHouse and its node(s) (WSS/HTTP), plus, for the `validators` and `tomls` workers, **outbound HTTPS (port 443)
   to public hosts**:
-  - the **UNL publishers** of `GH_UNL_PUBLISHERS` (by default `vl.ripple.com` and `unl.xrplf.org` on XRPL, `vl.xahau.org` on Xahau), and
+  - the **UNL publishers** of `GH_UNL_PUBLISHERS` (by default `vl.ripple.com` and `unl.xrplf.org` on XRPL, `vl.xahau.org` on Xahau,
+    `vl.altnet.rippletest.net` on XRPL Testnet, none on Xahau Testnet), and
   - the **domains validators claim**: `https://<domain>/.well-known/xrp-ledger.toml` (Xahau: `xahau.toml`) for every validator that names a
     domain in its manifest. These hosts are open-ended, so a hostname allowlist cannot cover them; a host that has no outbound HTTPS
     to arbitrary sites sets **`GH_DOMAIN_VERIFICATION=false`** (the domains then show `pending`) and keeps egress to the publishers only.
+  - the **domains accounts name** (the `tomls` worker): `https://<domain>/.well-known/xrp-ledger.toml` (Xahau and its testnet: `xahau.toml`) for every domain
+    an account's `Domain` field names, once a day, 16 at a time at most. That is **tens of thousands of hosts** on a mainnet, chosen by whoever sets a Domain,
+    so a hostname allowlist is impossible here too. A host that cannot reach arbitrary sites sets **`GH_DOMAIN_VERIFICATION=false`**, which switches this worker
+    off as well as the validators' checks: no toml is read, and on a store still empty no account is `verified` and every account that names a domain shows it
+    as an unverified domain (`kind: "domain"`); a store the worker filled before keeps verifying names from its rows until it is emptied
+    ([operations](operations.md#the-display-names)). Keeping the worker on needs the egress above and nothing else (it needs no node).
   - A DNS resolver that answers A and AAAA queries (the fetch resolves names itself; `/etc/hosts` is not consulted).
 - The fetches ignore `HTTP_PROXY` / `HTTPS_PROXY`: reach the internet by NAT or a transparent egress, not through a proxy variable.
 - The syncer refuses, by itself, every host that resolves to a private, loopback, link-local, reserved or metadata address
@@ -49,7 +129,7 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
 
 ## Build
 
-Both images build from the **repo root** (the context is the whole workspace) on the public `node:22.23.2-bookworm-slim` base
+The three images (api, syncer, exporter) build from the **repo root** (the context is the whole workspace) on the public `node:22.23.2-bookworm-slim` base
 (Node >= 20.19 is required) and run as the non-root `node` user. The private `@gatehub/toolbox` needs your npm token at install
 time. The token is passed as a **BuildKit secret** read from the `NPM_TOKEN` environment variable: it is mounted for one `RUN` only,
 written to `~/.npmrc` inside it and removed before the layer is committed. It is never a build argument or environment variable and
@@ -64,6 +144,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod build
 # or one image by hand
 docker build --secret id=npm_token,env=NPM_TOKEN -f apps/api/Dockerfile    -t gatehub/data-api    .
 docker build --secret id=npm_token,env=NPM_TOKEN -f apps/syncer/Dockerfile -t gatehub/data-syncer .
+docker build --secret id=npm_token,env=NPM_TOKEN -f apps/exporter/Dockerfile -t gatehub/data-exporter .
 ```
 
 Without the secret the build stops with `secret npm_token: not found` (an empty secret: `the npm_token secret is empty`).
@@ -73,10 +154,11 @@ Notes:
   `IMAGE_TAG` (default `latest` in prod, `dev` in the dev compose).
 - Install, build and `pnpm deploy` run in a **single `RUN`** (pnpm workspace symlinks do not survive across BuildKit layers); the
   build then checks that the deployed shared package contains `dist`, `schema/001_baseline.sql`, `config/markets/*.json` and
-  `config/definitions/*.json`, and the syncer image `dist/cli/range-ingest.js`. `*.tsbuildinfo` is ignored by git and docker (a stale
+  `config/definitions/*.json`, the syncer image `dist/cli/range-ingest.js`, and the exporter image the shared `export/` module and
+  `@google-cloud/storage`. `*.tsbuildinfo` is ignored by git and docker (a stale
   one makes `tsc` skip emit).
 - The images set `NODE_ENV=production` and `GH_ENV=container` (no env file: the configuration is the environment).
-- `EXPOSE`: api `3001` + `3000` (metrics), syncer `3002` + `3000`. Never publish the metrics port.
+- `EXPOSE`: api `3001` + `3000` (metrics), syncer `3002` + `3000`, exporter `3005` + `3000`. Never publish the metrics port.
 - Entry points of the syncer image (all relative to `/app`): `node dist/main.js` (default), the migration job below, and
   `node dist/cli/range-ingest.js --from <n> --to <m>`.
 
@@ -86,7 +168,8 @@ GitHub Actions runs two workflows (`.github/workflows/`):
 
 - **`ci.yml`**, on every pull request to `master` and every push to `master`. It has three parts:
   - one job runs `pnpm build` and `pnpm test`;
-  - three jobs run the e2e suites (shared, api, syncer) in parallel, each against its own testcontainers ClickHouse;
+  - three jobs run the e2e suites (shared, api, syncer) in parallel, each against its own testcontainers ClickHouse (the api suite
+    also runs the exporter, against the harness's api and an in-memory store: `apps/api/test/exports.e2e-spec.ts`);
   - a job summary shows the changelog of what is not released yet.
 
   A newer push to a pull request cancels its older run.
@@ -97,15 +180,15 @@ GitHub Actions runs two workflows (`.github/workflows/`):
        and `v<n>.<n>.<n>-*`;
      - a tag that has the shape but is not a semantic version, such as `v1.2.3-rc.01`, starts a run that stops at this step.
   2. **Test:** the whole of `ci.yml`.
-  3. **Images:** both images for `linux/amd64` and `linux/arm64`, pushed to GitHub Packages as `ghcr.io/gatehubnet/data-api` and
-     `ghcr.io/gatehubnet/data-syncer`, tagged with the version without its `v` (`1.4.0`).
-  4. **Latest:** `latest` on both images points at the newest version tag, a pre-release included, whose two images are both
+  3. **Images:** the three images for `linux/amd64` and `linux/arm64`, pushed to GitHub Packages as `ghcr.io/gatehubnet/data-api`,
+     `ghcr.io/gatehubnet/data-syncer` and `ghcr.io/gatehubnet/data-exporter`, tagged with the version without its `v` (`1.4.0`).
+  4. **Latest:** `latest` on every image points at the newest version tag, a pre-release included, whose images are all
      published. Every release works this out again when it reaches this step, one release at a time. So:
      - a release that finishes after a newer one leaves `latest` on the newer one;
      - a late patch for an older line, such as `v1.3.5` after `v1.4.0`, publishes `1.3.5` and leaves `latest` alone;
-     - both `latest` tags are pointed at the same version, one after the other. That is not atomic: if the second cannot be moved
+     - the `latest` tags are pointed at the same version, one after the other. That is not atomic: if one cannot be moved
        (after three tries), the job fails and says which tag is on which version. Running the job again, or the next release, puts
-       both on the same version;
+       them all on the same version;
      - a registry error is retried, and if it persists the step fails and leaves `latest` alone. Only the registry's "not found"
        counts as not published.
   5. **Release:** the GitHub release of the tag. Its body is the changelog since the previous tag, made by [git-cliff](https://git-cliff.org)
@@ -126,8 +209,9 @@ no layer. The images are pushed with the workflow's own `GITHUB_TOKEN`.
 Pull requests from forks get no secrets, so their install fails. A new package on ghcr.io starts **private**: make it public under the
 organisation's Packages → the package → Package settings, if it should be pulled without a login. The compose files keep building their
 images from the checkout (`pull_policy: build`). To run a released image, use its ghcr.io name instead. **Deploy by version, the
-same version for both images** (`ghcr.io/gatehubnet/data-api:1.4.0` with `ghcr.io/gatehubnet/data-syncer:1.4.0`), not by `latest`:
-the two `latest` tags move one after the other, and a deployment that pulls them at the wrong moment could get two versions.
+same version for every image** (`ghcr.io/gatehubnet/data-api:1.4.0` with `ghcr.io/gatehubnet/data-syncer:1.4.0` and
+`ghcr.io/gatehubnet/data-exporter:1.4.0`), not by `latest`: the `latest` tags move one after the other, and a deployment that pulls
+them at the wrong moment could get two versions.
 
 ## Schema migrations
 
@@ -139,6 +223,9 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   `schema_migrations`, then exits 0. The apis and syncers wait for their job (`depends_on: service_completed_successfully`).
 - The path is `node_modules/@gatehub/data-api-shared/...`, not `packages/shared/...`: inside the image the shared package is a
   deployed dependency (`pnpm deploy --legacy`), and `packages/shared` does not exist.
+- `migrate-shared` runs the same command with the argument `shared`: it creates the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`,
+  default `shared`) and applies `schema-shared/*.sql` with its own `schema_migrations`. It is one job for both networks, and both apis
+  wait for it ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)).
 - It is idempotent and checksummed. By hand: `docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl`.
 - `GH_RUN_MIGRATIONS_ON_BOOT` is `false` in the compose files (convenient only for a single dev process). See
   [data-model](data-model.md#5-migrations).
@@ -150,6 +237,40 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   and should come before the syncer (advisable: the syncer writes the column on every row of every live volume set, and on the pinned ClickHouse a row with a field the table lacks is inserted without it, with no error,
   so the fee estimates of the ticks before the migration are lost and the live `amm_volume` day set reads as not known until `migrate` has run and the next tick has written it; `syncer_aggregator_errors_total{job="volume_live"}` does not show it).
   The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last ([the AMM data additions](operations.md#the-amm-data-additions)).
+- `009_account_network_names.sql` (one `CREATE TABLE IF NOT EXISTS`, the operator's account network names) is additive and comes before the api: an api without it serves
+  every account without a network name and logs the failed load at every reload, but answers. The syncer never touches the table. The compose files make the api wait for `migrate`.
+- `011_nft_data.sql` (ten `CREATE TABLE IF NOT EXISTS`: the five NFT ledger tables, the four NFT aggregates and `nft_dirty`) is additive but **sets an order**: `migrate`
+  first, then the syncer, then the api. A syncer of this version (parser version 5 or later) writes the five NFT ledger tables with every ledger, and an insert into a missing table
+  fails the batch, so the live runner would retry the same ledgers without end; the NFT routes of the api answer 500 until the tables exist. The compose files make both wait
+  for `migrate`; by hand, run `migrate`, start the syncer, and the api last. The history is filled afterwards ([the NFT data](operations.md#the-nft-data),
+  [backfill](backfill.md#nft-re-ingest)).
+- `012_display_names.sql` (two `CREATE TABLE IF NOT EXISTS`: the ledger-derived `account_domains` and `domain_tomls`) is additive but **sets an order**: `migrate` first, then the syncer, then
+  the api. A syncer of this version (parser version 6 or later) writes `account_domains` with every ledger, and an insert into a missing table fails the batch, so the live runner would retry the same
+  ledgers without end; the `tomls` worker refuses to boot without the two tables, and `GET /v2/account_names` and `GET /v2/toml/{domain}` answer 500 until they exist. The compose files make
+  both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. Then the account domains are seeded once per network ([operations](operations.md#the-display-names),
+  [backfill](backfill.md#account-domains-seed)).
+- `013_ledger_objects.sql` (three `CREATE TABLE IF NOT EXISTS`: the ledger-derived `object_changes` and `account_object_changes`, and the aggregate `escrows`) is additive but **sets an order**:
+  `migrate` first, then the syncer, then the api. A syncer of this version (parser version 7 or later) writes the two ledger tables with every ledger, and an insert into a missing table fails the batch,
+  so the live runner would retry the same ledgers without end; its `escrows` job reads and writes the third, and the object routes of the api answer 500 until the tables exist. Nothing checks for
+  them at boot. The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. Then delegation is re-ingested on the XRP Ledger
+  ([operations](operations.md#ledger-objects-and-delegation), [backfill](backfill.md#ledger-objects-and-delegation-re-ingest)).
+- `014_issued_tokens.sql` (four `CREATE TABLE IF NOT EXISTS`: the ledger-derived `state_touches`, and the aggregates `token_generations`, `token_lines` and `tokens`) is additive but **sets an order**:
+  `migrate` first, then the syncer, then the api. A syncer of this version (parser version 8) writes `state_touches` with every ledger, and an insert into a missing table fails the batch, so the
+  live runner would retry the same ledgers without end; its `tokens` job reads and writes the other three, and the token routes of the api answer 500 until the tables exist. The syncer refuses to boot
+  without them (the `ingest` worker needs `state_touches`, the `aggregator` worker all four: `lacks the schema of 014_issued_tokens.sql`), also because a job that cannot read its tables would keep `agg_dirty`
+  from draining for every job ([troubleshooting](troubleshooting.md#agg_dirty-does-not-drain-the-tokens-hook-fails)). The compose files make
+  both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. The syncer's ClickHouse user needs `ALTER DELETE` on `token_lines` and `tokens` (the privilege that `ALTER TABLE ... DROP PARTITION` asks for) (the shipped
+  full-access `data_api` user has it, [clickhouse](clickhouse.md)). The first generation of the issued tokens is built by the `tokens` job in the hours after the deploy (finish any history fill first: a fill that moves the coverage start restarts the build, [operations](operations.md#issued-tokens)): the explorer's `TOKENS` switch waits for
+  `syncer_tokens_live` 1 ([operations](operations.md#issued-tokens)).
+- `015_supply.sql` (four `CREATE TABLE IF NOT EXISTS`: the ledger-derived Xahau mint tables `genesis_mints`, `imports` and `reward_claims`, and the aggregate `network_supply`) is additive but **sets an
+  order**: `migrate` first, then the syncer, then the api. A syncer of this version (parser version 9) writes the three ledger tables on Xahau, whenever a ledger has mint rows (a successful `GenesisMint` or `Import`, or any `ClaimReward`) (on XRPL they stay empty), and an insert into a
+  missing table fails the batch, so the live runner would retry the same ledgers without end. Its `supply` job reads them and
+  writes `network_supply`, and the supply routes of the api answer 500 until the tables exist. A syncer with the `ingest` worker refuses to boot without the three mint tables, and one with the `aggregator` worker without all four
+  (`lacks the schema of 015_supply.sql`, on every network: the schema is one, on Xahau the first ledger with a mint would fail its batch and the `supply` job reads the mint tables, while it writes `network_supply` on both), after the same check for 014. The compose files make both wait for `migrate`; by hand,
+  run `migrate`, start the syncer, and the api last.
+- `016_validator_toml_details.sql` (one `ALTER` that adds five columns to `validator_domains`) is additive but **sets an order**: `migrate` first, then the syncer, then the api. Without the columns the domain checker's pass fails, and every validators route of the api answers 500, because both read them. A syncer with the `validators` worker refuses to boot without them (`lacks the schema of 016_validator_toml_details.sql`). By hand, run `migrate`, start the syncer, and the api last. An api of this release deployed before the syncer serves no `toml` and counts every validator as unknown, without an error.
+- `017_mpt.sql` (seven `CREATE TABLE IF NOT EXISTS`: the ledger-derived `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers`, and the aggregates `mpt_issuances` and `mpt_holders`) is additive but **sets an
+  order**: `migrate` first, then the syncer, then the api. A syncer of this version (parser version 10) writes the five ledger tables on XRPL and XRPL Testnet, whenever a ledger has MPT rows (on Xahau and Xahau Testnet there are none), and an insert into a missing table fails the batch, so the live runner would retry the same ledgers without end. The `mpt_state` job reads them and writes the two aggregates, and the MPT routes of the api answer 500 until the tables exist. A syncer with the `ingest` worker refuses to boot without the five ledger tables, and one with the `aggregator` worker without `mpt_touches`, the two state tables and the two aggregates (`lacks the schema of 017_mpt.sql`, on every network, as the schema is one), after the check of 016. By hand, run `migrate`, start the syncer, and the api last.
 
 ## Configuration and secrets
 
@@ -158,7 +279,7 @@ never commit them. `.env*` files are git-ignored (only `.env.example` files are 
 context. Secrets: `GH_API_KEYS`, `GH_RATE_LIMIT_KEYS` (it holds API keys), `GH_CLICKHOUSE_PASSWORD`, node URLs that carry credentials, and the
 build-time `NPM_TOKEN`.
 
-### `deploy/.env.prod`
+### `deploy/.env.prod` and `deploy/.env.sandbox`
 
 `deploy/.env.prod` is only the `--env-file` of `docker compose` (interpolation): **no container gets it as a whole**. Each service
 in `docker-compose.prod.yaml` lists the variables it needs ([which service gets what](configuration.md#which-service-gets-which-variables-production-compose)),
@@ -175,6 +296,9 @@ live-subscription switch, the fetch throttle, the `GH_LOGGER` pair). Nothing rea
 template lists every variable with a comment, diff your file against it. `GH_API_KEYS` and `GH_CLICKHOUSE_PASSWORD` are required (the compose file stops without
 them), and the API refuses placeholder keys (`dev-api-key`, `change-me...`).
 
+`deploy/.env.sandbox` is the same kind of file for the sandbox ([Environments](#environments)): `cp deploy/.env.sandbox.example deploy/.env.sandbox`.
+It has the production template's variables, with the testnets' values and the sandbox explorer's API key.
+
 ## Option 1: Docker Compose (reference / single host)
 
 ```bash
@@ -185,7 +309,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --b
 docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod ps
 ```
 
-Start order: Keeper (healthy) -> ClickHouse (healthy) -> `migrate-xrpl` / `migrate-xahau` (complete) -> syncers and apis ->
+Start order: Keeper (healthy) -> ClickHouse (healthy) -> `migrate-xrpl` / `migrate-xahau` / `migrate-shared` (complete) -> syncers and apis ->
 nginx. The syncer opens its probe port only once its node connection is up, and answers 503 while it is more than
 `GH_MAX_LAG_HEALTHY` ledgers behind for over a minute (catching up): `unhealthy` there is informational, compose restarts nothing
 on it.
@@ -267,6 +391,10 @@ docker compose run --rm migrate-xahau                        # the schema of one
   placeholder is allowed. Never use it anywhere reachable.
 - The stack is configured from the environment of your shell (`GH_CLICKHOUSE_USER`, `GH_CLICKHOUSE_PASSWORD`, `GH_API_KEYS`,
   `XRPL_NODE_ENDPOINTS`, ...); `apps/*/.env` is not read.
+- **A testnet locally:** the slots take their network from `XRPL_NETWORK` and `XAHAU_NETWORK` here too, e.g.
+  `XRPL_NETWORK=xrpl-testnet docker compose --profile full up -d --build` runs XRPL Testnet in the `*-xrpl` services, in the database
+  `xrpl_testnet`, from the testnet's public servers (leave `XRPL_NODE_ENDPOINTS` unset, or a mainnet value fails the boot). Keep each variable
+  in its family (`xrpl` or `xrpl-testnet`; `xahau` or `xahau-testnet`).
 - ClickHouse has no `CLICKHOUSE_DB`: the migrate jobs create the databases. An existing volume from the old stack must be recreated
   (`docker compose down -v`).
 

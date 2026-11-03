@@ -2,16 +2,19 @@
  * Check the amendment metadata file of a network (spec 2.6) against a public node, and optionally against what the
  * syncer indexed.
  *
- *   pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl|xahau [--endpoint <wss url>] [--clickhouse]
+ *   pnpm --filter @gatehub/data-api-shared amendments:check -- \
+ *     --network xrpl|xahau|xrpl-testnet|xahau-testnet [--endpoint <wss url>] [--clickhouse]
  *
- * It loads `config/amendments/<network>.json` (a file that does not pass the loader's checks fails the run), checks that the
- * node is of that network (`server_info.network_id`: a Xahau node for the XRPL file fails the run), asks the node for `feature`
- * and for the `Amendments` ledger object (`ledger_entry`, the validated ledger), and prints:
+ * It loads `config/amendments/<family>.json` (`xrpl.json` for XRPL and XRPL Testnet, `xahau.json` for Xahau and Xahau
+ * Testnet; a file that does not pass the loader's checks fails the run), checks that the node is of that network
+ * (`server_info.network_id` is one the network's profile accepts: a node of another network fails the run), asks the node
+ * for `feature` and for the `Amendments` ledger object (`ledger_entry`, the validated ledger), and prints:
  *
  *   - the names the node knows that the file lacks (add an entry for each);
  *   - the IDs of the ledger (enabled, or with a majority) and of the current votes that neither the file nor the node
  *     names (the node may lack a name, F10: find it in the newest `features.macro` and add it);
- *   - the entries whose `enabled.ledger_index` differs from the indexed `EnableAmendment` (fix or drop the `enabled`).
+ *   - the entries whose `enabled.ledger_index` differs from the indexed `EnableAmendment` (fix or drop the `enabled`); always
+ *     empty on a testnet, whose loader drops the family file's `enabled` entries.
  *
  * `--endpoint` defaults to the first default endpoint of the network. `--clickhouse` adds the voted IDs of the newest
  * round (`amendment_tallies`) and the indexed `EnableAmendment` transactions with flags 0 (`tx_by_type`, then
@@ -20,7 +23,7 @@
 import { clickHouseConfigFromEnv } from '../src/clickhouse/clickhouse.config';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { Table } from '../src/clickhouse/tables';
-import { getNetworkProfile, NetworkName, NetworkProfile } from '../src/network';
+import { getNetworkProfile, isNetworkName, networkChoiceText, NetworkName, NetworkProfile } from '../src/network';
 import {
   AMENDMENTS_OBJECT_INDEX,
   AmendmentsCheckFindings,
@@ -41,7 +44,9 @@ const CONNECT_TIMEOUT_MS = 60_000;
 
 function usage(message?: string): never {
   if (message) console.error(`error: ${message}\n`);
-  console.error('usage: amendments-check --network xrpl|xahau [--endpoint <wss url>] [--clickhouse]');
+  console.error(
+    'usage: amendments-check --network xrpl|xahau|xrpl-testnet|xahau-testnet [--endpoint <wss url>] [--clickhouse]',
+  );
   process.exit(2);
 }
 
@@ -63,7 +68,7 @@ export function parseArgs(argv: string[]): Options {
     values[name] = value;
   }
   const network = values.network;
-  if (network !== 'xrpl' && network !== 'xahau') usage('--network must be xrpl or xahau');
+  if (!isNetworkName(network)) usage(networkChoiceText('--network'));
   const endpoint = values.endpoint ?? getNetworkProfile(network).defaultNodeEndpoints[0];
   if (!/^wss?:\/\//.test(endpoint)) usage('--endpoint must be a ws:// or wss:// URL');
   return { network, endpoint, clickhouse };
@@ -184,7 +189,7 @@ async function main(): Promise<void> {
       votes = await votedIds(clickhouse);
       events = await enabledEvents(clickhouse);
     } finally {
-      await clickhouse.onModuleDestroy();
+      await clickhouse.close();
     }
   }
 

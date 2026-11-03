@@ -14,6 +14,14 @@ const AMM_LEDGER_TABLES = [
   Table.AmmGovernance,
 ];
 
+const NFT_LEDGER_TABLES = [
+  Table.NftEvents,
+  Table.AccountNftEvents,
+  Table.CollectionNftEvents,
+  Table.NftSales,
+  Table.NftTouches,
+];
+
 interface Delete {
   sql: string;
   params: Record<string, unknown>;
@@ -53,6 +61,66 @@ describe('LEDGER_KEYED_TABLES', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(tables).not.toContain(Table.AmmPools);
     expect(tables).not.toContain(Table.AmmDaily);
+  });
+
+  it('lists the five NFT ledger tables: the sales and the touches by a million, the three event tables by ten million', () => {
+    for (const table of NFT_LEDGER_TABLES) {
+      const partitionSize = table === Table.NftSales || table === Table.NftTouches ? P6 : P7;
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize }]);
+    }
+  });
+
+  it('does not list the NFT aggregates or nft_dirty: a ledger rewrite must not touch them', () => {
+    const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
+    for (const table of [
+      Table.Nfts,
+      Table.AccountNfts,
+      Table.NftCollections,
+      Table.NftCollectionHolders,
+      Table.NftDirty,
+    ]) {
+      expect(tables).not.toContain(table);
+    }
+  });
+
+  it('lists account_domains by ten million, and not domain_tomls: a ledger rewrite must not touch the tomls', () => {
+    expect(LEDGER_KEYED_TABLES.filter((t) => t.table === Table.AccountDomains)).toEqual([
+      { table: Table.AccountDomains, partitionSize: P7 },
+    ]);
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.DomainTomls);
+  });
+
+  it('lists object_changes and account_object_changes by ten million, and not escrows: a ledger rewrite must not touch the aggregate', () => {
+    for (const table of [Table.ObjectChanges, Table.AccountObjectChanges]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P7 }]);
+    }
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.Escrows);
+  });
+
+  it('lists state_touches by a million, and not the token aggregates: a ledger rewrite must not touch them', () => {
+    expect(LEDGER_KEYED_TABLES.filter((t) => t.table === Table.StateTouches)).toEqual([
+      { table: Table.StateTouches, partitionSize: P6 },
+    ]);
+    const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
+    for (const table of [Table.TokenGenerations, Table.TokenLines, Table.Tokens]) expect(tables).not.toContain(table);
+  });
+
+  it('lists the three Xahau mint tables by a million, and not network_supply: a ledger rewrite must not touch the snapshots', () => {
+    for (const table of [Table.GenesisMints, Table.Imports, Table.RewardClaims]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P6 }]);
+    }
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.NetworkSupply);
+  });
+
+  it('lists the five MPT ledger tables with their partitions, and not the two aggregates: a ledger rewrite must not touch them', () => {
+    for (const table of [Table.MptIssuanceStates, Table.MptHolderStates, Table.MptIssuanceTransfers]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P7 }]);
+    }
+    for (const table of [Table.MptTouches, Table.MptTransfers]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P6 }]);
+    }
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.MptIssuances);
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.MptHolders);
   });
 
   it('lists every table once and keeps the commit marker first', () => {

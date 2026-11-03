@@ -3,7 +3,7 @@ import { Injectable } from '@nestjs/common';
 import BigNumber from 'bignumber.js';
 import { decodeMarker, KeysetKey, paginate } from '../common/pagination';
 import { bucketStart, ceilBucket, dayText, MAX_DAY_MS, nextBucket, VolumeInterval } from './volume-buckets';
-import { StoredVolumeRow, sumParts, toVolumeRow, VolumePart, VolumeRow } from './volume-object';
+import { sentinelCountOf, StoredVolumeRow, sumParts, toVolumeRow, VolumePart, VolumeRow } from './volume-object';
 
 /** The `interval`s of the historical rows. */
 export const VOLUME_INTERVALS: readonly VolumeInterval[] = ['day', 'week', 'month'];
@@ -63,6 +63,10 @@ const BUCKET_OF_DAY: Record<VolumeInterval, string> = {
  * more); the rows of the page's buckets are the second, so a page costs its own days. The reads are ranges of the primary
  * key `(metric, day, component)`. A bucket exists when one of its days has a set, a day of zero volume included (its set
  * holds the sentinel): it is a row with no components.
+ *
+ * The sentinel of a set is no component, but its `count` is the `count` of the row of the NFT volume (every sale of the window,
+ * those with no rate too): a bucket carries it (`VolumeBucket.sentinelCount`), the days' sentinels added up for a week or a
+ * month. The other metrics' sentinels count 0 and their rows are counted from their parts, as before.
  */
 @Injectable()
 export class VolumeService {
@@ -98,7 +102,12 @@ export class VolumeService {
     const display = q.display
       ? { asset: q.display, rate: await this.rates.exchangeRate({ currency: this.native }, q.display, { live: true }) }
       : undefined;
-    const bucket = { start: Number(rows[0].start_time), end: Number(rows[0].end_time), parts: sumParts(rows) };
+    const bucket = {
+      start: Number(rows[0].start_time),
+      end: Number(rows[0].end_time),
+      parts: sumParts(rows),
+      sentinelCount: sentinelCountOf(rows),
+    };
     return [toVolumeRow(q.metric, bucket, this.native, display)];
   }
 
@@ -156,11 +165,18 @@ export class VolumeService {
       : undefined;
 
     const rows = starts.map((start) => {
-      const parts: VolumePart[] = sumParts(byBucket.get(start) ?? []);
+      const stored = byBucket.get(start) ?? [];
+      const parts: VolumePart[] = sumParts(stored);
       const display =
         q.display && vwaps ? { asset: q.display, rate: vwaps.get(start / 1000) ?? new BigNumber(0) } : undefined;
       // the row ends where the next bucket starts (exclusive), as a live row ends at its `end`
-      const bucket = { start: start / 1000, end: nextBucket(start, q.interval) / 1000, parts };
+      const bucket = {
+        start: start / 1000,
+        end: nextBucket(start, q.interval) / 1000,
+        parts,
+        // (a bucket of days adds up the days' sentinels: the NFT volume's row counts every sale of its days)
+        sentinelCount: sentinelCountOf(stored),
+      };
       return toVolumeRow(q.metric, bucket, this.native, display);
     });
     return { rows, ...(page.marker !== undefined && { marker: page.marker }) };

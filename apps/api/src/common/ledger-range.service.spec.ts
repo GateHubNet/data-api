@@ -26,8 +26,10 @@ function chWith(ledgers: [number, number][]): Fake {
     if (sql.includes('close_time >=')) rows = rows.filter(([, close]) => close >= (secs as number));
     else if (sql.includes('close_time <')) rows = rows.filter(([, close]) => close < (secs as number));
     if (sql.includes('DESC')) rows = [...rows].reverse();
-    return rows.slice(0, 1).map(([ledger_index]) => ({
+    return rows.slice(0, 1).map(([ledger_index, close_time]) => ({
       ledger_index,
+      // what `latestWithTime` asks for besides the index
+      ...(sql.includes('AS close_time') && { close_time }),
       // the lookup of the last ledger before a bound also reports when the newest ledger closed
       ...(sql.includes('head_close') && { head_close: all[all.length - 1][1] }),
     }));
@@ -166,6 +168,30 @@ describe('LedgerRangeResolver', () => {
       await resolver.latest();
       expect(query).toHaveBeenCalledTimes(2);
       expect(await new LedgerRangeResolver(chWith([]).ch).latest()).toBeUndefined();
+    });
+  });
+
+  describe('latestWithTime', () => {
+    it('is the highest committed ledger and its close time in unix seconds, in one read, and it is never cached', async () => {
+      const { ch, query } = chWith(LEDGERS);
+      const resolver = new LedgerRangeResolver(ch);
+      const newest = { ledger_index: 14, close_time: secs('2015-01-14T12:00:30Z') };
+      expect(await resolver.latestWithTime()).toEqual(newest);
+      expect(query).toHaveBeenCalledTimes(1);
+      expect(String(query.mock.calls[0][0])).toContain('toUnixTimestamp(close_time) AS close_time');
+      expect(String(query.mock.calls[0][0])).toContain('ORDER BY ledger_index DESC LIMIT 1');
+      await resolver.latestWithTime();
+      expect(query).toHaveBeenCalledTimes(2);
+    });
+
+    it('reads a 64-bit style text from ClickHouse as the numbers they are', async () => {
+      const query = jest.fn(async () => [{ ledger_index: '107972102', close_time: '1793250000' }]);
+      const resolver = new LedgerRangeResolver({ query } as unknown as ClickHouseService);
+      expect(await resolver.latestWithTime()).toEqual({ ledger_index: 107_972_102, close_time: 1_793_250_000 });
+    });
+
+    it('is undefined on an empty database', async () => {
+      expect(await new LedgerRangeResolver(chWith([]).ch).latestWithTime()).toBeUndefined();
     });
   });
 

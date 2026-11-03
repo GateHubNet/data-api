@@ -1,4 +1,10 @@
-import { clickHouseConfigFromEnv, getNetworkProfile, NetworkProfile } from '@gatehub/data-api-shared';
+import {
+  clickHouseConfigFromEnv,
+  getNetworkProfile,
+  networkLogText,
+  NetworkProfile,
+  sharedDatabaseFromEnv,
+} from '@gatehub/data-api-shared';
 import {
   DynamicModule,
   Inject,
@@ -21,6 +27,7 @@ import { AmmModule } from './amm/amm.module';
 import { ApiKeyGuard } from './auth/api-key.guard';
 import { ApiThrottlerGuard } from './common/api-throttler.guard';
 import { CommonModule } from './common/common.module';
+import { FeatureCoverageModule } from './common/feature-coverage.module';
 import { MetricsInterceptor } from './common/metrics.interceptor';
 import { NotFoundModule } from './common/not-found.controller';
 import { pathDecodeErrors } from './common/path-decode-errors';
@@ -34,11 +41,18 @@ import {
 } from './config/api.config';
 import { ExchangesModule } from './exchanges/exchanges.module';
 import { RatesModule } from './exchanges/rates.module';
+import { ExportsModule } from './exports/exports.module';
+import { LedgerObjectsModule } from './ledger-objects/ledger-objects.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
+import { MptModule } from './mpt/mpt.module';
+import { NamesModule } from './names/names.module';
 import { NetworkModule } from './network/network.module';
+import { NftModule } from './nft/nft.module';
+import { PathPaymentsModule } from './path-payments/path-payments.module';
 import { PaymentsModule } from './payments/payments.module';
 import { StatsModule } from './stats/stats.module';
+import { TokensModule } from './tokens/tokens.module';
 import { TransactionsModule } from './transactions/transactions.module';
 import { ValidationsModule } from './validations/validations.module';
 import { ValidatorsModule } from './validators/validators.module';
@@ -53,7 +67,12 @@ async function assemble(): Promise<DynamicModule> {
   apiKeysOf(config); // throws now, before anything is built, when production has no key
   rateLimitKeysOf(config); // and on an invalid GH_RATE_LIMIT_KEYS (the guard checks it again when it is built)
   const profile = getNetworkProfile(config.network);
-  return CommonModule.register({ config, profile, clickHouse: clickHouseConfigFromEnv(process.env, profile) });
+  return CommonModule.register({
+    config,
+    profile,
+    clickHouse: clickHouseConfigFromEnv(process.env, profile),
+    sharedDatabase: sharedDatabaseFromEnv(process.env),
+  });
 }
 
 const assembled = assemble();
@@ -70,6 +89,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   LedgersModule,
   TransactionsModule,
   PaymentsModule,
+  PathPaymentsModule,
   ExchangesModule,
   RatesModule,
   AccountsModule,
@@ -79,6 +99,12 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   ValidatorsModule,
   StatsModule,
   AmmModule,
+  NftModule,
+  ExportsModule,
+  NamesModule,
+  LedgerObjectsModule,
+  TokensModule,
+  MptModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */
@@ -98,6 +124,7 @@ function cacheControl(value: string) {
     }),
     XrplModule,
     LivelinessModule,
+    FeatureCoverageModule,
     ...ENDPOINT_MODULES,
     NotFoundModule, // last: it answers every /v2 route nothing above serves
   ],
@@ -127,7 +154,7 @@ export class AppModule implements NestModule, OnModuleInit {
   }
 
   onModuleInit(): void {
-    new Logger('Api').log(`network=${this.profile.name} native=${this.profile.nativeCurrency}`);
+    new Logger('Api').log(`${networkLogText(this.profile)} native=${this.profile.nativeCurrency}`);
     // The service runs behind the GateHub reverse proxy (TLS termination + edge routing). Trust it so `req.ip` resolves
     // to the real client from X-Forwarded-For, which the rate limit and the logs need. `trustProxyHops` is how many
     // hops to trust (1 = the GateHub proxy).

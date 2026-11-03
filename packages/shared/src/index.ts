@@ -2,20 +2,32 @@
 export * from './clickhouse/clickhouse.config';
 export * from './clickhouse/clickhouse.module';
 export * from './clickhouse/clickhouse.service';
-export { runMigrations } from './clickhouse/migrate';
+export { SHARED_SCHEMA_DIR, runMigrations, runSharedMigrations } from './clickhouse/migrate';
 export type { MigrateOptions, MigrateResult } from './clickhouse/migrate';
 export * from './clickhouse/rows';
 export * from './clickhouse/tables';
 
 // Parsers
+export * from './parsers/account-domains.parser';
+export * from './parsers/account-states.parser';
 export * from './parsers/accounts-created.parser';
 export * from './parsers/affected-accounts.parser';
 export * from './parsers/amm.parser';
 export * from './parsers/balance-changes.parser';
 export * from './parsers/exchanges.parser';
 export * from './parsers/from-client.parser';
+export * from './parsers/import.parser';
+export * from './parsers/mpt-deltas';
+export * from './parsers/mpt.parser';
+export * from './parsers/nft.parser';
+export * from './parsers/object-changes.parser';
 export * from './parsers/parser.interface';
+export * from './parsers/path-payments.parser';
 export * from './parsers/payment.parser';
+export * from './parsers/permissions';
+export * from './parsers/rewards.parser';
+export * from './parsers/state-touches.parser';
+export * from './parsers/trust-line-states.parser';
 
 // Network
 export * from './network';
@@ -23,9 +35,16 @@ export * from './network';
 // Validators
 export * from './validators';
 
+// Tomls (the rules for reading a domain's toml)
+export * from './tomls';
+
 // Node connection
 export * from './xrpl/node-client';
 export * from './xrpl/node-throttle';
+
+// Exports (export jobs and the storage of their files)
+export * from './export/export-jobs';
+export * from './export/export-storage';
 
 // Nest helpers
 export * from './nest/shutdown-signals';
@@ -44,10 +63,19 @@ export * from './aggregate/aggregate-sets';
 export * from './aggregate/amm-daily.job';
 export * from './aggregate/amm-pools.job';
 export * from './aggregate/amm-reads';
+export * from './aggregate/escrows.job';
 export * from './aggregate/markets-live.job';
+export * from './aggregate/mpt-state.job';
+export * from './aggregate/nft-collections.job';
+export * from './aggregate/nft-state';
+export * from './aggregate/nft-state.job';
 export * from './aggregate/pair-hourly.job';
 export * from './aggregate/rates-daily.job';
 export * from './aggregate/stats.job';
+export * from './aggregate/supply';
+export * from './aggregate/supply.job';
+export * from './aggregate/token-rules';
+export * from './aggregate/tokens.job';
 export * from './aggregate/volume.job';
 
 // Query
@@ -57,12 +85,23 @@ export * from './query/candle-columns';
 export * from './query/daily-rates';
 export * from './query/decimal';
 export * from './query/distinct-page';
+export * from './query/newest-page';
+export * from './query/nft-prices';
+export * from './query/parser-coverage';
 export * from './query/rates.service';
+export * from './query/supply';
 export * from './query/valuation';
 
 // Utils
 export * from './util/amount';
 export * from './util/ctid';
+export * from './util/currency-code';
 export * from './util/helpers';
+export * from './util/keylets';
+export * from './util/mpt';
+export * from './util/mpt-metadata';
+export * from './util/nftoken-id';
 export * from './util/quality';
+export * from './util/set-fee';
+export * from './util/stable-json';
 export * from './util/time';

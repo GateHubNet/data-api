@@ -13,7 +13,7 @@ import { join } from 'node:path';
  *   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
  *     -keyout tls/example.key -out tls/example.crt \
  *     -subj "/CN=gatehub-data-api test (self-signed, test only)" \
- *     -addext "subjectAltName=DNS:a.example,DNS:b.example,DNS:c.example,DNS:d.example,DNS:e.example,DNS:unl.example,DNS:northpeak.example,DNS:www.northpeak.example"
+ *     -addext "subjectAltName=DNS:a.example,DNS:b.example,DNS:c.example,DNS:d.example,DNS:e.example,DNS:unl.example,DNS:northpeak.example,DNS:www.northpeak.example,DNS:ok.example,DNS:missing.example,DNS:down.example,DNS:slow.example,DNS:bad.example,DNS:big.example,DNS:moved.example"
  *
  * A test that needs another host adds `DNS:<host>` to the list and runs the command again (both files change).
  */

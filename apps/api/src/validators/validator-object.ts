@@ -1,7 +1,8 @@
-import { compact } from '../common/format';
+import { compact, fmtTime } from '../common/format';
 import type { AgreementWindow } from './agreement-windows';
 import type { AmendmentsAssembly, AmendmentStatus } from './amendment-status';
-import type { DirectoryEntry, DomainState, ManifestInfo } from './directory';
+import type { DirectoryEntry, DomainState, ManifestInfo, TomlFacts } from './directory';
+import type { DomainTomlFacts } from './domain-toml-facts';
 import { instant, wholeUnits } from './summary-object';
 
 /*
@@ -35,7 +36,31 @@ export const VALIDATOR_ROW_KEYS = [
   'amendment_votes',
   'first_seen',
   'last_seen',
+  'toml',
 ] as const;
+
+/** The keys of `toml` on a validator row, in order: what the verified file's `[[VALIDATORS]]` entry says (D8). */
+export const TOML_KEYS = ['owner_country', 'server_country', 'network', 'unl'] as const;
+
+/** The keys of `toml` on the answer for one validator, in order: the row's, then its domain's facts from the toml store. */
+export const TOML_DETAIL_KEYS = [
+  'owner_country',
+  'server_country',
+  'network',
+  'unl',
+  'principals',
+  'modified',
+  'accounts_listed',
+  'currencies',
+  'currencies_listed',
+  'fetched',
+] as const;
+
+/** The keys of a currency of `toml.currencies`, in order. */
+export const CURRENCY_KEYS = ['code', 'issuer'] as const;
+
+/** The most currencies `toml.currencies` lists; `currencies_listed` counts them all. */
+const MAX_TOML_CURRENCIES = 10;
 
 /** The keys of a window of agreement, in order. */
 export const AGREEMENT_KEYS = ['missed', 'total', 'score', 'incomplete', 'partial'] as const;
@@ -126,6 +151,13 @@ export interface DetailAmendmentVotes {
   votes: VoteEntry[];
 }
 
+export interface TomlObject {
+  owner_country?: string;
+  server_country?: string;
+  network?: string;
+  unl?: string;
+}
+
 export interface ValidatorRow {
   validation_public_key: string;
   domain?: string;
@@ -147,6 +179,17 @@ export interface ValidatorRow {
   amendment_votes?: RowAmendmentVotes;
   first_seen?: string;
   last_seen?: string;
+  toml?: TomlObject;
+}
+
+/** `toml` on the answer for one validator. */
+export interface TomlDetailObject extends TomlObject {
+  principals?: string[];
+  modified?: string;
+  accounts_listed?: number;
+  currencies?: { code: string; issuer?: string }[];
+  currencies_listed?: number;
+  fetched?: string;
 }
 
 export interface ManifestObject {
@@ -167,8 +210,9 @@ export interface ValidatorsBody {
   validators: ValidatorRow[];
 }
 
-export interface ValidatorDetail extends Omit<ValidatorRow, 'amendment_votes'> {
+export interface ValidatorDetail extends Omit<ValidatorRow, 'amendment_votes' | 'toml'> {
   amendment_votes: DetailAmendmentVotes;
+  toml?: TomlDetailObject;
   manifest?: ManifestObject;
   daily_agreement: DailyObject[];
   result: 'success';
@@ -231,6 +275,36 @@ function yesOf(entry: DirectoryEntry, amendments: NamedAmendments): YesEntry[] {
   });
 }
 
+/** `toml` of a row: `{}` when the verified file gives none of the four. */
+const tomlOf = (facts: TomlFacts): TomlObject =>
+  compact({
+    owner_country: facts.ownerCountry,
+    server_country: facts.serverCountry,
+    network: facts.network,
+    unl: facts.unl,
+  });
+
+/** `toml` of the answer for one validator: the row's, followed by the facts of its domain when the store has them in effect. */
+function tomlDetailOf(facts: TomlFacts, store: DomainTomlFacts | undefined): TomlDetailObject {
+  const row = tomlOf(facts);
+  if (store === undefined) return row;
+  const { principals, modified, accountsListed, currencies, fetchedAt } = store;
+  return compact({
+    ...row,
+    principals: principals.length > 0 ? [...principals] : undefined,
+    modified: modified === null ? undefined : fmtTime(modified),
+    accounts_listed: accountsListed > 0 ? accountsListed : undefined,
+    currencies:
+      currencies.length > 0
+        ? currencies
+            .slice(0, MAX_TOML_CURRENCIES)
+            .map(({ code, issuer }) => compact({ code, issuer: issuer === '' ? undefined : issuer }))
+        : undefined,
+    currencies_listed: currencies.length > 0 ? currencies.length : undefined,
+    fetched: instant(fetchedAt),
+  });
+}
+
 const manifestOf = (manifest: ManifestInfo): ManifestObject =>
   compact({
     sequence: manifest.sequence,
@@ -265,6 +339,7 @@ function rowOf<V>(entry: DirectoryEntry, votes: V | undefined): RowWith<V> {
     amendment_votes: votes,
     first_seen: entry.firstSeen === undefined ? undefined : instant(entry.firstSeen),
     last_seen: entry.lastSeen === undefined ? undefined : instant(entry.lastSeen),
+    toml: entry.toml === undefined ? undefined : tomlOf(entry.toml),
   });
 }
 
@@ -295,9 +370,14 @@ export function buildValidatorsBody(
 
 /**
  * The answer for one validator (spec 3.3): the row with `amendment_votes` always there, and holding a vote on every amendment
- * still being decided; then its manifest, its 30 days of agreement and the result.
+ * still being decided, and `toml` with the facts of its domain (`facts`); then its manifest, its 30 days of agreement and the
+ * result.
  */
-export function validatorDetail(entry: DirectoryEntry, amendments: ListedAmendments): ValidatorDetail {
+export function validatorDetail(
+  entry: DirectoryEntry,
+  amendments: ListedAmendments,
+  facts?: DomainTomlFacts,
+): ValidatorDetail {
   const record = entry.record;
   const yes = yesOf(entry, amendments);
   const voted = new Set(yes.map((each) => each.id));
@@ -318,6 +398,7 @@ export function validatorDetail(entry: DirectoryEntry, amendments: ListedAmendme
     // the row has `amendment_votes` in its place already: naming it again keeps the place and drops the `undefined`
     ...rowOf(entry, amendmentVotes),
     amendment_votes: amendmentVotes,
+    ...(entry.toml !== undefined && { toml: tomlDetailOf(entry.toml, facts) }),
     ...(entry.manifest !== undefined && { manifest: manifestOf(entry.manifest) }),
     daily_agreement: entry.daily.map(
       (day): DailyObject =>

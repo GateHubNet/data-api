@@ -217,12 +217,22 @@ async function resolveAddresses(host: string): Promise<ResolvedAddress[]> {
   return [...v4, ...v6];
 }
 
-/** The `User-Agent` of the fetches of the validators worker: `gatehub-data-api/<version of apps/syncer/package.json> (validators)`. */
-export function validatorsUserAgent(): string {
+/** `gatehub-data-api/<version of apps/syncer/package.json> (<worker>)`: the `User-Agent` of the fetches of a worker. */
+function syncerUserAgent(worker: string): string {
   const { version } = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
     version: string;
   };
-  return `gatehub-data-api/${version} (validators)`;
+  return `gatehub-data-api/${version} (${worker})`;
+}
+
+/** The `User-Agent` of the fetches of the validators worker: `gatehub-data-api/<version of apps/syncer/package.json> (validators)`. */
+export function validatorsUserAgent(): string {
+  return syncerUserAgent('validators');
+}
+
+/** The `User-Agent` of the fetches of the tomls worker: `gatehub-data-api/<version of apps/syncer/package.json> (tomls)`. */
+export function tomlsUserAgent(): string {
+  return syncerUserAgent('tomls');
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);

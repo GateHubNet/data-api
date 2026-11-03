@@ -130,6 +130,284 @@ paths:
                         status:
                           type: string
                       additionalProperties: true
+  "/v2/network/validators/summary":
+    get:
+      operationId: ValidatorsController_summary
+      summary: Get the summary of the validators of the network
+      description: 'The figures of the Validators board: the validators seen in the
+        last 24 hours, the trusted UNL with its publishers and the quorum, the negative
+        UNL, the fees, the next flag ledger, the software versions and how far the
+        agreement and the votes are computed. There are no parameters.'
+      parameters: []
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/validators/countries":
+    get:
+      operationId: ValidatorsController_countries
+      summary: Get the validators of the network per server country
+      description: How many validators of a scope name each country as the server_country
+        of their verified toml, and how many of them are on the trusted UNL; those
+        without one count as unknown. Every count is what the list gives with the
+        same scope and country. JSON only.
+      parameters:
+      - name: scope
+        required: false
+        in: query
+        description: 'Default: unl.'
+        schema:
+          enum:
+          - unl
+          - all
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/validators":
+    get:
+      operationId: ValidatorsController_list
+      summary: Get the validators of the network
+      description: 'The validators of the trusted UNL, or of the UNL and every validator
+        seen in the last 24 hours, with their agreement, their domain and its verification,
+        the lists they are on, their software version, and what they vote for: fees
+        and amendments. Validators with a domain come first, by domain, then the others
+        by key. `format=csv` gives the rows as a CSV file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: country
+        required: false
+        in: query
+        description: 'An ISO 3166-1 alpha-2 code, any case (uk is GB): the validators
+          whose toml''s server_country is it. unknown, any case: those without one.'
+        schema: {}
+      - name: q
+        required: false
+        in: query
+        description: A part of the domain, the master key or the signing key (at most
+          100 characters).
+        schema: {}
+      - name: amendment
+        required: false
+        in: query
+        description: 'The name or the ID (64 hex digits) of an amendment: the validators
+          that vote for it.'
+        schema: {}
+      - name: publisher
+        required: false
+        in: query
+        description: 'The id of a publisher of the summary: its list in use.'
+        schema: {}
+      - name: scope
+        required: false
+        in: query
+        description: 'Default: unl.'
+        schema:
+          enum:
+          - unl
+          - all
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/validators/{key}":
+    get:
+      operationId: ValidatorsController_detail
+      summary: Get a validator of the network
+      description: 'One validator by its master key, its signing key or 66 hex digits:
+        the row of the list, its vote on every amendment being decided, the facts
+        of its verified toml with those of its domain (principals, last modified,
+        accounts, currencies), its manifest and its agreement of each of the last
+        30 days. JSON only.'
+      parameters:
+      - name: key
+        required: true
+        in: path
+        description: A master key (nH...), a signing key (n9...) or 66 hex digits
+          (02, 03 or ED first).
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/validators/{key}/validations":
+    get:
+      operationId: ValidatorsController_validatorValidations
+      summary: Get the validations of a validator
+      description: 'The validations one validator made in the last 7 days, newest
+        first: for each ledger and hash the sightings added up, whether the ledger
+        is the one the indexer holds, and the first and last time the validation was
+        seen. The rows recorded under the validator''s signing keys are its own. `format=csv`
+        gives the page as a CSV file.'
+      parameters:
+      - name: key
+        required: true
+        in: path
+        description: A master key (nH...), a signing key (n9...) or 66 hex digits
+          (02, 03 or ED first).
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: descending
+        required: false
+        in: query
+        description: Default true; false lists the oldest first.
+        schema:
+          type: boolean
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/amendments":
+    get:
+      operationId: AmendmentsController_list
+      summary: Get the amendments of the network
+      description: 'Every amendment the network knows: enabled, with a majority, voting,
+        obsolete or unknown, with the votes of the newest voting round and, for the
+        enabled ones, when they were enabled. The answer states the rules, the newest
+        round and the next flag ledger. `format=csv` gives the amendments as a CSV
+        file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: status
+        required: false
+        in: query
+        description: 'A comma list of enabled, majority, voting, obsolete and unknown.
+          Default: all.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/amendments/{name}":
+    get:
+      operationId: AmendmentsController_detail
+      summary: Get an amendment of the network
+      description: One amendment by its name or its ID, with the envelope of the list,
+        how each validator votes on it, its rounds of the last 30 days and its history.
+        JSON only.
+      parameters:
+      - name: name
+        required: true
+        in: path
+        description: The name of the amendment (as written, else in any case when
+          only one has it) or its ID (64 hex digits).
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/account_names":
+    get:
+      operationId: AccountNamesController_list
+      summary: Get the display names of up to 100 addresses
+      description: 'One entry per address asked, in the order asked (an address asked
+        twice is answered at each place). `display_name` is the name to show and what
+        stands behind it: `verified` (the toml of the account domain lists the address;
+        the text is its description, else the domain), `account` (the name the operator
+        gave the address) or `domain` (the account domain, which nothing vouches for).
+        `domain` is the account domain whatever its state; `account_name`, `account_network_name`
+        and `labels` are served whenever they exist. Any address is answered: one
+        that is no account on this network still has its name and labels and no domain.
+        A key without a value is left out.'
+      parameters:
+      - name: addresses
+        required: true
+        in: query
+        description: 1 to 100 classic addresses separated by `,` (no spaces). A repeated
+          address is answered at each place and counts towards the 100. Case matters.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - account_names
+  "/v2/toml/{domain}":
+    get:
+      operationId: TomlController_get
+      summary: Get what the toml of a domain says
+      description: 'What the toml file of a domain says, as the last check of it stored:
+        the accounts it lists, the currencies, the principals'' names and the validators,
+        only the entries that count on this network (no network, or a name of it).
+        `status` is `ok` (the file was read) or `failed`, with the `reason` and, for
+        `http_status`, the `status_code`; a toml that failed transiently still carries
+        what its last read said until 24 hours after the re-read it missed, one after
+        a definite failure carries nothing but the check. `checked` is when the domain
+        was last checked, `fetched` when the content was read. Emails and social handles
+        are never served. A key without a value is left out. 404 when the domain was
+        never checked (no account and no validator named it while the workers ran,
+        or its first check has not run yet); a domain nobody names any more answers
+        its last check.'
+      parameters:
+      - name: domain
+        required: true
+        in: path
+        description: A domain as an account names it (`northpeak.example`); the case
+          does not matter.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - toml
   "/v2/ledgers":
     get:
       operationId: LedgersController_getLedger
@@ -330,8 +608,9 @@ paths:
       summary: Get payments
       description: The `Payment` transactions between two different accounts of the
         ledgers that closed between `start` and `end`, oldest first; with a currency
-        in the path, only the payments of that currency. `format=csv` gives the payments
-        as a flat CSV file.
+        in the path, only the payments of that currency. An MPT payment has the issuance
+        ID as its `currency`, its amounts in integer units, and `mpt_issuance_id`
+        as its last key. `format=csv` gives the payments as a flat CSV file.
       parameters:
       - name: format
         required: false
@@ -373,7 +652,8 @@ paths:
         required: false
         in: path
         description: 'A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
-          or the native currency alone. Omitted: all currencies.'
+          the native currency alone, or an MPT: its 48 hex digits, with or without
+          its issuer. Omitted: all currencies.'
         schema: {}
       responses:
         '200':
@@ -386,8 +666,9 @@ paths:
       summary: Get payments
       description: The `Payment` transactions between two different accounts of the
         ledgers that closed between `start` and `end`, oldest first; with a currency
-        in the path, only the payments of that currency. `format=csv` gives the payments
-        as a flat CSV file.
+        in the path, only the payments of that currency. An MPT payment has the issuance
+        ID as its `currency`, its amounts in integer units, and `mpt_issuance_id`
+        as its last key. `format=csv` gives the payments as a flat CSV file.
       parameters:
       - name: format
         required: false
@@ -429,13 +710,66 @@ paths:
         required: false
         in: path
         description: 'A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
-          or the native currency alone. Omitted: all currencies.'
+          the native currency alone, or an MPT: its 48 hex digits, with or without
+          its issuer. Omitted: all currencies.'
         schema: {}
       responses:
         '200':
           description: ''
       tags:
       - payments
+  "/v2/path_payments":
+    get:
+      operationId: PathPaymentsController_list
+      summary: Get path payments
+      description: 'The path payments of the ledgers that closed between `start` and
+        `end`, oldest first: the successful payments whose delivery used someone else’s
+        liquidity (an order-book offer, an AMM pool, or an account other than the
+        delivered currency’s issuer rippling between its trust lines), payments to
+        oneself included. Each says what left the source, what reached the destination
+        and what it crossed. `format=csv` gives them as a CSV file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - path_payments
   "/v2/exchanges/{base}/{counter}":
     get:
       operationId: ExchangesController_pair
@@ -788,8 +1122,16 @@ paths:
     get:
       operationId: AccountsController_lookup
       summary: Get an account
-      description: When and by whom an account was created. An address that was created
+      description: 'When and by whom an account was created. An address that was created
         more than once (deleted and funded again) answers with its latest creation.
+        `account_name` is the name the operator gave the address, the same on every
+        network, and `account_network_name` the name it gave the account on this network
+        only. `account_labels` are the labels the operator put on the address (`scam`,
+        `spam`, `advisory`), keyed by label, each with its `description` and, when
+        given, its `source` and `url`; the same on every network. Each is left out
+        when there is none. `flags=true` adds the account flags, named for the network:
+        at the ledger `ledger_index`, `ledger_hash` or `date` names, from the account
+        state history, else from the live node.'
       parameters:
       - name: address
         required: true
@@ -797,6 +1139,28 @@ paths:
         description: The address of the account.
         schema:
           type: string
+      - name: date
+        required: false
+        in: query
+        description: 'With `flags`: the last ledger closed at or before this time.
+          Alias: `close_time`.'
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: 'With `flags`: the hash of the ledger.'
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: 'With `flags`: a ledger number. Alias: `ledger`.'
+        schema: {}
+      - name: flags
+        required: false
+        in: query
+        description: Add the account flags.
+        schema:
+          type: boolean
       responses:
         '200':
           description: ''
@@ -842,7 +1206,8 @@ paths:
         `start` and `end`, oldest first. With `min_sequence` or `max_sequence` the
         list is instead the transactions the account sent, by their sequence number,
         and `start` and `end` are ignored. `type` and `result` are the names of the
-        network (`Payment`, `tesSUCCESS`).
+        network (`Payment`, `tesSUCCESS`). `format=csv` serves the same list as a
+        CSV of summary rows from the account's side.
       parameters:
       - name: address
         required: true
@@ -850,6 +1215,11 @@ paths:
         description: The address of the account.
         schema:
           type: string
+      - name: format
+        required: false
+        in: query
+        description: "`csv`: one summary row per transaction, file `<address> - transactions.csv`."
+        schema: {}
       - name: marker
         required: false
         in: query
@@ -1257,13 +1627,14 @@ paths:
     get:
       operationId: AccountBalanceChangesController_list
       summary: Get the balance changes of an account
-      description: Every change of a balance of the account (the native currency and
-        its trust lines) made by the transactions of the ledgers that closed between
-        `start` and `end`, oldest first; the fee of a transaction comes first, as
-        a `transaction_cost` without a `node_index`. `currency`, `counterparty` (alias
-        `issuer`) and `change_type` (alias `type`) keep the changes of that currency,
-        against that counterparty, of that kind. `format=csv` gives the changes as
-        a CSV file.
+      description: Every change of a balance of the account (the native currency,
+        its trust lines and its MPTs) made by the transactions of the ledgers that
+        closed between `start` and `end`, oldest first; the fee of a transaction comes
+        first, as a `transaction_cost` without a `node_index`. `currency`, `counterparty`
+        (alias `issuer`) and `change_type` (alias `type`) keep the changes of that
+        currency, against that counterparty, of that kind. The change of an MPT has
+        the issuance ID as its `currency`, its amounts in integer units, and `mpt_issuance_id`
+        as its last key. `format=csv` gives the changes as a CSV file.
       parameters:
       - name: address
         required: true
@@ -1313,6 +1684,7 @@ paths:
           - escrow_finish
           - paychannel_fund
           - paychannel_payout
+          - clawback
           type: string
       - name: counterparty
         required: false
@@ -1344,13 +1716,16 @@ paths:
     get:
       operationId: AccountBalancesController_list
       summary: Get the balances of an account
-      description: The balances of the account on a ledger of the live node, the native
-        one first (it has no `counterparty`), then the trust lines in the order of
-        the node. The ledger is chosen by `ledger_index`, `ledger_hash` or `date`
-        (the last ledger closed at or before it, answered with its `close_time`);
-        without any of them it is the newest validated one. `currency` keeps the balances
-        of one currency, `counterparty` the trust lines with one account. `limit=all`
-        reads every trust line. `format=csv` gives the balances as a CSV file.
+      description: The balances of the account at a ledger, the native one first (it
+        has no `counterparty`), then the trust lines. A ledger named by `ledger_hash`,
+        `date` (the last ledger closed at or before it) or a numeric `ledger_index`
+        is read from the indexed state history, with the trust lines ordered by (counterparty,
+        currency), and answered with its `close_time`; without any of them (or with
+        `validated`, `closed`, `current`) the balances come from the live node, the
+        newest validated ledger by default, with the trust lines in the node's order.
+        `currency` keeps the balances of one currency, `counterparty` the trust lines
+        with one account. `limit=all` reads every trust line. `format=csv` gives the
+        balances as a CSV file.
       parameters:
       - name: address
         required: true
@@ -1813,24 +2188,24 @@ paths:
       description: Every balance change of the window counts once, the fees (`transaction_cost`)
         too. A change type is one of transaction_cost, payment_destination, payment_source,
         exchange, intermediary, escrow_create, escrow_finish, escrow_cancel, paychannel_fund,
-        paychannel_payout; the changes of transaction types that have none are grouped
-        without a `change_type`. `in` is the sum of the positive changes and `out`
-        the sum of the negative ones as a positive amount; `in_value` and `out_value`
-        are their values in the native currency (the native currency is worth itself,
-        an issued amount its amount over the rate of its day, cut to 17 significant
-        digits per change type, asset and day, and 0 without a rate; a change on a
-        line the account owes on is a change of its own currency), and `net_value`
-        is `in_value` minus `out_value`. `totals` has an entry for each change type
-        that has a change, in that order. Without `interval` `rows` are per change
-        type and asset (`issuer` is left out for the native currency), the largest
-        `in_value + out_value` first; with one they are per bucket and change type,
-        with `date` the start of the bucket. The window is whole UTC days, from the
-        day of `start` to the day of `end` (both included, whatever the time of day),
-        widened to whole buckets when there is an `interval`; the answer's `start`
-        is the start of the first day or bucket and `end` the start of the one after
-        the last, so it is exclusive. An `end` before `start` is an empty answer.
-        With an interval, at most 1000 buckets. `format=csv` gives the rows as a CSV
-        file.
+        paychannel_payout, clawback; the changes of transaction types that have none
+        are grouped without a `change_type`. `in` is the sum of the positive changes
+        and `out` the sum of the negative ones as a positive amount; `in_value` and
+        `out_value` are their values in the native currency (the native currency is
+        worth itself, an issued amount its amount over the rate of its day, cut to
+        17 significant digits per change type, asset and day, and 0 without a rate;
+        a change on a line the account owes on is a change of its own currency), and
+        `net_value` is `in_value` minus `out_value`. `totals` has an entry for each
+        change type that has a change, in that order. Without `interval` `rows` are
+        per change type and asset (`issuer` is left out for the native currency),
+        the largest `in_value + out_value` first; with one they are per bucket and
+        change type, with `date` the start of the bucket. The window is whole UTC
+        days, from the day of `start` to the day of `end` (both included, whatever
+        the time of day), widened to whole buckets when there is an `interval`; the
+        answer's `start` is the start of the first day or bucket and `end` the start
+        of the one after the last, so it is exclusive. An `end` before `start` is
+        an empty answer. With an interval, at most 1000 buckets. `format=csv` gives
+        the rows as a CSV file.
       parameters:
       - name: address
         required: true
@@ -2109,6 +2484,1523 @@ paths:
           description: ''
       tags:
       - accounts
+  "/v2/accounts/{address}/trustlines":
+    get:
+      operationId: AccountTrustlinesController_list
+      summary: Get the trust lines of an account
+      description: 'The trust lines of the account at a ledger, from the indexed state
+        history, with each line from the account''s side: its balance, its limit and
+        the peer''s, no-ripple, authorization and freeze on both sides, and its quality
+        in and out. Lines with a zero balance are listed; lines deleted at or before
+        the ledger are not. Ordered and paged by (counterparty, currency). The ledger
+        is chosen by `ledger_hash`, `date` (the last ledger closed at or before it)
+        or `ledger_index`; without any of them it is the newest indexed one. An issuer''s
+        lines are its holders. `format=csv` gives the lines as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: The `marker` of the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema: {}
+      - name: counterparty
+        required: false
+        in: query
+        description: Only the lines with this account.
+        schema: {}
+      - name: currency
+        required: false
+        in: query
+        description: Only the lines in this currency.
+        schema: {}
+      - name: date
+        required: false
+        in: query
+        description: 'The last ledger closed at or before this time. Alias: `close_time`.'
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of the ledger.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: 'A ledger number. Alias: `ledger`.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/path_payments":
+    get:
+      operationId: AccountPathPaymentsController_list
+      summary: Get the path payments of an account
+      description: The path payments the account sent or received in the ledgers that
+        closed between `start` and `end`, oldest first, as `GET /v2/path_payments`
+        serves them; a payment to oneself is listed once. `format=csv` gives them
+        as a CSV file.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/nfts":
+    get:
+      operationId: AccountNftsController_holdings
+      summary: Get the NFTs an account holds
+      description: 'The NFTs and URITokens the account holds now, grouped by collection
+        (issuer, then taxon) and then by serial (on Xahau by id): each as `GET /v2/nfts/{nft_id}`
+        gives it, except that `last_sale` has no `converted_amount` in a list. An
+        NFT the account sold or gave away, and a burned one, are not listed. `issuer`
+        keeps the NFTs of that issuer, and with `taxon` those of one collection (a
+        `taxon` without an `issuer` is a 400). `format=csv` gives the NFTs as a CSV
+        file (without `coverage`).'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the holder.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: taxon
+        required: false
+        in: query
+        description: Only the NFTs of this taxon of the issuer. Needs `issuer`.
+        schema: {}
+      - name: issuer
+        required: false
+        in: query
+        description: Only the NFTs of this issuer.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/nft_history":
+    get:
+      operationId: AccountNftsController_history
+      summary: Get the NFT history of an account
+      description: 'The events of NFTs and URITokens in which the account has a role,
+        in the ledgers that closed between `start` and `end`, oldest first, or newest
+        first with `descending=true`: each as `GET /v2/nfts/{nft_id}/history` gives
+        it, with `account` the account that did it. An event is listed once, whatever
+        number of roles the account has in it. A `modify` names no account, so it
+        is in no account history. `event` keeps the events of those kinds, `role`
+        those in which the account is any of the roles named (the issuer of a mint,
+        burn or sale, the minter when it is not the issuer, the owner before or after,
+        the broker, the owner of an offer, the destination of an offer). `format=csv`
+        gives the events as a CSV file (without `coverage`).'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: role
+        required: false
+        in: query
+        description: 'A comma list of issuer, minter, from, to, broker, offer_owner,
+          destination. Default: any role.'
+        schema: {}
+      - name: event
+        required: false
+        in: query
+        description: 'A comma list of mint, burn, modify, offer_create, offer_cancel,
+          offer_removed, sale, transfer. Default: all. `modify` is accepted and always
+          gives nothing here: a modify names no account.'
+        schema: {}
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the first ledger.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/escrows/{sequence}":
+    get:
+      operationId: AccountEscrowController_escrow
+      summary: Get the escrow an account created with a sequence
+      description: 'The escrow the account created with this `Sequence` (a ticketed
+        `EscrowCreate`: its `TicketSequence`), as `GET /v2/escrows/{escrow_id}` gives
+        it.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the escrow owner (a classic address).
+        schema:
+          type: string
+      - name: sequence
+        required: true
+        in: path
+        description: 'The `Sequence` (or `TicketSequence`) of the `EscrowCreate`:
+          digits, at most 4294967295.'
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/delegations":
+    get:
+      operationId: AccountDelegationsController_list
+      summary: Get the delegations of an account
+      description: 'The delegations the account gave (`direction=given`, the default:
+        it is the `account` of the entry) or holds (`direction=held`: it is the `authorize`)
+        that are in the ledger as of the newest committed ledger, the entry changed
+        last first, then by `delegation_id`. Each lists the `permissions` the delegate
+        was given, with the last transaction that changed the entry (`updated`) and
+        the one that made it (`created`, when it is indexed). An entry whose list
+        was emptied is deleted and is not listed. `format=csv` gives the delegations
+        as a CSV file, with the permission names in one cell separated by a space
+        (without `coverage`). Xahau has no delegation: its list is empty.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account (a classic address).
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: direction
+        required: false
+        in: query
+        description: "`given` (default): the delegations the account made. `held`:
+          those it was given."
+        schema:
+          enum:
+          - given
+          - held
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/mpt":
+    get:
+      operationId: AccountMptController_list
+      summary: Get the MPT holdings of an account
+      description: 'The account''s balances of MPTs at the newest committed ledger
+        (`ledger_index`, `close_time`), by issuance ID: the integer units it can move
+        (`amount`) and has in escrow (`escrowed_amount`), `locked` when the balance
+        cannot move (its own flag or the issuance''s), and its `authorized` flag.
+        `issuer` comes from the ID; `ticker`, `name` and `asset_scale` from the issuance,
+        when its state is known. `include_zero` adds a balance of nothing; a deleted
+        token is never listed. The marker is the ID of the last row. `format=csv`
+        gives the holdings as a CSV file `<address> - mpt.csv` (without `coverage`).
+        A network without MPT has an empty list, complete.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account (a classic address).
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: 'From the previous page: the ID of its last row.'
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: include_zero
+        required: false
+        in: query
+        description: Also a balance of nothing.
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/nfts/{nft_id}":
+    get:
+      operationId: NftsController_detail
+      summary: Get an NFT or URIToken
+      description: 'The NFT folded from its indexed events: its owner and since when,
+        its mint and burn, its URI, its sales (`sale_count`, the newest as `last_sale`
+        with `converted_amount`, its price in the native currency where the asset
+        has a rate) and the fields of its id (`taxon`, `serial` and `transfer_fee`
+        on XRPL only). `owner` is absent for a burned NFT and when no indexed event
+        names one; `minted` is absent when its mint is not indexed (`coverage.complete`
+        says whether the history of this NFT is whole).'
+      parameters:
+      - name: nft_id
+        required: true
+        in: path
+        description: The 64 hex digits of the NFT or URIToken id, in any case.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nfts
+  "/v2/nfts/{nft_id}/history":
+    get:
+      operationId: NftsController_history
+      summary: Get the history of an NFT or URIToken
+      description: The events of the NFT in the ledgers that closed between `start`
+        and `end` (mint, burn, modify, offers created, cancelled and removed, sales,
+        transfers), oldest first, or newest first with `descending=true`. A sale carries
+        `converted_amount`, its price in the native currency where the asset has a
+        rate. `event` is a comma list that keeps the events of those kinds. `format=csv`
+        gives the events as a CSV file (without `coverage`).
+      parameters:
+      - name: nft_id
+        required: true
+        in: path
+        description: The 64 hex digits of the NFT or URIToken id, in any case.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: event
+        required: false
+        in: query
+        description: 'A comma list of mint, burn, modify, offer_create, offer_cancel,
+          offer_removed, sale, transfer. Default: all.'
+        schema: {}
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the first ledger.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nfts
+  "/v2/nfts/{nft_id}/offers":
+    get:
+      operationId: NftsController_offers
+      summary: Get the open offers of an NFT or URIToken
+      description: The offers made for the NFT that no later event has cancelled,
+        removed or accepted, newest first, worked out from its offer events. An expired
+        offer is listed until it is removed. A URIToken has at most one, the entry's.
+        `type` keeps the offers that sell the NFT (`sell`) or those that bid for it
+        (`buy`).
+      parameters:
+      - name: nft_id
+        required: true
+        in: path
+        description: The 64 hex digits of the NFT or URIToken id, in any case.
+        schema:
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: type
+        required: false
+        in: query
+        description: Only the sell or the buy offers.
+        schema:
+          enum:
+          - sell
+          - buy
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nfts
+  "/v2/nft_collections/{issuer}/nfts":
+    get:
+      operationId: NftCollectionListsController_nfts
+      summary: Get the NFTs of a collection
+      description: 'The NFTs of the collection by serial (on Xahau, by id), as the
+        aggregate keeps them: each with its owner and since when, its mint, its sales
+        (`sale_count`, the newest as `last_sale`: a list has no `converted_amount`
+        for it, the NFT has) and its URI. Burned NFTs are left out unless `include_burned=true`.
+        With `owner` the NFTs that account holds. `format=csv` gives the NFTs as a
+        CSV file (without `coverage`).'
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: include_burned
+        required: false
+        in: query
+        description: Also the NFTs that were burned.
+        schema:
+          type: boolean
+      - name: owner
+        required: false
+        in: query
+        description: Only the NFTs of the collection this account holds.
+        schema: {}
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}/{taxon}/nfts":
+    get:
+      operationId: NftCollectionListsController_nfts
+      summary: Get the NFTs of a collection
+      description: 'The NFTs of the collection by serial (on Xahau, by id), as the
+        aggregate keeps them: each with its owner and since when, its mint, its sales
+        (`sale_count`, the newest as `last_sale`: a list has no `converted_amount`
+        for it, the NFT has) and its URI. Burned NFTs are left out unless `include_burned=true`.
+        With `owner` the NFTs that account holds. `format=csv` gives the NFTs as a
+        CSV file (without `coverage`).'
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: include_burned
+        required: false
+        in: query
+        description: Also the NFTs that were burned.
+        schema:
+          type: boolean
+      - name: owner
+        required: false
+        in: query
+        description: Only the NFTs of the collection this account holds.
+        schema: {}
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}/holders":
+    get:
+      operationId: NftCollectionListsController_holdersOf
+      summary: Get the holders of a collection
+      description: The accounts that hold NFTs of the collection and how many (`held`),
+        the most first, then by address, as of the last run of the collections job.
+        `format=csv` gives the holders as a CSV file (without `coverage`).
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}/{taxon}/holders":
+    get:
+      operationId: NftCollectionListsController_holdersOf
+      summary: Get the holders of a collection
+      description: The accounts that hold NFTs of the collection and how many (`held`),
+        the most first, then by address, as of the last run of the collections job.
+        `format=csv` gives the holders as a CSV file (without `coverage`).
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}/sales":
+    get:
+      operationId: NftCollectionListsController_sales
+      summary: Get the sales of a collection
+      description: 'The sales of the collection''s NFTs in the ledgers that closed
+        between `start` and `end`, oldest first, or newest first with `descending=true`:
+        the seller and buyer, whether it was `direct` or `brokered`, the price and
+        `converted_amount`, the price in the native currency where the asset has a
+        rate. `format=csv` gives the sales as a CSV file (without `coverage`).'
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the first ledger.'
+        schema: {}
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}/{taxon}/sales":
+    get:
+      operationId: NftCollectionListsController_sales
+      summary: Get the sales of a collection
+      description: 'The sales of the collection''s NFTs in the ledgers that closed
+        between `start` and `end`, oldest first, or newest first with `descending=true`:
+        the seller and buyer, whether it was `direct` or `brokered`, the price and
+        `converted_amount`, the price in the native currency where the asset has a
+        rate. `format=csv` gives the sales as a CSV file (without `coverage`).'
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the first ledger.'
+        schema: {}
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}/stats":
+    get:
+      operationId: NftCollectionListsController_stats
+      summary: Get the daily stats of a collection
+      description: 'One row for each UTC day of the window on which the collection
+        had a sale, a mint or a burn (a day without a row had no activity): `sales_count`,
+        `volume_native`, `avg_price_native` and `min_price_native` (in the native
+        currency, over the sales with a price in it: a sale of an asset with no rate
+        that day counts in `sales_count` only, and a day of none has neither price),
+        `mints` and `burns`. `start` is required and the window is at most 366 days.
+        `format=csv` gives the days as a CSV file (without `coverage`).'
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: now.'
+        schema: {}
+      - name: start
+        required: true
+        in: query
+        description: Start time.
+        schema: {}
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}/{taxon}/stats":
+    get:
+      operationId: NftCollectionListsController_stats
+      summary: Get the daily stats of a collection
+      description: 'One row for each UTC day of the window on which the collection
+        had a sale, a mint or a burn (a day without a row had no activity): `sales_count`,
+        `volume_native`, `avg_price_native` and `min_price_native` (in the native
+        currency, over the sales with a price in it: a sale of an asset with no rate
+        that day counts in `sales_count` only, and a day of none has neither price),
+        `mints` and `burns`. `start` is required and the window is at most 366 days.
+        `format=csv` gives the days as a CSV file (without `coverage`).'
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: now.'
+        schema: {}
+      - name: start
+        required: true
+        in: query
+        description: Start time.
+        schema: {}
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections":
+    get:
+      operationId: NftCollectionsController_list
+      summary: Get the NFT collections
+      description: The collections in their current state, the biggest first by `sort`
+        (`volume` of their sales in the native currency by default, `supply` or `holders`;
+        the ties by issuer, then taxon). A collection is `{issuer, taxon?, kind, supply,
+        holders, minted, burned, sales_count, volume_native, first_mint?, last_mint?,
+        last_ledger}`, updated by the collections job some minutes after its NFTs
+        change; `volume_native` is the sum of the prices of the sales that have one
+        in the native currency, as of that run. `total` is how many collections the
+        filter matches. The answer is kept 60 seconds. `format=csv` gives the collections
+        as a CSV file (without `coverage`).
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Default true; `false` for the smallest first.
+        schema:
+          type: boolean
+      - name: sort
+        required: false
+        in: query
+        description: 'Default: volume.'
+        schema:
+          enum:
+          - volume
+          - supply
+          - holders
+          type: string
+      - name: issuer
+        required: false
+        in: query
+        description: Only the collections of this issuer.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}":
+    get:
+      operationId: NftCollectionsController_detail
+      summary: Get an NFT collection
+      description: The collection of an issuer and a taxon on XRPL (`/{issuer}/{taxon}`),
+        of an issuer on Xahau (`/{issuer}`), as the list has it. 404 `collection not
+        found` for none, for the other network's form, and for a collection whose
+        NFTs the collections job has not counted yet (some minutes).
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_collections/{issuer}/{taxon}":
+    get:
+      operationId: NftCollectionsController_detail
+      summary: Get an NFT collection
+      description: The collection of an issuer and a taxon on XRPL (`/{issuer}/{taxon}`),
+        of an issuer on Xahau (`/{issuer}`), as the list has it. 404 `collection not
+        found` for none, for the other network's form, and for a collection whose
+        NFTs the collections job has not counted yet (some minutes).
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: The address of the issuer of the collection.
+        schema:
+          type: string
+      - name: taxon
+        required: false
+        in: path
+        description: The taxon of the collection, on XRPL (`/{issuer}/{taxon}`); Xahau
+          has none (`/{issuer}`).
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_collections
+  "/v2/nft_sales":
+    get:
+      operationId: NftSalesController_list
+      summary: Get the NFT sales of the network
+      description: 'The sales of NFTs (XRPL) and URITokens (Xahau) in the ledgers
+        that closed between `start` and `end`, oldest first, or newest first with
+        `descending=true`: each with the seller and buyer, whether it was `direct`
+        or `brokered` (with the `broker`, its `broker_fee` and the estimated `royalty_est`),
+        the price, and `converted_amount`, the price in the native currency where
+        the asset has a rate that day (a sale in an asset with no rate has none).
+        `currency` keeps the sales priced in one currency: the native currency alone,
+        or `CUR+issuer` (a space for the `+` is read as one). `format=csv` gives the
+        sales as a CSV file (without `coverage`).'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: currency
+        required: false
+        in: query
+        description: 'Only the sales priced in this currency: the native currency,
+          or `CUR+issuer`. Default: all.'
+        schema: {}
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the first ledger.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - nft_sales
+  "/v2/escrows/{escrow_id}":
+    get:
+      operationId: EscrowsController_detail
+      summary: Get an escrow
+      description: 'The escrow with the ID, as of the newest committed ledger: its
+        owner (`account`), destination, amount, times, condition and `status` (`pending`,
+        `can_be_finished`, `can_be_cancelled`, or once deleted `finished`, `cancelled`
+        or `removed`, with `removed` naming the transaction that deleted it), and
+        the newest 50 transactions that changed it. `history_marker` continues them
+        at `/v2/escrows/{id}/history?descending=true`.'
+      parameters:
+      - name: escrow_id
+        required: true
+        in: path
+        description: The 64 hex digits of the escrow ID, in any case.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - escrows
+  "/v2/escrows/{escrow_id}/history":
+    get:
+      operationId: EscrowsController_history
+      summary: Get the history of an escrow
+      description: The transactions that changed the escrow (created, finished, cancelled,
+        or removed), oldest first, or newest first with `descending=true`. `format=csv`
+        gives the events as a CSV file (without `coverage`).
+      parameters:
+      - name: escrow_id
+        required: true
+        in: path
+        description: The 64 hex digits of the escrow ID, in any case.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+      tags:
+      - escrows
+  "/v2/checks/{check_id}":
+    get:
+      operationId: ChecksController_detail
+      summary: Get a check
+      description: 'The check with the ID, as of the newest committed ledger: its
+        owner (`account`), destination, `send_max`, `expiration` and `status` (`open`,
+        `expired`, or once deleted `cashed`, `cancelled` or `removed`, with `removed`
+        naming the transaction that deleted it and `delivered` what a cash delivered),
+        and the newest 50 transactions that changed it. `history_marker` continues
+        them at `/v2/checks/{id}/history?descending=true`.'
+      parameters:
+      - name: check_id
+        required: true
+        in: path
+        description: The 64 hex digits of the check ID, in any case.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - checks
+  "/v2/checks/{check_id}/history":
+    get:
+      operationId: ChecksController_history
+      summary: Get the history of a check
+      description: The transactions that changed the check (created, cashed, cancelled,
+        or removed), oldest first, or newest first with `descending=true`. `format=csv`
+        gives the events as a CSV file (without `coverage`).
+      parameters:
+      - name: check_id
+        required: true
+        in: path
+        description: The 64 hex digits of the check ID, in any case.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+      tags:
+      - checks
+  "/v2/payment_channels/{channel_id}":
+    get:
+      operationId: PaymentChannelsController_detail
+      summary: Get a payment channel
+      description: 'The payment channel with the ID, as of the newest committed ledger:
+        its owner (`account`), destination, what was deposited (`amount`), paid out
+        (`balance`) and is left (`remaining`), `settle_delay`, `status` (`open`, `closing`,
+        or once deleted `closed` or `removed`), how many times it was funded and claimed
+        from (`funds`, `claims`), and the newest 50 transactions that changed it.
+        `history_marker` continues them at `/v2/payment_channels/{id}/history?descending=true`.'
+      parameters:
+      - name: channel_id
+        required: true
+        in: path
+        description: The 64 hex digits of the payment channel ID, in any case.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - payment_channels
+  "/v2/payment_channels/{channel_id}/history":
+    get:
+      operationId: PaymentChannelsController_history
+      summary: Get the history of a payment channel
+      description: The transactions that changed the payment channel (created, funded,
+        claimed from, closed), oldest first, or newest first with `descending=true`.
+        `format=csv` gives the events as a CSV file (without `coverage`).
+      parameters:
+      - name: channel_id
+        required: true
+        in: path
+        description: The 64 hex digits of the payment channel ID, in any case.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+      tags:
+      - payment_channels
+  "/v2/ledger_objects/{object_id}":
+    get:
+      operationId: LedgerObjectsController_lookup
+      summary: Look up a ledger object by its ID
+      description: 'Which kind of object the ID is, among the escrows, checks, payment
+        channels and delegations: its `object_type` (`Escrow`, `Check`, `PayChannel`
+        or `Delegate`), its owner (`account`), whether it was `deleted`, and the ledger
+        of its newest row, as of the newest committed ledger. An object that was created
+        before the index starts and has not been touched since is not known.'
+      parameters:
+      - name: object_id
+        required: true
+        in: path
+        description: The 64 hex digits of the object ID, in any case.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - ledger_objects
+  "/v2/mpt":
+    get:
+      operationId: MptController_lookup
+      summary: Look up several MPT issuances
+      description: A summary of each of 1 to 100 issuances, in the order asked, duplicates
+        too. An ID with no row, or whose state is not known, is the ID alone, as is
+        every ID on a network without MPT. No coverage, no paging, no CSV.
+      parameters:
+      - name: ids
+        required: true
+        in: query
+        description: A comma list of 1 to 100 issuance IDs.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - mpt
+  "/v2/mpt/{issuanceId}":
+    get:
+      operationId: MptController_issuance
+      summary: Get an MPT issuance
+      description: 'One issuance as of the last run of the `mpt_state` job: its issuer
+        and sequence, the ticker and name of its metadata, the ledger''s integer units
+        of its maximum, outstanding, escrowed and locked amounts (`asset_scale` says
+        how to show them), its holders, transfer fee and flags, its metadata (`metadata`
+        only when it was decoded; `metadata_hex` and `metadata_conforms` when it has
+        any), its creation when that is in the coverage, and `destroyed`. No row,
+        a state outside the coverage or newer than the last tick, and every ID on
+        a network without MPT are a 404 `issuance not found`. No CSV.'
+      parameters:
+      - name: issuanceId
+        required: true
+        in: path
+        description: 'The ID of the issuance: 48 hex digits in either case, answered
+          in upper case.'
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - mpt
+  "/v2/mpt/{issuanceId}/holders":
+    get:
+      operationId: MptController_holders
+      summary: Get the holders of an MPT issuance
+      description: The balances of an issuance as of the last run of the `mpt_state`
+        job, the largest first (`amount`, the integer units the holder can move, and
+        `escrowed_amount`, those it has in escrow, count together), then by address.
+        `locked` says the balance cannot move, by the holder's own flag or the issuance's;
+        `authorized` is the holder's flag, which means something when the issuance
+        requires it. `include_zero` adds the holders with nothing. An issuance whose
+        state is not known is served; no row is a 404 `issuance not found`, as is
+        every ID on a network without MPT. `format=csv` gives the holders as a CSV
+        file `<issuanceId> - holders.csv` (without `coverage`).
+      parameters:
+      - name: issuanceId
+        required: true
+        in: path
+        description: 'The ID of the issuance: 48 hex digits in either case, answered
+          in upper case.'
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: include_zero
+        required: false
+        in: query
+        description: Also the holders with nothing.
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+      tags:
+      - mpt
+  "/v2/mpt/{issuanceId}/transfers":
+    get:
+      operationId: MptController_transfers
+      summary: Get the transfers of an MPT issuance
+      description: What the successful transactions of the ledgers that closed between
+        `start` and `end` moved, clawed back, locked or unlocked of an issuance, oldest
+        first. `amount` is integer units; `source` and `destination` are left out
+        where there is none (a lock of every balance has no destination) and `fee`,
+        the transfer fee burned, unless it is above 0. `kind` and `account` (on either
+        side, not validated) keep those rows. An issuance whose state is not known
+        is served; no row is a 404 `issuance not found`, as is every ID on a network
+        without MPT. `format=csv` gives the transfers as a CSV file `<issuanceId>
+        - transfers.csv` (without `coverage`).
+      parameters:
+      - name: issuanceId
+        required: true
+        in: path
+        description: 'The ID of the issuance: 48 hex digits in either case, answered
+          in upper case.'
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
+        schema: {}
+      - name: account
+        required: false
+        in: query
+        description: Only the rows with this account as source or destination.
+        schema: {}
+      - name: kind
+        required: false
+        in: query
+        description: 'A comma list of payment, clawback, lock, unlock, escrow_create,
+          escrow_finish, escrow_cancel. Default: all.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - mpt
   "/v2/active_accounts/{base}/{counter}":
     get:
       operationId: ActiveAccountsController_activeAccounts
@@ -2543,6 +4435,90 @@ paths:
           description: ''
       tags:
       - network
+  "/v2/network/nft_volume":
+    get:
+      operationId: VolumeController_nftVolume
+      summary: Get the volume of the NFT sales on the network
+      description: 'The sales of NFTs (XRPL) and URITokens (Xahau), per collection,
+        in the native currency: per collection its `issuer` and `taxon` (XRPL only),
+        the number of its sales that have a price in the native currency (`count`),
+        the volume of them (`amount`), the rate (1, as the amount is in the native
+        currency) and `converted_amount`. A sale priced in an asset with no rate that
+        day is not in a component; the `count` of the row is every sale of the window,
+        those too. Components are listed by converted amount, the largest first; a
+        window without sales is a row with no components. Without `start` and `end`,
+        the live row of the rolling period `live` (day, 7day, 30day; default day).
+        With them, a row per `interval` (day, week from Monday, month, UTC) for the
+        days that were computed: a bucket is a row when it starts within `start` and
+        `end`, whole. `exchange_currency` / `exchange_issuer` show the amounts in
+        another currency, as for the exchange volume. `coverage` states whether the
+        NFT history is whole.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: exchange_issuer
+        required: false
+        in: query
+        description: Required for every currency but the native one.
+        schema: {}
+      - name: exchange_currency
+        required: false
+        in: query
+        description: 'Default: the native currency.'
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day.'
+        schema:
+          enum:
+          - day
+          - week
+          - month
+          type: string
+      - name: end
+        required: false
+        in: query
+        description: 'End time of the historical rows. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time of the historical rows. Default: the epoch.'
+        schema: {}
+      - name: live
+        required: false
+        in: query
+        description: 'Default: day. Ignored with start or end.'
+        schema:
+          enum:
+          - day
+          - 7day
+          - 30day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
   "/v2/network/markets":
     get:
       operationId: MarketsController_list
@@ -2633,6 +4609,98 @@ paths:
           - day
           - 7day
           - 30day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/supply":
+    get:
+      operationId: SupplyController_snapshot
+      summary: Get the supply of the native currency
+      description: 'The newest hourly snapshot of the native supply: every figure
+        is as of one ledger (`ledger_index`, `close_time`), computed at `computed_at`,
+        and an exact decimal text in whole units. `total` is the currency in existence.
+        `burned` is what was destroyed: on the XRP Ledger 100 billion XRP less the
+        total, exact from the ledger header, and on Xahau the fees of the indexed
+        ledgers (no cap). `minted` (Xahau) is what was created by the indexed ledgers,
+        `amount` being the sum of `rewards` (the rewards claimed), `import` (what
+        an Import credited) and `genesis_mint` (every other GenesisMint). `escrowed`
+        is the native currency in open escrows, `circulating` the total less the escrowed,
+        which counts what is in payment channels, in AMM pools and held as reserves.
+        `amm` (the XRP Ledger) is the native currency in the pools of automated market
+        makers, and `reserves` the least the accounts must keep: the accounts times
+        the base reserve plus their owned objects times the owner reserve (`base`,
+        `increment`), at the snapshot ledger. `minted`, `amm` and `reserves` are left
+        out where the network or the snapshot has none. A part read from the indexed
+        history ends with its `coverage`: the first ledger the history is whole from,
+        and whether it is whole back to where the feature starts. Before the first
+        snapshot the answer is 404 `supply not computed yet`.'
+      parameters: []
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/supply/minted":
+    get:
+      operationId: SupplyController_minted
+      summary: Get the native currency minted per day
+      description: 'The native currency created on each UTC day, by source, on a network
+        that mints (Xahau): `amount` is the sum of `rewards` (the rewards claimed),
+        `import` (what an Import credited) and `genesis_mint` (every other GenesisMint),
+        in whole units. Every day from the first one the indexed history covers whole
+        to the day of the newest ledger is a row, the days with no mint with zeros,
+        and the newest day is the running one, summed so far. The answer states the
+        `coverage` of the mints: the first ledger the history is whole from, and whether
+        it is whole back to the network''s first ledger. On a network that cannot
+        mint (the XRP Ledger) the list is empty. `format=csv` gives the rows as a
+        CSV file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the first day the mints are covered for.'
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day (the only one).'
+        schema:
+          enum:
+          - day
           type: string
       responses:
         '200':
@@ -2763,199 +4831,6 @@ paths:
           description: ''
       tags:
       - ledgers
-  "/v2/network/validators/summary":
-    get:
-      operationId: ValidatorsController_summary
-      summary: Get the summary of the validators of the network
-      description: 'The figures of the Validators board: the validators seen in the
-        last 24 hours, the trusted UNL with its publishers and the quorum, the negative
-        UNL, the fees, the next flag ledger, the software versions and how far the
-        agreement and the votes are computed. There are no parameters.'
-      parameters: []
-      responses:
-        '200':
-          description: ''
-      tags:
-      - network
-  "/v2/network/validators":
-    get:
-      operationId: ValidatorsController_list
-      summary: Get the validators of the network
-      description: 'The validators of the trusted UNL, or of the UNL and every validator
-        seen in the last 24 hours, with their agreement, their domain and its verification,
-        the lists they are on, their software version, and what they vote for: fees
-        and amendments. Validators with a domain come first, by domain, then the others
-        by key. `format=csv` gives the rows as a CSV file.'
-      parameters:
-      - name: format
-        required: false
-        in: query
-        description: 'Default: json.'
-        schema:
-          enum:
-          - json
-          - csv
-          type: string
-      - name: marker
-        required: false
-        in: query
-        description: From the previous page.
-        schema: {}
-      - name: limit
-        required: false
-        in: query
-        description: Default 200, at most 1000.
-        schema:
-          type: number
-      - name: q
-        required: false
-        in: query
-        description: A part of the domain, the master key or the signing key (at most
-          100 characters).
-        schema: {}
-      - name: amendment
-        required: false
-        in: query
-        description: 'The name or the ID (64 hex digits) of an amendment: the validators
-          that vote for it.'
-        schema: {}
-      - name: publisher
-        required: false
-        in: query
-        description: 'The id of a publisher of the summary: its list in use.'
-        schema: {}
-      - name: scope
-        required: false
-        in: query
-        description: 'Default: unl.'
-        schema:
-          enum:
-          - unl
-          - all
-          type: string
-      responses:
-        '200':
-          description: ''
-      tags:
-      - network
-  "/v2/network/validators/{key}":
-    get:
-      operationId: ValidatorsController_detail
-      summary: Get a validator of the network
-      description: 'One validator by its master key, its signing key or 66 hex digits:
-        the row of the list, its vote on every amendment being decided, its manifest
-        and its agreement of each of the last 30 days. JSON only.'
-      parameters:
-      - name: key
-        required: true
-        in: path
-        description: A master key (nH...), a signing key (n9...) or 66 hex digits
-          (02, 03 or ED first).
-        schema:
-          type: string
-      responses:
-        '200':
-          description: ''
-      tags:
-      - network
-  "/v2/network/validators/{key}/validations":
-    get:
-      operationId: ValidatorsController_validatorValidations
-      summary: Get the validations of a validator
-      description: 'The validations one validator made in the last 7 days, newest
-        first: for each ledger and hash the sightings added up, whether the ledger
-        is the one the indexer holds, and the first and last time the validation was
-        seen. The rows recorded under the validator''s signing keys are its own. `format=csv`
-        gives the page as a CSV file.'
-      parameters:
-      - name: key
-        required: true
-        in: path
-        description: A master key (nH...), a signing key (n9...) or 66 hex digits
-          (02, 03 or ED first).
-        schema:
-          type: string
-      - name: format
-        required: false
-        in: query
-        description: 'Default: json.'
-        schema:
-          enum:
-          - json
-          - csv
-          type: string
-      - name: descending
-        required: false
-        in: query
-        description: Default true; false lists the oldest first.
-        schema:
-          type: boolean
-      - name: marker
-        required: false
-        in: query
-        description: From the previous page.
-        schema: {}
-      - name: limit
-        required: false
-        in: query
-        description: Default 200, at most 1000.
-        schema:
-          type: number
-      responses:
-        '200':
-          description: ''
-      tags:
-      - network
-  "/v2/network/amendments":
-    get:
-      operationId: AmendmentsController_list
-      summary: Get the amendments of the network
-      description: 'Every amendment the network knows: enabled, with a majority, voting,
-        obsolete or unknown, with the votes of the newest voting round and, for the
-        enabled ones, when they were enabled. The answer states the rules, the newest
-        round and the next flag ledger. `format=csv` gives the amendments as a CSV
-        file.'
-      parameters:
-      - name: format
-        required: false
-        in: query
-        description: 'Default: json.'
-        schema:
-          enum:
-          - json
-          - csv
-          type: string
-      - name: status
-        required: false
-        in: query
-        description: 'A comma list of enabled, majority, voting, obsolete and unknown.
-          Default: all.'
-        schema: {}
-      responses:
-        '200':
-          description: ''
-      tags:
-      - network
-  "/v2/network/amendments/{name}":
-    get:
-      operationId: AmendmentsController_detail
-      summary: Get an amendment of the network
-      description: One amendment by its name or its ID, with the envelope of the list,
-        how each validator votes on it, its rounds of the last 30 days and its history.
-        JSON only.
-      parameters:
-      - name: name
-        required: true
-        in: path
-        description: The name of the amendment (as written, else in any case when
-          only one has it) or its ID (64 hex digits).
-        schema:
-          type: string
-      responses:
-        '200':
-          description: ''
-      tags:
-      - network
   "/v2/stats":
     get:
       operationId: StatsController_list
@@ -3625,6 +5500,282 @@ paths:
           description: ''
       tags:
       - amm
+  "/v2/exports":
+    post:
+      operationId: ExportsController_create
+      summary: Ask for an export of a list
+      description: 'Queues an export of the list at `path` (any route with a CSV form,
+        with its parameters) in `format` (`csv`, or `pdf`: a landscape A4 document
+        with a header and the list''s chosen columns). A list over time must name
+        `start` and `end`. The exporter of the network makes the file in the background;
+        `GET /v2/exports/{id}` reports it.'
+      parameters: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - path
+              - format
+              properties:
+                path:
+                  type: string
+                  example: "/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01"
+                format:
+                  type: string
+                  enum:
+                  - csv
+                  - pdf
+      responses:
+        '202':
+          description: ''
+      tags:
+      - exports
+  "/v2/exports/{id}":
+    get:
+      operationId: ExportsController_find
+      summary: Get an export
+      description: The state of an export (`queued`, `running`, `done`, `failed`)
+        for the API key that asked for it; any other key gets 404. When it is done,
+        `url` downloads the file for 15 minutes; each request makes a new one.
+      parameters:
+      - name: id
+        required: true
+        in: path
+        description: The id `POST /v2/exports` answered.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - exports
+  "/v2/tokens":
+    get:
+      operationId: TokensController_list
+      summary: Get the tokens, ranked by holders
+      description: 'The tokens of a kind with the most holders first, then by issuer,
+        then by the token; `rank` is the place of a token in that order among the
+        tokens the filters select. `kind=mpt` lists the MPT issuances instead of the
+        currencies issued on trust lines (`issued`, the default): its row, its `totals`
+        and its search are in the MPT section of the reference, and the rest of this
+        text is of `issued`. A token is a currency and its issuer, as of the last
+        run of the tokens job (`ledger_index` and `close_time` are the ledger it is
+        through): its holders (the accounts that hold a positive balance), `trust_lines`
+        (the lines that count), `supply` (the exact sum of the balances), the `price`
+        of the last day against the native currency with its `price_change` (percent)
+        and `price_time` (the month when the day has none, without a change), the
+        `native_volume` and `trades` of the day, and the issuer''s `domain`, whether
+        its toml `listed` the token, and the `name` it gives it. `min_holders` keeps
+        the tokens with at least that many holders; `q` (1 to 64 characters) keeps
+        the tokens of an issuer (a classic address), or those whose code, name or
+        domain contains it (any case), whose currency it is (40 hex digits) or whose
+        issuer starts with it. `total` is the number of tokens the filters select,
+        on all pages; `total_below`, with `min_holders`, the number that match `q`
+        but have fewer holders. `totals` describe the whole kind, whatever the filters:
+        `tokens`, `tokens_with_10_holders`, `holders` (distinct holders of all tokens;
+        left out while the job has not counted them) and the `native_volume` of the
+        day on the markets (left out without a day set). Before the job has built
+        a generation the answer has no tokens. The ranking is rebuilt each minute,
+        so a token can move between pages from one minute to the next. `format=csv`
+        gives the tokens as a CSV file (without `coverage`).'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: q
+        required: false
+        in: query
+        description: 'A search, 1 to 64 characters: an issuer address, or text in
+          the code, name or domain, a currency in hex, an issuer prefix. With `kind=mpt`:
+          an issuer address, an issuance ID, or text in the ticker or name, an issuer
+          prefix, an ID prefix of 8 hex digits or more.'
+        schema: {}
+      - name: min_holders
+        required: false
+        in: query
+        description: 'Only the tokens with at least this many holders: 0 to 1,000,000,000.
+          Default 0.'
+        schema:
+          type: number
+      - name: kind
+        required: false
+        in: query
+        description: 'Default: issued.'
+        schema:
+          enum:
+          - issued
+          - mpt
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - tokens
+  "/v2/tokens/{token}/holders":
+    get:
+      operationId: TokensController_holders
+      summary: Get the holders of a token
+      description: The accounts that hold a positive balance of the token, the largest
+        balance first, then by address, as of the last run of the tokens job (`ledger_index`
+        and `close_time` are the ledger it is through). `rank` is the holder's place
+        in that order among all the holders, whatever the page; `share` is its balance
+        over the token `supply` (exact, rounded half up to 6 decimals); `limit` is
+        the holder's limit; `frozen` and `authorized` are the issuer's freeze and
+        authorization of the line. The path names the token like the detail does;
+        a token the job does not know (no live row, an LP token, no generation yet)
+        is a 404. `format=csv` gives the holders as a CSV file `<code or currency>
+        <issuer> - holders.csv` (without `coverage`).
+      parameters:
+      - name: token
+        required: true
+        in: path
+        description: 'A currency and its issuer, `{currency}.{issuer}` (or with `+`
+          or `|` for the dot): a 3-character code, 40 hex digits or a text of 4 to
+          20 characters, then the issuer address. The segment is split at its last
+          separator.'
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      responses:
+        '200':
+          description: ''
+      tags:
+      - tokens
+  "/v2/tokens/{token}/transfers":
+    get:
+      operationId: TokensController_transfers
+      summary: Get the transfers of a token
+      description: 'The payments that delivered the token, oldest first: the `Payment`
+        transactions between two different accounts that delivered the currency of
+        the issuer (a payment to oneself is not a payment, as in `/v2/payments`),
+        with the `amount` delivered and the tags the payment has. The window, `descending`,
+        `limit` and `marker` are those of `/v2/payments` (`start` inclusive, `end`
+        the end of the period it names; the marker is `(ledger_index, tx_index)`).
+        The path names the token like the detail does, but the list does not look
+        the token up: a token nobody was paid in, one the tokens job does not know
+        and an LP token list the transfers they have, and no transfers is an empty
+        list. `coverage` is that of the payments of the ledgers, not of the state
+        tables. `format=csv` gives the transfers as a CSV file `<code or currency>
+        <issuer> - transfers.csv` with a column for each key of a transfer (without
+        `coverage`).'
+      parameters:
+      - name: token
+        required: true
+        in: path
+        description: 'A currency and its issuer, `{currency}.{issuer}` (or with `+`
+          or `|` for the dot): a 3-character code, 40 hex digits or a text of 4 to
+          20 characters, then the issuer address. The segment is split at its last
+          separator.'
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - tokens
+  "/v2/tokens/{token}":
+    get:
+      operationId: TokensController_token
+      summary: Get a token
+      description: 'One issued token as of the last run of the tokens job (`ledger_index`
+        and `close_time` are the ledger it is through): its holders, `trust_lines`
+        and exact `supply`, the `price` of the last day with its change and the volume
+        and trades of the day, the issuer''s `domain` and the `toml_url` of its toml,
+        whether the toml `listed` the token and what it says of it (`toml`), the issuer''s
+        `issuer_settings` (left out while the issuer has no row in the state tables),
+        its `markets` of the day (the token is always the base), and `last_ledger`,
+        the newest ledger of one of its lines. A token with no live row (no line counts,
+        an LP token, or no generation yet) is a 404 `token not found`. No CSV.'
+      parameters:
+      - name: token
+        required: true
+        in: path
+        description: 'A currency and its issuer, `{currency}.{issuer}` (or with `+`
+          or `|` for the dot): a 3-character code, 40 hex digits or a text of 4 to
+          20 characters, then the issuer address. The segment is split at its last
+          separator.'
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - tokens
 info:
   title: data-api
   description: Ripple Data API v2 compatible API for XRPL and Xahau, served from ClickHouse.

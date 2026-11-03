@@ -16,17 +16,100 @@
  * and a `DateTime` as a `'YYYY-MM-DD HH:MM:SS'` string. Select `toString(col)` when the exact digits matter.
  */
 
+import type { NftEventName, NftKind } from '../parsers/nft.parser';
+import type { TomlAccount, TomlCurrency, TomlValidator } from '../tomls/toml-read';
+
 /**
  * Version of the ledger parsers. Stored on every `ledgers` row so a later parser change can find stale rows.
  *
  *  - 1: the Ripple v2 data (payments, exchanges, balance changes, accounts created).
  *  - 2: AMM data (swaps as exchanges, pool states, liquidity, governance). Ledgers from the AMM enablement ledger
  *       (86795265 on mainnet) written with version 1 lack these rows; `--reprocess` rewrites them.
+ *  - 3: account and trust line state history (`account_states`, `trust_line_states`). Ledgers written with an older
+ *       version lack these rows; the state tables cover only the ledgers above the last one an older parser wrote
+ *       (`STATE_PARSER_VERSION`).
+ *  - 4: path payments (`path_payments`, and their index by account `account_path_payments`). Ledgers written with an
+ *       older version have none; `--reprocess` rewrites them.
+ *  - 5: NFT and URIToken events (the five NFT tables); `NFT_PARSER_VERSION`
+ *  - 6: account domains (`account_domains`): the Domain of every account root that has or had one, after each change.
+ *       Ledgers written with an older version have none; the seed of `docs/backfill.md` fills the current domains of the
+ *       state history's ledgers.
+ *  - 7: the history of escrows, checks, payment channels and delegations (`object_changes` and `account_object_changes`),
+ *       a delegate's `account_transactions` row, the fee booked to a delegated transaction's delegate, and the typed
+ *       balance changes of issued-token channels; `OBJECT_PARSER_VERSION`. Ledgers written with an older version have
+ *       none of these; `--reprocess` rewrites them.
+ *  - 8: the touch index of the token aggregate (`state_touches`). A ledger written by an older version has none; the job
+ *       never applies a window that holds one (`TOKEN_PARSER_VERSION`).
+ *  - 9: Xahau minting (`genesis_mints`, `imports`, `reward_claims`); `MINT_PARSER_VERSION`. A Xahau ledger written with an
+ *       older version lacks these rows, and the minted supply is counted from the first ledger that has them;
+ *       `--reprocess` rewrites them. XRPL has none of the three transaction types, so its ledgers hold no mint row of any
+ *       version.
+ *  - 10: the MPT data (`mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers`, `mpt_issuance_transfers`), MPT
+ *       payments in `payments`, `payments_by_currency` and `account_payments`, an `MPToken`'s rows in `balance_changes`, and
+ *       the type `clawback` on the rows of a `Clawback`; `MPT_PARSER_VERSION`. Ledgers written with an older version have none of
+ *       these; `--reprocess` rewrites them. Xahau has no MPT, so its ledgers hold no MPT row of any version.
+ *
+ * A reader that depends on a feature compares a ledger's version with that feature's constant (`AMM_PARSER_VERSION`,
+ * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`, `NFT_PARSER_VERSION`, `DOMAIN_PARSER_VERSION`, `OBJECT_PARSER_VERSION`,
+ * `TOKEN_PARSER_VERSION`, `MINT_PARSER_VERSION`, `MPT_PARSER_VERSION`), never with `PARSER_VERSION`.
  */
-export const PARSER_VERSION = 2;
+export const PARSER_VERSION = 10;
 
 /** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
 export const AMM_PARSER_VERSION = 2;
+
+/**
+ * The first parser version that writes the state history (`account_states` and `trust_line_states`): a ledger written by
+ * an older one lacks their rows. The two tables share it, so one coverage answers for both. Gates compare with this
+ * constant, never with `PARSER_VERSION`, which later features move on.
+ */
+export const STATE_PARSER_VERSION = 3;
+/**
+ * The first parser version that writes `path_payments` and `account_path_payments`: a ledger written by an older one
+ * lacks them.
+ */
+export const PATH_PARSER_VERSION = 4;
+
+/**
+ * The first parser version that writes the five NFT tables (`nft_events`, `account_nft_events`, `collection_nft_events`,
+ * `nft_sales` and `nft_touches`): a ledger written by an older one lacks their rows. Gates compare with this constant,
+ * never with `PARSER_VERSION`, which later features move on.
+ */
+export const NFT_PARSER_VERSION = 5;
+
+/**
+ * The first parser version that writes `account_domains`: a ledger written by an older one lacks its rows. Gates compare
+ * with this constant, never with `PARSER_VERSION`, which later features move on.
+ */
+export const DOMAIN_PARSER_VERSION = 6;
+
+/**
+ * The first parser version that writes `object_changes` and `account_object_changes`, gives a transaction's Delegate its
+ * `account_transactions` row, books a delegated fee to the delegate and types issued-token channels in tokens. Readers gate
+ * on it, never on `PARSER_VERSION`.
+ */
+export const OBJECT_PARSER_VERSION = 7;
+
+/**
+ * The first parser version that writes `state_touches`, the ledger-ordered index of the trust lines and issuers a transaction
+ * changed: a ledger written by an older one has none, and the tokens job never applies a window that holds one. Gates compare
+ * with this constant, never with `PARSER_VERSION`, which later features move on.
+ */
+export const TOKEN_PARSER_VERSION = 8;
+
+/**
+ * The first parser version that writes `genesis_mints`, `imports` and `reward_claims`, the Xahau mints the supply adds up: a
+ * ledger written by an older one lacks their rows. Readers of the three tables (the `supply` job and the minted days) gate on
+ * this constant, never on `PARSER_VERSION`, which later features move on.
+ */
+export const MINT_PARSER_VERSION = 9;
+
+/**
+ * The first parser version that writes the five MPT ledger tables and the MPT rows of the existing ones: a ledger written by an
+ * older one lacks them. Readers of the MPT data (the coverage of the MPT routes and the `mpt_state` job) gate on this constant, never
+ * on `PARSER_VERSION`, which later features move on.
+ */
+export const MPT_PARSER_VERSION = 10;
 
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;
@@ -237,6 +320,57 @@ export interface AccountsCreatedRow {
  * it is not; a reader carries the last known value forward. The pair is in Ripple's canonical
  * (base, counter) order, like `exchanges`.
  */
+/**
+ * The state of an account root after a transaction that changed it (migration 005). `balance` is the native balance in
+ * whole units, `fields` the JSON of the node's final fields, `deleted` 1 for the node an AccountDelete removed.
+ */
+export interface AccountStatesRow {
+  account: string;
+  ledger_index: number;
+  tx_index: number;
+  /** The node's position in `meta.AffectedNodes`. */
+  node_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  balance: string;
+  flags: number;
+  sequence: number;
+  owner_count: number;
+  fields: string;
+  deleted: number;
+}
+
+/**
+ * The state of a trust line after a transaction that changed it, from one side (migration 006): two rows per changed
+ * line, one per account. `balance` is the account's (positive: the counterparty owes it), `limit` its own limit, the
+ * `_peer` / `peer_` columns are the counterparty's settings; `flags` is the RippleState `Flags` as stored. `deleted` is 1
+ * for the node that removed the line.
+ */
+export interface TrustLineStatesRow {
+  account: string;
+  counterparty: string;
+  currency: string;
+  ledger_index: number;
+  tx_index: number;
+  /** The node's position in `meta.AffectedNodes`. */
+  node_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  balance: string;
+  limit: string;
+  limit_peer: string;
+  no_ripple: number;
+  no_ripple_peer: number;
+  authorized: number;
+  peer_authorized: number;
+  freeze: number;
+  peer_freeze: number;
+  quality_in: number;
+  quality_out: number;
+  flags: number;
+  deleted: number;
+}
+
 export interface AmmPoolStatesRow {
   amm_account: string;
   ledger_index: number;
@@ -328,6 +462,383 @@ export interface AmmGovernanceRow {
   slot_discounted_fee: number | null;
   slot_expiration: number | null;
   auth_accounts: string[];
+}
+
+/** A path payment (migration 007): one row per successful Payment whose delivery used someone else's liquidity. */
+export interface PathPaymentsRow {
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  source: string;
+  destination: string;
+  delivered_amount: string;
+  currency: string;
+  /** `''` for the native currency. */
+  issuer: string;
+  /** What left the source, the fee not included. */
+  source_amount: string;
+  source_currency: string;
+  /** `''` for the native currency. */
+  source_issuer: string;
+  offers_crossed: number;
+  amm_pools: string[];
+  rippled_through: string[];
+}
+
+/**
+ * The index of `path_payments` by account (migration 008): a row for the source and one for the destination of a path
+ * payment, one row for a payment to oneself. The path payment itself is read from `path_payments` by its key.
+ */
+export interface AccountPathPaymentsRow {
+  account: string;
+  ledger_index: number;
+  tx_index: number;
+}
+
+/**
+ * One event of an NFT or URIToken (`nft_events`, migration 011): the event's place in its transaction is
+ * `(ledger_index, tx_index, event_index)`. Ids are 64 upper-case hex digits. `taxon_key` is the taxon on XRPL and 0 on
+ * Xahau, `serial` the id's sequence on XRPL and 0 on Xahau, `transfer_fee` is in 1/100000. An absent string is `''`, an
+ * absent number `null`. Amounts are exact decimal text in whole units (`amount_f` is the Float64 shadow); the native
+ * currency is `XRP` or `XAH` with an `amount_issuer` of `''`.
+ */
+export interface NftEventsRow {
+  nft_id: string;
+  ledger_index: number;
+  tx_index: number;
+  event_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  kind: NftKind;
+  event: NftEventName;
+  issuer: string;
+  taxon: number | null;
+  taxon_key: number;
+  serial: number;
+  nft_flags: number;
+  transfer_fee: number;
+  /** Hex as on the ledger: the new URI of a mint or a modify, else `''`. */
+  uri: string;
+  /** URITokens. */
+  digest: string;
+  /** Who did it: the offer's owner for an offer event, else the sender. */
+  account: string;
+  /** The owner before (burn, sale, transfer). */
+  from_account: string;
+  /** The owner after (mint, sale, transfer). */
+  to_account: string;
+  /** The `NFTokenOffer`'s `LedgerIndex`; on Xahau the URIToken id. */
+  offer_id: string;
+  /** 1 for a sell offer, else 0. */
+  is_sell_offer: number;
+  /** The offer's amount, or the sale's price. */
+  amount: string;
+  amount_f: number;
+  currency: string;
+  amount_issuer: string;
+  destination: string;
+  /** Unix seconds, `null` when the offer has none. */
+  expiration: UnixSeconds | null;
+  broker: string;
+  broker_fee: string;
+  royalty_est: string;
+  /** `offer_removed` only: `sale`, `burn`, `transfer` or `other`. */
+  removed_by: string;
+}
+
+/**
+ * A copy of an `nft_events` row for each account the event involves (`account_nft_events`, migration 011): `account` is
+ * the account the row is for, `actor` the `account` of the event, `roles` the account's roles in it (`issuer`, `minter`,
+ * `from`, `to`, `broker`, `offer_owner`, `destination`); an account with two roles in an event has one row.
+ */
+export interface AccountNftEventsRow {
+  account: string;
+  nft_id: string;
+  ledger_index: number;
+  tx_index: number;
+  event_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  kind: NftKind;
+  event: NftEventName;
+  issuer: string;
+  taxon: number | null;
+  taxon_key: number;
+  serial: number;
+  nft_flags: number;
+  transfer_fee: number;
+  uri: string;
+  digest: string;
+  actor: string;
+  from_account: string;
+  to_account: string;
+  offer_id: string;
+  is_sell_offer: number;
+  amount: string;
+  amount_f: number;
+  currency: string;
+  amount_issuer: string;
+  destination: string;
+  expiration: UnixSeconds | null;
+  broker: string;
+  broker_fee: string;
+  royalty_est: string;
+  removed_by: string;
+  roles: string[];
+}
+
+/** A copy of every event by collection (`collection_nft_events`, migration 011): the columns of `nft_events`. */
+export type CollectionNftEventsRow = NftEventsRow;
+
+/** A copy of the `sale` events in ledger order (`nft_sales`, migration 011): the columns of `nft_events`. */
+export type NftSalesRow = NftEventsRow;
+
+/**
+ * One row per NFT a transaction had an event of (`nft_touches`, migration 011): the narrow, ledger-ordered index the
+ * aggregator scans for the NFTs that changed.
+ */
+export interface NftTouchesRow {
+  ledger_index: number;
+  tx_index: number;
+  nft_id: string;
+  issuer: string;
+  taxon_key: number;
+  serial: number;
+}
+
+/**
+ * The Domain of an account root after a transaction that changed an account that has or had one (`account_domains`,
+ * migration 012): one row per AccountRoot node of the transaction's metadata. `domain_hex` is the Domain as the ledger
+ * holds it (upper-case hex), `''` when the node has none; `deleted` is 1 for a deleted node. Unlike the other ledger
+ * tables it is ordered by `account`, so merges keep about one row per account and partition: the row with the largest
+ * `version` is the current domain.
+ */
+export interface AccountDomainsRow {
+  account: string;
+  ledger_index: number;
+  tx_index: number;
+  /** The node's position in `meta.AffectedNodes`. */
+  node_index: number;
+  /** `ledger_index * 2^32 + tx_index * 2^16 + node_index` as decimal text: it passes 2^53. */
+  version: string;
+  domain_hex: string;
+  deleted: number;
+}
+
+/**
+ * One created, modified or deleted node of a tracked type (`Escrow`, `Check`, `PayChannel`, `Delegate`) in a
+ * transaction's metadata (`object_changes`, migration 013): the object's state after the transaction, what changed, and
+ * the event it was. `(object_type, object_id, ledger_index, tx_index)` is unique, a transaction has one node per object.
+ * A row is written whatever the transaction's result. `fields`, `previous` and `event_fields` are JSON text with sorted
+ * keys and the ledger's raw values (drops as text, amount objects, Ripple-epoch times), `'{}'` when there is nothing.
+ */
+export interface ObjectChangesRow {
+  /** The node's `LedgerEntryType`: `Escrow`, `Check`, `PayChannel` or `Delegate`. */
+  object_type: string;
+  /** The node's `LedgerIndex`: 64 digits, upper case. */
+  object_id: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  tx_type: string;
+  result: string;
+  /** The transaction's `Account`. */
+  sender: string;
+  /** The transaction's `Delegate`, `''` when it has none. */
+  delegate: string;
+  action: 'created' | 'modified' | 'deleted';
+  /** Per type: `create`, `finish`, `cancel`, `removed`, `cash`, `close`, `fund`, `claim`, `set`, ... (spec 2.2). */
+  event: string;
+  /** The object's `Account`. */
+  owner: string;
+  /** Its `Destination` (`Escrow`, `Check`, `PayChannel`) or `Authorize` (`Delegate`). */
+  counterparty: string;
+  /** The node's fields after the transaction (`NewFields` of a created node, else `FinalFields`), without the thread fields. */
+  fields: string;
+  /** The node's `PreviousFields`, with the same exclusions. */
+  previous: string;
+  /** The facts the event takes from the transaction: `sequence`, `fulfillment`, `delivered`. */
+  event_fields: string;
+}
+
+/**
+ * The index of `object_changes` by account (`account_object_changes`, migration 013): a row for the owner and one for the
+ * counterparty of each of its rows, two rows when they are the same account. `role` is in the key, so the delegations an
+ * account gave (`owner`) and holds (`counterparty`) are each a prefix. The row itself is read from `object_changes` by
+ * its key.
+ */
+export interface AccountObjectChangesRow {
+  account: string;
+  object_type: string;
+  role: 'owner' | 'counterparty';
+  ledger_index: number;
+  tx_index: number;
+  object_id: string;
+  action: 'created' | 'modified' | 'deleted';
+}
+
+/**
+ * A trust line or an account whose token state a transaction may have changed (`state_touches`, migration 014): the narrow,
+ * ledger-ordered index of `trust_line_states` and `account_states`, as `AmmPoolTouchesRow` is of the pool states. The tokens
+ * job reads it by a range of the primary key. For a `line` row `account` is the line's low account, `counterparty` its high
+ * account and `currency` the currency as the ledger writes it; for an `account` row (an account whose token settings may have
+ * changed) `counterparty` and `currency` are `''`.
+ */
+export interface StateTouchesRow {
+  ledger_index: number;
+  tx_index: number;
+  kind: 'line' | 'account';
+  account: string;
+  counterparty: string;
+  currency: string;
+}
+
+/**
+ * One native entry of a successful `GenesisMint` on Xahau (`genesis_mints`, migration 015): `mint_index` is the entry's position in
+ * `GenesisMints`, so an entry without a native amount leaves a gap and the key never moves. `amount` is in drops;
+ * `parent_tx_hash` is the `EmitDetails.EmitParentTxnID` and `emit_hook_hash` the `EmitDetails.EmitHookHash`, each `''` when
+ * absent. Empty on XRPL.
+ */
+export interface GenesisMintsRow {
+  ledger_index: number;
+  tx_index: number;
+  mint_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  destination: string;
+  amount: UInt64Value;
+  parent_tx_hash: string;
+  emit_hook_hash: string;
+}
+
+/**
+ * A successful `Import` on Xahau (`imports`, migration 015), the columns the supply needs. `minted` is in drops: the balance of
+ * the account after the Import, less its balance before it, plus the Fee, which the Import also burned. `account_created`
+ * is 1 when the Import created the account. Empty on XRPL.
+ */
+export interface ImportsRow {
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  account: string;
+  minted: UInt64Value;
+  account_created: number;
+}
+
+/**
+ * A `ClaimReward` on Xahau, whatever its result (`reward_claims`, migration 015): the parent of a reward mint is a claim whether or
+ * not the claim succeeded. `issuer` is `''` for a claim without one; `opt_out` is 1 for a claim that opts out of the rewards.
+ * Empty on XRPL.
+ */
+export interface RewardClaimsRow {
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  account: string;
+  issuer: string;
+  opt_out: number;
+}
+
+/** What an MPT transfer was: a mint and a redemption are each a `payment`, as on the ledger. */
+export type MptTransferKind =
+  | 'payment'
+  | 'clawback'
+  | 'lock'
+  | 'unlock'
+  | 'escrow_create'
+  | 'escrow_finish'
+  | 'escrow_cancel';
+
+/**
+ * The state of an issuance after a transaction that changed its `MPTokenIssuance` node, whatever the result
+ * (`mpt_issuance_states`, migration 017): the node's final fields, `NewFields` for a created node. `maximum_amount` is `null` when
+ * not set (the ledger's 2^63-1), `escrowed_amount` is the node's `LockedAmount` and `metadata_hex` is `''` when there is none.
+ * Empty on Xahau, as every MPT table.
+ */
+export interface MptIssuanceStatesRow {
+  mpt_issuance_id: string;
+  ledger_index: number;
+  tx_index: number;
+  node_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  issuer: string;
+  sequence: number;
+  flags: number;
+  asset_scale: number;
+  maximum_amount: UInt64Value | null;
+  outstanding_amount: UInt64Value;
+  escrowed_amount: UInt64Value;
+  transfer_fee: number;
+  metadata_hex: string;
+  deleted: number;
+}
+
+/**
+ * The state of a holder's balance after a transaction that changed its `MPToken` node, whatever the result (`mpt_holder_states`,
+ * migration 017). `amount` is `MPTAmount` and `escrowed_amount` the token's `LockedAmount`, each 0 when absent.
+ */
+export interface MptHolderStatesRow {
+  holder: string;
+  mpt_issuance_id: string;
+  ledger_index: number;
+  tx_index: number;
+  node_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  amount: UInt64Value;
+  escrowed_amount: UInt64Value;
+  flags: number;
+  deleted: number;
+}
+
+/** Which issuance and holder a transaction touched (`mpt_touches`, migration 017), `holder` `''` for the issuance's own node. */
+export interface MptTouchesRow {
+  ledger_index: number;
+  tx_index: number;
+  mpt_issuance_id: string;
+  holder: string;
+}
+
+/**
+ * One MPT a successful transaction moved, clawed back, locked or unlocked (`mpt_transfers`, migration 017). `source` and
+ * `destination` are `''` when there is none (a lock of every balance has no destination), `fee` the transfer fee burned.
+ */
+export interface MptTransfersRow {
+  ledger_index: number;
+  tx_index: number;
+  mpt_issuance_id: string;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  kind: MptTransferKind;
+  source: string;
+  destination: string;
+  amount: UInt64Value;
+  fee: UInt64Value;
+}
+
+/** The same rows as `mpt_transfers`, ordered by issuance (`mpt_issuance_transfers`, migration 017). */
+export interface MptIssuanceTransfersRow {
+  mpt_issuance_id: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  kind: MptTransferKind;
+  source: string;
+  destination: string;
+  amount: UInt64Value;
+  fee: UInt64Value;
 }
 
 // -- Node-sourced tables -----------------------------------------------------------------------------------------
@@ -468,6 +979,14 @@ export interface ValidatorDomainsRow {
   next_check_at: UnixSeconds;
   /** The `[[ACCOUNTS]]` addresses of the last TOML that verified, sorted; empty when unverified. */
   accounts: string[];
+  /** Upper-case ISO 3166-1 alpha-2 codes from the `[[VALIDATORS]]` entry that lists the key; `''` when not given or not verified. */
+  owner_country: string;
+  server_country: string;
+  /** The file's claims, which nothing checks; `''` when absent or not verified. */
+  toml_network: string;
+  toml_unl: string;
+  /** What the checker read of the file: 0 for a row from before D8 (a transient failure within the grace carries it on), else `TOML_DETAILS_VERSION`. */
+  toml_version: number;
 }
 
 /** The ledger state the node reports: enabled amendments, majorities, negative UNL and fees at `ledger_index`. */
@@ -863,6 +1382,353 @@ export interface AccountTradesDailyRow {
   version: UInt64Value;
 }
 
+// -- NFT aggregates (migration 011) ------------------------------------------------------------------------------
+
+/**
+ * The state of one NFT or URIToken (`nfts`), rebuilt from its events by the aggregator. `owner` is `''` when the NFT is
+ * burned or when no indexed event names it; `first_ledger` and `last_ledger` are the oldest and newest indexed event the
+ * row has seen. Readers keep the newest `version` of each key.
+ */
+export interface NftsRow {
+  issuer: string;
+  taxon_key: number;
+  serial: number;
+  nft_id: string;
+  kind: NftKind;
+  taxon: number | null;
+  nft_flags: number;
+  transfer_fee: number;
+  owner: string;
+  owner_ledger: number | null;
+  owner_tx: string;
+  owner_time: UnixSeconds | null;
+  uri: string;
+  digest: string;
+  minted_ledger: number | null;
+  minted_tx: string;
+  minted_time: UnixSeconds | null;
+  minted_by: string;
+  minted_to: string;
+  burned: number;
+  burned_ledger: number | null;
+  burned_tx: string;
+  burned_time: UnixSeconds | null;
+  burned_by: string;
+  sale_count: number;
+  last_sale_ledger: number | null;
+  last_sale_tx: string;
+  last_sale_time: UnixSeconds | null;
+  last_sale_amount: string;
+  last_sale_currency: string;
+  last_sale_amount_issuer: string;
+  first_ledger: number;
+  last_ledger: number;
+  version: UInt64Value;
+}
+
+/**
+ * One row for every account an NFT ever had as owner in the index (`account_nfts`): `held` is 1 for the current owner. A
+ * holding is the newest row of a key with `held = 1`.
+ */
+export interface AccountNftsRow {
+  owner: string;
+  issuer: string;
+  taxon_key: number;
+  serial: number;
+  nft_id: string;
+  held: number;
+  version: UInt64Value;
+}
+
+/**
+ * One collection (`nft_collections`): an issuer and, on XRPL, a taxon (`taxon_key` is 0 on Xahau). `supply` counts the
+ * NFTs not burned, `minted` and `burned` the indexed mint and burn events, `volume_native` the converted price (exact text,
+ * with its `Float64` shadow) of the sales with a rate.
+ */
+export interface NftCollectionsRow {
+  issuer: string;
+  taxon_key: number;
+  kind: NftKind;
+  taxon: number | null;
+  supply: UInt64Value;
+  holders: UInt64Value;
+  minted: UInt64Value;
+  burned: UInt64Value;
+  sales_count: UInt64Value;
+  volume_native: string;
+  volume_native_f: number;
+  first_mint_ledger: number | null;
+  first_mint_tx: string;
+  first_mint_time: UnixSeconds | null;
+  last_mint_ledger: number | null;
+  last_mint_tx: string;
+  last_mint_time: UnixSeconds | null;
+  last_ledger: number;
+  version: UInt64Value;
+}
+
+/**
+ * The holders of a collection (`nft_collection_holders`): `held` NFTs of it, 0 for a holder of the collection's newest set
+ * that is gone. A reader keeps the newest row per owner with `held > 0`.
+ */
+export interface NftCollectionHoldersRow {
+  issuer: string;
+  taxon_key: number;
+  owner: string;
+  held: number;
+  version: UInt64Value;
+}
+
+// -- Escrows (migration 013) -------------------------------------------------------------------------------------
+
+/**
+ * One row of `escrows`, rebuilt from `object_changes` by the aggregator: the newest `version` of an `escrow_id` is the
+ * escrow, and the row with `escrow_id = ''` is the **sentinel** that holds the escrowed total. An escrow row has
+ * `open_count` and `through_ledger` 0.
+ *
+ * `currency` is `XRP` or `XAH` with an `issuer` of `''` for the native currency, the 3-letter or 40-hex code of an issued
+ * token, the 48-hex issuance ID for an MPT (with its issuer). `amount` is in whole units, an MPT's raw integer units;
+ * `amount_drops` the drops of a native escrow, 0 for a token. `last_ledger` is the ledger of the escrow's newest
+ * `object_changes` row, `deleted` is 1 once it was finished, cancelled or removed.
+ *
+ * The sentinel: `open_count` is the number of open native escrows (`deleted = 0`, in the native currency), `amount_drops` the
+ * sum of their drops, `through_ledger` the ledger the job has processed up to; its other columns are empty or 0.
+ */
+export interface EscrowsRow {
+  escrow_id: string;
+  owner: string;
+  destination: string;
+  sequence: number | null;
+  currency: string;
+  issuer: string;
+  amount: string;
+  amount_drops: UInt64Value;
+  /** `Nullable(DateTime64(0, 'UTC'))`, unix seconds: a ledger time can be as late as 2136, past the last second of a `DateTime`. */
+  finish_after: UnixSeconds | null;
+  /** As `finish_after`. */
+  cancel_after: UnixSeconds | null;
+  has_condition: number;
+  created_ledger: number | null;
+  last_ledger: number;
+  deleted: number;
+  open_count: UInt64Value;
+  through_ledger: number;
+  version: UInt64Value;
+}
+
+// -- Issued tokens (migration 014) -------------------------------------------------------------------------------
+
+/**
+ * One row of `token_generations`, the state of the tokens job: a row is written for every change of a generation, and the
+ * newest `version` of a `generation` is its state. The live generation is the highest one whose newest row is `live`.
+ *
+ * `coverage_from` is the state coverage start the generation was built on and `head_ledger` the ledger its account pass reads
+ * at. `account_cursor` is the last account the pass finished (`''` before the first) and `pass_done` is 1 once the pass has
+ * finished. `through_ledger` is the ledger up to which every touch has been applied, `repair_from` the lowest ledger to apply
+ * again (0: none). `holders` is the number of distinct holders of all tokens at `holders_ledger`.
+ */
+export interface TokenGenerationsRow {
+  generation: number;
+  state: 'building' | 'live' | 'retired';
+  config_version: number;
+  coverage_from: number;
+  head_ledger: number;
+  account_cursor: string;
+  pass_done: number;
+  through_ledger: number;
+  repair_from: number;
+  holders: number;
+  holders_ledger: number;
+  started_at: UnixSecondsMs;
+  changed_at: UnixSecondsMs;
+  version: UInt64Value;
+}
+
+/**
+ * One row of `token_lines`: a trust line that counts, from the token's side. `balance` is the holder's (0 or above, exact
+ * decimal text, `balance_f` its `Float64` shadow) and `limit` the holder's limit. `frozen` and `authorized` are the issuer
+ * side's freeze and auth flags and `ledger_index` is the ledger of the line's newest state. `deleted = 1` is a tombstone:
+ * the line no longer counts. A reader names one `generation`, keeps the newest `version` of each (issuer, currency, holder)
+ * and drops tombstones after that. `version` is the writer's clock in milliseconds, at least one more than any version
+ * already written, as text or a number.
+ */
+export interface TokenLinesRow {
+  generation: number;
+  issuer: string;
+  currency: string;
+  holder: string;
+  balance: string;
+  balance_f: number;
+  limit: string;
+  frozen: number;
+  authorized: number;
+  ledger_index: number;
+  deleted: number;
+  version: UInt64Value;
+}
+
+/**
+ * One row of `tokens`, one per token and recompute. `code` is the currency as text (`''` when it has none), `supply` the exact
+ * sum of the holders' balances (`supply_f` its shadow) and `last_ledger` the newest `ledger_index` of the token's lines. The
+ * issuer's settings are those of its newest `account_states` row at the ledger the row was computed at: `issuer_flags` (the
+ * `Flags` of its AccountRoot), `transfer_rate` (0 when absent) and `issuer_ledger` (that row's ledger, 0 when the issuer has no
+ * row in the state tables). `domain` is the issuer's account domain (`''` when none); `listed`, `name` and `toml` come from the
+ * toml of that domain: `toml` is the JSON of the served fields of the matched currency entry, `''` when not listed.
+ * `deleted = 1`: no line counts any more.
+ */
+export interface TokensRow {
+  generation: number;
+  issuer: string;
+  currency: string;
+  code: string;
+  holders: number;
+  trust_lines: number;
+  supply: string;
+  supply_f: number;
+  last_ledger: number;
+  issuer_ledger: number;
+  issuer_flags: number;
+  transfer_rate: number;
+  domain: string;
+  listed: number;
+  name: string;
+  toml: string;
+  deleted: number;
+  version: UInt64Value;
+}
+
+// -- Supply (migration 015) --------------------------------------------------------------------------------------
+
+/**
+ * One snapshot of the native supply (`network_supply`), written by the aggregator's `supply` job in one insert; the newest
+ * `version` of a `ledger_index` is the snapshot, and a reader takes the newest snapshot with `newestSnapshot` (the newest
+ * `ledger_index`, then the highest `version` of it). All amounts are in drops. `ledger_index` and `close_time` are the snapshot
+ * ledger's; `started_at` is when the cycle began (the cadence reads it) and `computed_at` when the row was written.
+ *
+ * `burned` is 10^17 less `total_coins` on XRPL and the sum of `fee_total` up to the ledger on Xahau. `escrowed` and `escrow_count`
+ * are the open native escrows. `amm` is the drops in the pools (`null` on a network without AMM) and `amm_pools` the live pools with
+ * a native reserve above 0. `reserve_base` and `reserve_inc` are `null` when no reserve value is known at the ledger. `accounts` are
+ * the existing accounts, AMM pool accounts left out, and `owner_count` the sum of their `OwnerCount`. `minted_rewards`,
+ * `minted_import` and `minted_genesis` are every indexed mint up to the ledger, `null` on XRPL.
+ */
+export interface NetworkSupplyRow {
+  ledger_index: number;
+  close_time: UnixSeconds;
+  started_at: UnixSeconds;
+  computed_at: UnixSeconds;
+  total_coins: UInt64Value;
+  burned: UInt64Value;
+  escrowed: UInt64Value;
+  escrow_count: UInt64Value;
+  amm: UInt64Value | null;
+  amm_pools: number;
+  reserve_base: UInt64Value | null;
+  reserve_inc: UInt64Value | null;
+  accounts: UInt64Value;
+  owner_count: UInt64Value;
+  minted_rewards: UInt64Value | null;
+  minted_import: UInt64Value | null;
+  minted_genesis: UInt64Value | null;
+  version: UInt64Value;
+}
+
+// -- MPT aggregates (migration 017) -------------------------------------------------------------------------------
+
+/**
+ * The current state of an issuance (`mpt_issuances`), rebuilt by the aggregator's `mpt_state` job: a recompute writes a whole new row
+ * under a newer `version`, and readers keep the newest `version` of each issuance. `issuer` and `sequence` come from the ID.
+ * `state_known` is 0 when `mpt_issuance_states` has no row of it in the coverage, and then the state columns are at their
+ * defaults. `escrowed_amount` is the node's `LockedAmount`; `locked_amount` and `locked_holders` are what the issuer has locked.
+ * `metadata` is the decoded object as JSON, `''` when the hex is not a JSON object. The `created_*` are `null` when the
+ * `MPTokenIssuanceCreate` is outside the coverage. `last_ledger` is the newest touch this row has seen.
+ */
+export interface MptIssuancesRow {
+  mpt_issuance_id: string;
+  issuer: string;
+  sequence: number;
+  state_known: number;
+  flags: number;
+  asset_scale: number;
+  maximum_amount: UInt64Value | null;
+  outstanding_amount: UInt64Value;
+  escrowed_amount: UInt64Value;
+  locked_amount: UInt64Value;
+  locked_holders: number;
+  holders: number;
+  transfer_fee: number;
+  metadata_hex: string;
+  metadata: string;
+  metadata_conforms: number;
+  ticker: string;
+  name: string;
+  created_ledger: number | null;
+  created_time: UnixSeconds | null;
+  created_tx_hash: string | null;
+  last_ledger: number;
+  destroyed: number;
+  version: UInt64Value;
+}
+
+/**
+ * The current balance of a holder of an issuance (`mpt_holders`), recomputed per touched pair by the aggregator's `mpt_state` job.
+ * `deleted` is 1 when the `MPToken` was deleted (the holder opted out).
+ */
+export interface MptHoldersRow {
+  mpt_issuance_id: string;
+  holder: string;
+  amount: UInt64Value;
+  escrowed_amount: UInt64Value;
+  flags: number;
+  last_ledger: number;
+  deleted: number;
+  version: UInt64Value;
+}
+
+// -- Domain tomls (migration 012) --------------------------------------------------------------------------------
+
+/**
+ * Why a check of a domain's toml failed: the safe fetcher's reasons, `domain_invalid` and `toml_invalid` (the text was
+ * fetched but is not TOML). `''` for a check that succeeded.
+ */
+export type TomlReason =
+  | ''
+  | 'dns_error'
+  | 'connect_error'
+  | 'tls_error'
+  | 'timeout'
+  | 'http_status'
+  | 'too_large'
+  | 'redirect_rejected'
+  | 'blocked_address'
+  | 'domain_invalid'
+  | 'toml_invalid';
+
+/**
+ * One check of a domain's toml (`domain_tomls`, written by the tomls worker): the newest row of a domain, the largest
+ * `checked_at`, is its current word. `modified` to `principals` are what the toml says in effect: read at `fetched_at`,
+ * carried over by a transient failure within the grace, empty (and `fetched_at` null) otherwise.
+ */
+export interface DomainTomlsRow {
+  /** Lower case. */
+  domain: string;
+  toml_url: string;
+  status: 'ok' | 'failed';
+  reason: TomlReason;
+  /** The HTTP status when `reason` is `http_status`, else 0. */
+  status_code: number;
+  checked_at: UnixSecondsMs;
+  fetched_at: UnixSecondsMs | null;
+  next_check_at: UnixSeconds;
+  /** Consecutive failed checks. */
+  failures: number;
+  modified: UnixSeconds | null;
+  expires: UnixSeconds | null;
+  accounts: TomlAccount[];
+  currencies: TomlCurrency[];
+  validators: TomlValidator[];
+  principals: string[];
+}
+
 // -- Internal bookkeeping ----------------------------------------------------------------------------------------
 
 export interface IngestLogRow {
@@ -879,8 +1745,84 @@ export interface AggDirtyRow {
   created_at: UnixSecondsMs;
 }
 
+/** A ledger range whose NFTs must be rebuilt (`nft_dirty`, migration 011), as `agg_dirty` is for hours. */
+export interface NftDirtyRow {
+  from_ledger: number;
+  to_ledger: number;
+  created_at: UnixSecondsMs;
+}
+
 export interface SyncerLeaseRow {
   network: string;
   holder: string;
   heartbeat: UnixSecondsMs;
+}
+
+/**
+ * A row of `account_network_names` (`Table.AccountNetworkNames`, migration 009): the name of an address on this network,
+ * with the columns of `account_names` of the shared database. `added_at` defaults to the insert time.
+ */
+export interface AccountNetworkNamesRow {
+  address: string;
+  name: string;
+  /** 1: the row removes the network name of the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
+}
+
+/** The state of an export job (`export_jobs`, migration 010): one row per state, the highest `seq` of an id is the job. */
+export interface ExportJobsRow {
+  /** Unguessable: 32 hex digits of a random number. */
+  id: string;
+  /** 0 for the `queued` row of the api, then one more for every state the exporter writes. */
+  seq: number;
+  /** The hex SHA-256 of the API key that asked for the export, `''` when the api ran without keys. */
+  key_hash: string;
+  /** The list as the client named it: `/v2/…?…`. */
+  path: string;
+  format: string;
+  status: 'queued' | 'running' | 'done' | 'failed';
+  created: UnixSecondsMs;
+  /** When the job entered this state. */
+  at: UnixSecondsMs;
+  /** The data rows of the file (done), else 0. */
+  rows: UInt64Value;
+  /** The storage key of the file (done), else `''`. */
+  object: string;
+  /** Why the job failed (failed), else `''`. */
+  error: string;
+}
+
+// -- The shared database (ADR-0014, schema-shared/*.sql) ---------------------------------------------------------
+
+/** A row of `account_names` (`SharedTable.AccountNames`): `added_at` defaults to the insert time. */
+export interface AccountNamesRow {
+  address: string;
+  name: string;
+  /** 1: the row removes the name of the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
+}
+
+/** The labels the operator can put on an address: the values of the `Enum8` of `account_labels.label`. */
+export type AccountLabel = 'scam' | 'spam' | 'advisory';
+
+/**
+ * A row of `account_labels` (`SharedTable.AccountLabels`): `source` and `url` default to `''` (none), `added_at` to the
+ * insert time.
+ */
+export interface AccountLabelsRow {
+  address: string;
+  label: AccountLabel;
+  description: string;
+  /** Who says so; `''` when nobody is named. */
+  source: string;
+  /** Where it is said; `''` when there is no link. */
+  url: string;
+  /** 1: the row removes this label from the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
 }

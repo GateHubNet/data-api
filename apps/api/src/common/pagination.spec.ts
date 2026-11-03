@@ -6,6 +6,7 @@ import { RippleHttpError } from './errors';
 import {
   decodeMarker,
   encodeMarker,
+  keysetBranches,
   keysetClause,
   KeysetKey,
   KeyType,
@@ -235,6 +236,81 @@ describe('keysetClause', () => {
 describe('keysetClause with a null', () => {
   it('refuses a null: a tuple comparison does not compare it, the list that has one builds its own condition', () => {
     expect(() => keysetClause(KEYS, false, [null, 2])).toThrow(/null/);
+  });
+});
+
+describe('keysetBranches', () => {
+  const ACCOUNT_KEYS: KeysetKey[] = [
+    { column: 'issuer', type: 'String' },
+    { column: 'taxon_key', type: 'UInt32' },
+    { column: 'serial', type: 'UInt32' },
+    { column: 'nft_id', type: 'String' },
+  ];
+
+  it('has no clause on the first page', () => {
+    expect(keysetBranches(ACCOUNT_KEYS, false)).toEqual({ clause: '', params: {} });
+  });
+
+  it('is the branches of the tuple comparison, each a conjunction of plain comparisons on a prefix of the key', () => {
+    const { clause, params } = keysetBranches(ACCOUNT_KEYS, false, ['rIssuer', 7, 42, 'ABCD']);
+    expect(clause).toBe(
+      '((issuer > {k0:String}) OR (issuer = {k0:String} AND taxon_key > {k1:UInt32}) OR ' +
+        '(issuer = {k0:String} AND taxon_key = {k1:UInt32} AND serial > {k2:UInt32}) OR ' +
+        '(issuer = {k0:String} AND taxon_key = {k1:UInt32} AND serial = {k2:UInt32} AND nft_id > {k3:String}))',
+    );
+    expect(params).toEqual({ k0: 'rIssuer', k1: 7, k2: 42, k3: 'ABCD' });
+  });
+
+  it('compares the other way when descending, and prefixes the param names', () => {
+    const { clause, params } = keysetBranches(KEYS, true, [5, 2], 'a');
+    expect(clause).toBe('((ledger_index < {a0:UInt32}) OR (ledger_index = {a0:UInt32} AND tx_index < {a1:UInt16}))');
+    expect(params).toEqual({ a0: 5, a1: 2 });
+  });
+
+  it('works for a single column, and keeps strings out of the SQL text', () => {
+    const { clause } = keysetBranches([{ column: 'owner', type: 'String' }], false, ["x'; DROP TABLE t; --"]);
+    expect(clause).toBe('((owner > {k0:String}))');
+    expect(clause).not.toContain('DROP');
+  });
+
+  it('selects the rows after the marker, exactly as the tuple comparison does (evaluated over every key of a small grid)', () => {
+    const issuers = ['rA', 'rB', 'rC'];
+    const rows: [string, number, number, string][] = [];
+    for (const issuer of issuers)
+      for (const taxon of [0, 1])
+        for (const serial of [1, 2]) for (const id of ['A', 'B']) rows.push([issuer, taxon, serial, id]);
+    const before = (a: unknown[], b: unknown[]): number => {
+      for (let i = 0; i < a.length; i++)
+        if (a[i] !== b[i]) return (a[i] as string | number) < (b[i] as string | number) ? -1 : 1;
+      return 0;
+    };
+    for (const descending of [false, true]) {
+      for (const marker of rows) {
+        const { clause, params } = keysetBranches(ACCOUNT_KEYS, descending, marker);
+        // the clause as JavaScript over the columns of a row: the placeholders are the values, `=` is `===`
+        const js = clause
+          .replace(/\{(k\d):\w+\}/g, (_m, name: string) => JSON.stringify(params[name]))
+          .replace(/ = /g, ' === ')
+          .replace(/ AND /g, ' && ')
+          .replace(/ OR /g, ' || ');
+        const matches = new Function('issuer', 'taxon_key', 'serial', 'nft_id', `return ${js};`) as (
+          ...row: unknown[]
+        ) => boolean;
+        for (const row of rows) {
+          expect([descending, marker, row, matches(...row)]).toEqual([
+            descending,
+            marker,
+            row,
+            descending ? before(row, marker) < 0 : before(row, marker) > 0,
+          ]);
+        }
+      }
+    }
+  });
+
+  it('refuses values that do not fit the keys, and a null, instead of silently paging from the start', () => {
+    expect(() => keysetBranches(KEYS, false, [1])).toThrow(/2 columns but 1 value/);
+    expect(() => keysetBranches(KEYS, false, [1, null])).toThrow(/cannot compare a null/);
   });
 });
 

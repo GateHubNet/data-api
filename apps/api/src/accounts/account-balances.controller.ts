@@ -22,11 +22,14 @@ interface AccountBalancesBody {
 }
 
 /**
- * `GET /v2/accounts/:address/balances` (`api/routes/accountBalances.js`): the balances of an account on the live node.
+ * `GET /v2/accounts/:address/balances` (`api/routes/accountBalances.js`): the balances of an account at a historical
+ * ledger from the account state history in ClickHouse, or at the current ledger from the live node (ADR-0015).
  *
  * The checks come in the order of the original: the address (400 `invalid ripple address`), the date (400 `invalid date
- * format`), the limit (400 `invalid limit`). `ledger_index` (alias `ledger`), `ledger_hash` and `date` (alias
- * `close_time`) choose the ledger, `validated` when none does; see `AccountBalancesService` for the rest.
+ * format`), the limit (400 `invalid limit`). `ledger_hash`, `date` (alias `close_time`) and a numeric `ledger_index`
+ * (alias `ledger`) name a historical ledger; none, or `validated`, `closed`, `current`, is the node's; see
+ * `AccountBalancesService` for the rest. Only a live answer carries the `Cache-Control` of the live cache: a historical
+ * one keeps the global header of `/v2`, as the other routes that read ClickHouse.
  */
 @RippleController('v2/accounts')
 export class AccountBalancesController {
@@ -41,11 +44,13 @@ export class AccountBalancesController {
   @ApiOperation({
     summary: 'Get the balances of an account',
     description:
-      'The balances of the account on a ledger of the live node, the native one first (it has no `counterparty`), then ' +
-      'the trust lines in the order of the node. The ledger is chosen by `ledger_index`, `ledger_hash` or `date` (the ' +
-      'last ledger closed at or before it, answered with its `close_time`); without any of them it is the newest ' +
-      'validated one. `currency` keeps the balances of one currency, `counterparty` the trust lines with one account. ' +
-      '`limit=all` reads every trust line. `format=csv` gives the balances as a CSV file.',
+      'The balances of the account at a ledger, the native one first (it has no `counterparty`), then the trust lines. ' +
+      'A ledger named by `ledger_hash`, `date` (the last ledger closed at or before it) or a numeric `ledger_index` is ' +
+      'read from the indexed state history, with the trust lines ordered by (counterparty, currency), and answered with ' +
+      'its `close_time`; without any of them (or with `validated`, `closed`, `current`) the balances come from the live ' +
+      "node, the newest validated ledger by default, with the trust lines in the node's order. `currency` keeps the " +
+      'balances of one currency, `counterparty` the trust lines with one account. `limit=all` reads every trust line. ' +
+      '`format=csv` gives the balances as a CSV file.',
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })
   @ApiQuery({ name: 'ledger_index', required: false, description: 'A ledger number. Alias: `ledger`.' })
@@ -80,8 +85,8 @@ export class AccountBalancesController {
       limit,
     });
 
-    // private and no older than the live cache, in place of the global header of /v2 (R108)
-    res.setHeader('Cache-Control', liveCacheControl(this.config.liveCacheTtlMs));
+    // a live answer: private and no older than the live cache, in place of the global header of /v2 (R108)
+    if (found.live) res.setHeader('Cache-Control', liveCacheControl(this.config.liveCacheTtlMs));
     return {
       result: 'success',
       ledger_index: found.ledgerIndex,

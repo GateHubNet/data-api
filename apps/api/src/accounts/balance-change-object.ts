@@ -1,4 +1,4 @@
-import { BalanceChangesRow } from '@gatehub/data-api-shared';
+import { BalanceChangesRow, isMptIssuanceId } from '@gatehub/data-api-shared';
 import { fmtTime } from '../common/format';
 
 /**
@@ -6,7 +6,8 @@ import { fmtTime } from '../common/format';
  * builds). The keys come in the order of the original: the columns of HBase's `d` family, then those of the `f` family,
  * each sorted by name. A field the change does not have is left out: the fee has no node, the native currency no
  * counterparty, a change of most transaction types no change type, and only the change of a party to an escrow or a
- * payment channel has the `escrow_*` and `paychannel_*` fields. The account and the client are stripped.
+ * payment channel has the `escrow_*` and `paychannel_*` fields. The account and the client are stripped. An MPT change (no
+ * original has one) ends with `mpt_issuance_id`: its `currency` is the issuance ID and its amounts are the ledger's integer units.
  *
  * `paychannel_balance_change` is not served (R61): the parser computes it and the table keeps it, but the original's
  * `prepareParsedData` never wrote it to HBase, so data.ripple.com never returned it. The other three
@@ -24,7 +25,7 @@ export interface BalanceChangeObject {
   paychannel_fund_change?: string;
   paychannel_fund_final_balance?: string;
   tx_index: number;
-  /** `transaction_cost`, `payment_source`, `payment_destination`, `exchange`, `intermediary`, `escrow_*`, `paychannel_*`. */
+  /** `transaction_cost`, `payment_source`, `payment_destination`, `exchange`, `intermediary`, `escrow_*`, `paychannel_*`, `clawback`. */
   change_type?: string;
   /** The other side of the trust line; the native currency has none. */
   counterparty?: string;
@@ -35,6 +36,8 @@ export interface BalanceChangeObject {
   ledger_index: number;
   paychannel_counterparty?: string;
   tx_hash: string;
+  /** The `currency` of an MPT change, its 48 hex digits; no other change has it. */
+  mpt_issuance_id?: string;
 }
 
 /**
@@ -105,5 +108,6 @@ export function toBalanceChangeObject(row: StoredBalanceChange): BalanceChangeOb
     ledger_index: row.ledger_index,
     ...(row.paychannel_counterparty !== null && { paychannel_counterparty: row.paychannel_counterparty }),
     tx_hash: row.tx_hash,
+    ...(isMptIssuanceId(row.currency) && { mpt_issuance_id: row.currency }),
   };
 }

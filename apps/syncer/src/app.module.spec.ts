@@ -41,7 +41,8 @@ async function boot(
   for (const key of Object.keys(process.env)) {
     if (key.startsWith('GH_') && key !== 'GH_ENV') delete process.env[key];
   }
-  Object.assign(process.env, env);
+  // Required, and nothing here connects: the ClickHouse service is stubbed.
+  Object.assign(process.env, { GH_CLICKHOUSE_URL: 'http://127.0.0.1:1' }, env);
   try {
     let booted: Booted | undefined;
     await jest.isolateModulesAsync(async () => {
@@ -68,7 +69,7 @@ async function boot(
       const { FeeStatsPoller } = await import('./fees/fee-stats-poller');
       const { ShutdownSignals } = await import('@gatehub/data-api-shared');
       const { AppModule } = await import('./app.module');
-      const clickhouse = { ping: jest.fn(async () => pingOk), onModuleDestroy: jest.fn() };
+      const clickhouse = { ping: jest.fn(async () => pingOk), onApplicationShutdown: jest.fn() };
       const node = {
         start: jest.fn(),
         stop: jest.fn(async () => undefined),

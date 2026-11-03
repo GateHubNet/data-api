@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { hasOwn, REFERENCE, referenceChecks } from '../../test/support/api-reference-check';
 import * as amendmentObject from './amendment-object';
 import {
   AMENDMENT_DETAIL_KEYS,
@@ -13,6 +13,8 @@ import {
   ROUND_POINT_KEYS,
   UNL_VOTE_KEYS,
 } from './amendment-object';
+import * as countriesObject from './countries-object';
+import { COUNTRIES_KEYS, COUNTRY_KEYS, UNKNOWN_KEYS } from './countries-object';
 import * as summaryObject from './summary-object';
 import { PUBLISHER_KEYS, SUMMARY_KEYS } from './summary-object';
 import * as validationRowObject from './validation-row-object';
@@ -20,6 +22,7 @@ import { VALIDATION_ROW_KEYS, VALIDATIONS_BODY_KEYS } from './validation-row-obj
 import * as validatorObject from './validator-object';
 import {
   AGREEMENT_KEYS,
+  CURRENCY_KEYS,
   DAILY_KEYS,
   DETAIL_AMENDMENT_VOTES_KEYS,
   DETAIL_TAIL_KEYS,
@@ -28,6 +31,8 @@ import {
   LIST_BODY_KEYS,
   MANIFEST_KEYS,
   ROW_AMENDMENT_VOTES_KEYS,
+  TOML_DETAIL_KEYS,
+  TOML_KEYS,
   VALIDATOR_ROW_KEYS,
   VOTE_ENTRY_KEYS,
   YES_ENTRY_KEYS,
@@ -45,14 +50,7 @@ import {
  * fit a line.
  */
 
-const REFERENCE = join(__dirname, '..', '..', '..', '..', 'docs', 'api-reference.md');
-const SECTION = 'Validators and amendments';
-
-/**
- * Whether `key` is an own key of `object`: `in` would take a key of the prototype (`constructor`, `toString`) for one of the
- * map. (`Object.hasOwn` is ES2022, past the ES2021 library of the repo's TypeScript.)
- */
-const hasOwn = (object: object, key: string): boolean => Object.prototype.hasOwnProperty.call(object, key);
+const HEADING = '## Validators and amendments';
 
 /** The object as the reference names it on its line, and the constant that holds its keys. One entry for each constant of the routes. */
 const OBJECTS: Record<string, readonly string[]> = {
@@ -62,6 +60,13 @@ const OBJECTS: Record<string, readonly string[]> = {
   // GET /v2/network/validators and GET /v2/network/validators/{key}
   'the validators answer': LIST_BODY_KEYS,
   'a validator row': VALIDATOR_ROW_KEYS,
+  'toml on a validator row': TOML_KEYS,
+  'toml on the validator answer': TOML_DETAIL_KEYS,
+  'a toml currency': CURRENCY_KEYS,
+  // GET /v2/network/validators/countries
+  'the countries answer': COUNTRIES_KEYS,
+  'a country': COUNTRY_KEYS,
+  unknown: UNKNOWN_KEYS,
   'an agreement window': AGREEMENT_KEYS,
   domain_verification: DOMAIN_VERIFICATION_KEYS,
   fee_vote: FEE_VOTE_KEYS,
@@ -88,51 +93,7 @@ const OBJECTS: Record<string, readonly string[]> = {
   'a history event': HISTORY_KEYS,
 };
 
-/** The section of the reference, from its `##` heading to the next one. */
-function sectionOf(markdown: string): string {
-  const heading = `\n## ${SECTION}\n`;
-  const start = markdown.indexOf(heading);
-  if (start < 0) throw new Error(`docs/api-reference.md has no "${SECTION}" section`);
-  const rest = markdown.slice(start + 1);
-  const end = rest.indexOf('\n## ', 1);
-  return end < 0 ? rest : rest.slice(0, end);
-}
-
-interface KeysLine {
-  object: string;
-  /** The keys as written, with the `?` of an optional one stripped. */
-  keys: string[];
-}
-
-/** Every `Keys of <object>, in order: ...` line of the section, in the order they stand. */
-function keyLines(markdown: string): KeysLine[] {
-  return [...sectionOf(markdown).matchAll(/^Keys of (.+?), in order: (.+)$/gm)].map(([, object, list]) => ({
-    object,
-    keys: list
-      .replace(/`/g, '')
-      .replace(/\.\s*$/, '')
-      .split(',')
-      .map((key) => key.trim().replace(/\?$/, '')),
-  }));
-}
-
-/** What is wrong with the lines of a reference, as sentences: a line that drifted, one that is missing, one nothing owns, one written twice. */
-function problemsOf(markdown: string): string[] {
-  const lines = keyLines(markdown);
-  const problems: string[] = [];
-  for (const [object, constant] of Object.entries(OBJECTS)) {
-    const own = lines.filter((line) => line.object === object);
-    if (own.length === 0) problems.push(`missing: no line for ${object}`);
-    else if (own.length > 1) problems.push(`twice: ${own.length} lines for ${object}`);
-    else if (JSON.stringify(own[0].keys) !== JSON.stringify(constant)) {
-      problems.push(`drifted: ${object} is written ${own[0].keys.join(', ')}; the code serves ${constant.join(', ')}`);
-    }
-  }
-  for (const { object } of lines) {
-    if (!hasOwn(OBJECTS, object)) problems.push(`unknown: a line for "${object}", which the map does not name`);
-  }
-  return problems;
-}
+const { keyLines, problemsOf, lineOf: lineIn } = referenceChecks(HEADING, OBJECTS);
 
 describe('the "Validators and amendments" section of docs/api-reference.md', () => {
   const markdown = readFileSync(REFERENCE, 'utf8');
@@ -150,9 +111,9 @@ describe('the "Validators and amendments" section of docs/api-reference.md', () 
     expect(names).toHaveLength(Object.keys(OBJECTS).length);
   });
 
-  it('is checked against every *_KEYS constant of the four objects modules: none is left out of the map', () => {
-    const exported = [summaryObject, validatorObject, amendmentObject, validationRowObject].flatMap((module) =>
-      Object.entries(module).filter(([name]) => name.endsWith('_KEYS')),
+  it('is checked against every *_KEYS constant of the five objects modules: none is left out of the map', () => {
+    const exported = [summaryObject, validatorObject, amendmentObject, validationRowObject, countriesObject].flatMap(
+      (module) => Object.entries(module).filter(([name]) => name.endsWith('_KEYS')),
     );
     expect(exported.length).toBeGreaterThanOrEqual(26);
     const mapped = new Set<unknown>(Object.values(OBJECTS));
@@ -166,13 +127,7 @@ describe('the "Validators and amendments" section of docs/api-reference.md', () 
   });
 
   describe('the check itself', () => {
-    const lineOf = (object: string): string => {
-      const found = /^Keys of .+?, in order: .+$/gm;
-      for (const [line] of sectionOf(markdown).matchAll(found)) {
-        if (line.startsWith(`Keys of ${object}, in order:`)) return line;
-      }
-      throw new Error(`no line for ${object}`);
-    };
+    const lineOf = (object: string): string => lineIn(markdown, object);
 
     it('finds a line whose keys swapped places', () => {
       const line = lineOf('a publisher');
@@ -212,7 +167,7 @@ describe('the "Validators and amendments" section of docs/api-reference.md', () 
 
     it('does not read a line of another section', () => {
       expect(() => keyLines(markdown.replace('\n## Validators and amendments\n', '\n## Other\n'))).toThrow(
-        'has no "Validators and amendments" section',
+        'has no "## Validators and amendments" heading',
       );
       const outside = markdown.replace('\n## Stats\n', '\n## Stats\n\nKeys of a ghost, in order: `a, b`.\n');
       expect(outside).not.toBe(markdown);

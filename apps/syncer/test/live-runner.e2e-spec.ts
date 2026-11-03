@@ -28,22 +28,51 @@ import {
 } from '../src/ingest/live-runner';
 import { LedgerNotValidatedError } from '../src/ingest/rpc-ledger-source';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { ammTemplate, range, syntheticChain, SyntheticLedger } from './synthetic-chain';
+import {
+  ammTemplate,
+  mintTemplate,
+  mptTemplate,
+  nftTemplate,
+  objectTemplate,
+  range,
+  syntheticChain,
+  syntheticHash,
+  SyntheticLedger,
+} from './synthetic-chain';
 
 /** `L(1)` .. `L(30)` = 9999986 .. 10000015: the chain crosses the partition boundary at ledger 10,000,000. */
 const BASE = 9_999_985;
 const L = (i: number): number => BASE + i;
 const CHAIN = syntheticChain(L(1), 30);
+/** The same indexes under other hashes: what a node serves after its network was reset. */
+const RESET_CHAIN = syntheticChain(L(1), 30, { salt: 'reset' });
 
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 
 /**
  * Tables whose sorting key holds the ledger index, so that their row count is exact until a merge. Every synthetic
  * ledger carries the template's transactions, so `tx_by_hash` (ORDER BY hash) collapses them at any merge: it is left out.
+ * So is `account_domains` (ORDER BY account): the rows of one account collapse within an insert (`optimize_on_insert`)
+ * and at the merges, and the ledgers repeat the template's accounts (spec decision 7). `domainsUpTo` and `expectRows`
+ * compare the newest row of each account instead.
  */
-const COUNTED_TABLES = LEDGER_KEYED_TABLES.map((t) => t.table).filter((t) => t !== Table.TxByHash);
+const COUNTED_TABLES = LEDGER_KEYED_TABLES.map((t) => t.table).filter(
+  (t) => t !== Table.TxByHash && t !== Table.AccountDomains,
+);
 
 type Counts = Record<string, number>;
+
+/** The newest `account_domains` row (its `version`, decimal text) of each account the ledgers `L(1)` .. `last` of `chain` write. */
+function domainsUpTo(last: number, chain: SyntheticLedger[] = CHAIN): Map<string, string> {
+  const newest = new Map<string, bigint>();
+  for (const { index, raw } of chain) {
+    if (index > last) continue;
+    for (const { account, version } of buildLedgerRows(raw, ctx).accountDomains) {
+      if (BigInt(version) > (newest.get(account) ?? -1n)) newest.set(account, BigInt(version));
+    }
+  }
+  return new Map([...newest].map(([account, version]) => [account, version.toString()]));
+}
 
 /** What the counted tables hold when exactly the ledgers `L(1)` .. `last` of `chain` are committed. */
 function expectedCounts(last: number, chain: SyntheticLedger[] = CHAIN): Counts {
@@ -69,7 +98,7 @@ class TestSource implements LedgerSource {
   /** Index -> how many more fetches of it fail with `LedgerNotValidatedError`. */
   readonly notValidated = new Map<number, number>();
   available: number;
-  private readonly byIndex: Map<number, RawLedger>;
+  private byIndex: Map<number, RawLedger>;
 
   constructor(
     public head: number,
@@ -93,6 +122,11 @@ class TestSource implements LedgerSource {
     const ledger = this.byIndex.get(index);
     if (!ledger || index > this.available) throw new LedgerNotAvailableError(index);
     return ledger;
+  }
+
+  /** The node changes chain under a running runner: it serves `chain` from now on (set `head` and `available` too). */
+  useChain(chain: SyntheticLedger[]): void {
+    this.byIndex = new Map(chain.map((l) => [l.index, l.raw]));
   }
 
   /** How often `index` was fetched. */
@@ -167,7 +201,7 @@ describe('LiveRunner (e2e)', () => {
   });
 
   afterAll(async () => {
-    for (const svc of services) await svc.onModuleDestroy();
+    for (const svc of services) await svc.close();
     await clickhouse?.container.stop();
   });
 
@@ -225,6 +259,20 @@ describe('LiveRunner (e2e)', () => {
 
   async function tableCounts(svc: ClickHouseService): Promise<Counts> {
     return Object.fromEntries(await Promise.all(COUNTED_TABLES.map(async (t) => [t, await count(svc, t)] as const)));
+  }
+
+  /** The newest `account_domains` row of each account the table holds. */
+  async function storedDomains(svc: ClickHouseService): Promise<Map<string, string>> {
+    const rows = await svc.query<{ account: string; version: string }>(
+      `SELECT account, toString(max(version)) AS version FROM ${Table.AccountDomains} GROUP BY account`,
+    );
+    return new Map(rows.map((r) => [r.account, r.version]));
+  }
+
+  /** The counted tables hold exactly the rows of the ledgers `L(1)` .. `last`, and `account_domains` its newest row per account. */
+  async function expectRows(svc: ClickHouseService, last: number, chain: SyntheticLedger[] = CHAIN): Promise<void> {
+    expect(await tableCounts(svc)).toEqual(expectedCounts(last, chain));
+    expect(await storedDomains(svc)).toEqual(domainsUpTo(last, chain));
   }
 
   /** `count() == uniqExact(ledger_index, tx_index)` on `transactions`: no transaction row is there twice. */
@@ -372,7 +420,7 @@ describe('LiveRunner (e2e)', () => {
     ]);
 
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
-    expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
+    await expectRows(svc, L(30));
     await expectNoDuplicateTransactions(svc);
     // Every ledger was fetched exactly once, and nothing below the start or above the head.
     expect([...source.fetches].sort((a, b) => a - b)).toEqual(range(L(1), L(30)));
@@ -544,8 +592,11 @@ describe('LiveRunner (e2e)', () => {
     orphanTransactions = 0;
     onFailure?: () => void;
 
-    constructor(private readonly svc: ClickHouseService) {
-      super(svc, ctx);
+    constructor(
+      private readonly svc: ClickHouseService,
+      private readonly parse: typeof ctx = ctx,
+    ) {
+      super(svc, parse);
     }
 
     override async write(ledgers: RawLedger[]): Promise<LedgerWriteResult> {
@@ -558,7 +609,7 @@ describe('LiveRunner (e2e)', () => {
       };
       try {
         // Same runId: these inserts are this writer's, and recovery must wait for exactly them.
-        return await new LedgerWriter(commitFails, ctx, { runId: this.runId }).write(ledgers);
+        return await new LedgerWriter(commitFails, this.parse, { runId: this.runId }).write(ledgers);
       } catch (err) {
         const first = Math.min(...ledgers.map((l) => l.header.ledger_index));
         this.orphanTransactions = await count(this.svc, Table.Transactions, `ledger_index >= ${first}`);
@@ -579,7 +630,7 @@ describe('LiveRunner (e2e)', () => {
     expect(writer.calls).toBe(2); // the failed writer is never used again: a new runId carries on
     await expectNoDuplicateTransactions(svc);
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
-    expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
+    await expectRows(svc, L(30));
     expect(runner.status()).toMatchObject({ state: 'live', checkpoint: L(30), lag: 0 });
     expect(runner.status().recovering).toBeUndefined();
     expect(logger.lines).toContainEqual(
@@ -620,6 +671,8 @@ describe('LiveRunner (e2e)', () => {
       ]) {
         expect([table, counts[table] > 0]).toEqual([table, true]);
       }
+      // and the accounts of the pools' transactions with a Domain: account_domains has rows to compare
+      expect(domainsUpTo(L(12), AMM_CHAIN).size).toBeGreaterThan(0);
     });
 
     it('writes the AMM rows with the ledgers and adds the pools it could not classify to the counter', async () => {
@@ -631,7 +684,7 @@ describe('LiveRunner (e2e)', () => {
       await within(runner.runOnce(), 20_000, 'Catching up 12 AMM ledgers');
 
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
-      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), AMM_CHAIN));
+      await expectRows(svc, L(12), AMM_CHAIN);
       expect(await unclassified(metrics)).toBe(before + 12 * UNCLASSIFIED_PER_LEDGER);
     });
 
@@ -659,7 +712,7 @@ describe('LiveRunner (e2e)', () => {
 
       expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
-      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), AMM_CHAIN));
+      await expectRows(svc, L(12), AMM_CHAIN);
       expect(await unclassified(metrics)).toBe(before + 12 * UNCLASSIFIED_PER_LEDGER);
     });
 
@@ -675,6 +728,290 @@ describe('LiveRunner (e2e)', () => {
 
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(9)));
       expect(await unclassified(metrics)).toBe(before + 9 * UNCLASSIFIED_PER_LEDGER);
+    });
+  });
+
+  describe('NFT rows and syncer_nft_skipped_total', () => {
+    /** Offers per ledger with an MPT amount, which the parser skips (see `nftTemplate`). */
+    const SKIPPED_PER_LEDGER = 2;
+    // Every ledger: the transactions of a recorded mainnet ledger (mints and offers: rows in the NFT tables) and 2 offers
+    // that give no row.
+    const NFT_CHAIN = syntheticChain(L(1), 12, { template: nftTemplate(SKIPPED_PER_LEDGER) });
+
+    /** The counter now. It is process-wide, so a test compares it with its value before. */
+    const skipped = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.nftSkippedTotal.get()).values[0]?.value ?? 0;
+
+    it('the chain has rows for the NFT tables and two skipped events per ledger', () => {
+      const total = NFT_CHAIN.reduce((sum, l) => sum + buildLedgerRows(l.raw, ctx).diagnostics.nftSkipped, 0);
+      expect(total).toBe(12 * SKIPPED_PER_LEDGER);
+      const counts = expectedCounts(L(12), NFT_CHAIN);
+      for (const table of [Table.NftEvents, Table.AccountNftEvents, Table.CollectionNftEvents, Table.NftTouches]) {
+        expect([table, counts[table] > 0]).toEqual([table, true]);
+      }
+      expect(domainsUpTo(L(12), NFT_CHAIN).size).toBeGreaterThan(0);
+    });
+
+    it('writes the NFT rows with the ledgers and adds the events it skipped to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), NFT_CHAIN), { metrics });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 NFT ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      await expectRows(svc, L(12), NFT_CHAIN);
+      expect(await skipped(metrics)).toBe(before + 12 * SKIPPED_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without NFT skips', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await skipped(metrics)).toBe(before);
+    });
+
+    it('counts a batch once: not for a write that failed and was recovered, only for the one that committed', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+      // The second batch fails after its child rows went in; recovery deletes them and writes the batch again.
+      const writer = new FailOnSecondWrite(svc);
+      const { runner } = makeRunner(svc, new TestSource(L(12), NFT_CHAIN), { metrics, writer });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 NFT ledgers through a failed write');
+
+      expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      await expectRows(svc, L(12), NFT_CHAIN);
+      expect(await skipped(metrics)).toBe(before + 12 * SKIPPED_PER_LEDGER);
+    });
+  });
+
+  describe('object rows and syncer_objects_unclassified_total', () => {
+    /** Changes per ledger that no event expects: the rows have the event `update` (see `objectTemplate`). */
+    const UPDATES_PER_LEDGER = 2;
+    // Every ledger: a recorded EscrowCreate, CheckCreate, PaymentChannelCreate and DelegateSet (rows in both object tables)
+    // and 2 escrow changes that no event expects.
+    const OBJECT_CHAIN = syntheticChain(L(1), 12, { template: objectTemplate(UPDATES_PER_LEDGER) });
+
+    /** The counter now. It is process-wide, so a test compares it with its value before. */
+    const unclassifiedObjects = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.objectsUnclassifiedTotal.get()).values[0]?.value ?? 0;
+
+    it('the chain has rows for both object tables and two unclassified changes per ledger', () => {
+      const total = OBJECT_CHAIN.reduce(
+        (sum, l) => sum + buildLedgerRows(l.raw, ctx).diagnostics.objectsUnclassified,
+        0,
+      );
+      expect(total).toBe(12 * UPDATES_PER_LEDGER);
+      const counts = expectedCounts(L(12), OBJECT_CHAIN);
+      for (const table of [Table.ObjectChanges, Table.AccountObjectChanges]) {
+        expect([table, counts[table] > 0]).toEqual([table, true]);
+      }
+    });
+
+    it('writes the object rows with the ledgers and adds the changes it could give no event to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), OBJECT_CHAIN), { metrics });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 object ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      await expectRows(svc, L(12), OBJECT_CHAIN);
+      expect(await unclassifiedObjects(metrics)).toBe(before + 12 * UPDATES_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without object changes that no event expects', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await unclassifiedObjects(metrics)).toBe(before);
+    });
+
+    it('counts a batch once: not for a write that failed and was recovered, only for the one that committed', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+      // The second batch fails after its child rows went in; recovery deletes them and writes the batch again.
+      const writer = new FailOnSecondWrite(svc);
+      const { runner } = makeRunner(svc, new TestSource(L(12), OBJECT_CHAIN), { metrics, writer });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 object ledgers through a failed write');
+
+      expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      await expectRows(svc, L(12), OBJECT_CHAIN);
+      expect(await unclassifiedObjects(metrics)).toBe(before + 12 * UPDATES_PER_LEDGER);
+    });
+  });
+
+  describe('mint rows and syncer_parser_anomalies_total', () => {
+    const xahau = parseContextFor(getNetworkProfile('xahau'));
+    /** Successful Imports per ledger whose minted drops come out below 0 and are stored as 0 (see `mintTemplate`). */
+    const CLAMPED_PER_LEDGER = 2;
+    // Every ledger: a recorded Import, ClaimReward and GenesisMint of 8 entries (rows in all three mint tables) and 2
+    // clamped Imports.
+    const MINT_CHAIN = syntheticChain(L(1), 12, { template: mintTemplate(CLAMPED_PER_LEDGER) });
+
+    /** The counter now, for the one kind. It is process-wide, so a test compares it with its value before. */
+    const clamped = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.parserAnomaliesTotal.get()).values.find((v) => v.labels.kind === 'import_minted_negative')
+        ?.value ?? 0;
+
+    const MINT_TABLES: ReadonlyArray<[Table, 'genesisMints' | 'imports' | 'rewardClaims']> = [
+      [Table.GenesisMints, 'genesisMints'],
+      [Table.Imports, 'imports'],
+      [Table.RewardClaims, 'rewardClaims'],
+    ];
+
+    /** The rows of the three mint tables that writing the ledgers `L(1)` .. `last` of the chain gives. */
+    const expectedMint = (last: number): Counts =>
+      Object.fromEntries(
+        MINT_TABLES.map(([table, key]) => [
+          table,
+          MINT_CHAIN.filter((l) => l.index <= last).reduce(
+            (sum, l) => sum + buildLedgerRows(l.raw, xahau)[key].length,
+            0,
+          ),
+        ]),
+      );
+    const storedMint = async (svc: ClickHouseService): Promise<Counts> =>
+      Object.fromEntries(
+        await Promise.all(MINT_TABLES.map(async ([table]) => [table, await count(svc, table)] as const)),
+      );
+
+    it('the chain has rows for all three mint tables and two clamped Imports per ledger', () => {
+      const total = MINT_CHAIN.reduce(
+        (sum, l) => sum + buildLedgerRows(l.raw, xahau).diagnostics.importMintedNegative,
+        0,
+      );
+      expect(total).toBe(12 * CLAMPED_PER_LEDGER);
+      // per ledger: 1 recorded Import and the 2 clamped ones, 1 ClaimReward, 8 mints
+      expect(expectedMint(L(12))).toEqual({ genesis_mints: 12 * 8, imports: 12 * 3, reward_claims: 12 });
+    });
+
+    it('writes the mint rows with the ledgers and adds the clamped Imports to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await clamped(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), MINT_CHAIN), {
+        metrics,
+        writer: new LedgerWriter(svc, xahau),
+      });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 Xahau mint ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await storedMint(svc)).toEqual(expectedMint(L(12)));
+      expect(await clamped(metrics)).toBe(before + 12 * CLAMPED_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without Xahau mints', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await clamped(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await storedMint(svc)).toEqual({ genesis_mints: 0, imports: 0, reward_claims: 0 });
+      expect(await clamped(metrics)).toBe(before);
+    });
+
+    it('counts a batch once: not for a write that failed and was recovered, only for the one that committed', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await clamped(metrics);
+      // The second batch fails after its child rows went in; recovery deletes them and writes the batch again.
+      const writer = new FailOnSecondWrite(svc, xahau);
+      const { runner } = makeRunner(svc, new TestSource(L(12), MINT_CHAIN), { metrics, writer });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 Xahau mint ledgers through a failed write');
+
+      expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await storedMint(svc)).toEqual(expectedMint(L(12)));
+      expect(await clamped(metrics)).toBe(before + 12 * CLAMPED_PER_LEDGER);
+    });
+  });
+
+  describe('MPT rows and syncer_parser_anomalies_total', () => {
+    /** Transactions per ledger whose MPT amount cannot be read (see `mptTemplate`). */
+    const UNREADABLE_PER_LEDGER = 2;
+    // Every ledger: a recorded MPTokenAuthorize and a Payment with a transfer fee (rows in all five MPT tables) and 2 unreadable tokens.
+    const MPT_CHAIN = syntheticChain(L(1), 12, { template: mptTemplate(UNREADABLE_PER_LEDGER) });
+
+    /** The counter now, for the one kind. It is process-wide, so a test compares it with its value before. */
+    const unreadable = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.parserAnomaliesTotal.get()).values.find((v) => v.labels.kind === 'mpt_unreadable')?.value ?? 0;
+
+    const MPT_TABLES: ReadonlyArray<
+      [Table, 'mptIssuanceStates' | 'mptHolderStates' | 'mptTouches' | 'mptTransfers' | 'mptIssuanceTransfers']
+    > = [
+      [Table.MptIssuanceStates, 'mptIssuanceStates'],
+      [Table.MptHolderStates, 'mptHolderStates'],
+      [Table.MptTouches, 'mptTouches'],
+      [Table.MptTransfers, 'mptTransfers'],
+      [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+    ];
+
+    /** The rows of the five MPT tables that writing the ledgers `L(1)` .. `last` of the chain gives. */
+    const expectedMpt = (last: number): Counts =>
+      Object.fromEntries(
+        MPT_TABLES.map(([table, key]) => [
+          table,
+          MPT_CHAIN.filter((l) => l.index <= last).reduce((sum, l) => sum + buildLedgerRows(l.raw, ctx)[key].length, 0),
+        ]),
+      );
+    const storedMpt = async (svc: ClickHouseService): Promise<Counts> =>
+      Object.fromEntries(
+        await Promise.all(MPT_TABLES.map(async ([table]) => [table, await count(svc, table)] as const)),
+      );
+
+    it('the chain has rows for all five MPT tables and two unreadable tokens per ledger', () => {
+      const total = MPT_CHAIN.reduce((sum, l) => sum + buildLedgerRows(l.raw, ctx).diagnostics.mptAnomalies, 0);
+      expect(total).toBe(12 * UNREADABLE_PER_LEDGER);
+      for (const value of Object.values(expectedMpt(L(12)))) expect(value).toBeGreaterThan(0);
+    });
+
+    it('writes the MPT rows with the ledgers and adds the unreadable amounts to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unreadable(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), MPT_CHAIN), { metrics });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 MPT ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await storedMpt(svc)).toEqual(expectedMpt(L(12)));
+      expect(await unreadable(metrics)).toBe(before + 12 * UNREADABLE_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without MPTs', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unreadable(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await storedMpt(svc)).toEqual(Object.fromEntries(MPT_TABLES.map(([table]) => [table, 0])));
+      expect(await unreadable(metrics)).toBe(before);
     });
   });
 
@@ -745,7 +1082,7 @@ describe('LiveRunner (e2e)', () => {
     expect(await rowsAbove(svc, L(30))).toEqual(noRows()); // no orphans
     await expectNoDuplicateTransactions(svc); // no duplicates
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
-    expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
+    await expectRows(svc, L(30));
   });
 
   it('deletes the orphans of a crashed first write before writing into an empty database', async () => {
@@ -757,7 +1094,7 @@ describe('LiveRunner (e2e)', () => {
 
     await expectNoDuplicateTransactions(svc);
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
-    expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
+    await expectRows(svc, L(30));
   });
 
   it('cleans up after a crashed first write that started below the current head (no GH_SYNC_START_LEDGER)', async () => {
@@ -896,6 +1233,247 @@ describe('LiveRunner (e2e)', () => {
     expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(10) });
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
     expect(source.fetches).toEqual([L(10)]);
+  });
+
+  describe('a head below the checkpoint (a reset testnet, or a node that is behind)', () => {
+    /** The message of a head below the checkpoint whose ledger has another hash than the stored one. */
+    const resetMessage = (head: number): string =>
+      `The node's validated ledger ${head} has hash ${syntheticHash(head, 'reset')}, ` +
+      `but ledger ${head} is stored with hash ${syntheticHash(head)}: the network was reset, or the node is of another chain`;
+
+    /** Commits `L(1)`..`L(10)` of `CHAIN` (the checkpoint is `L(10)`), on the network `cfg` names. */
+    async function committedTen(cfg: Partial<SyncerConfig> = {}): Promise<ClickHouseService> {
+      const svc = await freshService();
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { cfg });
+      await runner.runOnce();
+      await runner.stop();
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      return svc;
+    }
+
+    it('reads the head at boot with a warning for each failed try, as the loop does: no error, not recovering', async () => {
+      const svc = await committedTen();
+      const source = new TestSource(L(12));
+      let failures = 2;
+      const validatedHead = source.validatedHead.bind(source);
+      source.validatedHead = async () => {
+        if (failures-- > 0) throw new Error('node unreachable');
+        return validatedHead();
+      };
+      const { runner, logger } = makeRunner(svc, source, { options: { backoffInitialMs: 20, backoffMaxMs: 40 } });
+
+      await within(runner.runOnce(), 15_000, 'the boot');
+
+      expect(logger.lines.filter((l) => l.level === 'error')).toEqual([]);
+      expect(
+        logger.lines.filter((l) => l.level === 'warn' && l.message.startsWith('Could not read the validated head')),
+      ).toHaveLength(2);
+      expect(runner.status().recovering).toBeUndefined();
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+    });
+
+    it("halts at boot when the node's head is below the checkpoint under another hash: the network was reset", async () => {
+      const svc = await committedTen();
+      const metrics = new PrometheusService();
+      const before = await halts(metrics, 'chain_break');
+      const source = new TestSource(L(5), RESET_CHAIN);
+      const { runner } = makeRunner(svc, source, { metrics });
+
+      await expect(runner.runOnce()).rejects.toMatchObject({
+        name: 'ChainBreakError',
+        message: resetMessage(L(5)),
+        ledgerIndex: L(5),
+      });
+
+      expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(10), error: resetMessage(L(5)) });
+      // Only the node's ledger at its head was fetched: not the checkpoint, which the node does not have.
+      expect(source.fetches).toEqual([L(5)]);
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await halts(metrics, 'chain_break')).toBe(before + 1);
+    });
+
+    it("waits at boot when the node's head is below the checkpoint with the stored hash: the node is behind", async () => {
+      const svc = await committedTen();
+      const source = new TestSource(L(5));
+      const { runner, logger } = makeRunner(svc, source, {
+        options: { headSilenceMs: 50, backoffInitialMs: 50, backoffMaxMs: 100 },
+      });
+
+      await runner.onApplicationBootstrap();
+      await pause(500);
+
+      expect(runner.status().state).not.toBe('halted');
+      expect(source.fetchCount(L(5))).toBe(1); // the check
+      const warnings = logger.lines.filter((l) => l.level === 'warn' && l.message.includes('below the checkpoint'));
+      expect(warnings).toEqual([
+        {
+          level: 'warn',
+          message: `The node's validated head ${L(5)} is below the checkpoint ${L(10)}, with the stored hash: waiting for it to catch up`,
+        },
+      ]);
+
+      // The node catches up: the runner carries on after the checkpoint.
+      source.head = L(12);
+      source.available = L(12);
+      await waitFor(() => runner.status().checkpoint === L(12), 'the checkpoint to reach L(12)');
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(runner.status().state).not.toBe('halted');
+    });
+
+    it('halts while live when the head falls below the checkpoint under another hash', async () => {
+      const svc = await committedTen();
+      const source = new TestSource(L(10));
+      const { runner } = makeRunner(svc, source, { options: { headSilenceMs: 50, headBelowCheckMs: 300 } });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().state === 'live', 'the runner to be live at L(10)');
+
+      // The network is reset: the node serves another chain, and its head is low.
+      source.useChain(RESET_CHAIN);
+      source.head = L(3);
+      source.available = L(3);
+      await waitFor(() => runner.status().state === 'halted', 'the runner to halt');
+
+      expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(10), error: resetMessage(L(3)) });
+      await expect(runner.runOnce()).rejects.toMatchObject({
+        name: 'ChainBreakError',
+        message: resetMessage(L(3)),
+        ledgerIndex: L(3),
+      });
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+    });
+
+    it('checks a head below the checkpoint once per distinct head and at most once per headBelowCheckMs', async () => {
+      const svc = await committedTen();
+      const source = new TestSource(L(10));
+      const fetchedAt = new Map<number, number[]>();
+      const fetch = source.fetch.bind(source);
+      jest.spyOn(source, 'fetch').mockImplementation(async (index: number) => {
+        fetchedAt.set(index, [...(fetchedAt.get(index) ?? []), Date.now()]);
+        return fetch(index);
+      });
+      const { runner } = makeRunner(svc, source, { options: { headSilenceMs: 50, headBelowCheckMs: 300 } });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().state === 'live', 'the runner to be live at L(10)');
+      expect(source.fetches).toEqual([L(10)]); // the boot's fetch of the checkpoint, and nothing else
+
+      // The head drops to L(5), the node still on the same chain: one check of it, at once.
+      source.head = L(5);
+      await waitFor(() => source.fetchCount(L(5)) === 1, 'the check of L(5)');
+      const checkedL5 = (fetchedAt.get(L(5)) as number[])[0];
+
+      // The next head is another one, but the last check is younger than headBelowCheckMs: not yet.
+      source.head = L(6);
+      await pause(120);
+      expect(source.fetchCount(L(6))).toBe(0);
+      await waitFor(() => source.fetchCount(L(6)) === 1, 'the check of L(6)');
+      expect((fetchedAt.get(L(6)) as number[])[0] - checkedL5).toBeGreaterThanOrEqual(300);
+
+      // The same head, polled over and over, is not checked again.
+      await pause(700);
+      expect(source.fetchCount(L(5))).toBe(1);
+      expect(source.fetchCount(L(6))).toBe(1);
+      expect(source.fetches).toEqual([L(10), L(5), L(6)]);
+      expect(runner.status()).toMatchObject({ checkpoint: L(10), head: L(10) });
+      expect(runner.status().state).not.toBe('halted');
+    });
+
+    it('on a testnet, halts when the head is below the first indexed ledger', async () => {
+      const cfg = { network: 'xrpl-testnet', syncStartLedger: L(10) };
+      const svc = await freshService();
+      const { runner: first } = makeRunner(svc, new TestSource(L(20)), { cfg });
+      await first.runOnce();
+      await first.stop();
+      expect(await committedIndexes(svc)).toEqual(range(L(10), L(20)));
+
+      const source = new TestSource(L(3));
+      const { runner } = makeRunner(svc, source, { cfg });
+      const message = `The node's validated head ${L(3)} is below the first indexed ledger ${L(10)}: the network was reset`;
+
+      await expect(runner.runOnce()).rejects.toMatchObject({
+        name: 'ChainBreakError',
+        message,
+        ledgerIndex: L(3),
+      });
+
+      expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(20), error: message });
+      expect(source.fetches).toEqual([]); // no stored hash to compare with: nothing to fetch
+    });
+
+    it('on a testnet, halts while live when the head falls below the first indexed ledger (the sandbox reset)', async () => {
+      const cfg = { network: 'xrpl-testnet', syncStartLedger: L(10) };
+      const svc = await freshService();
+      const { runner: first } = makeRunner(svc, new TestSource(L(20)), { cfg });
+      await first.runOnce();
+      await first.stop();
+      expect(await committedIndexes(svc)).toEqual(range(L(10), L(20)));
+
+      const metrics = new PrometheusService();
+      const before = await halts(metrics, 'chain_break');
+      const source = new TestSource(L(20));
+      const { runner } = makeRunner(svc, source, {
+        cfg,
+        metrics,
+        options: { headSilenceMs: 50, headBelowCheckMs: 300 },
+      });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().state === 'live', 'the runner to be live at L(20)');
+      expect(source.fetches).toEqual([L(20)]); // the boot's fetch of the checkpoint, and nothing else
+
+      // The sandbox is reset: the head hint jumps below the first indexed ledger. No stored ledger to compare it with.
+      source.head = L(3);
+      source.available = L(3);
+      await waitFor(() => runner.status().state === 'halted', 'the runner to halt');
+
+      const message = `The node's validated head ${L(3)} is below the first indexed ledger ${L(10)}: the network was reset`;
+      expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(20), error: message });
+      await expect(runner.runOnce()).rejects.toMatchObject({
+        name: 'ChainBreakError',
+        message,
+        ledgerIndex: L(3),
+      });
+      expect(source.fetches).toEqual([L(20)]);
+      expect(await committedIndexes(svc)).toEqual(range(L(10), L(20)));
+      expect(await halts(metrics, 'chain_break')).toBe(before + 1);
+    });
+
+    it('on a mainnet, waits when the head is below the first indexed ledger', async () => {
+      const cfg = { network: 'xrpl', syncStartLedger: L(10) };
+      const svc = await freshService();
+      const { runner: first } = makeRunner(svc, new TestSource(L(20)), { cfg });
+      await first.runOnce();
+      await first.stop();
+
+      const source = new TestSource(L(3));
+      const { runner } = makeRunner(svc, source, {
+        cfg,
+        options: { headSilenceMs: 50, backoffInitialMs: 50, backoffMaxMs: 100 },
+      });
+      await runner.onApplicationBootstrap();
+      await pause(500);
+
+      expect(runner.status()).toMatchObject({ checkpoint: L(20) });
+      expect(runner.status().state).not.toBe('halted');
+      expect(source.fetchCount(L(3))).toBe(0);
+    });
+
+    it('on a testnet, waits when the head is below the checkpoint in a gap of the stored ledgers', async () => {
+      const svc = await freshService();
+      // L(10), L(11) and L(15) .. L(16) are stored; the node is at L(13), which is no stored ledger, above the first.
+      // (L(15) opens a new partition of `ledgers`, so two writes: a commit never spans two partitions.)
+      await new LedgerWriter(svc, ctx).write(chainRaw(L(10), L(11)));
+      await new LedgerWriter(svc, ctx).write(chainRaw(L(15), L(16)));
+      const source = new TestSource(L(13));
+      const { runner } = makeRunner(svc, source, {
+        cfg: { network: 'xrpl-testnet' },
+        options: { headSilenceMs: 50, backoffInitialMs: 50, backoffMaxMs: 100 },
+      });
+      await runner.onApplicationBootstrap();
+      await pause(500);
+
+      expect(runner.status()).toMatchObject({ checkpoint: L(16) });
+      expect(runner.status().state).not.toBe('halted');
+      expect(source.fetchCount(L(13))).toBe(0);
+    });
   });
 
   it('waits as long as a rate-limited node asks before it fetches again, without a warning per fetch (ruling R98)', async () => {

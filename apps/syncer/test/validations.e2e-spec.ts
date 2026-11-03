@@ -106,7 +106,7 @@ describe('ValidationsCollector (e2e)', () => {
   });
 
   afterAll(async () => {
-    await ch?.onModuleDestroy();
+    await ch?.close();
     await clickhouse?.container.stop();
   });
 

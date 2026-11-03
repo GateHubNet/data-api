@@ -175,7 +175,7 @@ describe('main.ts under the toolbox bootstrap()', () => {
   it.each([
     ['GH_RATE_LIMIT', '0', 'GH_RATE_LIMIT must be a positive integer'],
     ['GH_HTTP_API_PORT', 'abc', 'GH_HTTP_API_PORT must be an integer between 1 and 65535'],
-    ['GH_NETWORK', 'bitcoin', 'GH_NETWORK must be xrpl or xahau'],
+    ['GH_NETWORK', 'bitcoin', 'GH_NETWORK must be one of xrpl, xahau, xrpl-testnet, xahau-testnet'],
     [
       'GH_NODE_ENDPOINTS',
       'https://example.com',

@@ -1,6 +1,8 @@
 import {
   AmendmentTalliesRow,
   ClickHouseService,
+  Fees,
+  feesOfSetFee,
   KEY_MAP_WITH,
   mappedKey,
   RECORD_LIFETIME_SECONDS,
@@ -16,7 +18,7 @@ import { SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { ComputeJob, ComputeTick } from './compute-loop';
 import { ListContext, loadListContext } from './stored-lists';
-import { Fees, feesOfSetFee, missingRound, roundQuorum, tallyRound, voteAmendmentsOf } from './tally';
+import { missingRound, roundQuorum, tallyRound, voteAmendmentsOf } from './tally';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from './validators.options';
 
 /** A round is processed once its voting ledger closed this long ago: the validations of it are in (spec 2.4). */
@@ -121,7 +123,7 @@ export class RoundsJob implements ComputeJob {
 
   constructor(
     @Inject(ClickHouseService) private readonly ch: Pick<ClickHouseService, 'query' | 'queryOne' | 'insert'>,
-    @Inject(SyncerConfig) private readonly cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlThreshold'>,
+    @Inject(SyncerConfig) private readonly cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlValidators' | 'unlThreshold'>,
     @Inject(PrometheusService) private readonly metrics: Pick<PrometheusService, 'validatorsRoundsLagLedgers'>,
     @Optional() @Inject(VALIDATORS_WORKER_OPTIONS) options: ValidatorsWorkerOptions = {},
   ) {

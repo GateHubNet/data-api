@@ -1,24 +1,50 @@
 import BigNumber from 'bignumber.js';
 import { createHash } from 'crypto';
-import { readFileSync } from 'fs';
+import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { PARSER_VERSION } from '../clickhouse/rows';
+import { syntheticHash } from '../../test/synthetic-hash';
+import { mptOfferHash, withMptOffers } from '../../test/synthetic-mpt-offers';
+import { EXPIRED_ACCEPT_BASE, withTecExpiredAccept } from '../../test/synthetic-tec-expired-accept';
+import { foldNftEvents } from '../aggregate/nft-state';
+import {
+  DOMAIN_PARSER_VERSION,
+  MINT_PARSER_VERSION,
+  MPT_PARSER_VERSION,
+  NFT_PARSER_VERSION,
+  OBJECT_PARSER_VERSION,
+  PARSER_VERSION,
+  TOKEN_PARSER_VERSION,
+} from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
 import { AmmParser } from '../parsers/amm.parser';
+import { ImportParser } from '../parsers/import.parser';
+import { NftParser, ParsedNft, rolesOf } from '../parsers/nft.parser';
+import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, parseContextFor, toParserTx } from '../parsers/parser.interface';
 import { PaymentParser } from '../parsers/payment.parser';
+import { RewardsParser } from '../parsers/rewards.parser';
+import { StateTouchesParser } from '../parsers/state-touches.parser';
 import { deepFreeze } from '../test-utils/deep-freeze';
+import { mptCase, mptCaseNames } from '../test-utils/mpt-cases';
+import { objectCase, objectFixturesDir } from '../test-utils/object-cases';
+import { mptIssuerOf } from '../util/mpt';
 import { buildLedgerRows, CHILD_TABLES, ChildRowsKey, LedgerParseError, LedgerRows } from './build-rows';
 import { FixtureLedgerSource } from './fixture-ledger-source';
 import { normalizeLedgerResponse, RawLedger } from './raw-ledger';
 
 const PACKAGE_ROOT = join(__dirname, '..', '..');
 const FIXTURES = join(PACKAGE_ROOT, 'test', 'fixtures');
-const DDL = readFileSync(join(PACKAGE_ROOT, 'schema', '001_baseline.sql'), 'utf8');
+/** Every schema file, in order: the ledger-derived tables are created in 001 and in later migrations (005, 007). */
+const DDL = readdirSync(join(PACKAGE_ROOT, 'schema'))
+  .filter((f) => f.endsWith('.sql'))
+  .sort()
+  .map((f) => readFileSync(join(PACKAGE_ROOT, 'schema', f), 'utf8'))
+  .join('\n');
 
 const XRPL: ParseContext = parseContextFor(getNetworkProfile('xrpl'));
 const XAHAU: ParseContext = parseContextFor(getNetworkProfile('xahau'));
+const XRPL_TESTNET: ParseContext = parseContextFor(getNetworkProfile('xrpl-testnet'));
 
 type Json = Record<string, any>;
 
@@ -66,11 +92,96 @@ const SETS: FixtureSet[] = [
     minNativeChecked: 150,
     minTrustlinesChecked: 50,
   },
+  // Whole mainnet ledgers around the recorded MPT cases, and the three enable ledgers (D9, Task 1).
+  {
+    name: 'recorded MPT cases (xrpl)',
+    ctx: XRPL,
+    dir: join(FIXTURES, 'xrpl', 'mpt'),
+    minNativeChecked: 500,
+    minTrustlinesChecked: 100,
+  },
 ];
 
 const RIPPLE_MOCK = SETS[0];
 const AMM_SET = SETS[2];
 const XAHAU_SET = SETS[3];
+const MPT_SET = SETS[4];
+
+/**
+ * The recorded NFT cases (`test/fixtures/xrpl/nft`) and URIToken cases (`xahau/uritoken`): whole mainnet ledgers around
+ * each case. They are no `SETS` entry, which hold the invariants of the older tables (the conservation of balances), but
+ * the NFT tests below use them.
+ */
+const NFT_SET: FixtureSet = {
+  name: 'recorded NFT cases (xrpl)',
+  ctx: XRPL,
+  dir: join(FIXTURES, 'xrpl', 'nft'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+const URITOKEN_SET: FixtureSet = {
+  name: 'recorded URIToken cases (xahau)',
+  ctx: XAHAU,
+  dir: join(FIXTURES, 'xahau', 'uritoken'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
+/**
+ * The recorded escrow, check, payment channel and delegation cases (`test/fixtures/{xrpl,xahau}/objects`, D5 Task 1):
+ * whole ledgers around each case. Like the NFT sets they are no `SETS` entry; the object tests below use them.
+ */
+const OBJECTS_XRPL: FixtureSet = {
+  name: 'recorded object cases (xrpl)',
+  ctx: XRPL,
+  dir: objectFixturesDir('xrpl'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+const OBJECTS_XAHAU: FixtureSet = {
+  name: 'recorded object cases (xahau)',
+  ctx: XAHAU,
+  dir: objectFixturesDir('xahau'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
+/**
+ * The recorded AccountSet and Clawback cases of the token aggregate (`test/fixtures/xrpl/state-touches`, D6 Task 2): whole
+ * ledgers around each case. No `SETS` entry either.
+ */
+const STATE_TOUCHES_XRPL: FixtureSet = {
+  name: 'recorded state touch cases (xrpl)',
+  ctx: XRPL,
+  dir: join(FIXTURES, 'xrpl', 'state-touches'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
+/**
+ * The recorded Imports of Xahau with their parent ledgers, and the two hand-made ledgers (`test/fixtures/xahau/mint`, D7
+ * Task 1): the only fixtures with `imports` rows. No `SETS` entry either.
+ */
+const MINT_XAHAU: FixtureSet = {
+  name: 'recorded mint cases (xahau)',
+  ctx: XAHAU,
+  dir: join(FIXTURES, 'xahau', 'mint'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
+/**
+ * The MPT cases mainnet does not have, recorded on XRPL Testnet (`test/fixtures/xrpl-testnet/mpt`, D9 Task 1): small ledgers, some
+ * without any account root with a Domain. No `SETS` entry either; the MPT tests below use it, and `balance-changes.parser.spec.ts`
+ * and `mpt-deltas.spec.ts` hold its conservation.
+ */
+const MPT_TESTNET_SET: FixtureSet = {
+  name: 'recorded MPT cases (xrpl-testnet)',
+  ctx: XRPL_TESTNET,
+  dir: join(FIXTURES, 'xrpl-testnet', 'mpt'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
 
 interface Built {
   raw: RawLedger;
@@ -125,12 +236,42 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.AmmLiquidity, 'ammLiquidity'],
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
+  [Table.AccountStates, 'accountStates'],
+  [Table.TrustLineStates, 'trustLineStates'],
+  [Table.PathPayments, 'pathPayments'],
+  [Table.AccountPathPayments, 'accountPathPayments'],
+  [Table.NftEvents, 'nftEvents'],
+  [Table.AccountNftEvents, 'accountNftEvents'],
+  [Table.CollectionNftEvents, 'collectionNftEvents'],
+  [Table.NftSales, 'nftSales'],
+  [Table.NftTouches, 'nftTouches'],
+  [Table.AccountDomains, 'accountDomains'],
+  [Table.ObjectChanges, 'objectChanges'],
+  [Table.AccountObjectChanges, 'accountObjectChanges'],
+  [Table.StateTouches, 'stateTouches'],
+  [Table.GenesisMints, 'genesisMints'],
+  [Table.Imports, 'imports'],
+  [Table.RewardClaims, 'rewardClaims'],
+  [Table.MptIssuanceStates, 'mptIssuanceStates'],
+  [Table.MptHolderStates, 'mptHolderStates'],
+  [Table.MptTouches, 'mptTouches'],
+  [Table.MptTransfers, 'mptTransfers'],
+  [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
 ];
+
+/** The five MPT ledger tables, with the property of `LedgerRows` that holds their rows. */
+const MPT_TABLES = [
+  [Table.MptIssuanceStates, 'mptIssuanceStates'],
+  [Table.MptHolderStates, 'mptHolderStates'],
+  [Table.MptTouches, 'mptTouches'],
+  [Table.MptTransfers, 'mptTransfers'],
+  [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+] as const;
 
 /** The columns of a table in the order of its CREATE TABLE statement. */
 function ddlColumns(table: Table): string[] {
   const match = new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\n\\(\\n([\\s\\S]*?)\\n\\)\\s*\\nENGINE`).exec(DDL);
-  if (!match) throw new Error(`no CREATE TABLE found for ${table} in 001_baseline.sql`);
+  if (!match) throw new Error(`no CREATE TABLE found for ${table} in the schema files`);
   return match[1]
     .split('\n')
     .map((line) => line.trim())
@@ -142,7 +283,7 @@ function orderByColumns(table: Table): string[] {
   const match = new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\n[\\s\\S]*?\\nORDER BY \\(?([^)\\n]+)\\)?`).exec(
     DDL,
   );
-  if (!match) throw new Error(`no ORDER BY found for ${table} in 001_baseline.sql`);
+  if (!match) throw new Error(`no ORDER BY found for ${table} in the schema files`);
   return match[1].split(',').map((c) => c.trim());
 }
 
@@ -418,6 +559,7 @@ describe('buildLedgerRows mapping', () => {
         fee_max: '0',
       });
       for (const [, key] of CHILD_TABLES) expect(empty[key]).toEqual([]);
+      expect(empty.stateTouches).toEqual([]);
     });
 
     it('maps a missing parent_close_time (genesis) to 0', () => {
@@ -519,6 +661,38 @@ describe('buildLedgerRows mapping', () => {
         { account: SENDER, sequence: 0, ledger_index: 5_000_000, tx_index: 3 },
         { account: SENDER, sequence: 8, ledger_index: 5_000_000, tx_index: 4 },
       ]);
+    });
+
+    it("gives the delegate an account_transactions row with is_initiator 0 and leaves account_tx_by_sequence the sender's", () => {
+      // xrpl/amm 107699656: the delegate signed the Batch (tx_index 33) and its six inner transactions, each an OfferCreate of
+      // the delegator `rnt8Pb…` with Fee 0 (idx 34 to 39). The metadata of an inner transaction never names the delegate.
+      const DELEGATE = 'rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK';
+      const DELEGATOR = 'rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL';
+      const { raw: ledger, rows: built } = ledgerNamed(AMM_SET, 107699656);
+      const inner = ledger.transactions.filter((t) => t.tx.Delegate === DELEGATE);
+
+      expect(inner.map((t) => t.meta.TransactionIndex)).toEqual([34, 35, 36, 37, 38, 39]);
+      for (const t of inner) {
+        const index = t.meta.TransactionIndex as number;
+        const listed = built.accountTransactions.filter((r) => r.tx_index === index);
+
+        expect(JSON.stringify(t.meta)).not.toContain(DELEGATE);
+        expect(listed.filter((r) => r.account === DELEGATE)).toEqual([
+          {
+            account: DELEGATE,
+            ledger_index: 107699656,
+            tx_index: index,
+            tx_type: 'OfferCreate',
+            result: 'tesSUCCESS',
+            is_initiator: 0,
+            close_time: built.ledger.close_time,
+          },
+        ]);
+        expect(listed.filter((r) => r.is_initiator === 1).map((r) => r.account)).toEqual([DELEGATOR]);
+        expect(built.accountTxBySequence.filter((r) => r.tx_index === index)).toEqual([
+          { account: DELEGATOR, sequence: t.tx.Sequence ?? 0, ledger_index: 107699656, tx_index: index },
+        ]);
+      }
     });
   });
 
@@ -1274,11 +1448,48 @@ describe('AMM rows (parser version 2)', () => {
       [Table.AmmLiquidity, 'ammLiquidity'],
       [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
       [Table.AmmGovernance, 'ammGovernance'],
+      [Table.AccountStates, 'accountStates'],
+      [Table.TrustLineStates, 'trustLineStates'],
+      [Table.NftEvents, 'nftEvents'],
+      [Table.AccountNftEvents, 'accountNftEvents'],
+      [Table.CollectionNftEvents, 'collectionNftEvents'],
+      [Table.NftSales, 'nftSales'],
+      [Table.NftTouches, 'nftTouches'],
+      [Table.AccountDomains, 'accountDomains'],
+      [Table.ObjectChanges, 'objectChanges'],
+      [Table.AccountObjectChanges, 'accountObjectChanges'],
+      [Table.StateTouches, 'stateTouches'],
+      [Table.GenesisMints, 'genesisMints'],
+      [Table.Imports, 'imports'],
+      [Table.RewardClaims, 'rewardClaims'],
+      [Table.MptIssuanceStates, 'mptIssuanceStates'],
+      [Table.MptHolderStates, 'mptHolderStates'],
+      [Table.MptTouches, 'mptTouches'],
+      [Table.MptTransfers, 'mptTransfers'],
+      [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+    ];
+
+    // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter. The Domain rows are in
+    // the recorded Xahau and XRPL ledgers: the Xahau flag ledger and 26540188 hold account roots with a Domain. The object
+    // rows are in the recorded escrow, check, channel and delegation ledgers. The mint rows are in the recorded Xahau ledgers
+    // 26540187 (a ClaimReward) and 26540188 (a GenesisMint); the Import rows only in the mint cases. The MPT rows are in the
+    // recorded MPT ledgers of both networks.
+    const recorded = (): Built[] => [
+      ...builtOf(AMM_SET),
+      ...builtOf(NFT_SET),
+      ...builtOf(URITOKEN_SET),
+      ...builtOf(XAHAU_SET),
+      ...builtOf(OBJECTS_XRPL),
+      ...builtOf(OBJECTS_XAHAU),
+      ...builtOf(STATE_TOUCHES_XRPL),
+      ...builtOf(MINT_XAHAU),
+      ...builtOf(MPT_SET),
+      ...builtOf(MPT_TESTNET_SET),
     ];
 
     it.each(tables)('%s', (table, key) => {
       const columns = ddlColumns(table);
-      const rows = collect(builtOf(AMM_SET), key);
+      const rows = collect(recorded(), key);
       expect(rows.length).toBeGreaterThan(0);
       for (const row of rows) expect(Object.keys(row)).toEqual(columns);
     });
@@ -1298,15 +1509,22 @@ describe('AMM rows (parser version 2)', () => {
         expect(rows.ammLiquidity).toEqual([]);
         expect(rows.accountAmmLiquidity).toEqual([]);
         expect(rows.ammGovernance).toEqual([]);
-        expect(rows.diagnostics).toEqual({ ammUnclassified: 0 });
+        expect(rows.diagnostics).toEqual({
+          ammUnclassified: 0,
+          nftSkipped: 0,
+          invalidDomains: 0,
+          objectsUnclassified: 0,
+          importMintedNegative: 0,
+          mptAnomalies: 0,
+        });
         for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
       }
     });
 
-    it('stores parser_version 2', () => {
-      expect(PARSER_VERSION).toBe(2);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(2);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(2);
+    it('stores parser_version 10 (the MPT data, after Xahau minting of 9)', () => {
+      expect(PARSER_VERSION).toBe(10);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(10);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(10);
     });
   });
 
@@ -1320,7 +1538,14 @@ describe('AMM rows (parser version 2)', () => {
           (sum, t) => sum + ammParser.parse(toParserTx(t, raw.header, null), XRPL).unclassified,
           0,
         );
-        expect(rows.diagnostics).toEqual({ ammUnclassified: expected });
+        expect(rows.diagnostics).toEqual({
+          ammUnclassified: expected,
+          nftSkipped: 0,
+          invalidDomains: 0,
+          objectsUnclassified: 0,
+          importMintedNegative: 0,
+          mptAnomalies: 0,
+        });
         total += expected;
       }
       expect(total).toBeGreaterThanOrEqual(0);
@@ -1347,10 +1572,868 @@ describe('AMM rows (parser version 2)', () => {
           poolLine(index),
         ]);
       const rows = buildLedgerRows(ledgerOf([offer(0, 'A'.repeat(64)), offer(1, 'B'.repeat(64))]), XRPL);
-      expect(rows.diagnostics).toEqual({ ammUnclassified: 2 });
+      expect(rows.diagnostics).toEqual({
+        ammUnclassified: 2,
+        nftSkipped: 0,
+        invalidDomains: 0,
+        objectsUnclassified: 0,
+        importMintedNegative: 0,
+        mptAnomalies: 0,
+      });
       expect(rows.ammPoolStates).toEqual([]);
       expect(rows.exchanges).toEqual([]);
     });
+  });
+});
+
+// -- NFT rows ---------------------------------------------------------------------------------------------------
+
+describe('NFT rows (parser version 5)', () => {
+  const nftParser = new NftParser();
+
+  interface Cases {
+    cases: Record<string, { ledger: number; hash: string }>;
+  }
+  const xrplCases = JSON.parse(readFileSync(join(NFT_SET.dir, 'manifest.json'), 'utf8')) as Cases;
+  const uriCases = JSON.parse(readFileSync(join(URITOKEN_SET.dir, 'manifest.json'), 'utf8')) as Cases;
+
+  /** What the NFT parser makes of one transaction of a ledger. */
+  const parsedOf = (set: FixtureSet, raw: RawLedger, hash: string): ParsedNft => {
+    const t = raw.transactions.find((r) => r.hash === hash);
+    if (!t) throw new Error(`${hash} is not in ledger ${raw.header.ledger_index}`);
+    return nftParser.parse(toParserTx(t, raw.header, null), set.ctx);
+  };
+
+  /** A recorded case: the rows of its ledger, a filter for those of the case's own transaction, and what the parser says. */
+  function nftCase(set: FixtureSet, manifest: Cases, name: string) {
+    const c = manifest.cases[name];
+    const { raw, rows } = ledgerNamed(set, c.ledger);
+    const tx = rows.transactions.find((r) => r.hash === c.hash);
+    if (!tx) throw new Error(`${name}: ${c.hash} is not in ledger ${c.ledger}`);
+    const mine = <T extends { tx_index: number }>(list: T[]): T[] => list.filter((r) => r.tx_index === tx.tx_index);
+    return { raw, rows, mine, tx, parsed: parsedOf(set, raw, c.hash) };
+  }
+  const xrpl = (name: string) => nftCase(NFT_SET, xrplCases, name);
+  const uritoken = (name: string) => nftCase(URITOKEN_SET, uriCases, name);
+
+  // The recorded brokered sale (107879497): the broker lists the sell offer of SELLER and the buy offer of BUYER together.
+  const BROKER = 'rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC';
+  const SELLER = 'rfivr3BK17R28wnVwpQQhSDvo2A2fmnEje';
+  const BUYER = 'rLCscV9iDJpvje4ZCKxGjYAMNtBA1Ltauk';
+  const ISSUER_OF_SALE = 'rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy';
+  const SOLD = '00190BB8DAEF366CB05EE8DCC919EF9A1AA24DD22B3D62C9D848920A0669E96F';
+  const SELL_OFFER = '05BC61CFB58ABA8969C852FBF907CC687A442AD3ED64FB30EA41149ECD0F6780';
+
+  describe('the five tables', () => {
+    it('writes the five NFT tables for a recorded brokered sale', () => {
+      const { raw, rows, mine, tx, parsed } = xrpl('brokered_sale_royalty');
+      // The two offers it consumed (offer_removed) and the sale: three events of one NFT, by four accounts in the sale.
+      expect(parsed.events.map((e) => e.event)).toEqual(['offer_removed', 'offer_removed', 'sale']);
+      const accounts = parsed.events.reduce((sum, e) => sum + rolesOf(e).size, 0);
+      expect(accounts).toBe(2 + 2 + 4);
+
+      expect(mine(rows.nftEvents)).toHaveLength(parsed.events.length);
+      expect(mine(rows.accountNftEvents)).toHaveLength(accounts);
+      expect(mine(rows.collectionNftEvents)).toHaveLength(parsed.events.length);
+      expect(mine(rows.nftSales)).toHaveLength(1);
+      expect(mine(rows.nftTouches)).toHaveLength(1);
+
+      const sale = {
+        nft_id: SOLD,
+        ledger_index: 107879497,
+        tx_index: tx.tx_index,
+        event_index: 2,
+        tx_hash: tx.hash,
+        tx_type: 'NFTokenAcceptOffer',
+        close_time: raw.header.close_time,
+        kind: 'nftoken',
+        event: 'sale',
+        issuer: ISSUER_OF_SALE,
+        taxon: 0,
+        taxon_key: 0,
+        serial: 107604335,
+        nft_flags: 25,
+        transfer_fee: 3000,
+        uri: '',
+        digest: '',
+        account: BROKER,
+        from_account: SELLER,
+        to_account: BUYER,
+        offer_id: SELL_OFFER,
+        is_sell_offer: 1,
+        amount: '150',
+        amount_f: 150,
+        currency: 'XRP',
+        amount_issuer: '',
+        destination: '',
+        expiration: null,
+        broker: BROKER,
+        broker_fee: '2.3835',
+        royalty_est: '4.428495',
+        removed_by: '',
+      };
+      expect(mine(rows.nftEvents).find((r) => r.event === 'sale')).toEqual(sale);
+      expect(mine(rows.nftSales)).toEqual([sale]);
+      expect(mine(rows.collectionNftEvents).find((r) => r.event === 'sale')).toEqual(sale);
+      expect(mine(rows.nftTouches)).toEqual([
+        {
+          ledger_index: 107879497,
+          tx_index: tx.tx_index,
+          nft_id: SOLD,
+          issuer: ISSUER_OF_SALE,
+          taxon_key: 0,
+          serial: 107604335,
+        },
+      ]);
+    });
+
+    it("gives each account of a sale its roles, and the broker's row holds roles: ['broker']", () => {
+      const { rows, mine } = xrpl('brokered_sale_royalty');
+      const sale = mine(rows.accountNftEvents).filter((r) => r.event === 'sale');
+      expect(sale.map((r) => [r.account, r.roles])).toEqual([
+        [ISSUER_OF_SALE, ['issuer']],
+        [SELLER, ['from']],
+        [BUYER, ['to']],
+        [BROKER, ['broker']],
+      ]);
+      // The copy of an event for an account is the event's row with `actor` for its `account`, and the roles.
+      const { account: eventAccount, ...event } = mine(rows.nftEvents).find((r) => r.event === 'sale')!;
+      for (const row of sale) {
+        const { actor, roles, ...copy } = row;
+        expect(actor).toBe(eventAccount);
+        expect(roles.length).toBeGreaterThan(0);
+        expect(copy).toEqual({ ...event, account: row.account });
+      }
+      // The broker is also the destination of both offers it consumed.
+      const asDestination = mine(rows.accountNftEvents).filter(
+        (r) => r.account === BROKER && r.event === 'offer_removed',
+      );
+      expect(asDestination.map((r) => r.roles)).toEqual([['destination'], ['destination']]);
+    });
+
+    it('keeps the copies of an event in objects of their own', () => {
+      const { rows, mine } = xrpl('brokered_sale_royalty');
+      const [event] = mine(rows.nftEvents).filter((r) => r.event === 'sale');
+      const [collection] = mine(rows.collectionNftEvents).filter((r) => r.event === 'sale');
+      const [sale] = mine(rows.nftSales);
+      expect(collection).toEqual(event);
+      expect(sale).toEqual(event);
+      expect(collection).not.toBe(event);
+      expect(sale).not.toBe(event);
+      expect(sale).not.toBe(collection);
+    });
+
+    it('gives an account with two roles in one event one row', () => {
+      // `mint_on_behalf`: the minter is also the account that gets the NFT (`minter` and `to`); the issuer is another account.
+      const behalf = xrpl('mint_on_behalf');
+      const minted = behalf.mine(behalf.rows.accountNftEvents);
+      expect(behalf.parsed.events).toHaveLength(1);
+      expect(minted.map((r) => [r.account, r.roles])).toEqual([
+        ['rwxH6YD51ygruAtDWixsgH5UUu6hmUi3AC', ['issuer']],
+        ['riMCiWg8QBej6Y3osDVt3u8FJWo2ephuN', ['minter', 'to']],
+      ]);
+      // A mint by the issuer itself: the issuer is also `to`, and there is no `minter`.
+      const own = xrpl('mint');
+      expect(own.mine(own.rows.accountNftEvents).map((r) => [r.account, r.roles])).toEqual([
+        ['ravC5cZreMZuKEWSrpra5nkWnfzPmrabec', ['issuer', 'to']],
+      ]);
+    });
+
+    it('writes one row per NFT and transaction in nft_touches, whatever the events of the NFT', () => {
+      // A mint with an offer: two events of one NFT, one touch.
+      const { rows, mine, parsed } = xrpl('mint_with_offer');
+      expect(parsed.events.map((e) => e.event)).toEqual(['mint', 'offer_create']);
+      expect(mine(rows.nftEvents)).toHaveLength(2);
+      expect(mine(rows.nftTouches)).toEqual([
+        {
+          ledger_index: 107886233,
+          tx_index: mine(rows.nftEvents)[0].tx_index,
+          nft_id: '00181F40AF09C1D4B4D1E8031467F3508DFFADABEA73255FBE9F0F960655EBFA',
+          issuer: 'rGxWAWXg8okZh29ojBRvEMpN5peQRV16Xu',
+          taxon_key: 3,
+          serial: 106294266,
+        },
+      ]);
+      // Several NFTs in one transaction: one touch for each.
+      const ledgerTouches = ledgerNamed(NFT_SET, 107874617).rows.nftTouches;
+      const byTx = new Map<number, number>();
+      for (const touch of ledgerTouches) byTx.set(touch.tx_index, (byTx.get(touch.tx_index) ?? 0) + 1);
+      expect(Math.max(...byTx.values())).toBeGreaterThan(1);
+    });
+
+    it('stores a URIToken as an NFT of the issuer with taxon_key 0 and serial 0, and the amount in the native XAH', () => {
+      const { rows, mine, parsed } = uritoken('uritoken_buy_above_ask');
+      expect(parsed.events.map((e) => e.event)).toEqual(['offer_removed', 'sale']);
+      expect(
+        mine(rows.nftEvents).map((r) => [r.kind, r.event, r.taxon, r.taxon_key, r.serial, r.amount, r.currency]),
+      ).toEqual([
+        ['uritoken', 'offer_removed', null, 0, 0, '4200', 'XAH'],
+        ['uritoken', 'sale', null, 0, 0, '4200', 'XAH'],
+      ]);
+      expect(mine(rows.nftSales)).toHaveLength(1);
+      expect(mine(rows.nftSales)[0]).toMatchObject({ amount_f: 4200, amount_issuer: '', royalty_est: '' });
+      const touches = mine(rows.nftTouches);
+      expect(touches).toHaveLength(1);
+      expect(touches[0]).toMatchObject({
+        nft_id: '9613336614047483F3AEC00173139D88FE9BA70720CAC2B46E12711A71A9AAE9',
+        issuer: 'rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb',
+        taxon_key: 0,
+        serial: 0,
+      });
+      // By collection: the issuer's, under taxon_key 0.
+      expect(mine(rows.collectionNftEvents).map((r) => [r.issuer, r.taxon_key])).toEqual([
+        ['rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb', 0],
+        ['rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb', 0],
+      ]);
+    });
+
+    it('writes an absent amount as the empty string and 0, and an absent expiration as null', () => {
+      const { rows, mine } = xrpl('burn');
+      const [burn] = mine(rows.nftEvents);
+      expect(burn).toMatchObject({ event: 'burn', amount: '', amount_f: 0, currency: '', expiration: null });
+      const gift = xrpl('mint_with_offer');
+      const [, offer] = gift.mine(gift.rows.nftEvents);
+      // The offer's expiration is in unix seconds, as the parser has it.
+      expect(offer).toMatchObject({ event: 'offer_create', amount: '0', amount_f: 0, currency: 'XRP' });
+      expect(typeof offer.expiration).toBe('number');
+    });
+
+    it.each([
+      ['XRPL', NFT_SET],
+      ['Xahau URITokens', URITOKEN_SET],
+      ['Xahau', XAHAU_SET],
+      ['the AMM cases', AMM_SET],
+    ])(
+      'every NFT row of the recorded ledgers (%s) holds the columns of its event, its transaction and its roles',
+      (_name, set) => {
+        let events = 0;
+        for (const { raw, rows } of builtOf(set)) {
+          const header = raw.header;
+          const expectedEvents: Json[] = [];
+          const expectedAccounts: Json[] = [];
+          const expectedTouches: Json[] = [];
+          const byHash = new Map(rows.transactions.map((r) => [r.hash, r]));
+          for (const t of raw.transactions) {
+            const tx = byHash.get(t.hash)!;
+            const seen = new Set<string>();
+            for (const e of parsedOf(set, raw, t.hash).events) {
+              const { event_index, ...columns } = e;
+              const row = {
+                ...columns,
+                event_index,
+                ledger_index: header.ledger_index,
+                tx_index: tx.tx_index,
+                tx_hash: t.hash,
+                tx_type: tx.tx_type,
+                close_time: header.close_time,
+                amount_f: e.amount === '' ? 0 : Number(e.amount),
+              };
+              expectedEvents.push(row);
+              for (const [holder, roles] of rolesOf(e)) {
+                const { account, ...others } = row;
+                expectedAccounts.push({ ...others, account: holder, actor: account, roles });
+              }
+              if (!seen.has(e.nft_id)) {
+                seen.add(e.nft_id);
+                expectedTouches.push({
+                  ledger_index: header.ledger_index,
+                  tx_index: tx.tx_index,
+                  nft_id: e.nft_id,
+                  issuer: e.issuer,
+                  taxon_key: e.taxon_key,
+                  serial: e.serial,
+                });
+              }
+            }
+          }
+          events += expectedEvents.length;
+          expect(rows.nftEvents).toEqual(expectedEvents);
+          expect(rows.collectionNftEvents).toEqual(expectedEvents);
+          expect(rows.nftSales).toEqual(expectedEvents.filter((e) => e.event === 'sale'));
+          expect(rows.accountNftEvents).toEqual(expectedAccounts);
+          expect(rows.nftTouches).toEqual(expectedTouches);
+        }
+        expect(events).toBeGreaterThan(20);
+      },
+    );
+
+    it('writes the offer a failed transaction deletes (synthetic-tec-expired-accept): one event, its touch and its accounts, no sale, and a fold that only moves its ledgers', () => {
+      // synthetic-tec-expired-accept: hand-made from the recorded sale_by_sell_offer (test/synthetic-tec-expired-accept.ts),
+      // under a hash of its own
+      const base = xrpl(EXPIRED_ACCEPT_BASE);
+      const rows = buildLedgerRows(withTecExpiredAccept(base.raw, base.tx.hash), XRPL);
+      const hash = syntheticHash('synthetic-tec-expired-accept', base.tx.hash);
+      const mine = <T extends { tx_index: number }>(list: T[]): T[] =>
+        list.filter((r) => r.tx_index === base.tx.tx_index);
+      expect(mine(rows.transactions)).toEqual([expect.objectContaining({ hash, result: 'tecEXPIRED' })]);
+
+      const seller = 'rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz';
+      const buyer = 'rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx';
+      const nftId = '00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91';
+      const events = mine(rows.nftEvents);
+      expect(events).toEqual([
+        expect.objectContaining({
+          nft_id: nftId,
+          tx_hash: hash,
+          tx_type: 'NFTokenAcceptOffer',
+          event_index: 0,
+          event: 'offer_removed',
+          removed_by: 'other',
+          account: seller,
+          offer_id: 'D6DBB6452D44459FDA013C79708D2E699EA2340D5444AC1695FF621A80FDFBDE',
+          amount: '10',
+          amount_f: 10,
+          destination: buyer,
+        }),
+      ]);
+      expect(mine(rows.collectionNftEvents)).toEqual(events);
+      expect(mine(rows.nftSales)).toEqual([]);
+      // the offer's owner and its destination find it; nobody is the issuer of an offer event
+      expect(mine(rows.accountNftEvents).map((r) => [r.account, r.roles, r.actor])).toEqual([
+        [seller, ['offer_owner'], seller],
+        [buyer, ['destination'], seller],
+      ]);
+      expect(mine(rows.nftTouches)).toEqual([
+        {
+          ledger_index: base.raw.header.ledger_index,
+          tx_index: base.tx.tx_index,
+          nft_id: nftId,
+          issuer: events[0].issuer,
+          taxon_key: events[0].taxon_key,
+          serial: events[0].serial,
+        },
+      ]);
+      // what the job folds of it: the NFT's first and last ledger, and no owner, sale or mint
+      const fold = foldNftEvents(events);
+      expect(fold).toMatchObject({
+        first_ledger: base.raw.header.ledger_index,
+        last_ledger: base.raw.header.ledger_index,
+        owner: '',
+        owners: [],
+        sale_count: 0,
+      });
+      expect(fold.minted).toBeUndefined();
+      expect(fold.last_sale).toBeUndefined();
+      // the other transactions of the ledger are as recorded
+      const others = <T extends { tx_index: number }>(list: T[]): T[] =>
+        list.filter((r) => r.tx_index !== base.tx.tx_index);
+      expect(others(rows.nftEvents)).toEqual(others(base.rows.nftEvents));
+    });
+
+    it('writes nothing for a ledger without NFT activity', () => {
+      for (const { rows } of builtOf(RIPPLE_MOCK)) {
+        expect(rows.nftEvents).toEqual([]);
+        expect(rows.accountNftEvents).toEqual([]);
+        expect(rows.collectionNftEvents).toEqual([]);
+        expect(rows.nftSales).toEqual([]);
+        expect(rows.nftTouches).toEqual([]);
+        expect(rows.diagnostics.nftSkipped).toBe(0);
+      }
+    });
+  });
+
+  describe('parser_version', () => {
+    it('stamps the parser version of the build on the ledger row: 10, with the NFT parser still at 5, the domain parser at 6, the object parser at 7, the token parser at 8 and the mint parser at 9', () => {
+      expect([PARSER_VERSION, MPT_PARSER_VERSION]).toEqual([10, 10]);
+      expect(MINT_PARSER_VERSION).toBe(9);
+      expect(NFT_PARSER_VERSION).toBe(5);
+      expect(DOMAIN_PARSER_VERSION).toBe(6);
+      expect(OBJECT_PARSER_VERSION).toBe(7);
+      expect(TOKEN_PARSER_VERSION).toBe(8);
+      for (const set of [NFT_SET, URITOKEN_SET, RIPPLE_MOCK]) {
+        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(10);
+      }
+      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(10);
+    });
+  });
+
+  describe('diagnostics.nftSkipped', () => {
+    it('counts skipped NFT events in diagnostics.nftSkipped (synthetic-mpt-offer: the recorded sell and buy offers priced with an MPT amount)', () => {
+      const sell = xrpl('sell_offer_create');
+      const buy = xrpl('buy_offer_create');
+      expect(sell.rows.ledger.ledger_index).toBe(buy.rows.ledger.ledger_index);
+      expect(sell.rows.diagnostics.nftSkipped).toBe(0);
+
+      // synthetic-mpt-offer: hand-made from the recorded sell_offer_create (test/synthetic-mpt-offers.ts), under a hash of its own
+      const one = buildLedgerRows(withMptOffers(sell.raw, [sell.tx.hash]), XRPL);
+      const altered = mptOfferHash(sell.tx.hash);
+      expect(altered).toMatch(/^[0-9A-F]{64}$/);
+      expect(one.transactions.map((r) => r.hash)).toContain(altered);
+      expect(one.transactions.map((r) => r.hash)).not.toContain(sell.tx.hash);
+      expect(one.diagnostics.nftSkipped).toBe(1);
+      expect(one.nftEvents).toHaveLength(sell.rows.nftEvents.length - 1);
+      expect(one.nftEvents.some((r) => r.tx_hash === altered)).toBe(false);
+      expect(one.nftTouches.some((r) => r.tx_index === sell.tx.tx_index)).toBe(false);
+
+      // Summed over the transactions of the ledger (synthetic-mpt-offer: the recorded buy_offer_create altered the same way).
+      const two = buildLedgerRows(withMptOffers(sell.raw, [sell.tx.hash, buy.tx.hash]), XRPL);
+      expect(two.diagnostics.nftSkipped).toBe(2);
+      expect(two.nftEvents).toHaveLength(sell.rows.nftEvents.length - 2);
+      // The transactions are all there, and the other tables are as without the edit.
+      expect(two.transactions).toHaveLength(sell.rows.transactions.length);
+      expect(two.diagnostics.ammUnclassified).toBe(sell.rows.diagnostics.ammUnclassified);
+    });
+
+    it('is the sum of what the parser skips, over the transactions of every recorded ledger, which is nothing', () => {
+      for (const set of [NFT_SET, URITOKEN_SET, XAHAU_SET, AMM_SET]) {
+        for (const { raw, rows } of builtOf(set)) {
+          const skipped = raw.transactions.reduce((sum, t) => sum + parsedOf(set, raw, t.hash).skipped, 0);
+          expect(rows.diagnostics.nftSkipped).toBe(skipped);
+          expect(skipped).toBe(0);
+        }
+      }
+    });
+  });
+});
+
+// -- Account domain rows ----------------------------------------------------------------------------------------
+
+describe('account_domains (parser version 6)', () => {
+  const NORTHPEAK = '6E6F7274687065616B2E6578616D706C65'; // northpeak.example
+  const HARBOR = '686172626F722E6578616D706C65'; // harbor.example
+  const DOMAIN_ACCOUNT = 'rDomainDomainDomainDomainDomainxx';
+  const DORMANT = 'rDormantDormantDormantDormantDormxx';
+
+  const root = (fields: Json, previous: Json): Json => ({
+    ModifiedNode: { LedgerEntryType: 'AccountRoot', FinalFields: fields, PreviousFields: previous },
+  });
+
+  /**
+   * Seven transactions: a payment, a payment that creates an account, a payment received by a dormant account with a Domain,
+   * the AccountSet that sets one (the account root is its node 1), a failed payment of that account, the AccountSet that clears
+   * the Domain, and the AccountDelete of the dormant account.
+   */
+  function domainLedger(): RawLedger {
+    const hash = (letter: string) => letter.repeat(64);
+    return ledgerOf([
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: RECEIVER, Amount: '10' }, 0, hash('A'), [
+        account(SENDER, '100', '88'),
+        account(RECEIVER, '10', '20'),
+      ]),
+      // a payment that creates an account without a Domain: no row
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: NEWBIE, Amount: '25000000' }, 1, hash('B'), [
+        account(SENDER, '88', '76'),
+        { CreatedNode: { LedgerEntryType: 'AccountRoot', NewFields: { Account: NEWBIE, Balance: '25000000' } } },
+      ]),
+      // a payment received by a dormant account that has a Domain
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: DORMANT, Amount: '10' }, 2, hash('C'), [
+        account(SENDER, '76', '64'),
+        root({ Account: DORMANT, Balance: '30', Domain: HARBOR }, { Balance: '20' }),
+      ]),
+      // the AccountSet that sets a Domain: the account root is the second node
+      rawTx({ TransactionType: 'AccountSet', Account: DOMAIN_ACCOUNT, Domain: NORTHPEAK, Sequence: 5 }, 3, hash('D'), [
+        { ModifiedNode: { LedgerEntryType: 'DirectoryNode', FinalFields: {}, PreviousFields: {} } },
+        root(
+          { Account: DOMAIN_ACCOUNT, Balance: '90', Domain: NORTHPEAK, Sequence: 6 },
+          { Balance: '102', Sequence: 5 },
+        ),
+      ]),
+      // a failed transaction of the same account
+      rawTx(
+        { TransactionType: 'Payment', Account: DOMAIN_ACCOUNT, Destination: RECEIVER, Amount: '10', Sequence: 6 },
+        4,
+        hash('E'),
+        [
+          root(
+            { Account: DOMAIN_ACCOUNT, Balance: '78', Domain: NORTHPEAK, Sequence: 7 },
+            { Balance: '90', Sequence: 6 },
+          ),
+        ],
+        'tecPATH_DRY',
+      ),
+      // the account clears its Domain, then is deleted
+      rawTx({ TransactionType: 'AccountSet', Account: DOMAIN_ACCOUNT, Domain: '', Sequence: 7 }, 5, hash('F'), [
+        root(
+          { Account: DOMAIN_ACCOUNT, Balance: '66', Sequence: 8 },
+          { Balance: '78', Domain: NORTHPEAK, Sequence: 7 },
+        ),
+      ]),
+      rawTx({ TransactionType: 'AccountDelete', Account: DORMANT, Destination: RECEIVER, Sequence: 3 }, 6, hash('G'), [
+        {
+          DeletedNode: {
+            LedgerEntryType: 'AccountRoot',
+            FinalFields: { Account: DORMANT, Balance: '0', Domain: HARBOR },
+          },
+        },
+        account(RECEIVER, '20', '50'),
+      ]),
+    ]);
+  }
+
+  it('writes a row for every change of an account that has or had a Domain, with the version of its place in the ledger', () => {
+    const { accountDomains, diagnostics } = buildLedgerRows(domainLedger(), XRPL);
+
+    const at = (tx_index: number, node_index: number) => ({
+      ledger_index: 5000000,
+      tx_index,
+      node_index,
+      version: String(BigInt(5000000) * 2n ** 32n + BigInt(tx_index) * 2n ** 16n + BigInt(node_index)),
+    });
+    expect(accountDomains).toEqual([
+      { account: DORMANT, ...at(2, 1), domain_hex: HARBOR, deleted: 0 },
+      { account: DOMAIN_ACCOUNT, ...at(3, 1), domain_hex: NORTHPEAK, deleted: 0 },
+      { account: DOMAIN_ACCOUNT, ...at(4, 0), domain_hex: NORTHPEAK, deleted: 0 },
+      { account: DOMAIN_ACCOUNT, ...at(5, 0), domain_hex: '', deleted: 0 },
+      { account: DORMANT, ...at(6, 0), domain_hex: '', deleted: 1 },
+    ]);
+    expect(diagnostics.invalidDomains).toBe(0);
+  });
+
+  it('keys a row by the AffectedNodes index and the transaction index, and takes the version of them', () => {
+    const [row] = buildLedgerRows(
+      ledgerOf(
+        [
+          rawTx({ TransactionType: 'AccountSet', Account: DOMAIN_ACCOUNT, Domain: NORTHPEAK }, 3, 'D'.repeat(64), [
+            { ModifiedNode: { LedgerEntryType: 'DirectoryNode', FinalFields: {}, PreviousFields: {} } },
+            { ModifiedNode: { LedgerEntryType: 'Offer', FinalFields: {}, PreviousFields: {} } },
+            { ModifiedNode: { LedgerEntryType: 'Offer', FinalFields: {}, PreviousFields: {} } },
+            { ModifiedNode: { LedgerEntryType: 'Offer', FinalFields: {}, PreviousFields: {} } },
+            { ModifiedNode: { LedgerEntryType: 'Offer', FinalFields: {}, PreviousFields: {} } },
+            root({ Account: DOMAIN_ACCOUNT, Domain: NORTHPEAK }, { Sequence: 5 }),
+          ]),
+        ],
+        { ledger_index: '107671593' },
+      ),
+      XRPL,
+    ).accountDomains;
+
+    expect(row).toEqual({
+      account: DOMAIN_ACCOUNT,
+      ledger_index: 107671593,
+      tx_index: 3,
+      node_index: 5,
+      version: '462445970643419141',
+      domain_hex: NORTHPEAK,
+      deleted: 0,
+    });
+  });
+
+  it('counts the Domains that are not hex in diagnostics.invalidDomains and writes them empty, never throws', () => {
+    const bad = (domain: unknown, index: number): Json =>
+      rawTx({ TransactionType: 'AccountSet', Account: DOMAIN_ACCOUNT }, index, String(index).repeat(64), [
+        root({ Account: `rBad${index}`, Domain: domain }, { Sequence: 5 }),
+      ]);
+    const { accountDomains, diagnostics } = buildLedgerRows(ledgerOf([bad(42, 0), bad('ZZ', 1), bad(HARBOR, 2)]), XRPL);
+
+    expect(accountDomains.map((r) => [r.account, r.domain_hex])).toEqual([
+      ['rBad0', ''],
+      ['rBad1', ''],
+      ['rBad2', HARBOR],
+    ]);
+    expect(diagnostics.invalidDomains).toBe(2);
+  });
+
+  it('reads the Xahau transactions that change an account root like any other', () => {
+    const { accountDomains } = buildLedgerRows(
+      ledgerOf([
+        rawTx({ TransactionType: 'SetHook', Account: DOMAIN_ACCOUNT }, 0, '1'.repeat(64), [
+          root({ Account: DOMAIN_ACCOUNT, Domain: NORTHPEAK }, { Balance: '5' }),
+        ]),
+      ]),
+      XAHAU,
+    );
+
+    expect(accountDomains.map((r) => [r.account, r.domain_hex])).toEqual([[DOMAIN_ACCOUNT, NORTHPEAK]]);
+  });
+
+  it('writes nothing for a ledger in which no account has a Domain', () => {
+    const rows = buildLedgerRows(sampleLedger(), XRPL);
+    expect(rows.accountDomains).toEqual([]);
+    expect(rows.diagnostics.invalidDomains).toBe(0);
+  });
+
+  // The same nodes, counted the same way: a row of account_domains sits on a row of account_states (the seed of
+  // docs/backfill.md puts the state's own place in the domain row), and its node_index is the AffectedNodes index.
+  it.each([...SETS, NFT_SET, URITOKEN_SET])(
+    'sits on the account_states row of the same node, over $name, and holds its Domain',
+    (set) => {
+      let checked = 0;
+      const place = (r: { account: string; tx_index: number; node_index: number }): string =>
+        `${r.account}/${r.tx_index}/${r.node_index}`;
+      for (const { rows } of builtOf(set)) {
+        const states = new Map(rows.accountStates.map((r) => [place(r), r] as const));
+        const domains = new Set(rows.accountDomains.map(place));
+        // an account root that ends with a Domain always has its row
+        for (const state of rows.accountStates.filter((r) => 'Domain' in JSON.parse(r.fields))) {
+          expect([place(state), domains.has(place(state))]).toEqual([place(state), true]);
+        }
+        for (const domain of rows.accountDomains) {
+          const state = states.get(place(domain));
+          expect(state).toBeDefined();
+          expect(domain.deleted).toBe(state!.deleted);
+          expect(domain.domain_hex).toBe(state!.deleted ? '' : (JSON.parse(state!.fields).Domain ?? ''));
+          checked++;
+        }
+      }
+      // every fixture set holds account roots with a Domain: the check is not vacuous
+      expect(checked).toBeGreaterThan(0);
+    },
+  );
+
+  it('is deterministic and leaves the ledger unchanged: the version is the place of the node, nothing else', () => {
+    const raw = domainLedger();
+    const before = JSON.stringify(raw);
+    expect(buildLedgerRows(raw, XRPL).accountDomains).toEqual(buildLedgerRows(raw, XRPL).accountDomains);
+    expect(JSON.stringify(raw)).toBe(before);
+  });
+});
+
+// -- Ledger object rows -----------------------------------------------------------------------------------------
+
+describe('ledger objects (parser version 7)', () => {
+  const objectParser = new ObjectChangesParser();
+
+  /** The recorded case `name`, with the rows of its ledger and the ones that belong to its transaction. */
+  function recorded(net: 'xrpl' | 'xahau', name: string) {
+    const found = objectCase(net, name);
+    if (!found) throw new Error(`${net}/objects has no recorded ${name}`);
+    const rows = buildLedgerRows(found.ledger, net === 'xrpl' ? XRPL : XAHAU);
+    const txIndex = found.tx.meta.TransactionIndex as number;
+    const mine = <T extends { tx_index: number }>(list: T[]): T[] => list.filter((r) => r.tx_index === txIndex);
+    return { ...found, rows, txIndex, mine };
+  }
+
+  /** A copy of the ledger (the recorded one is frozen) with `change` applied to the transaction `hash`. */
+  function withTx(ledger: RawLedger, hash: string, change: (tx: Json, meta: Json) => void): RawLedger {
+    const copy = structuredClone(ledger) as RawLedger;
+    const t = copy.transactions.find((r) => r.hash === hash);
+    if (!t) throw new Error(`${hash} is not in ledger ${ledger.header.ledger_index}`);
+    change(t.tx, t.meta);
+    return copy;
+  }
+
+  const ESCROW_ID = 'B95064B1A92F02EE009E6BDFB369CF476FB925BB8615456970E38774034A5D30';
+  const ESCROW_OWNER = 'rNeJW71pMjKy42j5jn7vnWZAbmuU6SKs6V';
+  const ESCROW_DESTINATION = 'rGtW2dWHmHQ3f65pfbjYF5PbFbdZwgwuqW';
+
+  it('writes an EscrowCreate as one object_changes row and an owner and a counterparty account row', () => {
+    // Recorded: mainnet ledger 107897249 closed at Ripple time 846262160.
+    const { rows, tx, txIndex, ledger, mine } = recorded('xrpl', 'escrow_create_timed');
+    expect(ledger.header.close_time).toBe(846_262_160 + 946_684_800);
+    expect(mine(rows.objectChanges)).toEqual([
+      {
+        object_type: 'Escrow',
+        object_id: ESCROW_ID,
+        ledger_index: 107897249,
+        tx_index: txIndex,
+        tx_hash: tx.hash,
+        close_time: 846_262_160 + 946_684_800,
+        tx_type: 'EscrowCreate',
+        result: 'tesSUCCESS',
+        sender: ESCROW_OWNER,
+        delegate: '',
+        action: 'created',
+        event: 'create',
+        owner: ESCROW_OWNER,
+        counterparty: ESCROW_DESTINATION,
+        fields:
+          `{"Account":"${ESCROW_OWNER}","Amount":"500000","CancelAfter":846265741,"Destination":"${ESCROW_DESTINATION}",` +
+          '"FinishAfter":846262201,"Sequence":107896555,"SourceTag":2610250016}',
+        previous: '{}',
+        event_fields: '{"sequence":107896555}',
+      },
+    ]);
+    const key = { object_type: 'Escrow', ledger_index: 107897249, tx_index: txIndex, object_id: ESCROW_ID };
+    expect(mine(rows.accountObjectChanges)).toEqual([
+      { account: ESCROW_OWNER, role: 'owner', action: 'created', ...key },
+      { account: ESCROW_DESTINATION, role: 'counterparty', action: 'created', ...key },
+    ]);
+  });
+
+  it('writes one account row per role when owner and counterparty are the same account', () => {
+    // Recorded: ripple-mock ledger 29136413, an EscrowCreate whose Destination is its own Account.
+    const { rows } = ledgerNamed(RIPPLE_MOCK, 29136413);
+    const account = 'rGhDCgik9CwiNpcNnYHkEHcMgw2dkLgtNB';
+    const id = 'DBA5231FDE231A51F94640F890BF8FFDA45586EDBBD0ECCEAF532ADB8AC01A6F';
+    expect(rows.objectChanges.map((r) => [r.object_id, r.owner, r.counterparty, r.sender])).toEqual([
+      [id, account, account, account],
+    ]);
+    expect(rows.accountObjectChanges.map((r) => [r.account, r.role, r.object_id, r.tx_index])).toEqual([
+      [account, 'owner', id, 9],
+      [account, 'counterparty', id, 9],
+    ]);
+  });
+
+  it('writes a row for each transaction that changes an object, in the order of the transactions', () => {
+    // Recorded: ripple-mock ledger 29709909, two claims on one channel.
+    const { rows } = ledgerNamed(RIPPLE_MOCK, 29709909);
+    const channel = '9366A220FD4448B0BB199474DA87DCE498CB6926D244C53371574C7DF2586A57';
+    expect(rows.objectChanges.map((r) => [r.object_type, r.object_id, r.tx_index, r.event, r.action])).toEqual([
+      ['PayChannel', channel, 37, 'claim', 'modified'],
+      ['PayChannel', channel, 38, 'claim', 'modified'],
+    ]);
+    expect(rows.accountObjectChanges.map((r) => [r.account, r.role, r.tx_index])).toEqual([
+      ['rMwWvk2A87HeaDQ4yPNqptk1NdgHBAZV9d', 'owner', 37],
+      ['rnNzy3iPc7gPEAJbAdXwxY1UTBamBqTYhR', 'counterparty', 37],
+      ['rMwWvk2A87HeaDQ4yPNqptk1NdgHBAZV9d', 'owner', 38],
+      ['rnNzy3iPc7gPEAJbAdXwxY1UTBamBqTYhR', 'counterparty', 38],
+    ]);
+  });
+
+  it("fills delegate from the transaction's Delegate", () => {
+    const base = recorded('xrpl', 'escrow_create_timed');
+    expect(base.mine(base.rows.objectChanges).map((r) => r.delegate)).toEqual(['']);
+
+    // synthetic-delegated-escrow-create: the recorded EscrowCreate with a Delegate field added (test-built, not recorded)
+    const delegate = 'rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK';
+    const raw = withTx(base.ledger, base.tx.hash, (tx) => (tx.Delegate = delegate));
+    const rows = buildLedgerRows(raw, XRPL);
+    const mine = rows.objectChanges.filter((r) => r.tx_hash === base.tx.hash);
+    expect(mine.map((r) => [r.sender, r.delegate, r.owner])).toEqual([[ESCROW_OWNER, delegate, ESCROW_OWNER]]);
+    // nothing else of the ledger changes but the delegate's own account_transactions row (Task 5)
+    expect(rows.objectChanges.map((r) => ({ ...r, delegate: '' }))).toEqual(
+      base.rows.objectChanges.map((r) => ({ ...r, delegate: '' })),
+    );
+    expect(rows.accountObjectChanges).toEqual(base.rows.accountObjectChanges);
+
+    // Recorded: a DelegateSet is no delegated transaction, and its Delegate node has no Delegate column
+    const set = recorded('xrpl', 'delegate_set_create');
+    const [created] = set.mine(set.rows.objectChanges);
+    expect(created).toMatchObject({
+      object_type: 'Delegate',
+      action: 'created',
+      event: 'set',
+      sender: 'rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL',
+      delegate: '',
+      owner: 'rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL',
+      counterparty: 'rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK',
+    });
+    expect(set.mine(set.rows.accountObjectChanges).map((r) => [r.account, r.role, r.object_type])).toEqual([
+      ['rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL', 'owner', 'Delegate'],
+      ['rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK', 'counterparty', 'Delegate'],
+    ]);
+  });
+
+  it('writes no counterparty row for an object that has none', () => {
+    // synthetic-escrow-create-no-destination: the recorded EscrowCreate without its Destination (an escrow to oneself has none)
+    const base = recorded('xrpl', 'escrow_create_timed');
+    const raw = withTx(base.ledger, base.tx.hash, (tx, meta) => {
+      delete tx.Destination;
+      for (const node of meta.AffectedNodes as Json[]) {
+        if (node.CreatedNode?.LedgerEntryType === 'Escrow') delete node.CreatedNode.NewFields.Destination;
+      }
+    });
+    const rows = buildLedgerRows(raw, XRPL);
+    const mine = <T extends { tx_index: number }>(list: T[]): T[] => list.filter((r) => r.tx_index === base.txIndex);
+    expect(mine(rows.objectChanges).map((r) => [r.owner, r.counterparty])).toEqual([[ESCROW_OWNER, '']]);
+    expect(mine(rows.accountObjectChanges).map((r) => [r.account, r.role])).toEqual([[ESCROW_OWNER, 'owner']]);
+  });
+
+  it('counts update rows in diagnostics.objectsUnclassified', () => {
+    // synthetic-object-update: a Payment whose metadata modifies an Escrow and a Check, and a second one that modifies a
+    // PayChannel, which no row of the event table expects (test-built, not recorded)
+    const node = (type: string, id: string, owner: string, destination: string): Json => ({
+      ModifiedNode: {
+        LedgerEntryType: type,
+        LedgerIndex: id,
+        FinalFields: { Account: owner, Destination: destination, Amount: '10' },
+        PreviousFields: { Amount: '20' },
+      },
+    });
+    const ids = ['1', '2', '3'].map((digit) => digit.repeat(64));
+    const raw = ledgerOf([
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: RECEIVER, Amount: '1' }, 0, 'A'.repeat(64), [
+        node('Escrow', ids[0], SENDER, RECEIVER),
+        node('Check', ids[1], RECEIVER, SENDER),
+      ]),
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: RECEIVER, Amount: '1' }, 1, 'B'.repeat(64), [
+        node('PayChannel', ids[2], SENDER, RECEIVER),
+      ]),
+    ]);
+    const rows = buildLedgerRows(raw, XRPL);
+    expect(rows.objectChanges.map((r) => [r.object_type, r.event, r.action])).toEqual([
+      ['Escrow', 'update', 'modified'],
+      ['Check', 'update', 'modified'],
+      ['PayChannel', 'update', 'modified'],
+    ]);
+    expect(rows.accountObjectChanges).toHaveLength(6);
+    expect(rows.diagnostics.objectsUnclassified).toBe(3);
+
+    // a ledger of events the table expects counts none, and a ledger without objects none either
+    expect(recorded('xrpl', 'escrow_create_timed').rows.diagnostics.objectsUnclassified).toBe(0);
+    expect(buildLedgerRows(sampleLedger(), XRPL).diagnostics.objectsUnclassified).toBe(0);
+  });
+
+  it('writes nothing for a ledger without object activity', () => {
+    const rows = buildLedgerRows(sampleLedger(), XRPL);
+    expect(rows.objectChanges).toEqual([]);
+    expect(rows.accountObjectChanges).toEqual([]);
+    expect(rows.diagnostics.objectsUnclassified).toBe(0);
+    // the first ripple-mock ledgers hold no escrow, check, channel or delegation (the later ones hold two, tested above)
+    for (const { rows: built } of builtOf(RIPPLE_MOCK).slice(0, 5)) {
+      expect(built.objectChanges).toEqual([]);
+      expect(built.accountObjectChanges).toEqual([]);
+    }
+  });
+
+  it.each([OBJECTS_XRPL, OBJECTS_XAHAU, RIPPLE_MOCK])(
+    'is what the parser says, row for row, with an index row per role, over $name',
+    (set) => {
+      const types = new Set<string>();
+      let changes = 0;
+      for (const { raw, rows } of builtOf(set)) {
+        const parsed = raw.transactions.flatMap((t) =>
+          objectParser.parse(toParserTx(t, raw.header, null), set.ctx).map((change) => ({ t, change })),
+        );
+        expect(rows.objectChanges.map((r) => [r.tx_index, r.object_type, r.object_id, r.action, r.event])).toEqual(
+          parsed.map(({ t, change }) => [
+            t.meta.TransactionIndex,
+            change.object_type,
+            change.object_id,
+            change.action,
+            change.event,
+          ]),
+        );
+
+        const index = rows.accountObjectChanges;
+        let at = 0;
+        for (const row of rows.objectChanges) {
+          // the transaction's columns
+          const t = raw.transactions.find((r) => r.hash === row.tx_hash)!;
+          expect(row.sender).toBe(t.tx.Account);
+          expect(row.delegate).toBe(typeof t.tx.Delegate === 'string' ? t.tx.Delegate : '');
+          expect(row.tx_type).toBe(t.tx.TransactionType);
+          expect(row.result).toBe(t.meta.TransactionResult);
+          // the index: the owner, then the counterparty unless there is none, in the order of the object rows
+          const wanted = [
+            ['owner', row.owner],
+            ...(row.counterparty === '' ? [] : [['counterparty', row.counterparty]]),
+          ];
+          for (const [role, account] of wanted) {
+            expect(index[at]).toEqual({
+              account,
+              object_type: row.object_type,
+              role,
+              ledger_index: row.ledger_index,
+              tx_index: row.tx_index,
+              object_id: row.object_id,
+              action: row.action,
+            });
+            at++;
+          }
+          types.add(row.object_type);
+          changes++;
+        }
+        expect(index).toHaveLength(at);
+        expect(rows.diagnostics.objectsUnclassified).toBe(
+          rows.objectChanges.filter((r) => r.event === 'update').length,
+        );
+      }
+      // the check is not vacuous: the sets hold rows, the recorded object sets of every tracked type
+      expect(changes).toBeGreaterThan(0);
+      if (set === OBJECTS_XRPL) expect([...types].sort()).toEqual(['Check', 'Delegate', 'Escrow', 'PayChannel']);
+    },
+  );
+
+  it('stamps parser_version 10 on the object ledgers: OBJECT_PARSER_VERSION, the first version with object rows, stays 7', () => {
+    expect(OBJECT_PARSER_VERSION).toBe(7);
+    expect(PARSER_VERSION).toBe(10);
+    for (const set of [OBJECTS_XRPL, OBJECTS_XAHAU]) {
+      for (const { rows } of builtOf(set)) {
+        expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
+        expect(rows.ledger.parser_version).toBeGreaterThanOrEqual(OBJECT_PARSER_VERSION);
+      }
+    }
   });
 });
 
@@ -1359,8 +2442,772 @@ function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]
   return Object.fromEntries(keys.map((key) => [key, object[key]])) as Pick<T, K>;
 }
 
+describe('state touches (parser version 8)', () => {
+  const stateTouches = new StateTouchesParser();
+  const SOURCES = [RIPPLE_MOCK, AMM_SET, XAHAU_SET, NFT_SET, OBJECTS_XRPL, OBJECTS_XAHAU, STATE_TOUCHES_XRPL];
+
+  it('is the version of the token aggregate: TOKEN_PARSER_VERSION is the PARSER_VERSION that introduced the table', () => {
+    expect(TOKEN_PARSER_VERSION).toBe(8);
+    expect(PARSER_VERSION).toBeGreaterThanOrEqual(TOKEN_PARSER_VERSION);
+  });
+
+  it.each(SOURCES)(
+    'is what the parser says for each transaction, in the order of the transactions, over $name',
+    (set) => {
+      let touches = 0;
+      for (const { raw, rows } of builtOf(set)) {
+        const expected = raw.transactions.flatMap((tx) => {
+          const t = toParserTx(tx, raw.header, null);
+          return stateTouches
+            .parse(deepFreeze(t), set.ctx)
+            .map((touch) => ({ ledger_index: raw.header.ledger_index, tx_index: t.tx_index, ...touch }));
+        });
+        expect(rows.stateTouches).toEqual(expected);
+        touches += expected.length;
+      }
+      expect(touches).toBeGreaterThan(0);
+    },
+  );
+
+  it('gives the touches of ripple-mock 11119620 (6 lines) and 11618225 (6 lines and the created account), and none to 11118827 and the Xahau ledgers', () => {
+    const kinds = (index: number) =>
+      ledgerNamed(RIPPLE_MOCK, index)
+        .rows.stateTouches.map((r) => r.kind)
+        .sort();
+    expect(kinds(11118827)).toEqual([]);
+    expect(kinds(11119620)).toEqual(['line', 'line', 'line', 'line', 'line', 'line']);
+    expect(kinds(11618225)).toEqual(['account', 'line', 'line', 'line', 'line', 'line', 'line']);
+    expect(ledgerNamed(XAHAU_SET, 26540188).rows.stateTouches).toEqual([]);
+  });
+
+  it("writes the transaction's own index, meta.TransactionIndex, and the line of a recorded Clawback", () => {
+    // (The node lists this transaction 123rd of 157 in the expanded ledger; its TransactionIndex is 80.)
+    const clawback = JSON.parse(readFileSync(join(FIXTURES, 'xrpl', 'state-touches', 'manifest.json'), 'utf8')).cases
+      .clawback as { ledger: number; hash: string };
+    const { raw, rows } = ledgerNamed(STATE_TOUCHES_XRPL, clawback.ledger);
+    const tx = raw.transactions.find((t) => t.hash === clawback.hash)!;
+    const txIndex = tx.meta.TransactionIndex as number;
+    expect(txIndex).toBe(80);
+
+    expect(rows.stateTouches.filter((r) => r.tx_index === txIndex)).toEqual([
+      {
+        ledger_index: clawback.ledger,
+        tx_index: txIndex,
+        kind: 'line',
+        account: 'rYNKrtQaf3vUVWVK5sw9rJdPGDLbxZu89',
+        counterparty: 'rYNK7JFGbJhkX8HhT4zw1LJ1Yiu3aa9Mp',
+        currency: '594F494E4B000000000000000000000000000000',
+      },
+    ]);
+  });
+
+  it('writes the touches of a failed transaction too, and none for a ledger without transactions', () => {
+    const failedSet = rawTx(
+      { TransactionType: 'AccountSet', Account: 'rSet' },
+      0,
+      'F'.repeat(64),
+      [
+        {
+          ModifiedNode: {
+            LedgerEntryType: 'AccountRoot',
+            FinalFields: { Account: 'rSet', Balance: '1', Sequence: 6 },
+            PreviousFields: { Balance: '13', Sequence: 5 },
+          },
+        },
+      ],
+      'tecNO_PERMISSION',
+    );
+    const rows = buildLedgerRows(ledgerOf([failedSet]), XRPL);
+
+    expect(rows.stateTouches).toEqual([
+      {
+        ledger_index: rows.ledger.ledger_index,
+        tx_index: 0,
+        kind: 'account',
+        account: 'rSet',
+        counterparty: '',
+        currency: '',
+      },
+    ]);
+    expect(buildLedgerRows(ledgerOf([]), XRPL).stateTouches).toEqual([]);
+  });
+});
+
+// -- Xahau mint rows --------------------------------------------------------------------------------------------
+
+describe('Xahau mint rows (parser version 9)', () => {
+  const rewardsParser = new RewardsParser();
+  const importParser = new ImportParser();
+
+  const CLAIM_HASH = '3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C';
+  const MINT_HASH = 'E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D';
+  const HOOK_HASH = '610F33B8EBF7EC795F822A454FB852156AEFE50BE0CB8326338A81CD74801864';
+  const GOVERNANCE_PARENT = 'DE1FEAEA69ABF97EA8D95341A6C9B79094746CD8F35C0557583BB986867BB48D';
+  const CLAIMER = 'rDitc4S7Y1GF2yzM4S2dayA4jYuK6YewSz';
+  const HOOK_ACCOUNT = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+
+  /** The ledgers of the mint directory that the manifest's `cases` mark as hand-made, by the file name they come from. */
+  function handMadeLedgers(): Set<number> {
+    const { cases } = JSON.parse(readFileSync(join(MINT_XAHAU.dir, 'manifest.json'), 'utf8')) as {
+      cases: Record<string, { file?: string }>;
+    };
+    const files = Object.values(cases)
+      .map((c) => c.file)
+      .filter((file): file is string => file !== undefined);
+    const present = readdirSync(MINT_XAHAU.dir);
+    for (const file of files) expect(present).toContain(file);
+    return new Set(files.map((file) => Number(/^(\d+)-/.exec(file)?.[1])));
+  }
+
+  /** The amendment id of XahauGenesis, from the definitions of the network. */
+  function xahauGenesisId(): string {
+    const { features } = JSON.parse(
+      readFileSync(join(PACKAGE_ROOT, 'config', 'definitions', 'xahau.json'), 'utf8'),
+    ) as {
+      features: Record<string, { name: string }>;
+    };
+    const found = Object.entries(features).find(([, feature]) => feature.name === 'XahauGenesis');
+    if (!found) throw new Error('XahauGenesis is not in the definitions of xahau');
+    return found[0];
+  }
+
+  it('is parser version 9 for the first version that has the rows, which readers gate on, and the build is at or above it', () => {
+    expect(MINT_PARSER_VERSION).toBe(9);
+    expect(PARSER_VERSION).toBeGreaterThanOrEqual(MINT_PARSER_VERSION);
+    for (const set of [XAHAU_SET, MINT_XAHAU]) {
+      for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
+    }
+  });
+
+  it('gives the recorded ClaimReward of 26540187 its reward_claims row (the ledger has no snapshot)', () => {
+    const { raw, rows } = ledgerNamed(XAHAU_SET, 26540187);
+    expect(raw.header.close_time).toBe(845_372_730 + 946_684_800);
+    expect(rows.rewardClaims).toEqual([
+      {
+        ledger_index: 26540187,
+        tx_index: 9,
+        tx_hash: CLAIM_HASH,
+        close_time: raw.header.close_time,
+        account: CLAIMER,
+        issuer: HOOK_ACCOUNT,
+        opt_out: 0,
+      },
+    ]);
+    expect(rows.genesisMints).toEqual([]);
+    expect(rows.imports).toEqual([]);
+    expect(rows.diagnostics.importMintedNegative).toBe(0);
+  });
+
+  it('gives the recorded GenesisMint of 26540188 one genesis_mints row per entry, in entry order, with its parent and hook', () => {
+    const { raw, rows } = ledgerNamed(XAHAU_SET, 26540188);
+    expect(rows.genesisMints.map((r) => [r.mint_index, r.destination, r.amount])).toEqual([
+      [0, 'rDitc4S7Y1GF2yzM4S2dayA4jYuK6YewSz', '11755654'],
+      [1, 'rD74dUPRFNfgnY2NzrxxYRXN4BrfGSN6Mv', '587351'],
+      [2, 'rN7XCq12KBvBLKad3wWsVUwmb3dNx1fx3e', '587351'],
+      [3, 'ra7MQw7YoMjUw6thxmSGE6jpAEY3LTHxev', '587351'],
+      [4, 'rfMB6RCNdWSB6TJXYwCEU5HvDC2eArJp8h', '587351'],
+      [5, 'r4FF5jjJMS2XqWDyTYStWrgARsj3FjaJ2J', '587351'],
+      [6, 'r4FRPZbLnyuVeGiSi1Ap6uaaPvPXYZh1XN', '587351'],
+      [7, 'rHsh4MNWJKXN2YGtSf95aEzFYzMqwGiBve', '587351'],
+    ]);
+    for (const row of rows.genesisMints) {
+      expect(row).toMatchObject({
+        ledger_index: 26540188,
+        tx_index: 0,
+        tx_hash: MINT_HASH,
+        close_time: raw.header.close_time,
+        parent_tx_hash: CLAIM_HASH,
+        emit_hook_hash: HOOK_HASH,
+      });
+    }
+    expect(rows.genesisMints.reduce((sum, r) => sum + BigInt(r.amount), 0n)).toBe(15_867_111n);
+    expect(rows.rewardClaims).toEqual([]);
+    expect(rows.imports).toEqual([]);
+  });
+
+  it('gives each recorded Import its imports row: a created account (Fee 0) and an account that existed (Fee 100)', () => {
+    const created = ledgerNamed(MINT_XAHAU, 24508587);
+    expect(created.rows.imports).toEqual([
+      {
+        ledger_index: 24508587,
+        tx_index: 80,
+        tx_hash: 'A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843',
+        close_time: created.raw.header.close_time,
+        account: 'rBPKXGERk7KrzZDGXscchv4eQoS2k6nV6M',
+        minted: '2000000',
+        account_created: 1,
+      },
+    ]);
+    const existing = ledgerNamed(MINT_XAHAU, 2609053);
+    expect(existing.rows.imports).toEqual([
+      {
+        ledger_index: 2609053,
+        tx_index: 1,
+        tx_hash: '3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE',
+        close_time: existing.raw.header.close_time,
+        account: 'rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge',
+        minted: '11',
+        account_created: 0,
+      },
+    ]);
+    // Their parent ledgers hold none of the three types.
+    for (const parent of [24508586, 2609052]) {
+      const { rows } = ledgerNamed(MINT_XAHAU, parent);
+      expect([rows.genesisMints, rows.imports, rows.rewardClaims]).toEqual([[], [], []]);
+    }
+  });
+
+  it('reads the two hand-made ledgers: an opt-out without an Issuer, and a mint whose parent is no claim', () => {
+    const optOut = ledgerNamed(MINT_XAHAU, 26540187).rows.rewardClaims;
+    expect(optOut).toHaveLength(1);
+    expect(optOut[0]).toMatchObject({ tx_hash: CLAIM_HASH, account: CLAIMER, issuer: '', opt_out: 1 });
+    const governance = ledgerNamed(MINT_XAHAU, 26540188).rows.genesisMints;
+    expect(governance).toHaveLength(8);
+    for (const row of governance) expect(row.parent_tx_hash).toBe(GOVERNANCE_PARENT);
+  });
+
+  it.each([XAHAU_SET, MINT_XAHAU])(
+    'are the rows of the parsers for each transaction, in the order of the transactions, over $name',
+    (set) => {
+      let claims = 0;
+      let mints = 0;
+      let imported = 0;
+      for (const { raw, rows } of builtOf(set)) {
+        const base = { ledger_index: raw.header.ledger_index, close_time: raw.header.close_time };
+        const claimRows: Json[] = [];
+        const mintRows: Json[] = [];
+        const importRows: Json[] = [];
+        for (const transaction of raw.transactions) {
+          const t = deepFreeze(toParserTx(transaction, raw.header, null));
+          const rewards = rewardsParser.parse(t, set.ctx);
+          if (rewards.claim) {
+            claimRows.push({
+              ...base,
+              tx_index: t.tx_index,
+              tx_hash: t.hash,
+              account: rewards.claim.account,
+              issuer: rewards.claim.issuer,
+              opt_out: rewards.claim.opt_out ? 1 : 0,
+            });
+          }
+          for (const mint of rewards.mints) {
+            mintRows.push({
+              ledger_index: base.ledger_index,
+              tx_index: t.tx_index,
+              mint_index: mint.mint_index,
+              tx_hash: t.hash,
+              close_time: base.close_time,
+              destination: mint.destination,
+              amount: mint.amount,
+              parent_tx_hash: mint.parent_tx_hash,
+              emit_hook_hash: mint.emit_hook_hash,
+            });
+          }
+          const parsed = importParser.parse(t, set.ctx);
+          if (parsed) {
+            importRows.push({
+              ...base,
+              tx_index: t.tx_index,
+              tx_hash: t.hash,
+              account: parsed.account,
+              minted: parsed.minted,
+              account_created: parsed.account_created ? 1 : 0,
+            });
+          }
+        }
+        expect(rows.rewardClaims).toEqual(claimRows);
+        expect(rows.genesisMints).toEqual(mintRows);
+        expect(rows.imports).toEqual(importRows);
+        claims += claimRows.length;
+        mints += mintRows.length;
+        imported += importRows.length;
+      }
+      // the check is not vacuous: each set holds rows of the types it was recorded for
+      if (set === XAHAU_SET) expect([claims, mints, imported]).toEqual([1, 8, 0]);
+      else expect([claims, mints, imported]).toEqual([1, 8, 2]);
+    },
+  );
+
+  /** Whether the ledger holds the `EnableAmendment` of XahauGenesis: it changes `total_coins` once, at the network's start. */
+  const enablesXahauGenesis = (raw: RawLedger, genesisId = xahauGenesisId()): boolean =>
+    raw.transactions.some((t) => t.tx.TransactionType === 'EnableAmendment' && t.tx.Amendment === genesisId);
+
+  /**
+   * The invariant of the supply on every ledger of `ledgers` whose parent is in `ledgers` too (the `excluded` indexes are in
+   * neither role), but for a ledger that enables XahauGenesis: the supply it began with is not a mint (decision 5). The
+   * entries minted by a `GenesisMint` plus the drops each `Import` brought equal the growth of `total_coins` plus the fees.
+   * Fails an `expect` when it does not hold, and says what it checked.
+   */
+  function checkMintInvariant(ledgers: readonly Built[], excluded: ReadonlySet<number> = new Set()) {
+    const genesisId = xahauGenesisId();
+    const byIndex = new Map(
+      ledgers
+        .filter((b) => !excluded.has(b.raw.header.ledger_index))
+        .map((b) => [b.raw.header.ledger_index, b] as const),
+    );
+    let pairs = 0;
+    let genesis = 0n;
+    let imported = 0n;
+    for (const [index, child] of byIndex) {
+      const parent = byIndex.get(index - 1);
+      if (!parent || enablesXahauGenesis(child.raw, genesisId)) continue;
+
+      const fromGenesis = child.rows.genesisMints.reduce((sum, r) => sum + BigInt(r.amount), 0n);
+      const fromImports = child.rows.imports.reduce((sum, r) => sum + BigInt(r.minted), 0n);
+      const grown = BigInt(child.rows.ledger.total_coins) - BigInt(parent.rows.ledger.total_coins);
+      expect([index, fromGenesis + fromImports]).toEqual([index, grown + BigInt(child.rows.ledger.fee_total)]);
+      genesis += fromGenesis;
+      imported += fromImports;
+      pairs++;
+    }
+    return { pairs, genesis, imported };
+  }
+
+  it('mints what the header grew by plus the fees, on every recorded parent and child', () => {
+    const handMade = handMadeLedgers();
+    expect([...handMade].sort()).toEqual([26540187, 26540188]);
+
+    const recorded = checkMintInvariant(builtOf(XAHAU_SET));
+    const cases = checkMintInvariant(builtOf(MINT_XAHAU), handMade);
+    const pairs = recorded.pairs + cases.pairs;
+    expect(pairs).toBe(3);
+    // not vacuous: both kinds of mint were part of it
+    expect(recorded.genesis + cases.genesis).toBeGreaterThan(0n);
+    expect(recorded.imported + cases.imported).toBeGreaterThan(0n);
+  });
+
+  describe('the XahauGenesis skip of that invariant', () => {
+    // No recorded ledger enables XahauGenesis (it did so at ledger 3), so the skip is shown on hand-built ones.
+    const ZERO = 'rrrrrrrrrrrrrrrrrrrrrhoLvTp';
+    const enable = (amendment: string): Json =>
+      rawTx(
+        { TransactionType: 'EnableAmendment', Account: ZERO, Fee: '0', Amendment: amendment },
+        0,
+        'E'.repeat(64),
+        [],
+      );
+    const pair = (amendment?: string): Built[] =>
+      [
+        ledgerOf([], { ledger_index: '5000000', total_coins: '1000' }),
+        // total_coins grows by 500 with no mint and no fee: not a mint, the supply the network began with
+        ledgerOf(amendment === undefined ? [] : [enable(amendment)], { ledger_index: '5000001', total_coins: '1500' }),
+      ].map((raw) => ({ raw, rows: buildLedgerRows(raw, XAHAU) }));
+
+    it('uses the id of the amendment: the first half of the SHA-512 of its name, as amendment ids are', () => {
+      expect(xahauGenesisId()).toBe(
+        createHash('sha512').update('XahauGenesis').digest('hex').slice(0, 64).toUpperCase(),
+      );
+      expect(xahauGenesisId()).toBe('6E739F4F8B07BED29FC9FF440DA3C301CD14A180DF45819F658FEC2F7DE31427');
+    });
+
+    it('skips a ledger that enables XahauGenesis, and holds any other ledger whose total_coins grows without a mint to the invariant', () => {
+      const id = xahauGenesisId();
+      expect(checkMintInvariant(pair(id))).toEqual({ pairs: 0, genesis: 0n, imported: 0n });
+      expect(enablesXahauGenesis(pair(id)[1].raw)).toBe(true);
+      // another amendment, or none, is no skip: the growth is unexplained and the invariant fails
+      expect(enablesXahauGenesis(pair('A'.repeat(64))[1].raw)).toBe(false);
+      expect(() => checkMintInvariant(pair('A'.repeat(64)))).toThrow();
+      expect(() => checkMintInvariant(pair())).toThrow();
+    });
+
+    it('is not taken by a recorded Xahau ledger: none enables XahauGenesis', () => {
+      for (const set of [XAHAU_SET, MINT_XAHAU]) {
+        for (const { raw } of builtOf(set)) expect(enablesXahauGenesis(raw)).toBe(false);
+      }
+    });
+  });
+
+  it.each([
+    [Table.GenesisMints, 'genesisMints', ['ledger_index', 'tx_index', 'mint_index']],
+    [Table.Imports, 'imports', ['ledger_index', 'tx_index']],
+    [Table.RewardClaims, 'rewardClaims', ['ledger_index', 'tx_index']],
+  ] as const)('%s has a unique ORDER BY key over the recorded Xahau ledgers', (table, key, columns) => {
+    expect(orderByColumns(table)).toEqual([...columns]);
+    for (const set of [XAHAU_SET, MINT_XAHAU]) {
+      const rows = collect(builtOf(set), key);
+      const seen = new Set(rows.map((row) => JSON.stringify(columns.map((c) => row[c]))));
+      expect(seen.size).toBe(rows.length);
+    }
+    expect(collect([...builtOf(XAHAU_SET), ...builtOf(MINT_XAHAU)], key).length).toBeGreaterThan(0);
+  });
+
+  it('gives every recorded XRPL ledger the three arrays empty', () => {
+    let ledgers = 0;
+    // every other directory of ledgers of the XRP Ledger and its testnet
+    const rest = (network: 'xrpl' | 'xrpl-testnet', dir: string): FixtureSet => ({
+      name: `${network}/${dir}`,
+      ctx: parseContextFor(getNetworkProfile(network)),
+      dir: join(FIXTURES, network, dir),
+      minNativeChecked: 0,
+      minTrustlinesChecked: 0,
+    });
+    const others = [
+      rest('xrpl', 'account-state'),
+      rest('xrpl', 'account-domains'),
+      rest('xrpl', 'path-payments'),
+      rest('xrpl-testnet', 'recorded'),
+    ];
+    for (const set of [...SETS.filter((s) => s.ctx === XRPL), NFT_SET, OBJECTS_XRPL, STATE_TOUCHES_XRPL, ...others]) {
+      for (const { rows } of builtOf(set)) {
+        expect([rows.genesisMints, rows.imports, rows.rewardClaims]).toEqual([[], [], []]);
+        expect(rows.diagnostics.importMintedNegative).toBe(0);
+        ledgers++;
+      }
+    }
+    expect(ledgers).toBeGreaterThan(100);
+    for (const set of others) expect([set.name, builtOf(set).length > 0]).toEqual([set.name, true]);
+    expect(buildLedgerRows(sampleLedger(), XRPL).imports).toEqual([]);
+  });
+
+  describe('a hand-built ledger', () => {
+    const created = (address: string, balance: string): Json => ({
+      CreatedNode: { LedgerEntryType: 'AccountRoot', NewFields: { Account: address, Balance: balance, Sequence: 1 } },
+    });
+    const importTx = (index: number, who: string, fee: string, nodes: Json[], result = 'tesSUCCESS'): Json =>
+      rawTx({ TransactionType: 'Import', Account: who, Fee: fee }, index, String(index).repeat(64), nodes, result);
+
+    const ledger = (): RawLedger =>
+      ledgerOf([
+        importTx(0, NEWBIE, '100', [account(NEWBIE, '1000000', '999911')]),
+        // the account lost more than the Fee it paid: cannot happen on the network (F5), so it is clamped and counted
+        importTx(1, SENDER, '100', [account(SENDER, '1000000', '999000')]),
+        importTx(2, TAKER, '100', [account(TAKER, '1000000', '999000')], 'tecNO_PERMISSION'),
+        importTx(3, RECEIVER, '0', [created(RECEIVER, '2000000')]),
+        importTx(4, PROVIDER, '100', [account(PROVIDER, '500', '300')]),
+      ]);
+
+    it('counts the clamped imports in diagnostics.importMintedNegative and writes them with minted 0', () => {
+      const rows = buildLedgerRows(ledger(), XAHAU);
+      expect(rows.diagnostics.importMintedNegative).toBe(2);
+      expect(rows.imports.map((r) => [r.tx_index, r.account, r.minted, r.account_created])).toEqual([
+        [0, NEWBIE, '11', 0],
+        [1, SENDER, '0', 0],
+        [3, RECEIVER, '2000000', 1],
+        [4, PROVIDER, '0', 0],
+      ]);
+    });
+
+    it('writes the claim of a failed ClaimReward, and no mint for a failed GenesisMint', () => {
+      const mint = (index: number, entries: unknown, result: string): Json =>
+        rawTx(
+          { TransactionType: 'GenesisMint', Account: HOOK_ACCOUNT, Fee: '0', GenesisMints: entries },
+          index,
+          String(index).repeat(64),
+          [],
+          result,
+        );
+      const rows = buildLedgerRows(
+        ledgerOf([
+          rawTx(
+            { TransactionType: 'ClaimReward', Account: SENDER, Issuer: HOOK_ACCOUNT, Flags: 0 },
+            0,
+            '0'.repeat(64),
+            [],
+            'tecNO_PERMISSION',
+          ),
+          mint(1, [{ GenesisMint: { Destination: RECEIVER, Amount: '5' } }], 'tecNO_PERMISSION'),
+          mint(
+            2,
+            [{ GenesisMint: { Destination: RECEIVER, Amount: '7' } }, { GenesisMint: { Destination: NEWBIE } }],
+            'tesSUCCESS',
+          ),
+          // a ledger cannot hold this; the build must still not throw
+          mint(3, 'not a list', 'tesSUCCESS'),
+        ]),
+        XAHAU,
+      );
+      expect(rows.rewardClaims.map((r) => [r.tx_index, r.account, r.issuer, r.opt_out])).toEqual([
+        [0, SENDER, HOOK_ACCOUNT, 0],
+      ]);
+      expect(rows.genesisMints.map((r) => [r.tx_index, r.mint_index, r.destination, r.amount])).toEqual([
+        [2, 0, RECEIVER, '7'],
+      ]);
+      expect(rows.imports).toEqual([]);
+    });
+  });
+});
+
+describe('MPT rows (parser version 10)', () => {
+  const SETS_OF_MPT = [MPT_SET, MPT_TESTNET_SET];
+  const everyBuilt = (): Built[] => SETS_OF_MPT.flatMap((set) => builtOf(set));
+
+  /** The ledger and the rows of a case's transaction. */
+  function rowsOfCase(name: string): { rows: LedgerRows; txIndex: number; hash: string } {
+    const t = mptCase(name);
+    const found = everyBuilt().find((b) => b.raw.header.ledger_index === t.ledger_index);
+    if (found === undefined) throw new Error(`${name}: ledger ${t.ledger_index} is not recorded`);
+    return { rows: found.rows, txIndex: t.tx_index, hash: t.hash };
+  }
+
+  const ofTx = <T extends { tx_index: number }>(rows: readonly T[], txIndex: number): T[] =>
+    rows.filter((r) => r.tx_index === txIndex);
+
+  it('is parser version 10 for both the build and the first version that has the rows, which readers gate on', () => {
+    expect([PARSER_VERSION, MPT_PARSER_VERSION]).toEqual([10, 10]);
+    for (const { rows } of everyBuilt()) expect(rows.ledger.parser_version).toBe(MPT_PARSER_VERSION);
+  });
+
+  // [issuance states, holder states, transfers] of each case's transaction, from FINDINGS and the cases' nodes.
+  const CASE_ROWS: Record<string, [number, number, number]> = {
+    issuance_create: [1, 0, 0],
+    issuance_create_short_keys: [1, 0, 0],
+    issuance_create_raw_metadata: [1, 0, 0],
+    issuance_create_no_max: [1, 0, 0],
+    issuance_set_lock_holder: [0, 1, 1],
+    issuance_set_unlock_holder: [0, 1, 1],
+    issuance_set_lock_all: [1, 0, 1],
+    issuance_destroy: [1, 0, 0],
+    authorize_holder: [0, 1, 0],
+    authorize_by_issuer: [0, 1, 0],
+    unauthorize_holder: [0, 1, 0],
+    payment_holder_to_holder: [0, 2, 1],
+    payment_mint: [1, 1, 1],
+    payment_redeem: [1, 1, 1],
+    payment_transfer_fee: [1, 2, 1],
+    payment_before_delivered_fix: [1, 1, 1],
+    payment_failed: [0, 0, 0],
+    clawback_full: [1, 1, 1],
+    clawback_partial: [1, 1, 1],
+    clawback_issued: [0, 0, 0],
+    escrow_create: [1, 1, 1],
+    escrow_finish: [1, 2, 1],
+    escrow_cancel: [1, 1, 1],
+    escrow_create_transfer_fee: [1, 1, 1],
+    escrow_finish_transfer_fee: [1, 2, 1],
+    escrow_finish_creates_token: [1, 2, 1],
+  };
+
+  it('names every recorded case', () => {
+    expect(Object.keys(CASE_ROWS).sort()).toEqual([...mptCaseNames()].sort());
+  });
+
+  it.each(Object.entries(CASE_ROWS))('writes the MPT rows of %s', (name, [issuances, holders, transfers]) => {
+    const { rows, txIndex } = rowsOfCase(name);
+    expect(ofTx(rows.mptIssuanceStates, txIndex)).toHaveLength(issuances);
+    expect(ofTx(rows.mptHolderStates, txIndex)).toHaveLength(holders);
+    expect(ofTx(rows.mptTouches, txIndex)).toHaveLength(issuances + holders);
+    expect(ofTx(rows.mptTransfers, txIndex)).toHaveLength(transfers);
+    expect(ofTx(rows.mptIssuanceTransfers, txIndex)).toHaveLength(transfers);
+  });
+
+  it('gives the rows the columns of the ledger and the transaction', () => {
+    const t = mptCase('payment_transfer_fee');
+    const { rows, txIndex } = rowsOfCase('payment_transfer_fee');
+    const id = t.tx.Amount.mpt_issuance_id as string;
+    const columns = {
+      ledger_index: t.ledger_index,
+      tx_index: txIndex,
+      tx_hash: t.hash,
+      tx_type: 'Payment',
+      close_time: t.close_time,
+    };
+    expect(ofTx(rows.mptIssuanceStates, txIndex)).toEqual([
+      {
+        mpt_issuance_id: id,
+        ...columns,
+        node_index: expect.any(Number),
+        issuer: 'rERShrtUSEXkrwtTpugPV4v8E787vpx1kb',
+        sequence: 93910752,
+        flags: 32,
+        asset_scale: 6,
+        maximum_amount: '1000000000000000',
+        outstanding_amount: '199999998994110',
+        escrowed_amount: '0',
+        transfer_fee: 589,
+        metadata_hex: expect.any(String),
+        deleted: 0,
+      },
+    ]);
+    expect(ofTx(rows.mptHolderStates, txIndex).map((r) => [r.holder, r.amount, r.deleted])).toEqual([
+      [t.tx.Account, '199999997994097', 0],
+      [t.tx.Destination, expect.any(String), 0],
+    ]);
+    expect(ofTx(rows.mptTransfers, txIndex)).toEqual([
+      {
+        ledger_index: t.ledger_index,
+        tx_index: txIndex,
+        mpt_issuance_id: id,
+        tx_hash: t.hash,
+        tx_type: 'Payment',
+        close_time: t.close_time,
+        kind: 'payment',
+        source: t.tx.Account,
+        destination: t.tx.Destination,
+        amount: '1000000',
+        fee: '5890',
+      },
+    ]);
+  });
+
+  it('writes deleted as 1 on what was removed', () => {
+    const destroy = rowsOfCase('issuance_destroy');
+    expect(ofTx(destroy.rows.mptIssuanceStates, destroy.txIndex)[0].deleted).toBe(1);
+    const unauthorize = rowsOfCase('unauthorize_holder');
+    expect(ofTx(unauthorize.rows.mptHolderStates, unauthorize.txIndex)[0].deleted).toBe(1);
+  });
+
+  it('touches each issuance and holder once per transaction', () => {
+    let checked = 0;
+    for (const { rows } of everyBuilt()) {
+      const expected = new Set([
+        ...rows.mptIssuanceStates.map((r) => `${r.tx_index}|${r.mpt_issuance_id}|`),
+        ...rows.mptHolderStates.map((r) => `${r.tx_index}|${r.mpt_issuance_id}|${r.holder}`),
+      ]);
+      const touches = rows.mptTouches.map((r) => `${r.tx_index}|${r.mpt_issuance_id}|${r.holder}`);
+      expect(new Set(touches)).toEqual(expected);
+      expect(touches).toHaveLength(expected.size);
+      for (const touch of rows.mptTouches) {
+        expect(Object.keys(touch)).toEqual(['ledger_index', 'tx_index', 'mpt_issuance_id', 'holder']);
+        expect(touch.ledger_index).toBe(rows.ledger.ledger_index);
+      }
+      checked += touches.length;
+    }
+    expect(checked).toBeGreaterThanOrEqual(50);
+  });
+
+  // Synthetic, edited from payment_mint: the holder's node is in the metadata twice, which no ledger writes.
+  it('touches a pair once when a transaction has two nodes of it', () => {
+    const t = mptCase('payment_mint');
+    const raw = structuredClone(everyBuilt().find((b) => b.raw.header.ledger_index === t.ledger_index)!.raw);
+    const copy = raw.transactions.find((r) => r.hash === t.hash)!;
+    const nodes = copy.meta.AffectedNodes as Json[];
+    const holder = nodes.find((n) => n.ModifiedNode?.LedgerEntryType === 'MPToken')!;
+    nodes.push(structuredClone(holder));
+    const rows = buildLedgerRows(raw, XRPL);
+    expect(ofTx(rows.mptHolderStates, t.tx_index)).toHaveLength(2);
+    expect(ofTx(rows.mptTouches, t.tx_index)).toHaveLength(2);
+  });
+
+  it('copies every transfer into mpt_issuance_transfers', () => {
+    let checked = 0;
+    for (const { rows } of everyBuilt()) {
+      expect(rows.mptIssuanceTransfers).toHaveLength(rows.mptTransfers.length);
+      const canonical = (row: Json): string => JSON.stringify(Object.entries(row).sort(([a], [b]) => (a < b ? -1 : 1)));
+      expect(rows.mptIssuanceTransfers.map(canonical)).toEqual(rows.mptTransfers.map(canonical));
+      checked += rows.mptTransfers.length;
+    }
+    expect(checked).toBeGreaterThanOrEqual(20);
+  });
+
+  it.each(MPT_TABLES)('keeps every key unique in %s', (table, key) => {
+    const columns = orderByColumns(table);
+    const rows = collect(everyBuilt(), key);
+    expect(rows.length).toBeGreaterThan(0);
+    const seen = new Set(rows.map((row) => JSON.stringify(columns.map((c) => row[c]))));
+    expect(seen.size).toBe(rows.length);
+  });
+
+  it('has the keys of the spec, the five of them', () => {
+    expect(MPT_TABLES.map(([table]) => orderByColumns(table))).toEqual([
+      ['mpt_issuance_id', 'ledger_index', 'tx_index', 'node_index'],
+      ['holder', 'mpt_issuance_id', 'ledger_index', 'tx_index', 'node_index'],
+      ['ledger_index', 'tx_index', 'mpt_issuance_id', 'holder'],
+      ['ledger_index', 'tx_index', 'mpt_issuance_id'],
+      ['mpt_issuance_id', 'ledger_index', 'tx_index'],
+    ]);
+  });
+
+  it('puts MPT payments in payments, payments_by_currency and account_payments, the ID as the currency', () => {
+    const t = mptCase('payment_transfer_fee');
+    const { rows, txIndex } = rowsOfCase('payment_transfer_fee');
+    const id = t.tx.Amount.mpt_issuance_id as string;
+    const issuer = mptIssuerOf(id);
+    expect(ofTx(rows.payments, txIndex)).toEqual([
+      expect.objectContaining({
+        source: t.tx.Account,
+        destination: t.tx.Destination,
+        currency: id,
+        issuer,
+        amount: '1000000',
+        delivered_amount: '1000000',
+        delivered_amount_f: 1000000,
+        max_amount: '1062500',
+        source_currency: id,
+      }),
+    ]);
+    expect(ofTx(rows.paymentsByCurrency, txIndex)).toEqual([
+      { currency: id, issuer, ledger_index: t.ledger_index, tx_index: txIndex },
+    ]);
+    expect(ofTx(rows.accountPayments, txIndex).map((r) => [r.account, r.direction, r.currency, r.issuer])).toEqual([
+      [t.tx.Account, 'sent', id, issuer],
+      [t.tx.Destination, 'received', id, issuer],
+    ]);
+  });
+
+  it('counts each MPT payment in payments_count and in no path payment, as it is direct', () => {
+    for (const name of ['payment_holder_to_holder', 'payment_mint', 'payment_redeem', 'payment_transfer_fee']) {
+      const { rows, txIndex } = rowsOfCase(name);
+      expect(ofTx(rows.payments, txIndex)).toHaveLength(1);
+      expect(rows.ledger.payments_count).toBe(rows.payments.length);
+      expect(ofTx(rows.pathPayments, txIndex)).toEqual([]);
+    }
+  });
+
+  it('puts the balance rows of an MPT in balance_changes, and a failed payment nowhere', () => {
+    const { rows, txIndex } = rowsOfCase('payment_transfer_fee');
+    expect(
+      ofTx(rows.balanceChanges, txIndex)
+        .filter((r) => r.counterparty !== '')
+        .map((r) => r.amount_change),
+    ).toEqual(['-1005890', '1005890', '1000000', '-1000000']);
+    const failed = rowsOfCase('payment_failed');
+    expect(ofTx(failed.rows.payments, failed.txIndex)).toEqual([]);
+    expect(ofTx(failed.rows.mptTransfers, failed.txIndex)).toEqual([]);
+  });
+
+  it('counts what the parser could not read in diagnostics, and nothing on the recorded ledgers', () => {
+    for (const { rows } of everyBuilt()) expect(rows.diagnostics.mptAnomalies).toBe(0);
+    // Synthetic, edited from payment_holder_to_holder: the receiver's MPTAmount is not digits.
+    const t = mptCase('payment_holder_to_holder');
+    const raw = structuredClone(everyBuilt().find((b) => b.raw.header.ledger_index === t.ledger_index)!.raw);
+    const copy = raw.transactions.find((r) => r.hash === t.hash)!;
+    const node = (copy.meta.AffectedNodes as Json[]).find(
+      (n) => n.ModifiedNode?.FinalFields?.Account === t.tx.Destination,
+    );
+    node!.ModifiedNode.FinalFields.MPTAmount = 'not digits';
+    const rows = buildLedgerRows(raw, XRPL);
+    expect(rows.diagnostics.mptAnomalies).toBe(1);
+    expect(ofTx(rows.mptHolderStates, t.tx_index).map((r) => r.amount)).toEqual(['0', '0']);
+  });
+
+  it('gives a recorded ledger of Xahau the five arrays empty', () => {
+    for (const set of [XAHAU_SET, MINT_XAHAU, OBJECTS_XAHAU, URITOKEN_SET]) {
+      for (const { rows } of builtOf(set)) {
+        for (const [, key] of MPT_TABLES) expect(rows[key]).toEqual([]);
+      }
+    }
+  });
+
+  it('gives a ledger with no MPT node the five arrays empty', () => {
+    for (const { rows } of builtOf(RIPPLE_MOCK)) {
+      for (const [, key] of MPT_TABLES) expect(rows[key]).toEqual([]);
+    }
+  });
+
+  /** A case's rows of the five MPT arrays, the payments and the balance changes: what the snapshots below pin. */
+  function goldenOf(name: string): Json {
+    const { rows, txIndex } = rowsOfCase(name);
+    return {
+      mptIssuanceStates: ofTx(rows.mptIssuanceStates, txIndex),
+      mptHolderStates: ofTx(rows.mptHolderStates, txIndex),
+      mptTouches: ofTx(rows.mptTouches, txIndex),
+      mptTransfers: ofTx(rows.mptTransfers, txIndex),
+      mptIssuanceTransfers: ofTx(rows.mptIssuanceTransfers, txIndex),
+      payments: ofTx(rows.payments, txIndex),
+      balanceChanges: ofTx(rows.balanceChanges, txIndex),
+    };
+  }
+
+  it.each(['payment_transfer_fee', 'escrow_finish_transfer_fee', 'clawback_full'])(
+    'matches the golden rows of %s',
+    (name) => {
+      expect(goldenOf(name)).toMatchSnapshot();
+    },
+  );
+});
+
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data and the 5 AMM ones', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones, the account domains, the object changes and their index by account, the state touches, the 3 Xahau mint tables, the 5 MPT ledger tables', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -1382,6 +3229,27 @@ describe('CHILD_TABLES', () => {
         Table.AmmLiquidity,
         Table.AccountAmmLiquidity,
         Table.AmmGovernance,
+        Table.AccountStates,
+        Table.TrustLineStates,
+        Table.PathPayments,
+        Table.AccountPathPayments,
+        Table.NftEvents,
+        Table.AccountNftEvents,
+        Table.CollectionNftEvents,
+        Table.NftSales,
+        Table.NftTouches,
+        Table.AccountDomains,
+        Table.ObjectChanges,
+        Table.AccountObjectChanges,
+        Table.StateTouches,
+        Table.GenesisMints,
+        Table.Imports,
+        Table.RewardClaims,
+        Table.MptIssuanceStates,
+        Table.MptHolderStates,
+        Table.MptTouches,
+        Table.MptTransfers,
+        Table.MptIssuanceTransfers,
       ].sort(),
     );
   });
@@ -1436,10 +3304,21 @@ const AMOUNT_FIELDS = new Set([
   'bid_min',
   'bid_max',
   'price_paid',
+  'broker_fee',
+  'royalty_est',
+]);
+
+/** The `LedgerRows` properties of the NFT tables: an amount they do not have is `''`, not a number. */
+const NFT_ROW_KEYS: ReadonlySet<string> = new Set([
+  'nftEvents',
+  'accountNftEvents',
+  'collectionNftEvents',
+  'nftSales',
+  'nftTouches',
 ]);
 
 /** Row fields that hold drops as an unsigned integer string. */
-const DROPS_FIELDS = new Set(['fee', 'fee_total', 'fee_min', 'fee_max', 'total_coins']);
+const DROPS_FIELDS = new Set(['fee', 'fee_total', 'fee_min', 'fee_max', 'total_coins', 'minted']);
 
 describe.each(SETS)('invariants over $name', (set) => {
   const built = () => builtOf(set);
@@ -1459,7 +3338,9 @@ describe.each(SETS)('invariants over $name', (set) => {
 
   describe('(a) the ORDER BY key of every table is unique', () => {
     it.each(ROW_KEY)('%s', (table, key) => {
-      const columns = orderByColumns(table);
+      // account_domains is ordered by account alone (spec 1.1): rows of one account merge into the newest, so what must
+      // be unique is the (account, version) the ReplacingMergeTree and the delete-and-write recovery rely on.
+      const columns = table === Table.AccountDomains ? ['account', 'version'] : orderByColumns(table);
       expect(columns.length).toBeGreaterThan(0);
 
       const rows = collect(built(), key);
@@ -1494,6 +3375,8 @@ describe.each(SETS)('invariants over $name', (set) => {
       for (const row of collect(built(), key)) {
         for (const [field, value] of Object.entries(row)) {
           if (value === null) continue;
+          // An NFT event with no price, no broker fee or no royalty has the empty string for it.
+          if (value === '' && NFT_ROW_KEYS.has(key)) continue;
           if (AMOUNT_FIELDS.has(field)) {
             if (typeof value !== 'string' || !new BigNumber(value).isFinite())
               problems.push(`${key}.${field}=${value}`);

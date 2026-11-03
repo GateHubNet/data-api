@@ -29,6 +29,9 @@ const V340 = encode(3, 4, 0, RELEASE);
 const V360 = encode(3, 6, 0, RELEASE);
 const V350RC1 = encode(3, 5, 0, RC1);
 
+/** The toml columns of a row from before D8. */
+const NO_TOML = { ownerCountry: '', serverCountry: '', tomlNetwork: '', tomlUnl: '', tomlVersion: 0 };
+
 function reads(over: Partial<DirectoryReads> = {}): DirectoryReads {
   return {
     builtAt: NOW,
@@ -219,6 +222,110 @@ describe('assembleDirectory', () => {
     });
   });
 
+  describe('the toml facts', () => {
+    const FACTS = { ownerCountry: 'NO', serverCountry: 'DE', tomlNetwork: 'main', tomlUnl: 'https://vl.ripple.com' };
+    const NO_FACTS = { ownerCountry: '', serverCountry: '', tomlNetwork: '', tomlUnl: '' };
+    const entryWith = (row: Partial<DirectoryReads['domains'][number]> = {}) =>
+      entryOf(
+        assembleDirectory(
+          reads({
+            seen: [seenRow('nHM1')],
+            manifests: [
+              { masterKey: 'nHM1', sequence: 1, signingKey: 'n9S1', domain: 'northpeak.example', signingKeysSeen: 1 },
+            ],
+            domains: [
+              {
+                key: 'nHM1',
+                domain: 'northpeak.example',
+                status: 'verified',
+                reason: '',
+                statusCode: 0,
+                tomlUrl: 'https://northpeak.example/.well-known/xrp-ledger.toml',
+                checked: 1_700_000_000,
+                verified: 1_700_000_000,
+                accounts: [],
+                ...FACTS,
+                tomlVersion: 1,
+                ...row,
+              },
+            ],
+          }),
+        ),
+        'nHM1',
+      );
+
+    it('gives a verified domain read by D8 its toml facts', () => {
+      const entry = entryWith();
+      const toml = { ownerCountry: 'NO', serverCountry: 'DE', network: 'main', unl: 'https://vl.ripple.com' };
+      expect(entry.domainState?.toml).toEqual(toml);
+      expect(entry.toml).toEqual(toml);
+    });
+
+    it('leaves out a fact the file does not give', () => {
+      expect(entryWith({ ...FACTS, ownerCountry: '', tomlUnl: '' }).toml).toEqual({
+        serverCountry: 'DE',
+        network: 'main',
+      });
+    });
+
+    it('gives toml {} for a verified domain whose file gives none of the four', () => {
+      expect(entryWith(NO_FACTS).toml).toEqual({});
+    });
+
+    it('gives no toml to a verified domain read before D8, an unverified one and a pending one', () => {
+      expect(entryWith({ tomlVersion: 0 }).toml).toBeUndefined();
+      expect(entryWith({ tomlVersion: 0 }).serverCountry).toBeUndefined();
+      expect(entryWith({ status: 'unverified', reason: 'not_listed' }).toml).toBeUndefined();
+      const pending = entryOf(
+        assembleDirectory(
+          reads({
+            seen: [seenRow('nHM1')],
+            manifests: [
+              { masterKey: 'nHM1', sequence: 1, signingKey: 'n9S1', domain: 'northpeak.example', signingKeysSeen: 1 },
+            ],
+          }),
+        ),
+        'nHM1',
+      );
+      expect(pending.domainState?.status).toBe('pending');
+      expect(pending.toml).toBeUndefined();
+    });
+
+    it('takes the newest row of a domain written in two cases, the older one being checked no more', () => {
+      const row = (domain: string, checked: number, serverCountry: string) => ({
+        key: 'nHM1',
+        domain,
+        status: 'verified' as const,
+        reason: '',
+        statusCode: 0,
+        tomlUrl: `https://${domain}/.well-known/xrp-ledger.toml`,
+        checked,
+        verified: checked,
+        accounts: [],
+        ...NO_FACTS,
+        serverCountry,
+        tomlVersion: 1,
+      });
+      const directory = assembleDirectory(
+        reads({
+          seen: [seenRow('nHM1')],
+          manifests: [
+            { masterKey: 'nHM1', sequence: 2, signingKey: 'n9S1', domain: 'northpeak.example', signingKeysSeen: 1 },
+          ],
+          // in the order of the read: by domain, so the old upper-case name first
+          domains: [row('Northpeak.example', 1_700_000_000, 'DE'), row('northpeak.example', 1_700_090_000, 'FI')],
+        }),
+      );
+      expect(entryOf(directory, 'nHM1').serverCountry).toBe('FI');
+      expect(entryOf(directory, 'nHM1').domainState?.checked).toBe(1_700_090_000);
+    });
+
+    it('sets serverCountry from the toml', () => {
+      expect(entryWith().serverCountry).toBe('DE');
+      expect(entryWith({ serverCountry: '' }).serverCountry).toBeUndefined();
+    });
+  });
+
   describe('manifests', () => {
     it('takes the domain, the signing key and the manifest of an entry from its newest manifest', () => {
       const directory = assembleDirectory(
@@ -277,6 +384,7 @@ describe('assembleDirectory', () => {
                   tomlUrl: '',
                   checked: NOW_S - 60,
                   accounts: [],
+                  ...NO_TOML,
                 },
               ],
             }),
@@ -356,6 +464,7 @@ describe('assembleDirectory', () => {
                 checked: 1_760_000_000.511,
                 verified: 1_760_000_000.511,
                 accounts: ['rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh'],
+                ...NO_TOML,
               },
             ],
           }),
@@ -378,6 +487,7 @@ describe('assembleDirectory', () => {
         tomlUrl: 'https://northpeak.example/.well-known/xrp-ledger.toml',
         checked: 1_760_000_000,
         accounts: [] as string[],
+        ...NO_TOML,
       };
       const entry = (domains: DirectoryReads['domains']) =>
         entryOf(
@@ -416,6 +526,7 @@ describe('assembleDirectory', () => {
                 checked: 1,
                 verified: 1,
                 accounts: [],
+                ...NO_TOML,
               },
               {
                 key: 'nHOTHER',
@@ -427,6 +538,7 @@ describe('assembleDirectory', () => {
                 checked: 1,
                 verified: 1,
                 accounts: [],
+                ...NO_TOML,
               },
             ],
           }),

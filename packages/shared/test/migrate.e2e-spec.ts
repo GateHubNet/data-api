@@ -1,9 +1,10 @@
 import { appendFileSync, copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { clickHouseConfigFromEnv } from '../src/clickhouse/clickhouse.config';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
-import { runMigrations } from '../src/clickhouse/migrate';
-import { Table } from '../src/clickhouse/tables';
+import { runMigrations, runSharedMigrations, SHARED_SCHEMA_DIR } from '../src/clickhouse/migrate';
+import { SharedTable, Table } from '../src/clickhouse/tables';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 import { SAMPLE_ROWS, TODAY_NOON } from './sample-rows';
 
@@ -85,6 +86,98 @@ const SHAPES: Record<Table, Shape> = {
     order: 'account, ledger_index, tx_index, amm_account',
   },
   [Table.AmmGovernance]: { engine: 'ReplacingMergeTree', partition: P7, order: 'amm_account, ledger_index, tx_index' },
+  [Table.AccountStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index, node_index',
+  },
+  [Table.TrustLineStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, counterparty, currency, ledger_index, tx_index, node_index',
+  },
+  [Table.PathPayments]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
+  [Table.AccountPathPayments]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index',
+  },
+  // the NFT ledger tables (migration 011): the events by NFT, by account and by collection, the sales and the touches
+  [Table.NftEvents]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'nft_id, ledger_index, tx_index, event_index',
+  },
+  [Table.AccountNftEvents]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index, event_index',
+  },
+  [Table.CollectionNftEvents]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'issuer, taxon_key, ledger_index, tx_index, event_index',
+  },
+  [Table.NftSales]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index, event_index' },
+  [Table.NftTouches]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index, nft_id' },
+  // the domain of an account (migration 012): ordered by account, not by the unique key
+  // (the exception to ADR-0007, spec 1.1)
+  [Table.AccountDomains]: { engine: 'ReplacingMergeTree', version: 'version', partition: P7, order: 'account' },
+  // the history of the tracked ledger objects (migration 013) and its narrow index by account: `role` is in the key, so the
+  // delegations an account gave (owner) and holds (counterparty) are each a prefix
+  [Table.ObjectChanges]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'object_type, object_id, ledger_index, tx_index',
+  },
+  [Table.AccountObjectChanges]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, object_type, role, ledger_index, tx_index, object_id',
+  },
+  // the ledger-ordered index of the lines and issuers whose token state changed (migration 014): the tokens job scans it by
+  // primary-key range, as the aggregator scans the other touch tables
+  [Table.StateTouches]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, kind, account, counterparty, currency',
+  },
+  // the Xahau mints (migration 015): ledger-derived, one row per entry of a successful GenesisMint, per successful Import and
+  // per ClaimReward, empty on XRPL
+  [Table.GenesisMints]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, mint_index',
+  },
+  [Table.Imports]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
+  [Table.RewardClaims]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
+  // the MPT ledger tables (migration 017): states by issuance and by holder, the touches and the transfers in ledger order, and
+  // the same transfers by issuance; empty on Xahau
+  [Table.MptIssuanceStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'mpt_issuance_id, ledger_index, tx_index, node_index',
+  },
+  [Table.MptHolderStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'holder, mpt_issuance_id, ledger_index, tx_index, node_index',
+  },
+  [Table.MptTouches]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, mpt_issuance_id, holder',
+  },
+  [Table.MptTransfers]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, mpt_issuance_id',
+  },
+  [Table.MptIssuanceTransfers]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'mpt_issuance_id, ledger_index, tx_index',
+  },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -210,6 +303,61 @@ const SHAPES: Record<Table, Shape> = {
     partition: 'toYear(day)',
     order: 'account, day, base_currency, base_issuer, counter_currency, counter_issuer, version',
   },
+  // the NFT aggregates (migration 011): version sets of the aggregator, no partition
+  [Table.Nfts]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'issuer, taxon_key, serial, nft_id',
+  },
+  [Table.AccountNfts]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'owner, issuer, taxon_key, serial, nft_id',
+  },
+  [Table.NftCollections]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'issuer, taxon_key',
+  },
+  [Table.NftCollectionHolders]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'issuer, taxon_key, owner',
+  },
+  // the aggregator's escrows and their sentinel row (migration 013): no partition, the newest version of an escrow wins
+  [Table.Escrows]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'escrow_id' },
+  // the issued-token aggregate (migration 014): the job's generations, and the lines and tokens of each generation, which are
+  // swapped and dropped by generation (PARTITION BY generation)
+  [Table.TokenGenerations]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'generation' },
+  [Table.TokenLines]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'generation',
+    order: 'issuer, currency, holder',
+  },
+  [Table.Tokens]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'generation',
+    order: 'issuer, currency',
+  },
+  // the supply snapshots (migration 015): no partition, the newest version of a ledger wins
+  [Table.NetworkSupply]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'ledger_index' },
+  // the MPT aggregates (migration 017): no partition, the newest version of an issuance and of a holder wins
+  [Table.MptIssuances]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'mpt_issuance_id' },
+  [Table.MptHolders]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'mpt_issuance_id, holder',
+  },
+  // what the tomls worker read of a domain (migration 012): one row per check, the newest wins
+  [Table.DomainTomls]: { engine: 'ReplacingMergeTree', version: 'checked_at', partition: '', order: 'domain' },
+  [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
   [Table.IngestLog]: {
     engine: 'ReplacingMergeTree',
     version: 'updated_at',
@@ -222,7 +370,15 @@ const SHAPES: Record<Table, Shape> = {
     partition: '',
     order: 'from_hour, to_hour',
   },
+  [Table.NftDirty]: {
+    engine: 'ReplacingMergeTree',
+    version: 'created_at',
+    partition: '',
+    order: 'from_ledger, to_ledger',
+  },
   [Table.SyncerLease]: { engine: 'ReplacingMergeTree', version: 'heartbeat', partition: '', order: 'network' },
+  // append-only: every state of a job is kept, the highest seq is the job (migration 010)
+  [Table.ExportJobs]: { engine: 'MergeTree', partition: '', order: 'id, seq' },
 };
 
 /** The aggregate tables of migration 003 (D2). */
@@ -241,6 +397,71 @@ const MIGRATION_003_TABLES: Table[] = [
 
 /** The fee estimates of the AMM volume's live day set (D2b): one column of `volume_live`. */
 const MIGRATION_004 = '004_amm_fee_estimates.sql';
+
+/** The account state history (spec #4, ticket #9): one ledger-derived table. */
+const MIGRATION_005 = '005_account_states.sql';
+
+/** The trust line state history (spec #4, ticket #10): one ledger-derived table. */
+const MIGRATION_006 = '006_trust_line_states.sql';
+
+/** The account network names the operator writes (ADR-0014, spec #4 ticket #8). */
+const MIGRATION_009 = '009_account_network_names.sql';
+/** The path payments (spec #4, ticket #13): one ledger-derived table. */
+const MIGRATION_007 = '007_path_payments.sql';
+/** The path payments of an account (spec #4, ticket #14): the ledger-derived index of path_payments by account. */
+const MIGRATION_008 = '008_account_path_payments.sql';
+/** The NFTs and URITokens (D3): five ledger-derived tables, four aggregates and the dirty ranges. */
+const MIGRATION_011 = '011_nft_data.sql';
+/** The tables of migration 011. */
+const MIGRATION_011_TABLES: Table[] = [
+  Table.NftEvents,
+  Table.AccountNftEvents,
+  Table.CollectionNftEvents,
+  Table.NftSales,
+  Table.NftTouches,
+  Table.Nfts,
+  Table.AccountNfts,
+  Table.NftCollections,
+  Table.NftCollectionHolders,
+  Table.NftDirty,
+];
+/** The display names (D4): the ledger-derived domain of an account and the toml store of the tomls worker. */
+const MIGRATION_012 = '012_display_names.sql';
+/** The tables of migration 012. */
+const MIGRATION_012_TABLES: Table[] = [Table.AccountDomains, Table.DomainTomls];
+/** The ledger objects and delegation (D5): the object history of the ledger, its index by account and the escrows aggregate. */
+const MIGRATION_013 = '013_ledger_objects.sql';
+/** The tables of migration 013. */
+const MIGRATION_013_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectChanges, Table.Escrows];
+/** The issued tokens (D6): the ledger-derived touch index of token state and the three aggregates of the `tokens` job. */
+const MIGRATION_014 = '014_issued_tokens.sql';
+/** The tables of migration 014. */
+const MIGRATION_014_TABLES: Table[] = [Table.StateTouches, Table.TokenGenerations, Table.TokenLines, Table.Tokens];
+/** The supply (D7): the three ledger-derived Xahau mint tables and the aggregate of the `supply` job. */
+const MIGRATION_015 = '015_supply.sql';
+/** The tables of migration 015. */
+const MIGRATION_015_TABLES: Table[] = [Table.GenesisMints, Table.Imports, Table.RewardClaims, Table.NetworkSupply];
+const MIGRATION_016 = '016_validator_toml_details.sql';
+/** The columns migration 016 adds to `validator_domains`, with their types. */
+const MIGRATION_016_COLUMNS = [
+  { name: 'owner_country', type: 'LowCardinality(String)' },
+  { name: 'server_country', type: 'LowCardinality(String)' },
+  { name: 'toml_network', type: 'String' },
+  { name: 'toml_unl', type: 'String' },
+  { name: 'toml_version', type: 'UInt8' },
+];
+/** MPTokens (D9): the five ledger-derived tables and the two aggregates of the `mpt_state` job. */
+const MIGRATION_017 = '017_mpt.sql';
+/** The tables of migration 017. */
+const MIGRATION_017_TABLES: Table[] = [
+  Table.MptIssuanceStates,
+  Table.MptHolderStates,
+  Table.MptTouches,
+  Table.MptTransfers,
+  Table.MptIssuanceTransfers,
+  Table.MptIssuances,
+  Table.MptHolders,
+];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -263,6 +484,27 @@ const DEDUP_TABLES: Table[] = [
   Table.AmmLiquidity,
   Table.AccountAmmLiquidity,
   Table.AmmGovernance,
+  Table.AccountStates,
+  Table.TrustLineStates,
+  Table.PathPayments,
+  Table.AccountPathPayments,
+  Table.NftEvents,
+  Table.AccountNftEvents,
+  Table.CollectionNftEvents,
+  Table.NftSales,
+  Table.NftTouches,
+  Table.AccountDomains,
+  Table.ObjectChanges,
+  Table.AccountObjectChanges,
+  Table.StateTouches,
+  Table.GenesisMints,
+  Table.Imports,
+  Table.RewardClaims,
+  Table.MptIssuanceStates,
+  Table.MptHolderStates,
+  Table.MptTouches,
+  Table.MptTransfers,
+  Table.MptIssuanceTransfers,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -307,7 +549,7 @@ describe('migrations (e2e)', () => {
 
   afterAll(async () => {
     delete process.env.GH_SCHEMA_DIR;
-    await admin?.onModuleDestroy();
+    await admin?.close();
     await ch?.container.stop();
     if (tempSchemaDir) rmSync(tempSchemaDir, { recursive: true, force: true });
   });
@@ -337,7 +579,7 @@ describe('migrations (e2e)', () => {
         expect(tracked.map((r) => r.filename)).toEqual(realFiles());
         tracked.forEach((r) => expect(r.checksum).toMatch(/^[0-9a-f]{64}$/));
       } finally {
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
 
@@ -345,6 +587,29 @@ describe('migrations (e2e)', () => {
       const result = await runMigrations({ config: config(), log });
       expect(result.applied).toEqual([]);
       expect(result.skipped).toEqual(realFiles());
+    });
+
+    it('(g) GH_NETWORK=xrpl-testnet creates and migrates xrpl_testnet', async () => {
+      const testnet = clickHouseConfigFromEnv({
+        GH_CLICKHOUSE_URL: ch.config.url,
+        GH_CLICKHOUSE_USER: ch.config.username,
+        GH_CLICKHOUSE_PASSWORD: ch.config.password,
+        GH_NETWORK: 'xrpl-testnet',
+      });
+      expect(testnet.database).toBe('xrpl_testnet');
+      expect(await databases()).not.toContain('xrpl_testnet');
+
+      const result = await runMigrations({ config: testnet, log });
+
+      expect(result.applied).toEqual(realFiles());
+      expect(await databases()).toContain('xrpl_testnet');
+      const svc = new ClickHouseService(testnet);
+      try {
+        const tables = (await svc.query<{ name: string }>('SHOW TABLES FROM xrpl_testnet')).map((r) => r.name);
+        expect(tables).toEqual(expect.arrayContaining(['ledgers', 'transactions']));
+      } finally {
+        await svc.close();
+      }
     });
 
     describe('baseline schema', () => {
@@ -356,7 +621,7 @@ describe('migrations (e2e)', () => {
       });
 
       afterAll(async () => {
-        await svc?.onModuleDestroy();
+        await svc?.close();
       });
 
       const systemTables = () =>
@@ -410,11 +675,13 @@ describe('migrations (e2e)', () => {
         expect(full.get(Table.ValidatorValidations)).toContain('ttl_only_drop_parts = 1');
       });
 
-      it('keeps transactions on a finer index granularity', async () => {
+      it('keeps transactions and account_domains on a finer index granularity', async () => {
         const rows = await systemTables();
         const grain = (name: string) =>
           /index_granularity = (\d+)/.exec(rows.find((t) => t.name === name)!.engine_full)?.[1];
         expect(grain(Table.Transactions)).toBe('1024');
+        // The names batch reads up to 100 accounts by key: a granule of 1024 rows keeps that read small (spec 1.1).
+        expect(grain(Table.AccountDomains)).toBe('1024');
         expect(grain(Table.Ledgers)).toBe('8192');
       });
 
@@ -715,12 +982,15 @@ describe('migrations (e2e)', () => {
         expect(row?.engine_full).toContain('ttl_only_drop_parts = 1');
       });
 
-      it('keeps validator_seen, the votes and the tallies for ever', async () => {
+      it('keeps validator_seen, the votes, the tallies and network_supply (spec decision 9) for ever', async () => {
         const kept = await svc.query<{ name: string; create_table_query: string }>(
           `SELECT name, create_table_query FROM system.tables WHERE database = {db:String} AND name IN {names:Array(String)}`,
-          { db: 'xahau', names: [Table.ValidatorSeen, Table.ValidatorVotes, Table.AmendmentTallies] },
+          {
+            db: 'xahau',
+            names: [Table.ValidatorSeen, Table.ValidatorVotes, Table.AmendmentTallies, Table.NetworkSupply],
+          },
         );
-        expect(kept).toHaveLength(3);
+        expect(kept).toHaveLength(4);
         for (const t of kept)
           expect({ table: t.name, ttl: /\bTTL\b/.test(t.create_table_query) }).toEqual({ table: t.name, ttl: false });
       });
@@ -754,7 +1024,7 @@ describe('migrations (e2e)', () => {
       });
 
       afterAll(async () => {
-        await svc?.onModuleDestroy();
+        await svc?.close();
       });
 
       it.each(tables)('%s: a typed sample row round-trips through the table', async (table) => {
@@ -904,6 +1174,45 @@ describe('migrations (e2e)', () => {
         expect(rows).toEqual([{ master_key: 'nHnew', seq: 9 }]);
       });
 
+      it('account_domains: a merge keeps the newest row of an account in a partition', async () => {
+        // version = ledger_index * 2^32 + tx_index * 2^16 + node_index, as text (it passes 2^53). The newer row goes in
+        // first: the version decides, not the order of the inserts.
+        const row = SAMPLE_ROWS[Table.AccountDomains];
+        const account = 'rMergedDomainAccountxxxxxxxxxxxxx';
+        const base = { ...row, account, ledger_index: 107_671_593, tx_index: 3 };
+        await svc.insert(Table.AccountDomains, [
+          { ...base, node_index: 6, version: '462445970643419142', domain_hex: '6E65772E6578616D706C65' },
+        ]);
+        await svc.insert(Table.AccountDomains, [
+          { ...base, node_index: 5, version: '462445970643419141', domain_hex: '6F6C642E6578616D706C65' },
+        ]);
+        await svc.command(`OPTIMIZE TABLE ${Table.AccountDomains} FINAL`);
+
+        const rows = await svc.query(
+          `SELECT domain_hex, toString(version) AS version FROM ${Table.AccountDomains} WHERE account = {account:String}`,
+          { account },
+        );
+        expect(rows).toEqual([{ domain_hex: '6E65772E6578616D706C65', version: '462445970643419142' }]);
+      });
+
+      it('domain_tomls: a merge keeps the newest check of a domain with its tuples', async () => {
+        const row = SAMPLE_ROWS[Table.DomainTomls];
+        const domain = 'northpeak.example';
+        const entry = { network: 'main', desc: 'Operations' };
+        const older = { ...row, domain, checked_at: 1_761_300_000.123, accounts: [{ address: 'rOlder', ...entry }] };
+        const newer = { ...row, domain, checked_at: 1_761_300_060.456, accounts: [{ address: 'rNewer', ...entry }] };
+        await svc.insert(Table.DomainTomls, [newer]);
+        await svc.insert(Table.DomainTomls, [older]);
+        await svc.command(`OPTIMIZE TABLE ${Table.DomainTomls} FINAL`);
+
+        const rows = await svc.query(
+          `SELECT checked_at, accounts FROM ${Table.DomainTomls} WHERE domain = {domain:String}`,
+          { domain },
+          { date_time_output_format: 'unix_timestamp' },
+        );
+        expect(rows).toEqual([{ checked_at: '1761300060.456', accounts: [{ address: 'rNewer', ...entry }] }]);
+      });
+
       it('fills the added columns for a row written without them', async () => {
         const { domain: _d, manifest: _m, source: _s, ...oldManifest } = SAMPLE_ROWS[Table.ValidatorManifests];
         await svc.insert(Table.ValidatorManifests, [{ ...oldManifest, ephemeral_key: 'n9oldshape' }]);
@@ -992,7 +1301,7 @@ describe('migrations (e2e)', () => {
     });
 
     afterAll(async () => {
-      await svc?.onModuleDestroy();
+      await svc?.close();
     });
 
     it('(c) refuses to run once an applied file was modified', async () => {
@@ -1084,14 +1393,15 @@ describe('migrations (e2e)', () => {
         expect(await tableNames()).toContain(Table.UnlPublishers);
         expect(await tableNames()).not.toContain(Table.ValidatorDomains);
 
-        // The real directory: 002 runs again from its first statement and completes, and 003 and 004, which come after it, are
-        // applied too.
+        // The real directory: 002 runs again from its first statement and completes, and every file after it (003, 004,
+        // 009, ...) is applied too.
         process.env.GH_SCHEMA_DIR = REAL_SCHEMA_DIR;
         const result = await runMigrations({ config, log });
-        expect(result).toEqual({
-          applied: ['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004],
-          skipped: ['001_baseline.sql'],
-        });
+        const after001 = readdirSync(REAL_SCHEMA_DIR)
+          .filter((f) => f.endsWith('.sql') && f !== '001_baseline.sql')
+          .sort();
+        expect(after001.slice(0, 3)).toEqual(['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004]);
+        expect(result).toEqual({ applied: after001, skipped: ['001_baseline.sql'] });
 
         // Every statement took effect: the ten tables, and the columns the two ALTERs added.
         const names = await tableNames();
@@ -1118,7 +1428,7 @@ describe('migrations (e2e)', () => {
       } finally {
         if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
         else process.env.GH_SCHEMA_DIR = previousDir;
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
   });
@@ -1245,7 +1555,1186 @@ describe('migrations (e2e)', () => {
 
         expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
       } finally {
-        await svc.onModuleDestroy();
+        await svc.close();
+      }
+    });
+  });
+
+  describe('migration 009', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-009-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 009 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_009_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_009);
+      expect(realFiles()).toContain(MIGRATION_009);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.AccountNetworkNames);
+
+      copyReal([MIGRATION_009]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_009], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.AccountNetworkNames);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+  describe('migration 005', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-005-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('applies 005 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_005_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_005);
+      expect(realFiles()).toContain(MIGRATION_005);
+      const exists = async () =>
+        admin.query<{ name: string }>(
+          `SELECT name FROM system.tables WHERE database = {db:String} AND name = {t:String}`,
+          { db: config.database, t: Table.AccountStates },
+        );
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await exists()).toEqual([]);
+
+      copyReal([MIGRATION_005]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_005], skipped: before });
+      expect(await exists()).toEqual([{ name: Table.AccountStates }]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+  describe('migration 006', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-006-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('applies 006 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_006_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_006);
+      expect(realFiles()).toContain(MIGRATION_006);
+      const exists = async () =>
+        admin.query<{ name: string }>(
+          `SELECT name FROM system.tables WHERE database = {db:String} AND name = {t:String}`,
+          { db: config.database, t: Table.TrustLineStates },
+        );
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await exists()).toEqual([]);
+
+      copyReal([MIGRATION_006]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_006], skipped: before });
+      expect(await exists()).toEqual([{ name: Table.TrustLineStates }]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+  describe('migration 007', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-007-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 007 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_007_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_007);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_007);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.PathPayments);
+
+      copyReal([MIGRATION_007]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_007], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.PathPayments);
+
+      const svc = new ClickHouseService(config);
+      try {
+        await svc.insert(Table.PathPayments, [SAMPLE_ROWS[Table.PathPayments]]);
+        expect(
+          await svc.query(
+            `SELECT * EXCEPT close_time, toUnixTimestamp(close_time) AS close_time FROM ${Table.PathPayments}`,
+          ),
+        ).toEqual([SAMPLE_ROWS[Table.PathPayments]]);
+        expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+      } finally {
+        await svc.close();
+      }
+    });
+  });
+  describe('migration 008', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-008-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 008 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_008_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_008);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_008);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.AccountPathPayments);
+
+      copyReal([MIGRATION_008]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_008], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.AccountPathPayments);
+
+      const svc = new ClickHouseService(config);
+      try {
+        await svc.insert(Table.AccountPathPayments, [SAMPLE_ROWS[Table.AccountPathPayments]]);
+        expect(await svc.query(`SELECT * FROM ${Table.AccountPathPayments}`)).toEqual([
+          SAMPLE_ROWS[Table.AccountPathPayments],
+        ]);
+        expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+      } finally {
+        await svc.close();
+      }
+    });
+  });
+
+  describe('migration 011', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-011-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 011 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_011_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_011);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_011);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_011_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_011]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_011], skipped: before });
+      for (const table of MIGRATION_011_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+
+  describe('migration 012', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-012-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 012 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_012_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_012);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_012);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_012_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_012]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_012], skipped: before });
+      for (const table of MIGRATION_012_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+
+  describe('migration 013', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-013-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 013 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_013_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_013);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_013);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_013_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_013]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_013], skipped: before });
+      for (const table of MIGRATION_013_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+
+  describe('migration 014', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-014-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 014 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_014_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_014);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_014);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_014_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_014]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_014], skipped: before });
+      for (const table of MIGRATION_014_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('drops one generation of token_lines and tokens with DROP PARTITION', async () => {
+      const config = { ...ch.config, database: 'ctl_014_drop' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        for (const generation of [1, 2]) {
+          await svc.insert(Table.TokenLines, [{ ...SAMPLE_ROWS[Table.TokenLines], generation }]);
+          await svc.insert(Table.Tokens, [{ ...SAMPLE_ROWS[Table.Tokens], generation }]);
+        }
+        const generationsOf = async (table: Table): Promise<number[]> =>
+          (await svc.query<{ generation: number }>(`SELECT DISTINCT generation FROM ${table} ORDER BY generation`)).map(
+            (r) => Number(r.generation),
+          );
+        expect(await generationsOf(Table.TokenLines)).toEqual([1, 2]);
+        expect(await generationsOf(Table.Tokens)).toEqual([1, 2]);
+
+        // the partition of a generation is the generation: the syncer drops it by number, the one statement that takes no parameter
+        await svc.command(`ALTER TABLE ${Table.TokenLines} DROP PARTITION 1`);
+        await svc.command(`ALTER TABLE ${Table.Tokens} DROP PARTITION 1`);
+
+        expect(await generationsOf(Table.TokenLines)).toEqual([2]);
+        expect(await generationsOf(Table.Tokens)).toEqual([2]);
+      } finally {
+        await svc.close();
+      }
+    });
+
+    it('keeps state_touches narrow: the six columns of the spec, and a kind that is an Enum8 of line and account', async () => {
+      const config = { ...ch.config, database: 'ctl_014_narrow' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const columns = await admin.query<{ name: string; type: string }>(
+        `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} ORDER BY position`,
+        { db: config.database, table: Table.StateTouches },
+      );
+      expect(columns).toEqual([
+        { name: 'ledger_index', type: 'UInt32' },
+        { name: 'tx_index', type: 'UInt32' },
+        { name: 'kind', type: "Enum8('line' = 1, 'account' = 2)" },
+        { name: 'account', type: 'String' },
+        { name: 'counterparty', type: 'String' },
+        { name: 'currency', type: 'LowCardinality(String)' },
+      ]);
+    });
+  });
+
+  describe('migration 015', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-015-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 015 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_015_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_015);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_015);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_015_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_015]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_015], skipped: before });
+      for (const table of MIGRATION_015_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('gives the four tables the columns of the spec, in order', async () => {
+      const config = { ...ch.config, database: 'ctl_015_columns' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const columnsOf = async (table: Table): Promise<Array<[string, string]>> =>
+        (
+          await admin.query<{ name: string; type: string }>(
+            `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} ORDER BY position`,
+            { db: config.database, table },
+          )
+        ).map((c) => [c.name, c.type]);
+
+      expect(await columnsOf(Table.GenesisMints)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['mint_index', 'UInt16'],
+        ['tx_hash', 'String'],
+        ['close_time', "DateTime('UTC')"],
+        ['destination', 'String'],
+        ['amount', 'UInt64'],
+        ['parent_tx_hash', 'String'],
+        ['emit_hook_hash', 'String'],
+      ]);
+      expect(await columnsOf(Table.Imports)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['tx_hash', 'String'],
+        ['close_time', "DateTime('UTC')"],
+        ['account', 'String'],
+        ['minted', 'UInt64'],
+        ['account_created', 'UInt8'],
+      ]);
+      expect(await columnsOf(Table.RewardClaims)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['tx_hash', 'String'],
+        ['close_time', "DateTime('UTC')"],
+        ['account', 'String'],
+        ['issuer', 'String'],
+        ['opt_out', 'UInt8'],
+      ]);
+      expect(await columnsOf(Table.NetworkSupply)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['close_time', "DateTime('UTC')"],
+        ['started_at', "DateTime('UTC')"],
+        ['computed_at', "DateTime('UTC')"],
+        ['total_coins', 'UInt64'],
+        ['burned', 'UInt64'],
+        ['escrowed', 'UInt64'],
+        ['escrow_count', 'UInt64'],
+        ['amm', 'Nullable(UInt64)'],
+        ['amm_pools', 'UInt32'],
+        ['reserve_base', 'Nullable(UInt64)'],
+        ['reserve_inc', 'Nullable(UInt64)'],
+        ['accounts', 'UInt64'],
+        ['owner_count', 'UInt64'],
+        ['minted_rewards', 'Nullable(UInt64)'],
+        ['minted_import', 'Nullable(UInt64)'],
+        ['minted_genesis', 'Nullable(UInt64)'],
+        ['version', 'UInt64'],
+      ]);
+    });
+
+    it('network_supply: NULL where a network has no value, and the newest snapshot by a read of the end of the key, with no FINAL', async () => {
+      const config = { ...ch.config, database: 'ctl_015_supply' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        const sample = SAMPLE_ROWS[Table.NetworkSupply];
+        const at = (ledgerOffset: number, version: number, over: Partial<typeof sample> = {}) => ({
+          ...sample,
+          ...over,
+          ledger_index: sample.ledger_index + ledgerOffset,
+          version,
+        });
+        // Merges are stopped, so it is the read and not a merge that picks the newest version.
+        await svc.command(`SYSTEM STOP MERGES ${Table.NetworkSupply}`);
+        try {
+          // an XRPL snapshot has no mints, a Xahau one no pools, and either has no reserve value before the first poll
+          await svc.insert(Table.NetworkSupply, [
+            at(-20, 100, { minted_rewards: null, minted_import: null, minted_genesis: null }),
+          ]);
+          await svc.insert(Table.NetworkSupply, [at(-10, 9_000, { amm: null })]);
+          // a cycle redone at the same ledger writes the same key under a newer version: the newer one goes in first
+          // here, so that it is the version and not the last insert that wins, in the read below and in the merge after
+          await svc.insert(Table.NetworkSupply, [at(0, 2_000, { reserve_base: null, reserve_inc: null })]);
+          await svc.insert(Table.NetworkSupply, [at(0, 1_000)]);
+
+          expect(
+            await svc.queryOne(
+              `SELECT ledger_index, toString(version) AS version, toString(amm) AS amm, reserve_base, reserve_inc,
+                      toString(minted_import) AS minted_import
+                 FROM ${Table.NetworkSupply} ORDER BY ledger_index DESC, version DESC LIMIT 1`,
+            ),
+          ).toEqual({
+            ledger_index: sample.ledger_index,
+            version: '2000',
+            amm: String(sample.amm),
+            reserve_base: null,
+            reserve_inc: null,
+            minted_import: String(sample.minted_import),
+          });
+          expect(
+            await svc.queryOne(
+              `SELECT toString(amm) AS amm, toString(minted_rewards) AS minted_rewards, toString(minted_import) AS minted_import,
+                      toString(minted_genesis) AS minted_genesis
+                 FROM ${Table.NetworkSupply} WHERE ledger_index = {ledger:UInt32}`,
+              { ledger: sample.ledger_index - 10 },
+            ),
+          ).toEqual({
+            amm: null,
+            minted_rewards: String(sample.minted_rewards),
+            minted_import: String(sample.minted_import),
+            minted_genesis: String(sample.minted_genesis),
+          });
+          expect(
+            await svc.queryOne(
+              `SELECT toString(minted_rewards) AS minted_rewards, toString(minted_import) AS minted_import,
+                      toString(minted_genesis) AS minted_genesis
+                 FROM ${Table.NetworkSupply} WHERE ledger_index = {ledger:UInt32}`,
+              { ledger: sample.ledger_index - 20 },
+            ),
+          ).toEqual({ minted_rewards: null, minted_import: null, minted_genesis: null });
+        } finally {
+          await svc.command(`SYSTEM START MERGES ${Table.NetworkSupply}`);
+        }
+
+        // a merge keeps the newest version of each ledger and nothing else
+        await svc.command(`OPTIMIZE TABLE ${Table.NetworkSupply} FINAL`);
+        expect(
+          await svc.query(
+            `SELECT ledger_index, toString(version) AS version FROM ${Table.NetworkSupply} ORDER BY ledger_index`,
+          ),
+        ).toEqual([
+          { ledger_index: sample.ledger_index - 20, version: '100' },
+          { ledger_index: sample.ledger_index - 10, version: '9000' },
+          { ledger_index: sample.ledger_index, version: '2000' },
+        ]);
+      } finally {
+        await svc.close();
+      }
+    });
+  });
+
+  describe('migration 016', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-016-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const columnsOf = async (database: string) =>
+      admin.query<{ name: string; type: string }>(
+        `SELECT name, type FROM system.columns
+         WHERE database = {db:String} AND table = {t:String} AND name IN {names:Array(String)}
+         ORDER BY position`,
+        { db: database, t: Table.ValidatorDomains, names: MIGRATION_016_COLUMNS.map((c) => c.name) },
+      );
+
+    it('is one ALTER of validator_domains that adds the five columns', () => {
+      const statements = statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_016), 'utf8'));
+      expect(statements).toHaveLength(1);
+      expect(statements[0]!.startsWith('ALTER TABLE validator_domains')).toBe(true);
+      expect(statements[0]!.match(/ADD COLUMN IF NOT EXISTS/g)).toHaveLength(5);
+      for (const { name } of MIGRATION_016_COLUMNS) {
+        expect(statements[0]!.match(new RegExp(`ADD COLUMN IF NOT EXISTS ${name} `, 'g'))).toHaveLength(1);
+      }
+    });
+
+    it('applies 016 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_016_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_016);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_016);
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await columnsOf(config.database)).toEqual([]);
+      const svc = new ClickHouseService(config);
+      try {
+        // a row written before the columns were there
+        const {
+          owner_country: _owner,
+          server_country: _server,
+          toml_network: _network,
+          toml_unl: _unl,
+          toml_version: _version,
+          ...older
+        } = SAMPLE_ROWS[Table.ValidatorDomains];
+        await svc.insert(Table.ValidatorDomains, [older]);
+
+        copyReal([MIGRATION_016]);
+        expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_016], skipped: before });
+        expect(await columnsOf(config.database)).toEqual(MIGRATION_016_COLUMNS);
+        expect(
+          await svc.query(
+            `SELECT owner_country, server_country, toml_network, toml_unl, toml_version FROM ${Table.ValidatorDomains}`,
+          ),
+        ).toEqual([{ owner_country: '', server_country: '', toml_network: '', toml_unl: '', toml_version: 0 }]);
+
+        expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+      } finally {
+        await svc.close();
+      }
+    });
+
+    it('completes 016 after a half-applied run', async () => {
+      const config = { ...ch.config, database: 'ctl_016_half' };
+      const before = realFiles().filter((f) => f !== MIGRATION_016);
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      await admin.command(
+        `ALTER TABLE ${config.database}.${Table.ValidatorDomains} ADD COLUMN owner_country LowCardinality(String) DEFAULT ''`,
+      );
+
+      copyReal([MIGRATION_016]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_016], skipped: before });
+      expect(await columnsOf(config.database)).toEqual(MIGRATION_016_COLUMNS);
+    });
+  });
+
+  describe('migration 017', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-017-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('is seven CREATE TABLE IF NOT EXISTS and nothing else', () => {
+      const statements = statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_017), 'utf8'));
+      expect(statements).toHaveLength(MIGRATION_017_TABLES.length);
+      expect(statements.map((s) => /^CREATE TABLE IF NOT EXISTS (\w+)\s/.exec(s)?.[1])).toEqual(MIGRATION_017_TABLES);
+    });
+
+    it('applies 017 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_017_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_017);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_017);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_017_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_017]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_017], skipped: before });
+      for (const table of MIGRATION_017_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('applies 017 twice: every statement can simply be run again, and a row stays', async () => {
+      const config = { ...ch.config, database: 'ctl_017_twice' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        await svc.insert(Table.MptTouches, [SAMPLE_ROWS[Table.MptTouches]]);
+        for (const statement of statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_017), 'utf8'))) {
+          await svc.command(statement);
+        }
+        expect(await svc.query(`SELECT mpt_issuance_id FROM ${Table.MptTouches}`)).toEqual([
+          { mpt_issuance_id: SAMPLE_ROWS[Table.MptTouches].mpt_issuance_id },
+        ]);
+      } finally {
+        await svc.close();
+      }
+    });
+
+    it('gives the seven tables the columns of the spec, in order', async () => {
+      const config = { ...ch.config, database: 'ctl_017_columns' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const columnsOf = async (table: Table): Promise<Array<[string, string]>> =>
+        (
+          await admin.query<{ name: string; type: string }>(
+            `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} ORDER BY position`,
+            { db: config.database, table },
+          )
+        ).map((c) => [c.name, c.type]);
+
+      const KIND =
+        "Enum8('payment' = 1, 'clawback' = 2, 'lock' = 3, 'unlock' = 4, 'escrow_create' = 5, 'escrow_finish' = 6, 'escrow_cancel' = 7)";
+
+      expect(await columnsOf(Table.MptIssuanceStates)).toEqual([
+        ['mpt_issuance_id', 'String'],
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['node_index', 'UInt16'],
+        ['tx_hash', 'String'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+        ['issuer', 'String'],
+        ['sequence', 'UInt32'],
+        ['flags', 'UInt32'],
+        ['asset_scale', 'UInt8'],
+        ['maximum_amount', 'Nullable(UInt64)'],
+        ['outstanding_amount', 'UInt64'],
+        ['escrowed_amount', 'UInt64'],
+        ['transfer_fee', 'UInt16'],
+        ['metadata_hex', 'String'],
+        ['deleted', 'UInt8'],
+      ]);
+      expect(await columnsOf(Table.MptHolderStates)).toEqual([
+        ['holder', 'String'],
+        ['mpt_issuance_id', 'String'],
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['node_index', 'UInt16'],
+        ['tx_hash', 'String'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+        ['amount', 'UInt64'],
+        ['escrowed_amount', 'UInt64'],
+        ['flags', 'UInt32'],
+        ['deleted', 'UInt8'],
+      ]);
+      expect(await columnsOf(Table.MptTouches)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['mpt_issuance_id', 'String'],
+        ['holder', 'String'],
+      ]);
+      expect(await columnsOf(Table.MptTransfers)).toEqual([
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['mpt_issuance_id', 'String'],
+        ['tx_hash', 'String'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+        ['kind', KIND],
+        ['source', 'String'],
+        ['destination', 'String'],
+        ['amount', 'UInt64'],
+        ['fee', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.MptIssuanceTransfers)).toEqual([
+        ['mpt_issuance_id', 'String'],
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['tx_hash', 'String'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+        ['kind', KIND],
+        ['source', 'String'],
+        ['destination', 'String'],
+        ['amount', 'UInt64'],
+        ['fee', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.MptIssuances)).toEqual([
+        ['mpt_issuance_id', 'String'],
+        ['issuer', 'String'],
+        ['sequence', 'UInt32'],
+        ['state_known', 'UInt8'],
+        ['flags', 'UInt32'],
+        ['asset_scale', 'UInt8'],
+        ['maximum_amount', 'Nullable(UInt64)'],
+        ['outstanding_amount', 'UInt64'],
+        ['escrowed_amount', 'UInt64'],
+        ['locked_amount', 'UInt64'],
+        ['locked_holders', 'UInt32'],
+        ['holders', 'UInt32'],
+        ['transfer_fee', 'UInt16'],
+        ['metadata_hex', 'String'],
+        ['metadata', 'String'],
+        ['metadata_conforms', 'UInt8'],
+        ['ticker', 'String'],
+        ['name', 'String'],
+        ['created_ledger', 'Nullable(UInt32)'],
+        ['created_time', "Nullable(DateTime('UTC'))"],
+        ['created_tx_hash', 'Nullable(String)'],
+        ['last_ledger', 'UInt32'],
+        ['destroyed', 'UInt8'],
+        ['version', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.MptHolders)).toEqual([
+        ['mpt_issuance_id', 'String'],
+        ['holder', 'String'],
+        ['amount', 'UInt64'],
+        ['escrowed_amount', 'UInt64'],
+        ['flags', 'UInt32'],
+        ['last_ledger', 'UInt32'],
+        ['deleted', 'UInt8'],
+        ['version', 'UInt64'],
+      ]);
+    });
+
+    it('holds 2^63-1 and a maximum that is not set apart, and the kinds of a transfer', async () => {
+      const config = { ...ch.config, database: 'ctl_017_values' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        const state = SAMPLE_ROWS[Table.MptIssuanceStates];
+        await svc.insert(Table.MptIssuanceStates, [
+          { ...state, tx_index: 1, maximum_amount: null },
+          { ...state, tx_index: 2, maximum_amount: '9223372036854775807' },
+        ]);
+        expect(
+          await svc.query(
+            `SELECT tx_index, toString(maximum_amount) AS maximum FROM ${Table.MptIssuanceStates} ORDER BY tx_index`,
+          ),
+        ).toEqual([
+          { tx_index: 1, maximum: null },
+          { tx_index: 2, maximum: '9223372036854775807' },
+        ]);
+
+        const kinds = [
+          'payment',
+          'clawback',
+          'lock',
+          'unlock',
+          'escrow_create',
+          'escrow_finish',
+          'escrow_cancel',
+        ] as const;
+        const transfer = SAMPLE_ROWS[Table.MptTransfers];
+        await svc.insert(
+          Table.MptTransfers,
+          kinds.map((kind, n) => ({ ...transfer, tx_index: n, kind })),
+        );
+        expect(
+          (await svc.query<{ kind: string }>(`SELECT kind FROM ${Table.MptTransfers} ORDER BY tx_index`)).map(
+            (r) => r.kind,
+          ),
+        ).toEqual(kinds);
+      } finally {
+        await svc.close();
+      }
+    });
+  });
+});
+
+/** The migration set of the shared database (ADR-0014): what the operator writes about an address, on every network. */
+const sharedFiles = () =>
+  readdirSync(SHARED_SCHEMA_DIR)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+const SHARED_002 = '002_account_labels.sql';
+
+describe('the shared database (e2e)', () => {
+  let ch: StartedClickHouse;
+  let admin: ClickHouseService;
+  const log = () => undefined;
+
+  beforeAll(async () => {
+    ch = await startClickHouse();
+    admin = new ClickHouseService(ch.config);
+  });
+
+  afterAll(async () => {
+    await admin?.close();
+    await ch?.container.stop();
+  });
+
+  const tablesOf = async (database: string): Promise<string[]> =>
+    (
+      await admin.query<{ name: string }>('SELECT name FROM system.tables WHERE database = {db:String} ORDER BY name', {
+        db: database,
+      })
+    ).map((r) => r.name);
+
+  it('creates the shared database with exactly the tables of SharedTable (plus schema_migrations)', async () => {
+    const config = { ...ch.config, database: 'shared' };
+    expect(await runSharedMigrations({ config, log })).toEqual({ applied: sharedFiles(), skipped: [] });
+    expect(await tablesOf('shared')).toEqual([...Object.values(SharedTable), 'schema_migrations'].sort());
+    expect(await runSharedMigrations({ config, log })).toEqual({ applied: [], skipped: sharedFiles() });
+  });
+
+  describe('account labels', () => {
+    let svc: ClickHouseService;
+    const labelRow = (address: string, label: string) => ({
+      address,
+      label,
+      description: 'Reported by victims',
+      source: '',
+      url: '',
+      removed: 0,
+      added_by: 'ops@gatehub.net',
+    });
+
+    beforeAll(async () => {
+      const config = { ...ch.config, database: 'shared_labels' };
+      await runSharedMigrations({ config, log });
+      svc = new ClickHouseService(config);
+    });
+
+    afterAll(async () => {
+      await svc?.close();
+    });
+
+    it('takes the labels scam, spam and advisory', async () => {
+      await svc.insert(
+        SharedTable.AccountLabels,
+        ['scam', 'spam', 'advisory'].map((label) => labelRow('rLabelled', label)),
+      );
+      const rows = await svc.query<{ label: string }>(
+        `SELECT toString(label) AS label FROM ${SharedTable.AccountLabels} WHERE address = 'rLabelled'`,
+      );
+      expect(rows.map((r) => r.label).sort()).toEqual(['advisory', 'scam', 'spam']);
+    });
+
+    it('rejects a misspelt label, in a typed insert and in the operator SQL insert', async () => {
+      // The client logs the rejected insert; the rejection itself is what is under test.
+      const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        await expect(svc.insert(SharedTable.AccountLabels, [labelRow('rMisspelt', 'scma')])).rejects.toThrow();
+        await expect(
+          svc.command(
+            `INSERT INTO ${SharedTable.AccountLabels} (address, label, description, added_by)
+             VALUES ('rMisspelt', 'Scam', 'the wrong case', 'ops@gatehub.net')`,
+          ),
+        ).rejects.toThrow();
+      } finally {
+        logged.mockRestore();
+      }
+      expect(await svc.query(`SELECT address FROM ${SharedTable.AccountLabels} WHERE address = 'rMisspelt'`)).toEqual(
+        [],
+      );
+    });
+  });
+
+  it('applies 002 to a shared database migrated before it, and then nothing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-schema-shared-002-'));
+    const config = { ...ch.config, database: 'shared_002_after' };
+    try {
+      const before = sharedFiles().filter((f) => f < SHARED_002);
+      expect(before).toEqual(['001_account_names.sql']);
+      for (const f of before) copyFileSync(join(SHARED_SCHEMA_DIR, f), join(dir, f));
+      expect(await runMigrations({ config, log, schemaDir: dir })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(SharedTable.AccountLabels);
+
+      copyFileSync(join(SHARED_SCHEMA_DIR, SHARED_002), join(dir, SHARED_002));
+      expect(await runMigrations({ config, log, schemaDir: dir })).toEqual({ applied: [SHARED_002], skipped: before });
+      expect(await tablesOf(config.database)).toContain(SharedTable.AccountLabels);
+      expect(await runMigrations({ config, log, schemaDir: dir })).toEqual({ applied: [], skipped: sharedFiles() });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  describe('migration 010', () => {
+    const MIGRATION_010 = '010_export_jobs.sql';
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-010-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('applies 010 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_010_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_010);
+      expect(realFiles()).toContain(MIGRATION_010);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      copyReal([MIGRATION_010]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_010], skipped: before });
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('keeps an export job for 7 days after it was created', async () => {
+      const config = { ...ch.config, database: 'ctl_010_ttl' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+      const svc = new ClickHouseService(config);
+      try {
+        const now = Date.now() / 1000;
+        const job = SAMPLE_ROWS[Table.ExportJobs];
+        const created = (days: number) => now - days * 86_400;
+        await svc.insert(Table.ExportJobs, [
+          { ...job, id: 'a'.repeat(32), created: created(8), at: created(8) },
+          { ...job, id: 'b'.repeat(32), created: created(6), at: created(6) },
+        ]);
+        await svc.command(`OPTIMIZE TABLE ${Table.ExportJobs} FINAL`);
+        expect(await svc.query(`SELECT id FROM ${Table.ExportJobs}`)).toEqual([{ id: 'b'.repeat(32) }]);
+      } finally {
+        await svc.close();
       }
     });
   });

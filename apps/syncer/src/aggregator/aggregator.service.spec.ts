@@ -1,13 +1,21 @@
 import {
+  configVersionOf,
+  DailyRates,
+  EscrowsStep,
+  getNetworkProfile,
   MarketsConfig,
+  NFT_VOLUME_CONFIG_VERSION,
   RatesService,
   StatsRecomputeAborted,
   Table,
+  TokenGenerationsRow,
   TRADE_LIVE_PERIODS,
   VOLUME_DAY_SETTLE_MS,
+  VolumeMetric,
   VolumeRecomputeAborted,
 } from '@gatehub/data-api-shared';
 import { AFTER_NOW, DAY, FakeClickHouse, HOUR, iso, NOW, NOW_SECONDS, QUIET, unix } from '../../test/aggregator-fakes';
+import { AggregateFunctions } from './aggregate-job-deps';
 import {
   AGGREGATOR_AMM_DAILY_BUDGET_MS,
   AGGREGATOR_DIRTY_BUDGET_MS,
@@ -15,6 +23,7 @@ import {
   AGGREGATOR_LIVE_BUDGET_MS,
   AGGREGATOR_SHUTDOWN_WAIT_MS,
   AGGREGATOR_TICK_BUDGET_MS,
+  AGGREGATOR_TOKENS_BUDGET_MS,
   AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS,
   AGGREGATOR_VOLUME_DAILY_BUDGET_MS,
   AGGREGATOR_VOLUME_LIVE_BUDGET_MS,
@@ -23,6 +32,7 @@ import {
   AggregatorService,
   MAX_SLICE_SECONDS,
   sliceRange,
+  TokensFunctions,
   VOLUME_BACKFILL_MAX_RETRY_MS,
   VOLUME_BACKFILL_RETRY_MS,
 } from './aggregator.service';
@@ -961,6 +971,16 @@ describe('AggregatorService volume jobs', () => {
     aggregatorRunsTotal: { inc: jest.Mock };
     aggregatorErrorsTotal: { inc: jest.Mock };
     aggregatorStatsLagSeconds: { set: jest.Mock };
+    nftStateLagLedgers: { set: jest.Mock };
+    nftDirtyLedgers: { set: jest.Mock };
+    nftCollectionsPending: { set: jest.Mock };
+    escrowsLagLedgers: { set: jest.Mock };
+    escrowsOpen: { set: jest.Mock };
+    tokensLive: { set: jest.Mock };
+    tokensLagLedgers: { set: jest.Mock };
+    tokensBuilding: { set: jest.Mock };
+    tokensRepairLedgers: { set: jest.Mock };
+    mptStateLagLedgers: { set: jest.Mock };
   };
   const created: AggregatorService[] = [];
 
@@ -1013,6 +1033,16 @@ describe('AggregatorService volume jobs', () => {
       aggregatorRunsTotal: { inc: jest.fn() },
       aggregatorErrorsTotal: { inc: jest.fn() },
       aggregatorStatsLagSeconds: { set: jest.fn() },
+      nftStateLagLedgers: { set: jest.fn() },
+      nftDirtyLedgers: { set: jest.fn() },
+      nftCollectionsPending: { set: jest.fn() },
+      escrowsLagLedgers: { set: jest.fn() },
+      escrowsOpen: { set: jest.fn() },
+      tokensLive: { set: jest.fn() },
+      tokensLagLedgers: { set: jest.fn() },
+      tokensBuilding: { set: jest.fn() },
+      tokensRepairLedgers: { set: jest.fn() },
+      mptStateLagLedgers: { set: jest.fn() },
     };
     events = [];
     liveCalls = [];
@@ -1062,7 +1092,8 @@ describe('AggregatorService volume jobs', () => {
       const ms = isClosed(key) ? closedDayMs : currentDayMs;
       if (ms > 0) jest.setSystemTime(Date.now() + ms);
       if (failing.has(key) || failing.has(`${metric}:${key}`)) throw new Error(`DB::Exception: ${metric} ${key}`);
-      computed.add(`${metric}:${key}:${markets.version}`);
+      // the config version the real set carries: the markets config's, and the NFT volume's own
+      computed.add(`${metric}:${key}:${configVersionOf(metric as VolumeMetric, markets)}`);
       dailyWrites.set(`${metric}/${key}`, ++writeSeq);
       return 0;
     });
@@ -1113,6 +1144,17 @@ describe('AggregatorService volume jobs', () => {
     ch.watermark = unix('2026-10-16T12:00:00Z');
     ch.closes = [unix('2026-10-10T08:00:00Z'), NOW_SECONDS - 3];
   };
+  /** A step of the escrows job that has nothing to do: the watermark is at the head. */
+  const quietEscrowsStep: EscrowsStep = {
+    from: 100,
+    to: 100,
+    head: 100,
+    touched: 0,
+    written: 0,
+    removed: 0,
+    setAside: [],
+    escrowed: { drops: '0', open: 0, through_ledger: 100 },
+  };
   const volumeEvents = (kind: 'live' | 'daily'): string[] => events.filter((e) => e.startsWith(kind));
   const dailyOf = (list: string[]): string[] => list.filter((e) => e.startsWith('daily')).map((e) => e.slice(6));
 
@@ -1129,12 +1171,12 @@ describe('AggregatorService volume jobs', () => {
         'volume_backfill',
       ]);
       const firstStats = events.findIndex((e) => e.startsWith('stats'));
-      const lastLive = events.lastIndexOf('live payment_volume day');
-      const lastCurrent = events.lastIndexOf(`daily amm_volume 2026-10-15`);
+      const lastLive = events.lastIndexOf('live nft_volume 30day');
+      const lastCurrent = events.lastIndexOf(`daily nft_volume 2026-10-15`);
       expect(lastLive).toBeLessThan(lastCurrent);
       expect(lastCurrent).toBeLessThan(firstStats);
       // the back-fill is the last thing the tick does
-      expect(events[events.length - 1]).toBe('daily amm_volume 2026-10-10');
+      expect(events[events.length - 1]).toBe('daily nft_volume 2026-10-10');
     });
 
     it('are without volumes the two jobs of the stats, and nothing is asked of the volume functions', async () => {
@@ -1148,10 +1190,44 @@ describe('AggregatorService volume jobs', () => {
       expect(dailySet).not.toHaveBeenCalled();
       expect(daysDone).not.toHaveBeenCalled();
     });
+
+    it('are, with the AMM pools, the NFT jobs and the escrows as well, volume_live, volume_daily, amm_pools, nft_state, escrows, stats_live, stats_dirty, nft_collections, volume_backfill, in this order', async () => {
+      caughtUp();
+      await service({
+        ammPools: { rates: RATES },
+        ammPoolsFunctions: {
+          watermark: async () => 0,
+          changedSince: async (_c, ledger) => ({ accounts: [], upTo: ledger }),
+        },
+        nfts: { rates: RATES, dailyRates: {} as DailyRates },
+        nftStateFunctions: {
+          watermark: async () => 0,
+          changedSince: async (_c, ledger) => ({ nfts: [], upTo: ledger }),
+          oldestDirty: async () => undefined,
+          dirtyLedgers: async () => 0,
+          head: async () => 0,
+        },
+        nftCollectionsFunctions: { behind: async () => [] },
+        escrows: { rates: RATES, nativeCurrency: 'XRP' },
+        escrowsFunctions: { step: async () => quietEscrowsStep },
+      }).tick();
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
+        'volume_live',
+        'volume_daily',
+        'amm_pools',
+        'nft_state',
+        'escrows',
+        'stats_live',
+        'stats_dirty',
+        'nft_collections',
+        'volume_backfill',
+      ]);
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+    });
   });
 
   describe('volume_live', () => {
-    it('refreshes the live sets of the three metrics at every tick, with the time of the tick: trade hour..30day, payment hour, day, amm hour..30day', async () => {
+    it('refreshes the live sets of the four metrics at every tick, with the time of the tick: trade hour..30day, payment hour, day, amm hour..30day, nft day, 7day, 30day', async () => {
       caughtUp();
       const svc = service();
       await svc.tick();
@@ -1168,6 +1244,9 @@ describe('AggregatorService volume jobs', () => {
         'live amm_volume 3day',
         'live amm_volume 7day',
         'live amm_volume 30day',
+        'live nft_volume day',
+        'live nft_volume 7day',
+        'live nft_volume 30day',
       ]);
       expect(liveCalls.every((c) => c.now.getTime() === NOW_MS)).toBe(true);
       const call = liveSet.mock.calls[0];
@@ -1178,7 +1257,7 @@ describe('AggregatorService volume jobs', () => {
       liveCalls.length = 0;
       jest.setSystemTime(NOW_MS + 60_000);
       await svc.tick();
-      expect(liveCalls).toHaveLength(12);
+      expect(liveCalls).toHaveLength(15);
       expect(liveCalls.every((c) => c.now.getTime() === NOW_MS + 60_000)).toBe(true);
     });
 
@@ -1193,7 +1272,7 @@ describe('AggregatorService volume jobs', () => {
       liveSet.mockRejectedValueOnce(new Error('DB::Exception: rates unavailable'));
       const svc = service();
       await svc.tick();
-      expect(volumeEvents('live')).toHaveLength(11);
+      expect(volumeEvents('live')).toHaveLength(14);
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('volume_live'));
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('trade_volume hour'));
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('rates unavailable'));
@@ -1205,7 +1284,7 @@ describe('AggregatorService volume jobs', () => {
 
       liveCalls.length = 0;
       await svc.tick();
-      expect(liveCalls).toHaveLength(12);
+      expect(liveCalls).toHaveLength(15);
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
     });
 
@@ -1259,16 +1338,18 @@ describe('AggregatorService volume jobs', () => {
   });
 
   describe('volume_daily: today and yesterday, at every tick', () => {
-    it('recomputes the daily sets of the three metrics for today and for yesterday (UTC)', async () => {
+    it('recomputes the daily sets of the four metrics for today and for yesterday (UTC)', async () => {
       caughtUp();
       await service().tick();
-      expect(dailyOf(volumeEvents('daily').slice(0, 6))).toEqual([
+      expect(dailyOf(volumeEvents('daily').slice(0, 8))).toEqual([
         'trade_volume 2026-10-16',
         'payment_volume 2026-10-16',
         'amm_volume 2026-10-16',
+        'nft_volume 2026-10-16',
         'trade_volume 2026-10-15',
         'payment_volume 2026-10-15',
         'amm_volume 2026-10-15',
+        'nft_volume 2026-10-15',
       ]);
       const [, , markets, , d, options] = dailySet.mock.calls[0];
       expect(markets).toBe(MARKETS);
@@ -1282,13 +1363,15 @@ describe('AggregatorService volume jobs', () => {
       ch.watermark = unix('2026-10-17T00:00:00Z');
       jest.setSystemTime(new Date('2026-10-17T00:00:30Z'));
       await service().tick();
-      expect(dailyOf(volumeEvents('daily').slice(0, 6))).toEqual([
+      expect(dailyOf(volumeEvents('daily').slice(0, 8))).toEqual([
         'trade_volume 2026-10-17',
         'payment_volume 2026-10-17',
         'amm_volume 2026-10-17',
+        'nft_volume 2026-10-17',
         'trade_volume 2026-10-16',
         'payment_volume 2026-10-16',
         'amm_volume 2026-10-16',
+        'nft_volume 2026-10-16',
       ]);
     });
 
@@ -1323,7 +1406,7 @@ describe('AggregatorService volume jobs', () => {
   });
 
   describe('volume_backfill: the closed days, once per config version, newest first', () => {
-    it('computes the closed days from the first ledger up to the day before yesterday, newest first, the three metrics', async () => {
+    it('computes the closed days from the first ledger up to the day before yesterday, newest first, the four metrics', async () => {
       caughtUp();
       await service().tick();
       const closed = dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
@@ -1331,18 +1414,23 @@ describe('AggregatorService volume jobs', () => {
         'trade_volume 2026-10-14',
         'payment_volume 2026-10-14',
         'amm_volume 2026-10-14',
+        'nft_volume 2026-10-14',
         'trade_volume 2026-10-13',
         'payment_volume 2026-10-13',
         'amm_volume 2026-10-13',
+        'nft_volume 2026-10-13',
         'trade_volume 2026-10-12',
         'payment_volume 2026-10-12',
         'amm_volume 2026-10-12',
+        'nft_volume 2026-10-12',
         'trade_volume 2026-10-11',
         'payment_volume 2026-10-11',
         'amm_volume 2026-10-11',
+        'nft_volume 2026-10-11',
         'trade_volume 2026-10-10',
         'payment_volume 2026-10-10',
         'amm_volume 2026-10-10',
+        'nft_volume 2026-10-10',
       ]);
       // asked which days of that window are done, for the config version of the markets
       expect(daysDone).toHaveBeenCalledWith(
@@ -1366,6 +1454,14 @@ describe('AggregatorService volume jobs', () => {
         new Date('2026-10-15T00:00:00Z'),
         4,
       );
+      // the NFT volume's own config version, not the markets config's (4)
+      expect(daysDone).toHaveBeenCalledWith(
+        ch,
+        'nft_volume',
+        new Date('2026-10-10T00:00:00Z'),
+        new Date('2026-10-15T00:00:00Z'),
+        NFT_VOLUME_CONFIG_VERSION,
+      );
       expect(NEWEST_CLOSED).toBe('2026-10-14');
     });
 
@@ -1375,19 +1471,28 @@ describe('AggregatorService volume jobs', () => {
       await svc.tick();
       dailySet.mockClear();
       await svc.tick();
-      expect(dailySet).toHaveBeenCalledTimes(6);
-      expect(dailyOf(volumeEvents('daily').slice(-6)).every((e) => !isClosed(e.split(' ')[1]))).toBe(true);
+      expect(dailySet).toHaveBeenCalledTimes(8);
+      expect(dailyOf(volumeEvents('daily').slice(-8)).every((e) => !isClosed(e.split(' ')[1]))).toBe(true);
     });
 
-    it('computes the days again for a new config version, and only for it', async () => {
+    it('computes the days again for a new config version, and only for it: not the NFT volume, whose version is its own', async () => {
       caughtUp();
       await service().tick();
       dailySet.mockClear();
       await service({}, { ...MARKETS, version: 5 }).tick();
       const closed = dailySet.mock.calls.filter((c) => isClosed(day(c[4])));
+      // five days of the trade, payment and AMM volumes; the NFT volume's days are done for its version
       expect(closed).toHaveLength(15);
+      expect(closed.some((c) => c[3] === 'nft_volume')).toBe(false);
       expect(closed.every((c) => c[2].version === 5)).toBe(true);
-      expect(daysDone).toHaveBeenLastCalledWith(ch, 'amm_volume', expect.any(Date), expect.any(Date), 5);
+      expect(daysDone).toHaveBeenCalledWith(ch, 'amm_volume', expect.any(Date), expect.any(Date), 5);
+      expect(daysDone).toHaveBeenCalledWith(
+        ch,
+        'nft_volume',
+        expect.any(Date),
+        expect.any(Date),
+        NFT_VOLUME_CONFIG_VERSION,
+      );
     });
 
     it('skips the days that are done, one metric apart from the other', async () => {
@@ -1396,20 +1501,26 @@ describe('AggregatorService volume jobs', () => {
       computed.add('trade_volume:2026-10-13:4');
       computed.add('payment_volume:2026-10-12:4');
       computed.add('amm_volume:2026-10-11:4');
+      computed.add(`nft_volume:2026-10-13:${NFT_VOLUME_CONFIG_VERSION}`);
+      computed.add('nft_volume:2026-10-12:4'); // a set of another version is not done
       await service().tick();
       const closed = dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
       expect(closed).toEqual([
         'payment_volume 2026-10-14',
         'amm_volume 2026-10-14',
+        'nft_volume 2026-10-14',
         'payment_volume 2026-10-13',
         'amm_volume 2026-10-13',
         'trade_volume 2026-10-12',
         'amm_volume 2026-10-12',
+        'nft_volume 2026-10-12',
         'trade_volume 2026-10-11',
         'payment_volume 2026-10-11',
+        'nft_volume 2026-10-11',
         'trade_volume 2026-10-10',
         'payment_volume 2026-10-10',
         'amm_volume 2026-10-10',
+        'nft_volume 2026-10-10',
       ]);
     });
 
@@ -1420,7 +1531,7 @@ describe('AggregatorService volume jobs', () => {
       ch.closes = [unix('2026-10-15T08:00:00Z'), NOW_SECONDS - 3];
       await service().tick();
       expect(daysDone).not.toHaveBeenCalled();
-      expect(dailySet).toHaveBeenCalledTimes(12); // today and yesterday, three metrics, twice
+      expect(dailySet).toHaveBeenCalledTimes(16); // today and yesterday, four metrics, twice
     });
 
     it('works under its own budget, a per-tick one, and goes on where it stopped next tick', async () => {
@@ -1436,7 +1547,7 @@ describe('AggregatorService volume jobs', () => {
         'trade_volume 2026-10-14',
         'payment_volume 2026-10-14',
         'amm_volume 2026-10-14',
-        'trade_volume 2026-10-13',
+        'nft_volume 2026-10-14',
       ]);
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('volume_backfill'));
 
@@ -1445,10 +1556,10 @@ describe('AggregatorService volume jobs', () => {
       await svc.tick();
       const second = dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
       expect(second).toEqual([
+        'trade_volume 2026-10-13',
         'payment_volume 2026-10-13',
         'amm_volume 2026-10-13',
-        'trade_volume 2026-10-12',
-        'payment_volume 2026-10-12',
+        'nft_volume 2026-10-13',
       ]);
     });
 
@@ -1533,14 +1644,16 @@ describe('AggregatorService volume jobs', () => {
       ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
       await service().tick();
       const at = events.indexOf('stats 2026-05-01T22:00:00Z');
-      expect(events.slice(at, at + 7)).toEqual([
+      expect(events.slice(at, at + 9)).toEqual([
         'stats 2026-05-01T22:00:00Z',
         'daily trade_volume 2026-05-01',
         'daily payment_volume 2026-05-01',
         'daily amm_volume 2026-05-01',
+        'daily nft_volume 2026-05-01',
         'daily trade_volume 2026-05-02',
         'daily payment_volume 2026-05-02',
         'daily amm_volume 2026-05-02',
+        'daily nft_volume 2026-05-02',
       ]);
       expect(ch.dirty).toEqual([]);
     });
@@ -1564,6 +1677,7 @@ describe('AggregatorService volume jobs', () => {
         'trade_volume 2026-05-01',
         'payment_volume 2026-05-01',
         'amm_volume 2026-05-01',
+        'nft_volume 2026-05-01',
       ]);
 
       // the second range was marked after the day began (the ingest wrote more ledgers meanwhile): the day is done again
@@ -1573,7 +1687,7 @@ describe('AggregatorService volume jobs', () => {
         mark('2026-05-01T05:00:00Z', '2026-05-01T06:00:00Z', NOW_MS + 5000),
       ];
       await service().tick();
-      expect(dailyOf(volumeEvents('daily')).filter((e) => e.endsWith('2026-05-01'))).toHaveLength(6);
+      expect(dailyOf(volumeEvents('daily')).filter((e) => e.endsWith('2026-05-01'))).toHaveLength(8);
     });
 
     it('a day that fails keeps the range, counts the failure, and the next tick does it again', async () => {
@@ -1617,6 +1731,210 @@ describe('AggregatorService volume jobs', () => {
     });
   });
 
+  describe('the escrows of agg_dirty ranges (the hook of stats_dirty)', () => {
+    it('fails the slice and keeps the range when the escrows hook fails (escrows_dirty)', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      const recomputeEscrows = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('DB::Exception: memory limit'))
+        .mockResolvedValue({ written: 0, removed: 0, setAside: [] });
+      const svc = service({
+        escrows: {
+          rates: { nativeCurrency: 'XRP', ledgersClosedIn: async () => ({ min: 100, max: 200 }) } as never,
+          nativeCurrency: 'XRP',
+        },
+        escrowsFunctions: {
+          step: async () => quietEscrowsStep,
+          read: async () => ({ drops: '0', open: 0, through_ledger: 100 }),
+          ofLedgers: async () => ['AA'.repeat(32)],
+          recompute: recomputeEscrows,
+        },
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'escrows_dirty' }]]);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        'Aggregator job escrows_dirty failed in 2026-05-01T00:00:00Z - 2026-05-01T03:00:00Z: DB::Exception: memory limit',
+      );
+      // the slice failed: the range is still there, and the jobs after stats_dirty were not kept from running
+      expect(ch.dirty).toEqual([mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')]);
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
+        'volume_live',
+        'volume_daily',
+        'escrows',
+        'stats_live',
+        'stats_dirty',
+        'volume_backfill',
+      ]);
+
+      // and the next tick does it again, and removes the range
+      await svc.tick();
+      expect(recomputeEscrows).toHaveBeenCalledTimes(2);
+      expect(ch.dirty).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('the tokens job', () => {
+    /** The account and market jobs over an empty world: no hour, day or partition to back-fill, and a set at each tick. */
+    const quietAggregates = (): Partial<AggregateFunctions> => ({
+      newestLedgerClose: async () => NOW_SECONDS - 3,
+      firstLedgerClose: async () => NOW_SECONDS - 3,
+      pairHourSets: async () => new Map(),
+      computePairHourSets: async (_c, _r, from, to) => (to - from) / HOUR,
+      computeMarketsSet: async () => ({
+        written: true,
+        pairs: 1,
+        startTime: NOW_SECONDS - DAY,
+        endTime: NOW_SECONDS,
+        ammShareKnown: true,
+      }),
+      marketsSetEndTimes: async () => new Map(),
+      marketsAmmShareKnown: async () => new Map(),
+      firstNativeTradeDay: async () => '2026-10-16',
+      validRateDays: async () => new Map(),
+      markRatesStale: async (_c, days) => days.length,
+      dirtyDaySpans: async () => [],
+      partitionSetVersions: async () => new Map(),
+      heavyAccounts: async () => new Map(),
+      rollupStates: async () => new Map(),
+    });
+
+    /**
+     * The `tokens` functions over the rows of `token_generations` in memory, in a world whose head is 1000. By default the account
+     * pass never ends (an account at every ask, `passMs` of the fake clock each), so the job always has more to do than its budget;
+     * with `pass: 'done'` it has none, and the first run makes a generation live. A write that sets `repair_from` (the hook's)
+     * fails while `hookFails` is set.
+     */
+    function tokensWorld(o: { passMs?: number; pass?: 'never-ends' | 'done' } = {}) {
+      const rows = new Map<number, TokenGenerationsRow>();
+      const state = { passes: 0, hookFails: undefined as Error | undefined };
+      const fns: Partial<TokensFunctions> = {
+        readTokenGenerations: async () => [...rows.values()],
+        writeTokenGeneration: async (_c, row) => {
+          if (row.repair_from > 0 && state.hookFails) throw state.hookFails;
+          rows.set(row.generation, row);
+        },
+        stateCoverageStart: async () => 1,
+        tokensVersionFloor: async () => '0',
+        head: async () => 1000,
+        nextPassAccounts: async () => {
+          if (o.pass === 'done') return [];
+          state.passes++;
+          if (o.passMs) jest.setSystemTime(Date.now() + o.passMs);
+          return [`rAccount${state.passes}`];
+        },
+        writePassLines: async () => undefined,
+        passTokens: async () => [],
+        touchesOfWindow: async (_c, from, head) => ({ to: head, lines: [], issuers: [] }),
+        parserFloorOf: async () => null,
+      };
+      return { fns, rows, state };
+    }
+
+    const rangeRates = { nativeCurrency: 'XRP', ledgersClosedIn: async () => ({ min: 100, max: 200 }) } as never;
+
+    it('runs tokens after markets_live and before stats_live, with its own budget', async () => {
+      expect(AGGREGATOR_TOKENS_BUDGET_MS).toBe(4000);
+      caughtUp();
+      // the gauges of the account and market jobs, which these tests of the volume jobs have not needed so far
+      for (const gauge of [
+        'pairHourlyMissingHours',
+        'marketsLiveAgeSeconds',
+        'marketsLiveAmmShareKnown',
+        'ratesDailyMissingDays',
+        'accountRollupsHeavyAccounts',
+        'accountRollupsPendingAccounts',
+      ]) {
+        Object.assign(metrics, { [gauge]: { set: jest.fn() } });
+      }
+      const world = tokensWorld({ passMs: 1000 });
+      await service({
+        aggregates: { rates: RATES, accountRollupMinRows: 0 },
+        aggregateFunctions: quietAggregates(),
+        tokens: { profile: getNetworkProfile('xrpl'), rates: RATES },
+        tokensFunctions: world.fns,
+      }).tick();
+      const jobs = metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job);
+      expect(jobs).toEqual([
+        'volume_live',
+        'volume_daily',
+        'pair_hourly',
+        'markets_live',
+        'tokens',
+        'stats_live',
+        'stats_dirty',
+        'rates_daily',
+        'account_rollups',
+        'volume_backfill',
+      ]);
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      // a batch of the pass a second, the 4 s of the job: it used its budget and no more, and the generation is still building
+      expect(world.state.passes).toBe(AGGREGATOR_TOKENS_BUDGET_MS / 1000);
+      expect(metrics.tokensBuilding.set).toHaveBeenLastCalledWith(1);
+      expect(metrics.tokensLive.set).toHaveBeenLastCalledWith(0);
+
+      // the budget is the option's when it is given
+      const short = tokensWorld({ passMs: 1000 });
+      await service({
+        budgetsMs: { tokens: 1500 },
+        tokens: { profile: getNetworkProfile('xrpl'), rates: RATES },
+        tokensFunctions: short.fns,
+      }).tick();
+      expect(short.state.passes).toBe(2);
+    });
+
+    it('does not run without the option, and the hook of a slice does not exist either', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      await service().tick();
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).not.toContain('tokens');
+      expect(metrics.tokensLive.set).not.toHaveBeenCalled();
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('counts a failure of the tokens hook as tokens_dirty and fails the slice', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      const world = tokensWorld({ pass: 'done' });
+      world.state.hookFails = new Error('DB::Exception: memory limit');
+      const svc = service({
+        tokens: { profile: getNetworkProfile('xrpl'), rates: rangeRates },
+        tokensFunctions: world.fns,
+      });
+      await svc.tick();
+
+      // the first run made a generation live; the hook could not write the mark of the slice
+      expect([...world.rows.values()].map((g) => [g.generation, g.state, g.through_ledger])).toEqual([
+        [1, 'live', 1000],
+      ]);
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'tokens_dirty' }]]);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        'Aggregator job tokens_dirty failed in 2026-05-01T00:00:00Z - 2026-05-01T03:00:00Z: DB::Exception: memory limit',
+      );
+      // the slice failed: the range is still there, and the jobs after stats_dirty were not kept from running
+      expect(ch.dirty).toEqual([mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')]);
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
+        'volume_live',
+        'volume_daily',
+        'tokens',
+        'stats_live',
+        'stats_dirty',
+        'volume_backfill',
+      ]);
+
+      // and the next tick does it again, and removes the range; the mark is the first ledger of the slice (`rangeRates`: 100, above the
+      // generation's coverage_from of 1)
+      world.state.hookFails = undefined;
+      await svc.tick();
+      expect(ch.dirty).toEqual([]);
+      expect(world.rows.get(1)?.repair_from).toBe(100);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('the closed days follow the ingest, not the clock', () => {
     const closedOf = (): string[] => dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
 
@@ -1631,9 +1949,11 @@ describe('AggregatorService volume jobs', () => {
         'trade_volume 2026-10-11',
         'payment_volume 2026-10-11',
         'amm_volume 2026-10-11',
+        'nft_volume 2026-10-11',
         'trade_volume 2026-10-10',
         'payment_volume 2026-10-10',
         'amm_volume 2026-10-10',
+        'nft_volume 2026-10-10',
       ]);
       expect(daysDone).toHaveBeenCalledWith(
         ch,
@@ -1647,11 +1967,21 @@ describe('AggregatorService volume jobs', () => {
       events.length = 0;
       ch.closes = [unix('2026-10-10T08:00:00Z'), unix('2026-10-13T01:00:00Z')];
       await svc.tick();
-      expect(closedOf()).toEqual(['trade_volume 2026-10-12', 'payment_volume 2026-10-12', 'amm_volume 2026-10-12']);
+      expect(closedOf()).toEqual([
+        'trade_volume 2026-10-12',
+        'payment_volume 2026-10-12',
+        'amm_volume 2026-10-12',
+        'nft_volume 2026-10-12',
+      ]);
       events.length = 0;
       ch.closes = [unix('2026-10-10T08:00:00Z'), unix('2026-10-14T20:00:00Z')];
       await svc.tick();
-      expect(closedOf()).toEqual(['trade_volume 2026-10-13', 'payment_volume 2026-10-13', 'amm_volume 2026-10-13']);
+      expect(closedOf()).toEqual([
+        'trade_volume 2026-10-13',
+        'payment_volume 2026-10-13',
+        'amm_volume 2026-10-13',
+        'nft_volume 2026-10-13',
+      ]);
     });
 
     it('the end of the day plus the settle time, to the second', async () => {
@@ -1660,11 +1990,21 @@ describe('AggregatorService volume jobs', () => {
       ch.closes = [unix('2026-10-10T08:00:00Z'), unix('2026-10-12T00:59:59Z')];
       await service().tick();
       // 10-11 ends at 10-12 00:00; the newest ledger is 59 min 59 s after it
-      expect(closedOf()).toEqual(['trade_volume 2026-10-10', 'payment_volume 2026-10-10', 'amm_volume 2026-10-10']);
+      expect(closedOf()).toEqual([
+        'trade_volume 2026-10-10',
+        'payment_volume 2026-10-10',
+        'amm_volume 2026-10-10',
+        'nft_volume 2026-10-10',
+      ]);
       events.length = 0;
       ch.closes = [unix('2026-10-10T08:00:00Z'), unix('2026-10-12T01:00:00Z')];
       await service().tick();
-      expect(closedOf()).toEqual(['trade_volume 2026-10-11', 'payment_volume 2026-10-11', 'amm_volume 2026-10-11']);
+      expect(closedOf()).toEqual([
+        'trade_volume 2026-10-11',
+        'payment_volume 2026-10-11',
+        'amm_volume 2026-10-11',
+        'nft_volume 2026-10-11',
+      ]);
     });
 
     it('an ingest that started at an old ledger leaves no closed day to back-fill: no sentinel-only set for days not yet ingested', async () => {
@@ -1675,7 +2015,7 @@ describe('AggregatorService volume jobs', () => {
       expect(closedOf()).toEqual([]);
       expect(daysDone).not.toHaveBeenCalled();
       // today and yesterday are still written (the stalest first): they are not final
-      expect(dailyOf(volumeEvents('daily'))).toHaveLength(6);
+      expect(dailyOf(volumeEvents('daily'))).toHaveLength(8);
     });
 
     it('the day of the newest ledger is never closed, and a day before the first ledger does not exist', async () => {
@@ -1697,28 +2037,31 @@ describe('AggregatorService volume jobs', () => {
   describe('the stalest set first (every set is refreshed in turn under a short budget)', () => {
     const seq = (calls: LiveCall[]): string[] => calls.map((c) => `${c.metric.replace('_volume', '')} ${c.period}`);
 
-    it('live: with a budget for two sets of twelve, every set is written within six ticks, and in any six ticks in a row', async () => {
+    it('live: with a budget for two sets of fifteen, every set is written within eight ticks, and in any eight ticks in a row', async () => {
       caughtUp();
       liveMs = 3000; // sets start at 0 s and 3 s; the third would start at 6 s, past the 5 s of the budget
       const svc = service();
       const ticks: string[][] = [];
-      for (let i = 0; i < 9; i++) {
+      for (let i = 0; i < 12; i++) {
         jest.setSystemTime(NOW_MS + i * 60_000);
         liveCalls.length = 0;
         await svc.tick();
         ticks.push(seq(liveCalls));
       }
-      expect(ticks.slice(0, 7)).toEqual([
+      expect(ticks.slice(0, 9)).toEqual([
         ['trade hour', 'trade day'],
         ['trade 3day', 'trade 7day'],
         ['trade 30day', 'payment hour'],
         ['payment day', 'amm hour'],
         ['amm day', 'amm 3day'],
         ['amm 7day', 'amm 30day'],
-        ['trade hour', 'trade day'],
+        ['nft day', 'nft 7day'],
+        // the stalest set is the one never written; then the one written longest ago
+        ['nft 30day', 'trade hour'],
+        ['trade day', 'trade 3day'],
       ]);
-      for (let from = 0; from + 6 <= ticks.length; from++) {
-        expect(new Set(ticks.slice(from, from + 6).flat()).size).toBe(12);
+      for (let from = 0; from + 8 <= ticks.length; from++) {
+        expect(new Set(ticks.slice(from, from + 8).flat()).size).toBe(15);
       }
     });
 
@@ -1750,6 +2093,9 @@ describe('AggregatorService volume jobs', () => {
         'amm 3day',
         'amm 7day',
         'amm 30day',
+        'nft day',
+        'nft 7day',
+        'nft 30day',
       ];
       const tickLive = async (svc: AggregatorService, i: number): Promise<string[]> => {
         jest.setSystemTime(NOW_MS + i * 60_000);
@@ -1758,7 +2104,7 @@ describe('AggregatorService volume jobs', () => {
         return seq(liveCalls);
       };
 
-      it('a set that always fails slowly (longer than the budget) is tried last: the other eleven are refreshed at every tick', async () => {
+      it('a set that always fails slowly (longer than the budget) is tried last: the other fourteen are refreshed at every tick', async () => {
         caughtUp();
         failing.add('trade_volume/hour');
         failMs = AGGREGATOR_VOLUME_LIVE_BUDGET_MS + 1000; // the failure alone is over the 5 s of the budget
@@ -1768,9 +2114,9 @@ describe('AggregatorService volume jobs', () => {
         for (let i = 1; i < 6; i++) {
           const calls = await tickLive(svc, i);
           // after that it is behind the sets that did not fail, which are all started (and take no time here) before it
-          expect(calls.slice(0, 11).sort()).toEqual([...HEALTHY].sort());
-          expect(calls[11]).toBe('trade hour');
-          expect(calls).toHaveLength(12);
+          expect(calls.slice(0, 14).sort()).toEqual([...HEALTHY].sort());
+          expect(calls[14]).toBe('trade hour');
+          expect(calls).toHaveLength(15);
         }
         // the healthy sets are written again at every tick; the one that fails never is
         expect(liveWrites.has('trade_volume/hour')).toBe(false);
@@ -1787,21 +2133,24 @@ describe('AggregatorService volume jobs', () => {
         expect(liveCalls).toHaveLength(3);
         for (let i = 1; i < 5; i++) {
           const calls = await tickLive(svc, i);
-          // the nine healthy sets first, then the three that failed (each fails again; the tick gives up at the third)
-          expect(calls.slice(0, 9).sort()).toEqual([
+          // the twelve healthy sets first, then the three that failed (each fails again; the tick gives up at the third)
+          expect(calls.slice(0, 12).sort()).toEqual([
             'amm 30day',
             'amm 3day',
             'amm 7day',
             'amm day',
             'amm hour',
+            'nft 30day',
+            'nft 7day',
+            'nft day',
             'payment day',
             'payment hour',
             'trade 30day',
             'trade 7day',
           ]);
-          expect(calls.slice(9).sort()).toEqual(['trade 3day', 'trade day', 'trade hour']);
+          expect(calls.slice(12).sort()).toEqual(['trade 3day', 'trade day', 'trade hour']);
         }
-        expect(liveWrites.size).toBe(9);
+        expect(liveWrites.size).toBe(12);
       });
 
       it('within each group the stalest is first; a set that recovers is back in the order of its version', async () => {
@@ -1835,14 +2184,16 @@ describe('AggregatorService volume jobs', () => {
         };
         expect((await dailyAt('2026-10-16T12:00:00Z'))[0]).toBe('trade_volume 2026-10-16');
         const next = await dailyAt('2026-10-16T12:01:00Z');
-        expect(next.slice(0, 5)).toEqual([
+        expect(next.slice(0, 7)).toEqual([
           'payment_volume 2026-10-16',
           'amm_volume 2026-10-16',
+          'nft_volume 2026-10-16',
           'trade_volume 2026-10-15',
           'payment_volume 2026-10-15',
           'amm_volume 2026-10-15',
+          'nft_volume 2026-10-15',
         ]);
-        expect(next[5]).toBe('trade_volume 2026-10-16');
+        expect(next[7]).toBe('trade_volume 2026-10-16');
         // the day moves on: the sets of the new day are not behind anything (the old one still fails, as yesterday's set)
         const tomorrow = await dailyAt('2026-10-17T00:00:30Z');
         expect(tomorrow[0]).toBe('trade_volume 2026-10-17');
@@ -1855,7 +2206,7 @@ describe('AggregatorService volume jobs', () => {
       });
     });
 
-    it('daily: yesterday is finalised after the midnight although the budget fits two of the six sets', async () => {
+    it('daily: yesterday is finalised after the midnight although the budget fits two of the eight sets', async () => {
       caughtUp();
       ch.closes = [unix('2026-10-15T08:00:00Z'), NOW_SECONDS - 3]; // nothing to back-fill
       currentDayMs = 3000; // two sets in the 4 s of the budget
@@ -1867,14 +2218,16 @@ describe('AggregatorService volume jobs', () => {
         return volumeEvents('daily').map((e) => e.slice(6));
       };
       expect(await tickAt('2026-10-16T12:00:00Z')).toEqual(['trade_volume 2026-10-16', 'payment_volume 2026-10-16']);
-      // nothing of yesterday has been written yet, nor the AMM volume of today: those sets are the stalest
-      expect(await tickAt('2026-10-16T12:01:00Z')).toEqual(['amm_volume 2026-10-16', 'trade_volume 2026-10-15']);
-      expect(await tickAt('2026-10-16T12:02:00Z')).toEqual(['payment_volume 2026-10-15', 'amm_volume 2026-10-15']);
+      // nothing of yesterday has been written yet, nor the AMM and NFT volumes of today: those sets are the stalest
+      expect(await tickAt('2026-10-16T12:01:00Z')).toEqual(['amm_volume 2026-10-16', 'nft_volume 2026-10-16']);
+      expect(await tickAt('2026-10-16T12:02:00Z')).toEqual(['trade_volume 2026-10-15', 'payment_volume 2026-10-15']);
+      expect(await tickAt('2026-10-16T12:03:00Z')).toEqual(['amm_volume 2026-10-15', 'nft_volume 2026-10-15']);
       // the midnight: today (the 17th) has no set at all, then yesterday (the 16th), whose sets are the old ones
       ch.closes = [unix('2026-10-15T08:00:00Z'), unix('2026-10-17T00:00:10Z')];
       expect(await tickAt('2026-10-17T00:00:30Z')).toEqual(['trade_volume 2026-10-17', 'payment_volume 2026-10-17']);
-      expect(await tickAt('2026-10-17T00:01:30Z')).toEqual(['amm_volume 2026-10-17', 'trade_volume 2026-10-16']);
-      expect(await tickAt('2026-10-17T00:02:30Z')).toEqual(['payment_volume 2026-10-16', 'amm_volume 2026-10-16']);
+      expect(await tickAt('2026-10-17T00:01:30Z')).toEqual(['amm_volume 2026-10-17', 'nft_volume 2026-10-17']);
+      expect(await tickAt('2026-10-17T00:02:30Z')).toEqual(['trade_volume 2026-10-16', 'payment_volume 2026-10-16']);
+      expect(await tickAt('2026-10-17T00:03:30Z')).toEqual(['amm_volume 2026-10-16', 'nft_volume 2026-10-16']);
     });
 
     it('reads the versions once per tick for each job, for today and yesterday only, and for the live sets', async () => {
@@ -1907,14 +2260,19 @@ describe('AggregatorService volume jobs', () => {
         'amm 3day',
         'amm 7day',
         'amm 30day',
+        'nft day',
+        'nft 7day',
+        'nft 30day',
       ]);
-      expect(volumeEvents('daily').slice(0, 6)).toEqual([
+      expect(volumeEvents('daily').slice(0, 8)).toEqual([
         'daily trade_volume 2026-10-16',
         'daily payment_volume 2026-10-16',
         'daily amm_volume 2026-10-16',
+        'daily nft_volume 2026-10-16',
         'daily trade_volume 2026-10-15',
         'daily payment_volume 2026-10-15',
         'daily amm_volume 2026-10-15',
+        'daily nft_volume 2026-10-15',
       ]);
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'volume_live' });
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'volume_daily' });
@@ -1941,6 +2299,9 @@ describe('AggregatorService volume jobs', () => {
         'amm 3day',
         'amm 7day',
         'amm 30day',
+        'nft day',
+        'nft 7day',
+        'nft 30day',
         'trade day',
         'payment hour',
       ]);
@@ -1969,27 +2330,35 @@ describe('AggregatorService volume jobs', () => {
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
       // the next tick leaves those three alone and fails on the next three
       expect(await tickAt(svc, 60_000)).toEqual([
+        'nft_volume 2026-10-14',
         'trade_volume 2026-10-13',
         'payment_volume 2026-10-13',
-        'amm_volume 2026-10-13',
       ]);
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(6);
       expect(await tickAt(svc, 120_000)).toEqual([
+        'amm_volume 2026-10-13',
+        'nft_volume 2026-10-13',
         'trade_volume 2026-10-12',
-        'payment_volume 2026-10-12',
-        'amm_volume 2026-10-12',
       ]);
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(9);
-      // and the one after that gets to the older days
       expect(await tickAt(svc, 180_000)).toEqual([
+        'payment_volume 2026-10-12',
+        'amm_volume 2026-10-12',
+        'nft_volume 2026-10-12',
+      ]);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(12);
+      // and the one after that gets to the older days
+      expect(await tickAt(svc, 240_000)).toEqual([
         'trade_volume 2026-10-11',
         'payment_volume 2026-10-11',
         'amm_volume 2026-10-11',
+        'nft_volume 2026-10-11',
         'trade_volume 2026-10-10',
         'payment_volume 2026-10-10',
         'amm_volume 2026-10-10',
+        'nft_volume 2026-10-10',
       ]);
-      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(9);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(12);
       expect(computed.has('payment_volume:2026-10-10:4')).toBe(true);
     });
 
@@ -2041,43 +2410,50 @@ describe('AggregatorService volume jobs', () => {
       expect(await tickAt(svc, VOLUME_BACKFILL_RETRY_MS + 60_000)).toEqual([]);
     });
 
-    it('the wait is for the config version it failed under: a new version retries the set at once', async () => {
+    it('the wait is for the config version it failed under: a new version retries the set at once, except the NFT volume, whose version is its own', async () => {
       caughtUp();
       failing.add('trade_volume:2026-10-14');
       failing.add('payment_volume:2026-10-14');
+      failing.add('nft_volume:2026-10-14');
       const markets = { ...MARKETS };
       const svc = service({}, markets);
+      // three sets of the 14th fail, and the tick gives up with the older days not started
       expect(await tickAt(svc, 0)).toEqual([
         'trade_volume 2026-10-14',
         'payment_volume 2026-10-14',
         'amm_volume 2026-10-14',
-        'trade_volume 2026-10-13',
-        'payment_volume 2026-10-13',
-        'amm_volume 2026-10-13',
-        'trade_volume 2026-10-12',
-        'payment_volume 2026-10-12',
-        'amm_volume 2026-10-12',
-        'trade_volume 2026-10-11',
-        'payment_volume 2026-10-11',
-        'amm_volume 2026-10-11',
-        'trade_volume 2026-10-10',
-        'payment_volume 2026-10-10',
-        'amm_volume 2026-10-10',
+        'nft_volume 2026-10-14',
       ]);
-      // the two sets of the 14th that failed wait: a minute later they are skipped
-      expect((await tickAt(svc, 60_000)).filter((e) => e.endsWith('2026-10-14'))).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
+      // the three that failed wait: a minute later they are skipped, and the older days go on
+      const second = await tickAt(svc, 60_000);
+      expect(second.filter((e) => e.endsWith('2026-10-14'))).toEqual([]);
+      expect(second).toHaveLength(16);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
       // the operator changes the config, and the reason of the failure with it: the version is new, the wait does not apply
       failing.clear();
       markets.version = 5;
       const retried = await tickAt(svc, 120_000);
-      expect(retried.slice(0, 3)).toEqual([
+      // (not the NFT volume of the 14th: its wait is for version 1, the version of its own that the markets config does not
+      // move, and the NFT volume of the other days is done for it)
+      expect(retried).toEqual([
         'trade_volume 2026-10-14',
         'payment_volume 2026-10-14',
         'amm_volume 2026-10-14',
+        ...[13, 12, 11, 10].flatMap((d) => [
+          `trade_volume 2026-10-${d}`,
+          `payment_volume 2026-10-${d}`,
+          `amm_volume 2026-10-${d}`,
+        ]),
       ]);
       expect(computed.has('trade_volume:2026-10-14:5')).toBe(true);
       expect(computed.has('payment_volume:2026-10-14:5')).toBe(true);
       expect(computed.has('amm_volume:2026-10-14:5')).toBe(true);
+      expect(computed.has(`nft_volume:2026-10-14:${NFT_VOLUME_CONFIG_VERSION}`)).toBe(false);
+      // it is tried again when its own wait is over, and then it is the only set left to do
+      expect(await tickAt(svc, VOLUME_BACKFILL_RETRY_MS)).toEqual(['nft_volume 2026-10-14']);
+      expect(computed.has(`nft_volume:2026-10-14:${NFT_VOLUME_CONFIG_VERSION}`)).toBe(true);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
     });
 
     it('does not wait on a set that failed because of the shutdown', async () => {
@@ -2118,18 +2494,18 @@ describe('AggregatorService volume jobs', () => {
     it('a run that finishes in time ends the streak: the next time it is said again', async () => {
       caughtUp();
       ch.closes = [unix('2026-10-12T08:00:00Z'), NOW_SECONDS - 3];
-      closedDayMs = 3000; // 9 sets (three closed days, three metrics), 4 a tick
+      closedDayMs = 3000; // 12 sets (three closed days, four metrics), 4 a tick
       const markets = { ...MARKETS };
       const svc = service({}, markets);
       for (let i = 0; i < 3; i++) {
         jest.setSystemTime(NOW_MS + i * 60_000);
         await svc.tick();
       }
-      // two ticks hit the budget (4 + 4 sets), the third did the last set in time
+      // two ticks hit the budget (4 + 4 sets), the third did the last four in time
       expect(budgetWarnings()).toBe(1);
       expect(budgetDebugs()).toBe(1);
 
-      // a new config version: all the days again, and a new streak
+      // a new config version: all the days again (the nine sets of the three metrics that read it), and a new streak
       markets.version = 5;
       for (let i = 3; i < 5; i++) {
         jest.setSystemTime(NOW_MS + i * 60_000);
@@ -2178,8 +2554,13 @@ describe('AggregatorService volume jobs', () => {
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('stats_dirty'));
     });
 
+    // `nft_state` is not registered in this test, on purpose: its job (3 s of its budget here) would move the stats slices and the
+    // volume sets of the dirty slices against the empirical bound on the length of a tick below (the budget of the tick, a stats
+    // slice, a set of each metric and the one closed day of `amm_daily`), which is a count of where the slices fall and not a
+    // property of the order of the jobs. That `nft_state` does not starve the live volumes, nor is starved, with every job
+    // registered and busy is shown in `aggregator.schedule.spec.ts`, whose bound is the budget of the tick plus one slice.
     it('a long stats sweep and a dirty backlog cannot starve the live volumes: they are refreshed first, at every tick, with every AMM job registered', async () => {
-      // 60 days of stats to catch up, 4 s a slice; 30 dirty ranges of a day, 4 s a slice; 300 closed days of volumes (three
+      // 60 days of stats to catch up, 4 s a slice; 30 dirty ranges of a day, 4 s a slice; 300 closed days of volumes (four
       // metrics, amm_volume the third) to back-fill, 3 s a set; the AMM pools (3 s a batch, always one more to do) and 225 closed days of amm_daily, 3 s a day,
       // run at every tick here although the days are only meant for every fifth
       ch.watermark = unix('2026-08-17T00:00:00Z');
@@ -2236,23 +2617,23 @@ describe('AggregatorService volume jobs', () => {
         liveCalls.length = 0;
         ammDailyStarts.length = 0;
         await svc.tick();
-        // the twelve live sets (five of them amm_volume) ran at the very start of the tick, before any stats slice, whatever followed
-        expect(liveCalls).toHaveLength(12);
+        // the fifteen live sets (five of them amm_volume) ran at the very start of the tick, before any stats slice, whatever followed
+        expect(liveCalls).toHaveLength(15);
         expect(liveCalls.filter((c) => c.metric === 'amm_volume').map((c) => c.period)).toEqual(TRADE_LIVE_PERIODS);
         expect(liveCalls.every((c) => c.at === tickStart)).toBe(true);
-        expect(events.slice(0, 12).every((e) => e.startsWith('live'))).toBe(true);
-        // and the six daily sets of today and yesterday (amm_volume among them), so the first stats slice comes after eighteen volume sets
-        expect(events.slice(12, 18).every((e) => e.startsWith('daily'))).toBe(true);
-        expect(events.findIndex((e) => e.startsWith('stats'))).toBeGreaterThanOrEqual(18);
-        // and the tick is over within its budget plus the slice in flight (a stats slice, and a volume set for each of the three
+        expect(events.slice(0, 15).every((e) => e.startsWith('live'))).toBe(true);
+        // and the eight daily sets of today and yesterday (amm_volume among them), so the first stats slice comes after twenty-three volume sets
+        expect(events.slice(15, 23).every((e) => e.startsWith('daily'))).toBe(true);
+        expect(events.findIndex((e) => e.startsWith('stats'))).toBeGreaterThanOrEqual(23);
+        // and the tick is over within its budget plus the slice in flight (a stats slice, and a volume set for each of the four
         // metrics in the days of a dirty slice: 3 s each here) plus the one closed day that the progress floor of amm_daily
-        // starts (3 s here) whatever is left of the tick
-        expect(Date.now() - tickStart).toBeLessThanOrEqual(AGGREGATOR_TICK_BUDGET_MS + 4000 + 3000 + 3000);
+        // starts (3 s here) whatever is left of the tick (measured: the fourth metric's set is the 3 s that the bound grew by)
+        expect(Date.now() - tickStart).toBeLessThanOrEqual(AGGREGATOR_TICK_BUDGET_MS + 4000 + 3000 + 3000 + 3000);
         // the stats sweep is far from done: the sweep and the backlog are what ran long
         expect(ch.dirty.length).toBeGreaterThan(0);
         // amm_pools ran after the live volumes, and amm_daily after the dirty queue, which is why it never starves them
         expect(events.indexOf('pools')).toBeGreaterThan(10);
-        const lastLive = events.lastIndexOf('live amm_volume 30day');
+        const lastLive = events.lastIndexOf('live nft_volume 30day');
         expect(events.findIndex((e) => e.startsWith('amm_daily'))).toBeGreaterThan(lastLive);
         // amm_daily had its turn although the sweeps used the tick up: the one closed day of its progress floor started, and
         // any set after that one started within the 4 s of the job
@@ -2288,11 +2669,11 @@ describe('AggregatorService volume jobs', () => {
         expect(recompute).toHaveBeenCalled();
         recompute.mockClear();
       }
-      // every one of the twelve sets was refreshed in every window of five ticks in a row (no set starves)
+      // every one of the fifteen sets was refreshed in every window of five ticks in a row (no set starves)
       const all = new Set(ticks.flat());
-      expect(all.size).toBe(12);
+      expect(all.size).toBe(15);
       for (let from = 0; from + 5 <= TICKS; from++) {
-        expect(new Set(ticks.slice(from, from + 5).flat()).size).toBe(12);
+        expect(new Set(ticks.slice(from, from + 5).flat()).size).toBe(15);
       }
       // the trade and payment sets are not behind the AMM ones for ever: they ran in the very first tick
       expect(ticks[0].slice(0, 7)).toEqual([
@@ -2331,7 +2712,7 @@ describe('AggregatorService volume jobs', () => {
       liveCalls.length = 0;
       jest.setSystemTime(NOW);
       await service({ liveBudgetMs: 1, budgetsMs: { volume_live: 100_000 } }).tick();
-      expect(liveCalls).toHaveLength(12);
+      expect(liveCalls).toHaveLength(15);
     });
   });
 });

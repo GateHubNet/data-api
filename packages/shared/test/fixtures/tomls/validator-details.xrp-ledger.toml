@@ -1,0 +1,34 @@
+# validator-details.xrp-ledger.toml: hand-written test data (D8), not recorded from any real domain.
+[METADATA]
+modified = 2026-10-02
+
+[[PRINCIPALS]]
+name = "Mara Lindqvist"
+email = "mara@northpeak.example"
+
+[[PRINCIPALS]]
+name = "ops@northpeak.example"
+
+[[PRINCIPALS]]
+name = "Tomas Okafor"
+
+[[VALIDATORS]]
+public_key = "__KEY_1__"
+owner_country = "no"
+server_country = " de "
+unl = "https://vl.ripple.com"
+server_location = "Frankfurt"
+
+[[VALIDATORS]]
+public_key = "__KEY_2__"
+network = "main"
+owner_country = "UK"
+server_country = "Germany"
+unl = "http://vl.example"
+
+[[ACCOUNTS]]
+address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+
+[[CURRENCIES]]
+code = "USD"
+issuer = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"

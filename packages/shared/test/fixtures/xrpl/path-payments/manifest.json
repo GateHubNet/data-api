@@ -1,0 +1,143 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://xrplcluster.com",
+  "recorded_at": "2026-10-24T14:51:43.774Z",
+  "validated_head": 107873475,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3": {
+      "ledger": 107872476,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "8AFED3CFAFC890BF399AC789450A0122BB01293F4982C4CA67A25F33A776B6C9": {
+      "ledger": 107873024,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "E362675D8230B1A615C9BF53BC0B288F3AAA36CDF8D4D3E3EE8A681966BE8397": {
+      "ledger": 11999941,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "5EA84EE8462DCCE5FEB0D9ED59A0B7D3C7EE6D532307ED12865DB28F0D78D3D4": {
+      "ledger": 107873045,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "91F75EC97B9BD4AA72E5E45C75AEBDA3251839C85F0BAE5736FF88B4F8B134B7": {
+      "ledger": 37999837,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "1761720BE5F12AE7E26992241E82A521AB3ED1B370C53C8971980E49501AEB10": {
+      "ledger": 13999940,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "4FA4CA051B7AADE70B5139570BEF9A7BE97659B6B6F670609E45AC11CD30F991": {
+      "ledger": 107873048,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "04D90AD7ABB8FCED1FD5C6B4092EA534904BEEF2990D21A101DD6C661FD013B8": {
+      "ledger": 107873048,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 11999941,
+      "bytes": 37839,
+      "gzipBytes": 7165
+    },
+    {
+      "ledger": 13999940,
+      "bytes": 51309,
+      "gzipBytes": 9833
+    },
+    {
+      "ledger": 37999837,
+      "bytes": 112083,
+      "gzipBytes": 20674
+    },
+    {
+      "ledger": 107872476,
+      "bytes": 691525,
+      "gzipBytes": 137564
+    },
+    {
+      "ledger": 107873024,
+      "bytes": 437906,
+      "gzipBytes": 94229
+    },
+    {
+      "ledger": 107873045,
+      "bytes": 1077686,
+      "gzipBytes": 254180
+    },
+    {
+      "ledger": 107873048,
+      "bytes": 213174,
+      "gzipBytes": 49767
+    }
+  ],
+  "cases": {
+    "through_the_book": {
+      "ledger": 107872476,
+      "hash": "2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3",
+      "type": "Payment",
+      "note": "Path payment: 0.165495 XRP to 0.2121364558499999 RLUSD (rMxCK...) through one order-book offer of rURtT...; an unfunded offer of rG4x... deleted on the way has no previous TakerPays/TakerGets and is not an offer crossed."
+    },
+    "through_a_pool": {
+      "ledger": 107873024,
+      "hash": "8AFED3CFAFC890BF399AC789450A0122BB01293F4982C4CA67A25F33A776B6C9",
+      "type": "Payment",
+      "note": "Path payment: 0.075143 XRP to 16538.3324944 DIP (rUmZ...) through the XRP/DIP pool rfjo7KfG7MepXCaFFxYT3B81auTKViu2kd alone (pool AccountRoot and one lsfAMMNode line); Paths names the DIP book, which the pool filled."
+    },
+    "through_a_market_maker": {
+      "ledger": 11999941,
+      "hash": "E362675D8230B1A615C9BF53BC0B288F3AAA36CDF8D4D3E3EE8A681966BE8397",
+      "type": "Payment",
+      "note": "Path payment: 1.002 USD of Bitstamp (rvYAf..., 0.2% transfer fee) to 1 USD of SnapSwap (rMwj...) rippling through the market maker rP7JWWD4zgm3GX1szbghTi2NXUniitWAKV, which holds both and moves 1 USD from one line to the other. No offer, no pool."
+    },
+    "round_trip_to_oneself_out": {
+      "ledger": 107873048,
+      "hash": "4FA4CA051B7AADE70B5139570BEF9A7BE97659B6B6F670609E45AC11CD30F991",
+      "type": "Payment",
+      "note": "Payment to oneself (rNGUb...): 0.962535 XRP to 494276.9094338 WLV through the XRP/WLV pool rEXkmSGLAEi26qzbWWU1tKxb9HCrFAXsYh. First leg of an arbitrage round trip in two payments of one ledger."
+    },
+    "round_trip_to_oneself_back": {
+      "ledger": 107873048,
+      "hash": "04D90AD7ABB8FCED1FD5C6B4092EA534904BEEF2990D21A101DD6C661FD013B8",
+      "type": "Payment",
+      "note": "Payment to oneself (rNGUb...): 494328.2283635 WLV back to 0.956085 XRP through the same pool. The WLV issuer rMhk9... only passes its own currency from the source to the pool (issuer side on both lines)."
+    },
+    "to_oneself_across_issuers": {
+      "ledger": 37999837,
+      "hash": "91F75EC97B9BD4AA72E5E45C75AEBDA3251839C85F0BAE5736FF88B4F8B134B7",
+      "type": "Payment",
+      "note": "Payment to oneself: 149.933416 XRP to 630.7873456426324 CNY of razq... through the XRP/CNY(rPT7...) offer of rh2K... and an offer of raX1... selling CNY of razq... for CNY of rPT7...: that owner has one CNY line up and one down, as a market maker would, but traded through an offer."
+    },
+    "not_only_through_the_issuer": {
+      "ledger": 107873045,
+      "hash": "5EA84EE8462DCCE5FEB0D9ED59A0B7D3C7EE6D532307ED12865DB28F0D78D3D4",
+      "type": "Payment",
+      "note": "Not a path payment: 75.08 $LYNX from one holder to another through its issuer rsr8... only, no Paths, no SendMax."
+    },
+    "not_unused_paths": {
+      "ledger": 13999940,
+      "hash": "1761720BE5F12AE7E26992241E82A521AB3ED1B370C53C8971980E49501AEB10",
+      "type": "Payment",
+      "note": "Not a path payment: 0.001 BTC of razq... from one holder to another through that issuer only, although Paths offered four routes (through XRP order books and three other BTC issuers). The metadata is the two BTC lines and the fee."
+    }
+  }
+}

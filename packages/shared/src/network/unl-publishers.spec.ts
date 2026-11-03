@@ -1,10 +1,22 @@
 import { getNetworkProfile } from './network-profile';
-import { defaultUnlThreshold, parseUnlPublishers, publisherIdOf } from './unl-publishers';
+import {
+  defaultUnlThreshold,
+  LOCAL_PUBLISHER_ID,
+  parseUnlPublishers,
+  parseUnlValidators,
+  publisherIdOf,
+} from './unl-publishers';
 
 const RIPPLE_KEY = 'ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734';
 const XRPLF_KEY = 'ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1';
 const XAHAU_KEY = 'EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8';
 const HEX = '0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF'; // 64 digits
+const XAHAU_TESTNET = [
+  'nHBoJCE3wPgkTcrNPMHyTJFQ2t77EyCAqcBRspFCpL6JhwCm94VZ',
+  'nHUVv4g47bFMySAZFUKVaXUYEmfiUExSoY4FzwXULNwJRzju4XnQ',
+  'nHBvr8avSFTz4TFxZvvi4rEJZZtyqE3J6KAAcVWVtifsE7edPM7q',
+  'nHUH3Z8TRU57zetHbEPr1ynyrJhxQCwrJvNjr4j1SMjYADyW1WWe',
+];
 
 describe('parseUnlPublishers', () => {
   it('reads the default publishers of both networks', () => {
@@ -15,6 +27,20 @@ describe('parseUnlPublishers', () => {
     expect(parseUnlPublishers(getNetworkProfile('xahau').defaultUnlPublishers)).toEqual([
       { id: 'vl.xahau.org', url: 'https://vl.xahau.org', publicKey: XAHAU_KEY },
     ]);
+  });
+
+  it("reads XRPL Testnet's default publisher", () => {
+    expect(parseUnlPublishers(getNetworkProfile('xrpl-testnet').defaultUnlPublishers)).toEqual([
+      {
+        id: 'vl.altnet.rippletest.net',
+        url: 'https://vl.altnet.rippletest.net',
+        publicKey: 'ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860',
+      },
+    ]);
+  });
+
+  it('has no default publisher for Xahau Testnet', () => {
+    expect(parseUnlPublishers(getNetworkProfile('xahau-testnet').defaultUnlPublishers)).toEqual([]);
   });
 
   it('is empty for an empty text', () => {
@@ -101,6 +127,17 @@ describe('parseUnlPublishers', () => {
       );
     });
 
+    it('the id local, in any case, which names the fixed list', () => {
+      expect(LOCAL_PUBLISHER_ID).toBe('local');
+      expect(() => parseUnlPublishers(`https://LOCAL=${RIPPLE_KEY}`)).toThrow(
+        'GH_UNL_PUBLISHERS entry 1: the id "local" is reserved',
+      );
+      expect(() => parseUnlPublishers(`${good},https://local/=${XRPLF_KEY}`)).toThrow(
+        'GH_UNL_PUBLISHERS entry 2: the id "local" is reserved',
+      );
+      expect(parseUnlPublishers(`https://local.example=${RIPPLE_KEY}`)[0].id).toBe('local.example');
+    });
+
     it('a key listed twice, also in another case', () => {
       expect(() => parseUnlPublishers(`${good},https://b.example=${RIPPLE_KEY}`)).toThrow(
         /^GH_UNL_PUBLISHERS entry 2: /,
@@ -109,6 +146,44 @@ describe('parseUnlPublishers', () => {
         /^GH_UNL_PUBLISHERS entry 2: /,
       );
     });
+  });
+});
+
+describe('parseUnlValidators', () => {
+  it('reads the fixed list of Xahau Testnet', () => {
+    expect(parseUnlValidators(getNetworkProfile('xahau-testnet').defaultUnlValidators)).toEqual(XAHAU_TESTNET);
+  });
+
+  it('has no fixed list on the other networks', () => {
+    for (const name of ['xrpl', 'xahau', 'xrpl-testnet'] as const) {
+      expect(parseUnlValidators(getNetworkProfile(name).defaultUnlValidators)).toEqual([]);
+    }
+  });
+
+  it('reads an empty text as no validators', () => {
+    expect([parseUnlValidators(''), parseUnlValidators(' , ')]).toEqual([[], []]);
+  });
+
+  it('trims the entries, skips empty ones and keeps the order given', () => {
+    const [a, b, c] = XAHAU_TESTNET;
+    expect(parseUnlValidators(` ${c} ,, ${a}\n,${b},`)).toEqual([c, a, b]);
+  });
+
+  it.each([
+    [`${XAHAU_TESTNET[0]},nonsense`, 'GH_UNL_VALIDATORS entry 2: must be a validator public key (n…)'],
+    [
+      'ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860',
+      'GH_UNL_VALIDATORS entry 1: must be a validator public key (n…)',
+    ],
+    [`${XAHAU_TESTNET[0]}, ${XAHAU_TESTNET[0]}`, 'GH_UNL_VALIDATORS entry 2: repeats a key'],
+    // Entries are counted over the non-empty ones.
+    [`,${XAHAU_TESTNET[0]},,${XAHAU_TESTNET[0]}`, 'GH_UNL_VALIDATORS entry 2: repeats a key'],
+    // A well-formed base58 string of the right length whose checksum or type byte is wrong is not a node public key.
+    [`${XAHAU_TESTNET[0].slice(0, -1)}X`, 'GH_UNL_VALIDATORS entry 1: must be a validator public key (n…)'],
+    // An account address (r…) decodes as base58 but is not a node public key.
+    ['rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh', 'GH_UNL_VALIDATORS entry 1: must be a validator public key (n…)'],
+  ])('refuses %j', (text, message) => {
+    expect(() => parseUnlValidators(text)).toThrow(message);
   });
 });
 

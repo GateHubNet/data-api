@@ -2,7 +2,7 @@
 
 The GateHub Data API is a drop-in replacement for the **Ripple Data API v2**
 ([rippled-historical-database](https://github.com/ripple/rippled-historical-database), served as
-`data.ripple.com`) for the **XRP Ledger** and for **Xahau**. Every endpoint of the Ripple API keeps its path, its parameters, its
+`data.ripple.com`) for the **XRP Ledger** and for **Xahau**, and for the testnet of each. Every endpoint of the Ripple API keeps its path, its parameters, its
 defaults and limits, its error messages and the shape and key order of its answers, so a client written for `data.ripple.com`
 works against it with two changes: it sends an API key, and it points at the host of the network it wants (see
 [Compatibility](#compatibility)).
@@ -12,9 +12,10 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md).
 
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
-[Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
-[Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [Validations](#validations) ·
-[Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Operational endpoints](#operational-endpoints)
+[Path payments](#path-payments) · [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
+[Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [NFTs](#nfts) · [Account names and tomls](#account-names-and-tomls) ·
+[Ledger objects](#ledger-objects) · [Tokens](#tokens) · [MPT](#mpt) · [Validations](#validations) · [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
+[Operational endpoints](#operational-endpoints)
 
 ---
 
@@ -22,17 +23,42 @@ Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#
 
 ### Hosts: one per network
 
-One deployment serves one network. The two deployments run the same images and answer the same paths:
+One deployment serves one network. The four deployments run the same images and answer the same paths:
 
 | Network | Host (behind the shipped nginx) | Native currency | Notes |
 | --- | --- | --- | --- |
-| XRP Ledger | `xrpl.data.<domain>` | `XRP` | CTID network id 0 |
-| Xahau | `xahau.data.<domain>` | `XAH` | CTID network id 21337 |
+| XRP Ledger | `xrpl.data.gatehub.net` (production) | `XRP` | CTID network id 0 |
+| Xahau | `xahau.data.gatehub.net` (production) | `XAH` | CTID network id 21337 |
+| XRPL Testnet | `xrpl.data.sandbox.gatehub.net` (sandbox) | `XRP` | CTID network id 1 |
+| Xahau Testnet | `xahau.data.sandbox.gatehub.net` (sandbox) | `XAH` | CTID network id 21338 |
 
-The paths are `/v2/...` on both hosts. The **native currency** of the network is the one that has no issuer: `XRP` on the XRP
-Ledger, `XAH` on Xahau. Wherever this page says "the native currency" it means that one; `XRP+rIssuer` on Xahau is an issued
+The hosts are `xrpl.data.<domain>` and `xahau.data.<domain>` of the deployment: GateHub's production domain is `gatehub.net`, its
+sandbox's `sandbox.gatehub.net`. The sandbox is a stack of its own on a host of its own, never a testnet on the production server
+([ADR-0009](adr/0009-one-deployment-per-network.md#amendment-2026-10-24-testnets)). A client knows the network by the host it calls;
+no route names a network.
+
+The paths are `/v2/...` on every host. The **native currency** of the network is the one that has no issuer: `XRP` on the XRP
+Ledger and XRPL Testnet, `XAH` on Xahau and Xahau Testnet. Wherever this page says "the native currency" it means that one; `XRP+rIssuer` on Xahau is an issued
 currency called `XRP`, and `XAH` on the XRP Ledger is an issued currency called `XAH`. Amounts of the native currency are
 always in whole units (drops divided by 1,000,000), as exact decimal text.
+
+An **MPT** is written `<48hex>` or `<48hex>+<issuer>`: 48 hex digits in any case are always an issuance ID, upper-cased in answers, and the issuer is the one the ID holds, so another one answers 400 `issuer does not match mpt issuance` ([MPT](#mpt)); 3-character and 40-hex codes stay issued currencies. A route that takes such an asset as a filter and holds no MPT (`asset` and `asset2` of [`/v2/amm/pools`](#amm), `currency` of [`/v2/nft_sales`](#nfts)) answers an MPT with an empty list, not a 400.
+
+**The testnets.** A testnet answers with the same routes, the same shapes and the same guarantees as the network it follows: wherever this
+page says "the XRP Ledger" or "Xahau" without a sentence about the testnets, XRPL Testnet answers as the XRP Ledger does and Xahau Testnet
+as Xahau does (XRPL Testnet has AMM pools, Xahau Testnet has none). Besides the host, the native currency and the CTID network id,
+four things differ in what the API serves:
+
+- **Data.** A testnet's index starts at the validated head of its deployment's first boot: the history before it is not in the index,
+  whatever its nodes hold. A testnet can be reset by its operators; its index is then dropped and starts again
+  ([operations](operations.md#a-testnet-was-reset)).
+- **Volumes.** A testnet ships an empty markets config, so `exchange_volume` has no market components, `payment_volume` has the native
+  currency's alone, and the rates of non-native assets are missing ([Network volume](#get-v2networkexchange_volume-payment_volume-and-amm_volume)).
+- **Validators.** XRPL Testnet has one list publisher (`vl.altnet.rippletest.net`). Xahau Testnet has none: its trusted validators are
+  a fixed list of four keys, served as the publisher `local` ([the summary](#get-v2networkvalidatorssummary)).
+- **Amendments.** A testnet shows no `enabled` day from the metadata file, which holds mainnet's: an amendment there has an `enabled`
+  object only from an indexed `EnableAmendment`. Its `majority_hold_seconds` is its own
+  ([amendments](#get-v2networkamendments)).
 
 ### Authentication
 
@@ -161,7 +187,8 @@ the unpaged list.
 Routes that list rows answer `format=csv` with `Content-Type: text/csv` and `Content-Disposition: attachment;
 filename="<name>.csv"; filename*=UTF-8''<name>.csv` (RFC 6266: the name quoted, `"` and `\` escaped and anything but printable
 ASCII as `_`, and the name itself in UTF-8, percent-encoded; clients show the latter). Nested objects are flattened to `a.b` and `c[0].d` columns, the columns are the union of the keys in the
-order of first appearance, and every cell is quoted. Routes with a CSV form say so below, with the file name.
+order of first appearance, and every cell is quoted. Routes with a CSV form say so below, with the file name. Every route with a
+CSV form can also be [exported](#exports): the whole list as one file, made in the background.
 
 **Differences from data.ripple.com**: flattening is applied on **every** route that has a CSV form. The original flattened nested objects with
 its `flattenJSON` helper on only some routes (9 of 29) and printed `[Object]` in the cells of the others, which made those CSVs unusable. The
@@ -173,9 +200,57 @@ name is the same, quoted (M12).
 
 Successful `/v2` answers carry `Cache-Control: private, max-age=60` (the `GH_CACHE_CONTROL` setting; empty sends no header):
 `private`, because an answer is for the holder of an API key and a shared cache that ignores the key would serve it to anybody. The
-live routes `/balances` and `/orders` send their own (see there), and so do the validator routes (see [Validators and amendments](#validators-and-amendments)).
+live answers of `/balances` (the current ledger) and `/orders` send their own (see there), and so do the validator routes (see [Validators and amendments](#validators-and-amendments)).
 Responses are gzip-compressed when the client asks for it. CORS headers are sent only for the origins in `GH_CORS_ORIGINS`.
 Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it (see [deployment](deployment.md)).
+
+### Coverage
+
+A feature whose data are read from ledger history says how much of that history the index holds. The routes of such a feature (the
+[NFTs](#nfts), the [ledger objects](#ledger-objects), the [tokens](#tokens), the [MPT issuances](#mpt) and the [supply](#get-v2networksupply); later features of the same program register with the same service and add no rule of their own) put
+
+```json
+"coverage": { "from_ledger_index": 107874617, "complete": false }
+```
+
+right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is not in the CSV.
+
+- **`from_ledger_index`** is where the feature's rows start: **one above the newest stored ledger that a parser older than the feature's wrote**,
+  or the oldest stored ledger when there is none (a database that was filled from its first ledger by the new parser). Gaps in the stored
+  ledgers do not matter (they are an operational fault with their own checks, [operations](operations.md)). It is left out, and `complete` is
+  false, when no ledger is stored at all.
+- **`complete`** is true when `from_ledger_index` is at or before **the ledger the feature starts at**, so that no row can be missing:
+  - A feature **that an amendment enabled** starts at the ledger the amendment was enabled in, as
+    [`GET /v2/network/amendments/{name}`](#get-v2networkamendmentsname) reports it (`enabled.ledger_index`): the `EnableAmendment` transaction
+    the index holds, and on a mainnet the amendment metadata file when it holds none. The API reports an enabling ledger only for an amendment that the
+    node's ledger state lists as enabled, which the syncer's `validators` worker polls. The ledger is never a constant of the code. NFTs are
+    `NonFungibleTokensV1_1` on the XRP Ledger (ledger 75,443,457) and `URIToken` on Xahau (ledger 1, its genesis). Escrows, payment channels and
+    checks are `Escrow`, `PayChan` and `Checks` on the XRP Ledger (ledger 28,685,313 for the first two, 56,219,905 for the checks), delegations
+    are `PermissionDelegationV1_1` (ledger 107,524,865) and the MPT issuances `MPTokensV1` (ledger 99,226,369); `Escrow` and `PayChan` are retired amendments, so the API knows their enabling ledger only
+    while the node's ledger state lists them. Where no enabling ledger is known, `complete` is false.
+  - A feature **as old as the network**, with no amendment, starts at the network's first ledger: **32,570** on the XRP
+    Ledger and **1** on Xahau, its genesis, so complete coverage on Xahau needs ledger 1 indexed (`range-ingest --from 1`). The escrows, payment
+    channels and checks of Xahau are such features: it has had them since its genesis, and its coverage starts at ledger 1. The issued tokens are such a feature on every
+    network: the list, the detail and the holders (made of the state tables, `issued_tokens`) and the transfers (the payments, `token_transfers`) each start at the first ledger,
+    so on a testnet they are never complete.
+  - **The testnets** have no first ledger (their index starts at the validated head of their deployment's first boot and is dropped when the
+    network is reset) and ignore the enable ledgers of the metadata file, which are mainnet's: a feature as old as the network is always
+    `complete: false` there, and a feature of an amendment only when the index holds the amendment's `EnableAmendment`. They are not
+    backfilled.
+  - A feature **a network cannot have** is `complete: true` (nothing can be missing) and its routes read no table: the delegations of Xahau and
+    Xahau Testnet, which have no permission delegation, and the MPT issuances of Xahau and Xahau Testnet, which have no MPT.
+- **One item.** The detail of one item (an NFT, with its history and offers; an escrow, a check or a payment channel, each with its history) states its own
+  coverage: the feature's, and complete also when the item's creation is indexed (its mint, or the transaction that created it, is at or above
+  `from_ledger_index`), whatever came before it. The detail of a token is the exception: it states the feature's `issued_tokens`, with no coverage of its own.
+- **Freshness.** A feature's coverage is kept for 60 seconds. A read of it that fails fails the route with the route's own 500 message, and no
+  `complete: false` is invented in its place.
+- **Placement.** `coverage` is the key after `result` on every answer derived from ledger history, lists, aggregates and details alike. An
+  answer made of parts that have coverages of their own puts each part's `coverage` as the last key of that part, and a part that needs no
+  history has none. A lookup that lists nothing (a batch of names, a ledger object by id) and an answer that is not derived from ledger history
+  carry none.
+
+Coverage turns `complete` once no ledger at or above the start ledger was written by an older parser, which is what re-ingesting the history
+does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of (and the reserves of the supply, feature `account_states`) come with version 3 and the payments their transfers are read from (and Xahau's burned supply, from the fee totals, feature `fees`) with version 1; the AMM data of the supply (feature `amm`) come with version 2 and the mint tables of Xahau's minted supply (feature `mints`) with version 9; the MPT data with version 10 (feature `mpt`).
 
 ### Compatibility
 
@@ -190,10 +265,17 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 
 Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs), the [AMM](#amm) endpoints (`/v2/amm/pools...`,
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
-`GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
-`GET /v2/network/validators/{key}/validations`. `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
+`GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary`, `GET /v2/network/validators/countries` and
+`GET /v2/network/validators/{key}/validations`, `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54), `GET /v2/path_payments` (the [path payments](#path-payments) of the
+network, spec #4) and `GET /v2/accounts/{address}/path_payments` (those of an account). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
+`GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
+ledger from the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), and
+`GET /v2/accounts/{address}/trustlines` lists an account's trust lines with all their settings at a ledger, from the same history.
+`GET /v2/accounts/{address}/balances` at a historical ledger reads that history too instead of the node, its trust lines then ordered
+by (counterparty, currency) ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 63).
 Exchange-based endpoints also differ in what they count: **swaps against AMM pools are exchanges here** (the original predates AMMs), see
 [Exchanges](#exchanges) and [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#6-amm-swaps-are-exchanges-adr-0011).
 
@@ -202,6 +284,42 @@ balance_changes, counterparties, exchanges}` and `GET /v2/network/markets`, and 
 `GET /v2/accounts/{address}/stats/{family}` and `GET /v2/accounts/{address}/reports` (the original ignored it there: a client that sent
 one now gets buckets). Their AMM data additions add the parameter `amm` and the fields `amm_share` and `amm_pool` to `GET /v2/network/markets`, the
 fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, and `computed_start` and `computed_end` to `GET /v2/amm/pools/{pool}/history?interval=day`.
+
+From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the fields of
+`GET /v2/accounts/{address}` `account_name`, the name the operator gave the address, `account_network_name`, the name the operator gave
+the account on this network only, and `account_labels`, the labels the operator put on the address; and [exports](#exports), `POST /v2/exports` and
+`GET /v2/exports/{id}`, in CSV or PDF ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
+
+From the NFT data ([ADR-0016](adr/0016-nft-and-uritoken-data.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 73 to 78): the
+[NFT endpoints](#nfts) (`/v2/nfts/{nft_id}` with `/history` and `/offers`, `/v2/accounts/{address}/nfts` and `/nft_history`,
+`/v2/nft_collections` with its collection and their `/nfts`, `/holders`, `/sales` and `/stats`, `/v2/nft_sales`), `GET /v2/network/nft_volume`,
+and the `coverage` field ([Coverage](#coverage)) that their answers carry.
+
+From the display names ([ADR-0017](adr/0017-display-names.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 79 to 83): the two routes of
+[Account names and tomls](#account-names-and-tomls), `GET /v2/account_names` (the display names of up to 100 addresses in one call, with their domains and
+labels; the key of the labels is `labels` where `GET /v2/accounts/{address}` says `account_labels`) and `GET /v2/toml/{domain}` (what the toml of a domain says,
+as the syncer last read it). No route of the original changes.
+
+From the ledger objects ([ADR-0018](adr/0018-ledger-object-history.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 7): the nine routes of
+[Ledger objects](#ledger-objects), `GET /v2/escrows/{id}`, `/v2/checks/{id}` and `/v2/payment_channels/{id}`, each with its `/history`,
+`GET /v2/ledger_objects/{id}`, `GET /v2/accounts/{address}/escrows/{sequence}` and `GET /v2/accounts/{address}/delegations`, and the `coverage`
+field that their answers carry (all but `GET /v2/ledger_objects/{id}`, a lookup). The original's lists of an account's escrows and channels are still out of scope (below).
+
+From the issued tokens ([ADR-0019](adr/0019-issued-tokens-from-state-history.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 8, items 94 to 102): the four routes of
+[Tokens](#tokens), [`GET /v2/tokens`](#get-v2tokens) (the issued tokens ranked by holders, with `kind`, `min_holders` and a search),
+[`GET /v2/tokens/{currency}.{issuer}`](#get-v2tokenscurrencyissuer) with its [`/holders`](#get-v2tokenscurrencyissuerholders) and
+[`/transfers`](#get-v2tokenscurrencyissuertransfers), and the `coverage` field that their answers carry. The original's `/v2/currencies` and `/v2/gateways` are still out of scope (below).
+
+From the supply ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 9, items 103 to 104): [`GET /v2/network/supply`](#get-v2networksupply) (the native supply at one
+ledger, an hourly snapshot, with the `coverage` of each part read from history) and [`GET /v2/network/supply/minted`](#get-v2networksupplyminted) (Xahau's minting per day and
+source, with its `coverage`; empty on the XRP Ledger). The original's `/v2/network/xrp_distribution` is still out of scope (below).
+
+From the validator toml details ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 10, items 105 to 107): `toml` on the [validator rows](#get-v2networkvalidators) and on [the answer for one validator](#get-v2networkvalidatorskey), the `country` filter of the list, and [`GET /v2/network/validators/countries`](#get-v2networkvalidatorscountries).
+
+From the MPT data ([ADR-0020](adr/0020-mpt-data.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 11, items 108 to 117): the routes of [MPT](#mpt), [`GET /v2/mpt/{issuanceId}`](#get-v2mptissuanceid) with its [`/holders`](#get-v2mptissuanceidholders) and
+[`/transfers`](#get-v2mptissuanceidtransfers), [`GET /v2/mpt?ids=`](#get-v2mptids) and [`GET /v2/accounts/{address}/mpt`](#get-v2accountsaddressmpt), `kind=mpt` on [`GET /v2/tokens`](#get-v2tokenskindmpt), and the `coverage` field that their answers carry (all but the lookup `?ids=`). Routes of the original gain what they used to drop, and a history without MPT changes only by the type `clawback`:
+an MPT payment is a payment, with `mpt_issuance_id` as the last key of its row in [`/v2/payments`](#payments) and of its [balance change](#get-v2accountsaddressbalance_changes), and a CSV column only when a row of the page has one; a balance change of an MPT is two rows, the holder's and the issuer's mirror, as on a trust line;
+`change_type` gains `clawback`, for every balance row of a `Clawback`, of an issued token too; and an asset can be written `<48hex>` or `<48hex>+<issuer>`, with the 400 `issuer does not match mpt issuance`.
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -321,7 +439,7 @@ An extra of the original that its README never listed: the newest ledger this de
 
 The object is `{hash, ledger_index, date, tx, meta}` in that order. `meta.delivered_amount` is added to every successful
 `Payment`: the metadata's `DeliveredAmount`, else the transaction's `Amount`, except for a *partial* payment from before the
-ledger the XRP Ledger fixed this in (4,594,094), which has `"unavailable"`. Xahau has no such cut-off.
+ledger the XRP Ledger fixed this in (4,594,094), which has `"unavailable"`. Xahau and the two testnets have no such cut-off.
 
 Errors: 400 `invalid hash`; 404 `transaction not found`; 500 `unable to retrieve transaction(s)`. No CSV.
 
@@ -371,7 +489,7 @@ oldest first.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `currency` (path) | all | `CUR+issuer` (the separators `+`, `\|` and `.` all work, the currency is upper-cased) or the native currency alone. The currency is that of the payment's `Amount`. |
+| `currency` (path) | all | `CUR+issuer` (the separators `+`, `\|` and `.` all work, the currency is upper-cased), the native currency alone, or an MPT: its issuance ID, with or without its issuer (`<48hex>[+issuer]`). The currency is that of the payment's `Amount`. |
 | `start` | the beginning | |
 | `end` | the newest ledger | |
 | `descending` | false | |
@@ -399,12 +517,14 @@ oldest first.
 
 Key order is the order of the original's row: `amount, delivered_amount, destination_balance_changes, max_amount?,
 source_balance_changes, tx_index, currency, destination, destination_tag?, executed_time, invoice_id?, issuer?, ledger_index,
-source, source_currency, source_tag?, tx_hash, transaction_cost`. `issuer` is absent for the native currency, tags that
+source, source_currency, source_tag?, tx_hash, transaction_cost, mpt_issuance_id?`. `issuer` is absent for the native currency, tags that
 the payment does not have are absent (a tag of `0` is a tag and is served). `transaction_cost` is the fee in whole units.
 The balance changes carry an empty `counterparty` for the native currency; the native balance change of the source does not include the fee (that is `transaction_cost`).
 
+An **MPT payment** has the issuance ID as its `currency`, the issuer the ID holds as its `issuer`, its amounts in the ledger's integer units, never scaled, and `mpt_issuance_id` as its last key; no other payment has that key, and the CSV has its column only when a row of the page has one. `delivered_amount` is the existing rule (`DeliveredAmount`, else `delivered_amount`, else `Amount`), except on a partial MPT payment with no `DeliveredAmount`, as one recorded before the amendment `fixMPTDeliveredAmount` would be (none is known): the node's `delivered_amount` is then only `Amount`, so it is what moved, the destination's rise, or the fall of `OutstandingAmount` for a payment to the issuer.
+
 Errors, in the order they are checked: 400 `invalid issuer address`, `invalid start date format`, `invalid end date format`,
-then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on Xahau), `issuer is required`;
+then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on Xahau), `issuer is required`, `issuer does not match mpt issuance`;
 `invalid marker`; 500 `unable to retrieve payments`.
 
 **Differences from data.ripple.com**
@@ -414,8 +534,112 @@ then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on 
 - The response has no top-level `currency`/`issuer` (the original's route read them from a result that never had them).
 - The CSV file name is built from the request (`payments - USD rIssuer.csv`); the original's formula repeated the currency and
   in practice produced `payments  .csv`.
-- Payments with MPT amounts are not payments of this API.
 - A missing `end` is open-ended (the original used the time of the request).
+- A **delegated** Payment (a `Delegate` signs it for the sender and pays its fee) has its fee booked to the delegate: the native `source_balance_changes` of the sender are the
+  amount alone, and a delegate that is the `destination` (a sweep to itself) has what arrived as its native `destination_balance_changes`, the fee not taken out (none
+  for a token payment to it), from the re-ingest of its ledger on (parser version 7, [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 91). The original
+  predates delegation.
+
+---
+
+## Path payments
+
+A GateHub extra (spec #4): the original had no such list. A **path payment** ([glossary](../GLOSSARY.md)) is a successful payment
+whose delivery used someone else's liquidity: it consumed or changed an order-book offer, changed an AMM pool, or rippled through
+the trust lines of an account other than the source, the destination and the delivered currency's issuer. Rippling only through
+that issuer is not a path payment, and neither is a payment whose `Paths` field went unused: only what the metadata shows counts. A
+payment to oneself through such liquidity (an arbitrage loop, a conversion) is a path payment, although
+[`/v2/payments`](#get-v2paymentscurrency) leaves payments to oneself out. `/v2/payments`, `/v2/accounts/{address}/payments` and the
+payment volumes are unchanged.
+
+The rows are written by the ingest from parser version 4 on (`PATH_PARSER_VERSION`). A ledger ingested by an older parser has no
+path payments until it is re-ingested ([backfill](backfill.md#path-payments-re-ingest)), so a window over such ledgers lists none.
+
+### `GET /v2/path_payments`
+
+The path payments of the ledgers that closed in the window, across the network, oldest first (by ledger and transaction).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | As on [`/v2/payments`](#get-v2paymentscurrency). |
+| `format` | json | `csv`: file `path payments.csv`. |
+
+```json
+{
+  "result": "success",
+  "count": 1,
+  "marker": "…",
+  "path_payments": [
+    {
+      "hash": "E362675D…", "ledger_index": 11999941, "executed_time": "2015-03-01T11:13:10Z",
+      "source": "rLD5…", "destination": "rGhs…",
+      "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
+      "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+    }
+  ]
+}
+```
+
+Key order: `hash, ledger_index, executed_time, source, destination, delivered_amount, currency, issuer?, source_amount,
+source_currency, source_issuer?, offers_crossed, amm_pools, rippled_through`.
+
+- `delivered_amount`, `currency`, `issuer`: what reached the destination (the delivered amount, as on `/v2/payments`). When the
+  payment's `Amount` names the destination as its issuer ("any issuer the destination trusts"), the issuer is the one whose line
+  the payment credited.
+- `source_amount`, `source_currency`, `source_issuer`: what left the source for the payment, the fee not included. The currency is
+  that of `SendMax` (without it, the delivered currency); when `SendMax` names the source as its issuer, the issuer is the one whose
+  line the payment debited. For a payment to oneself in the same asset, it is the delivered amount minus what the source's balance
+  gained.
+- The issuers are absent for the native currency.
+- `offers_crossed`: the number of order-book offers the payment consumed or changed. An unfunded or expired offer it removed on
+  the way is not counted.
+- `amm_pools`: the AMM pools whose holdings it changed, by pool account, in the order of the metadata.
+- `rippled_through`: the accounts that rippled the payment between two of their trust lines in one currency (the balance went up on
+  one and down on the other) while holding a balance on one of them, in the order of the metadata: a market maker. The source, the
+  destination, the delivered currency's issuer, the pools and the owners of the offers crossed are never listed, and neither is
+  another issuer that only passed its own currency from one holder to another.
+
+In the CSV the columns are these keys; `amm_pools` and `rippled_through` are one cell each, their accounts separated by a space.
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
+`unable to retrieve path payments`.
+
+### `GET /v2/accounts/{address}/path_payments`
+
+The path payments the account sent or received (it is their `source` or their `destination`) in the ledgers that closed in the
+window, oldest first (by ledger and transaction). A payment to oneself is listed once. An account a payment only rippled through,
+a pool and the owner of an offer crossed are named in the row but do not list it. The address is not checked, as on the other lists
+under an account: one that is none has no path payments.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | As on [`/v2/path_payments`](#get-v2path_payments). |
+| `format` | json | `csv`: file `<address> - path payments.csv`. |
+
+```json
+{
+  "result": "success",
+  "count": 2,
+  "path_payments": [
+    {
+      "hash": "E362675D…", "ledger_index": 11999941, "executed_time": "2015-03-01T11:13:10Z",
+      "source": "rLD5…", "destination": "rGhs…",
+      "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
+      "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+    },
+    "…"
+  ]
+}
+```
+
+The rows, their key order and the CSV columns are those of [`/v2/path_payments`](#get-v2path_payments). The list is read from the
+account's index of path payments (`account_path_payments`), written with them from parser version 4 on
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 67).
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
+`unable to retrieve path payments`.
 
 ---
 
@@ -618,8 +842,12 @@ address errors, `invalid date format`, `must not be a future date`; 500 `unable 
 ## Accounts
 
 The `{address}` of the account routes is **not validated** (as in the original) except where a route says otherwise
-(`/balances`, `/orders`): an address that does not exist simply has no rows. All account lists take the common window
-parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`.
+(`/balances`, `/orders`, `/trustlines`, `/escrows/{sequence}`, `/delegations`, `/mpt`): an address that does not exist simply has no rows. All account lists take the common window
+parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`. The path payments of an account are
+described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments), the escrow of an account by its
+sequence with the other escrow routes, under [`GET /v2/accounts/{address}/escrows/{sequence}`](#get-v2accountsaddressescrowssequence), the
+delegations an account gave or holds under [`GET /v2/accounts/{address}/delegations`](#get-v2accountsaddressdelegations), in [Ledger objects](#ledger-objects), and
+the MPTs an account holds under [`GET /v2/accounts/{address}/mpt`](#get-v2accountsaddressmpt), in [MPT](#mpt).
 
 ### `GET /v2/accounts`
 
@@ -644,12 +872,82 @@ accounts`.
 
 ### `GET /v2/accounts/{address}`
 
-`{ "result": "success", "account_data": { account, parent, initial_balance, inception, ledger_index, tx_hash } }`. 404
-`Account not found`; 500 `unable to get accounts`.
+The latest activation of the account, the name the operator gave its address, the name it gave the account on this network and
+the labels it put on the address.
+
+```json
+{ "result": "success",
+  "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
+                    "ledger_index": 11119603, "tx_hash": "…", "account_name": "…", "account_network_name": "…",
+                    "account_labels": { "scam": { "description": "Fake giveaway", "url": "https://…" },
+                                        "advisory": { "description": "…", "source": "…", "url": "https://…" } } } }
+```
+
+Key order: `account, parent, initial_balance, inception, ledger_index, tx_hash, genesis_balance?, genesis_index?,
+account_name?, account_network_name?, account_labels?, flags?`.
+
+- `account_name`: the **account name** of the address ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
+  the same on every network. The operator writes it into the shared database by hand
+  ([operations](operations.md#name-an-address)); the api loads the names every 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), so a
+  new or removed name shows within that time. Left out when the address has none.
+- `account_network_name`: the **account network name** of the account, its name on this network only ("USD Issuer" for
+  GateHub's issuing address on the XRP Ledger, which Xahau does not show). The operator writes it into the network's own
+  database by hand ([operations](operations.md#name-an-account-on-one-network)); it is loaded and reloaded with the names (60 s).
+  It is served with or without an `account_name`, and left out when the account has none.
+- `account_labels`: the **labels** of the address, the same on every network: an object keyed by label (`scam`, `spam`,
+  `advisory`, in that order), each `{ description, source?, url? }` in that key order, where `source` says who says so and `url`
+  links to where; each is left out when empty. The operator writes them into the shared database by hand
+  ([operations](operations.md#label-an-address)), and they load and reload with the names, so a new or removed label shows
+  within 60 s. Left out when the address has no label.
+
+The names and the labels do not make an account: an address with a name or a label but no activation on this network still
+answers 404 `Account not found`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `flags` | false | `true` adds `flags` to `account_data`: the **account flags**, one `true`/`false` per flag the network names, named without the `lsf` prefix, in the order of their bits. |
+| `date` (alias `close_time`) | | With `flags`: the last ledger closed at or before it. |
+| `ledger_index` (alias `ledger`) | | With `flags`: a ledger number, or `validated`, `closed`, `current`. |
+| `ledger_hash` | | With `flags`: the ledger with this hash. |
+
+Without `flags=true` nothing else is read, and the ledger parameters are not looked at: the answer is the one above. With it, a
+`date`, a numeric `ledger_index` or a `ledger_hash` reads the flags from the **account state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), never from the node, with the precedence of `/balances`
+(`ledger_hash` > `date` > `ledger_index`), and the answer names the ledger it was read at and when it closed. Without one (or with
+`validated`, `closed`, `current`) the flags come from `account_info` on the live node, the validated ledger by default; the answer
+then has the node's `ledger_index` and no `close_time`, is cached and carries the `Cache-Control` of `/balances`.
+
+```json
+{ "result": "success", "ledger_index": 107695660, "close_time": "2026-10-17T08:01:12Z",
+  "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
+                    "ledger_index": 11119603, "tx_hash": "…",
+                    "flags": { "PasswordSpent": false, "RequireDestTag": true, "RequireAuth": false, "DisallowXRP": false,
+                               "DisableMaster": false, "…": false } } }
+```
+
+The flags are those the network's definitions name. On the XRP Ledger: `PasswordSpent`, `RequireDestTag`, `RequireAuth`,
+`DisallowXRP`, `DisableMaster`, `NoFreeze`, `GlobalFreeze`, `DefaultRipple`, `DepositAuth`, `DisallowIncomingNFTokenOffer`,
+`DisallowIncomingCheck`, `DisallowIncomingPayChan`, `DisallowIncomingTrustline`, `AllowTrustLineLocking`, `AllowTrustLineClawback`
+(`LEDGER_ENTRY_FLAGS.AccountRoot` of the bundled definitions). On Xahau, whose definitions name none, a table kept from xahaud's
+`LedgerFormats.h`: `AllowTrustLineClawback` (0x1000), the XRP Ledger's nine from `PasswordSpent` to `DepositAuth`, `TshCollect`,
+`DisallowIncomingNFTokenOffer`, `DisallowIncomingCheck`, `DisallowIncomingPayChan`, `DisallowIncomingTrustline`, `URITokenIssuer` and
+`DisallowIncomingRemit`. The same bit can have another name on each network (0x80000000 is `AllowTrustLineClawback` on the XRP
+Ledger and `DisallowIncomingRemit` on Xahau).
+
+The flags at a ledger are those of the account's last change at or before it. The state history covers the ledgers above the newest
+ledger written by a parser older than parser version 3 (gaps in the ledger numbers do not matter); see
+[backfill](backfill.md#account-state-history-re-ingest). An account that has not changed since that start has no state yet.
+
+Errors, in order: 400 `invalid date format`, `invalid ledger hash` (only with `flags=true`); 404 `Account not found` (no activation);
+400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
+history does not cover); 404 `account not found` (no state of the account at that ledger, or the account was deleted; from the node:
+the node does not have the account); 500 `unable to get accounts`.
 
 **Differences from data.ripple.com** (both routes): an address that was created more than once (deleted with `AccountDelete`
 and funded again) answers with its **latest** creation; the original answered with the earliest. A transaction that creates
-several accounts is listed once per account (the original kept the last).
+several accounts is listed once per account (the original kept the last). `GET /v2/accounts/{address}` adds `account_name`,
+`account_network_name` and `account_labels`, and with `flags=true` the account flags, GateHub extras
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) items 55, 58, 57, 59 and 60).
 
 ### `GET /v2/accounts/{address}/transactions`
 
@@ -666,9 +964,39 @@ transaction objects of `/v2/transactions` without `ledger_hash`: `{hash, ledger_
 | `descending` | false | |
 | `limit` | 20 (max 1000) | |
 | `marker` | | |
+| `format` | json | `csv`: one **summary row** per transaction instead of the transaction object, file `<address> - transactions.csv`. Every other parameter applies as in JSON, and the pages follow the same `marker` and `Link` header. `binary` does not change the CSV. |
 
 Errors: 400 `invalid start date format`, `invalid end date format`, `invalid min_sequence`, `invalid max_sequence`, `invalid
-transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. No CSV.
+transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. Errors stay JSON with
+`format=csv`.
+
+**The CSV summary row** says what the transaction was from the account's side, readable without opening `tx` and `meta`. The
+columns, the same on every page and in this order:
+
+| Column | Meaning |
+| --- | --- |
+| `hash`, `ledger_index` | The transaction and its ledger. |
+| `executed_time` | The close time of the ledger, as the `date` of the JSON list (`2015-01-14T18:27:10+00:00`). |
+| `tx_type`, `result` | `Payment`, `tesSUCCESS`, ... |
+| `initiator` | `true` when the account sent the transaction (its `Account`), `false` when the transaction only affected it. |
+| `counterparty`, `amount`, `currency`, `issuer` | From one mapping per transaction type, below. Empty where the type has none. |
+| `fee` | The fee in whole units of the native currency, on the row of the account that paid it: the transaction's `Delegate` when it names one, else its sender (a delegated transaction's fee is the delegate's, not the sender's). An inner transaction of a Batch pays none (the outer one pays for all): its fee is `0` on that row. Empty on every other row. |
+| `flags_changed` | The account flags the transaction set or cleared. Empty for now: it fills once the account state history is recorded. |
+| `delegate` | The transaction's `Delegate`, the account that signed it for its sender and paid its fee, on the row of every account the transaction affected. Empty when the transaction has no delegate. Always the last column. |
+
+| Type | `counterparty` | `amount`, `currency`, `issuer` |
+| --- | --- | --- |
+| `Payment` | The destination for the sender, the sender for the destination. | The delivered amount of a successful payment, as `/v2/accounts/{address}/payments` gives it (a partial payment from before the fix gives `Amount`; an `Amount.issuer` that names a party is resolved through the trust lines). A failed payment delivered nothing and leaves them empty. An account that is neither party (an issuer the payment rippled through, the owner of an offer it took) gets none of the four. |
+| `TrustSet` | The peer of the trust line: the `LimitAmount` issuer for the sender, the sender for that issuer. | The limit the sender set, with its currency and issuer. |
+| any other (`OfferCreate`, `AccountSet`, ...) | empty | empty |
+
+Amounts are exact decimal strings in whole units, as on the ledger; the native currency is `XRP` or `XAH` and has no issuer.
+A page with no transactions is an empty file.
+
+```csv
+"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed","delegate"
+"91F79AC2…","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","true","r4L6Z…","2","EUR","rMwjY…","0.012","",""
+```
 
 ### `GET /v2/accounts/{address}/transactions/{sequence}`
 
@@ -678,7 +1006,8 @@ supported). A transaction that used a ticket has Sequence 0: the latest of them 
 
 **Differences from data.ripple.com** (both routes): `max_sequence` is inclusive (the HBase scan dropped its row); `type` and
 `result` are validated against the network definitions; a `min_sequence` above what a sequence can be gives an empty list and
-a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404.
+a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404. The original had no CSV for
+account transactions; `format=csv` with the summary row is a GateHub extra.
 
 ### `GET /v2/accounts/{address}/payments`
 
@@ -730,7 +1059,7 @@ first; the fee of a transaction comes first, as a `transaction_cost` row without
 | --- | --- | --- |
 | `currency` | all | Upper-cased. |
 | `counterparty` (alias `issuer`) | all | Not allowed together with the native currency. |
-| `change_type` (alias `type`) | all | One of `transaction_cost`, `exchange`, `intermediary`, `payment_source`, `payment_destination`, `escrow_create`, `escrow_cancel`, `escrow_finish`, `paychannel_fund`, `paychannel_payout`. |
+| `change_type` (alias `type`) | all | One of `transaction_cost`, `exchange`, `intermediary`, `payment_source`, `payment_destination`, `escrow_create`, `escrow_cancel`, `escrow_finish`, `paychannel_fund`, `paychannel_payout`, `clawback`. |
 | `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | |
 | `format` | json | `csv`: file `<address> - balance changes[ <CURRENCY>].csv`. |
 
@@ -743,13 +1072,15 @@ first; the fee of a transaction comes first, as a `transaction_cost` row without
 
 Key order: `amount_change, escrow_balance_change?, final_balance, node_index?, paychannel_final_balance?,
 paychannel_fund_change?, paychannel_fund_final_balance?, tx_index, change_type?, counterparty?, currency, escrow_counterparty?,
-executed_time, ledger_index, paychannel_counterparty?, tx_hash`. The native currency has no `counterparty`; the fee row has no
+executed_time, ledger_index, paychannel_counterparty?, tx_hash, mpt_issuance_id?`. The native currency has no `counterparty`; the fee row has no
 `node_index`; `change_type` is absent on changes of transaction types the original never classified; the `escrow_*` and
 `paychannel_*` fields appear only on the changes of a party to an escrow or payment channel. Amounts are exact decimal strings.
 
+The change of an **MPT** has the issuance ID as its `currency` (`currency=` takes it in any case) and `mpt_issuance_id` as its last key; no other change has that key, and the CSV has its column only when a row of the page has one. Its amounts are the ledger's integer units, never scaled. A holder's row has the issuer as its `counterparty`, and the issuer's mirror row, with the sign reversed, has the holder: `final_balance` of the mirror is minus what that holder holds, as on a trust line. `clawback` is the type of the rows of a `Clawback`, of an MPT or of an issued token, from the re-ingest of its ledger on (parser version 10).
+
 Errors: 400 `invalid start date format`, `invalid end date format`, `counterparty cannot be specified for XRP` (`XAH`),
 `invalid change_type - use: transaction_cost, exchange, intermediary, payment_source, payment_destination, escrow_create,
-escrow_cancel, escrow_finish, paychannel_fund, paychannel_payout`, `invalid marker`; 500 `unable to retrieve balance changes`.
+escrow_cancel, escrow_finish, paychannel_fund, paychannel_payout, clawback`, `invalid marker`; 500 `unable to retrieve balance changes`.
 
 **Differences**: the filter accepts the five escrow/payment-channel change types as well as the original's five (the rows carry
 them and the original rejected them, so no client could filter on a type it was served); balance changes are produced for
@@ -757,16 +1088,25 @@ every transaction type that moves a balance (RippleState changes of all transact
 original's parser covered only some; no row is made for a fee of 0 (Batch inner transactions); `paychannel_balance_change` is
 not served (the original computed it and never stored it).
 
+The fee row (`transaction_cost`) of a **delegated** transaction is the delegate's, the account that signed it and paid the fee, and the sender's own native row is its whole
+change; the delegate's list has it, and so have the stats, reports and analytics built from these rows, from the re-ingest of the transaction's ledger on (parser version 7,
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 91). The `paychannel_*` and `escrow_*` fields of a payment channel or escrow that holds an issued token (Xahau) carry
+token amounts, not drops; on Xahau the creator's trust line moves at each claim of a token channel, so a claim's creator row is typed `paychannel_fund` with the claimed
+delta (item 92).
+
 ### `GET /v2/accounts/{address}/balances`
 
-The balances of the account on a ledger of the **live node** (`GH_NODE_ENDPOINTS`): `account_info` for the native balance,
+The balances of the account at a ledger. A ledger named by `ledger_hash`, `date` or a numeric `ledger_index` is **historical**: the
+balances come from the **account and trust line state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), never from the node. With no ledger named, or with `validated`,
+`closed` or `current`, they come from the **live node** (`GH_NODE_ENDPOINTS`): `account_info` for the native balance,
 `account_lines` for the trust lines.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `ledger_index` (alias `ledger`) | newest validated | A number, or `validated`, `closed`, `current`. Anything else is ignored. |
-| `ledger_hash` | | 64 hex digits (400 `invalid ledger hash`). |
-| `date` (alias `close_time`) | | The last ledger **stored by this API** that closed at or before it; the answer then carries its `close_time`. |
+| `ledger_index` (alias `ledger`) | newest validated | A ledger number (historical), or `validated`, `closed`, `current` (the node). Anything else is ignored. |
+| `ledger_hash` | | 64 hex digits (400 `invalid ledger hash`): the ledger **stored by this API** with this hash. |
+| `date` (alias `close_time`) | | The last ledger **stored by this API** that closed at or before it. |
 | `currency` | all | Only balances in that currency (compared as written). The native currency alone gives just the native balance. |
 | `counterparty` (alias `issuer`) | all | Only the trust lines with that account (the native balance is not filtered). |
 | `limit` | 200 (max 400) or `all` | Counts the native balance. `all` reads every trust line and has no `limit` in the answer. |
@@ -779,29 +1119,46 @@ Precedence: `ledger_hash` > `date` > `ledger_index`.
   "balances": [{ "currency": "XRP", "value": "1000.5" }, { "currency": "USD", "counterparty": "r…", "value": "12.25" }] }
 ```
 
-The native balance comes first and has no `counterparty`; trust lines follow in the node's order. Errors, in order: 400 `invalid
-ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, 400 `the date provided is too old` (no stored
-ledger that early, or the node no longer has the ledger), 404 `account not found`; 500 `unable to retrieve balances`.
+Key order: `result, ledger_index, close_time?, limit?, balances`; a balance is `currency, counterparty?, value`. The native balance
+comes first and has no `counterparty`. A historical answer always carries the `close_time` of its ledger; a live one has none.
 
-Responses are cached in memory for `GH_LIVE_CACHE_TTL_MS` (default 10 s) per resolved request, so a `validated` answer is at
-most that old; the body says which ledger it was read at. The answer says the same downstream: `Cache-Control: private,
-max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`private, max-age=10` by default), or `no-store` when the live cache is off
-(`GH_LIVE_CACHE_TTL_MS=0`), in place of the global `GH_CACHE_CONTROL`. `limit=all` pages the node for at most 30 s in all; an
-account that needs longer gets 500 `unable to retrieve balances`. The pages of trust lines after `account_info` are read from the
-ledger named by `ledger_hash` or a numeric `ledger_index` as given, and from the index the node answered with for
-`validated` / `closed` / `current` (a marker belongs to one ledger).
+**Historical ledgers.** The native balance is the account's state at its last change at or before the ledger; the trust lines are
+those of [`/trustlines`](#get-v2accountsaddresstrustlines) at that ledger (a line with a zero balance is listed, a deleted one is
+not), each as its balance from the account's side, **ordered by (`counterparty`, `currency`)**. The state history covers the ledgers
+above the newest ledger written by a parser older than parser version 3, as for `/trustlines` and the account flags (see
+[backfill](backfill.md#account-state-history-re-ingest)): a ledger this API does not hold, a date before the first stored ledger, or a
+ledger the state history does not cover answers 400 `the date provided is too old`, and an account with no state at that ledger (it
+has not changed since the coverage starts, or did not exist yet), or one deleted at or before it, answers 404 `account not found`. A
+historical answer is not cached in memory and carries the global `GH_CACHE_CONTROL`, like the other routes that read ClickHouse. The
+risk of a big issuer's read is that of [`/trustlines`](#get-v2accountsaddresstrustlines).
 
-**Differences from data.ripple.com**: the default ledger is the newest **validated** one (the original asked for the open
-ledger); `ledger_hash` is honored (it was ignored); trust lines are paged until the limit is filled with lines that pass the
-filters (the original cut the first page and filtered afterwards, so a `currency` could miss lines); `limit=all` pages to
-completion (within 30 s); a date older than the first stored ledger is 400 (the original answered 500); balances are exact decimal
-strings.
+**The current ledger.** Trust lines come in the node's order. Responses are cached in memory for `GH_LIVE_CACHE_TTL_MS` (default
+10 s) per resolved request, so a `validated` answer is at most that old; the body says which ledger it was read at. The answer says
+the same downstream: `Cache-Control: private, max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`private, max-age=10` by default), or
+`no-store` when the live cache is off (`GH_LIVE_CACHE_TTL_MS=0`), in place of the global `GH_CACHE_CONTROL`. `limit=all` pages the
+node for at most 30 s in all; an account that needs longer gets 500 `unable to retrieve balances`. The pages of trust lines after
+`account_info` are read from the index the node answered with (a marker belongs to one ledger).
+
+Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, 400 `the date provided
+is too old` (historical: see above; current: the node does not have the ledger), 404 `account not found` (no state of the account at
+the ledger, or the node does not know it); 500 `unable to retrieve balances`.
+
+**Differences from data.ripple.com**: a historical ledger is read from the state history, not from the node, so its trust lines are
+ordered by (counterparty, currency) rather than in the node's order, and its answer always has `close_time`
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) item 63); the default ledger
+is the newest **validated** one (the original asked for the open ledger); `ledger_hash` is honored (it was ignored); trust lines are
+paged until the limit is filled with lines that pass the filters (the original cut the first page and filtered afterwards, so a
+`currency` could miss lines); `limit=all` pages to completion (within 30 s); a date older than the first stored ledger is 400 (the
+original answered 500); balances are exact decimal strings.
 
 ### `GET /v2/accounts/{address}/orders`
 
 The open offers of the account on a ledger of the live node, with the same ledger selectors, `limit` (200, max 400, or `all`),
-error order, caching (the in-memory live cache and its `Cache-Control`), 30 s limit of `limit=all` and ledger of the pages after
-the first as `/balances` (`currency` is ignored; `format=csv`: file `<address> - orders.csv`, flattened).
+error order, caching (the in-memory live cache and its `Cache-Control`) and 30 s limit of `limit=all` as `/balances` at the current
+ledger (`currency` is ignored; `format=csv`: file `<address> - orders.csv`, flattened). Unlike `/balances`, every ledger is read from
+the node, a historical one too: a hash or a ledger number is forwarded to it, a date becomes the last stored ledger closed at or
+before it, and the pages after the first are read from the ledger named, or from the index the node answered with for `validated` /
+`closed` / `current`.
 
 ```json
 { "result": "success", "ledger_index": 107695660, "limit": 200,
@@ -817,6 +1174,59 @@ ripple address`.
 
 **Differences**: `direction` is `sell` when the offer has the sell flag (the original hard-coded `buy`); the address is
 validated (the original let the node fail with a 500); `limit=all` is honored; the default ledger is the validated one.
+
+### `GET /v2/accounts/{address}/trustlines`
+
+The **trust lines** of the account at a ledger, with all their settings, from the **trust line state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)); it never reads the node. Each line is from the account's side,
+ordered and paged by (`counterparty`, `currency`). An issuer's lines are its holders. A GateHub extra: the original had no such route
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) items 61 and 62).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `ledger_index` (alias `ledger`) | newest indexed | A ledger number. `validated`, `closed`, `current` and anything else read the newest indexed ledger too. |
+| `ledger_hash` | | The stored ledger with this hash (400 `invalid ledger hash` unless 64 hex digits). |
+| `date` (alias `close_time`) | | The last stored ledger closed at or before it. |
+| `currency` | all | Only the lines in that currency (compared as written: `USD`, or the 40 hex digits of a non-standard code). |
+| `counterparty` | all | Only the lines with that account. |
+| `limit`, `marker` | 200 (max 1000) | See [Pagination](#pagination). |
+| `format` | json | `csv`: file `<address> - trustlines.csv`, one row per line, paged like the JSON. |
+
+Precedence: `ledger_hash` > `date` > `ledger_index`, as on `/balances`. With no ledger named the route reads the newest ledger this
+API has indexed (not the node's validated ledger), so a marker always belongs to this API's data and the pages never mix two sources;
+that ledger trails the network by the ingest delay. The marker is the (counterparty, currency) of the last line and does not hold the
+ledger: each page without a ledger named reads the newest ledger again, so a walk (or an [export](#exports)) that must be one ledger's
+names it with `ledger_index`, the `ledger_index` of the first page.
+
+```json
+{ "result": "success", "ledger_index": 26926380, "close_time": "2017-01-12T18:49:31Z", "count": 1, "marker": "…",
+  "trustlines": [{ "currency": "LBR", "counterparty": "r…", "balance": "5.017529627551844", "limit": "10000000",
+                   "limit_peer": "1000000", "no_ripple": false, "no_ripple_peer": false, "authorized": false,
+                   "peer_authorized": false, "freeze": true, "peer_freeze": false, "quality_in": 0, "quality_out": 0 }] }
+```
+
+Key order: `result, ledger_index, close_time, count, marker?, trustlines`; a line is `currency, counterparty, balance, limit,
+limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out`.
+
+- `balance`: the account's balance on the line, exact; positive when the counterparty owes it (a holder of an issued currency),
+  negative when it owes the counterparty (the issuer's side of the same line).
+- `limit` is the account's own limit, `limit_peer` the counterparty's. `no_ripple`, `authorized` and `freeze` are the account's
+  own settings (it set no-ripple on its side, it authorized the line, it froze the line); the `_peer` / `peer_` fields are the
+  counterparty's. `quality_in` and `quality_out` are the account's, as the ledger stores them (0 when it has none).
+- A line with a zero balance is listed; a line deleted at or before the ledger is not.
+
+The lines at a ledger are those of their last change at or before it. The state history covers the ledgers above the newest ledger
+written by a parser older than parser version 3, the same coverage as the account flags (see
+[backfill](backfill.md#account-state-history-re-ingest)); a line that has not changed since that start is not listed yet.
+
+Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, `invalid marker`;
+400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
+history does not cover, the newest one included when no ledger is named); 500 `unable to retrieve trustlines`.
+
+**Risk: an issuer's lines.** The read groups the account's whole line history up to the ledger, and every payment in an issuer's
+currencies changes its lines, so a big issuer's read may exceed the api's query guards (30 s, `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, and
+2 GiB, `API_CLICKHOUSE_MAX_QUERY_MEMORY` in production) and answer its 500. It can only be measured once
+the history spec has filled the tables; the remedy would be periodic state snapshots.
 
 ### `GET /v2/accounts/{address}/reports[/{date}]`
 
@@ -1053,8 +1463,8 @@ rollups.
 **Values.** The value of an amount follows the rule of `reports` and `stats/value`: the native currency is worth itself, an issued
 amount is worth the amount over the rate of its asset on its UTC day (units of the asset per native coin, as
 [`/v2/exchange_rates`](#get-v2exchange_ratesbasecounter) gives it in strict mode), the quotient cut to 17 significant digits for
-each group and day; an asset without a rate that day, or with a rate of 0, is worth 0 (so are LP tokens and any other asset with no
-DEX rate); sums of values are exact. For a balance change the asset is `(currency, counterparty)`, or `(currency, the account
+each group and day; an asset without a rate that day, or with a rate of 0, is worth 0 (so are LP tokens, MPTs and any other asset with no
+DEX rate: an MPT has its line in these routes, in `stats` and in `reports`, its amounts in raw integer units and its value 0); sums of values are exact. For a balance change the asset is `(currency, counterparty)`, or `(currency, the account
 itself)` where the change's balance is below 0: the account owes on that line, so what it moves is its own IOU. The rates of closed
 days are precomputed once a day for every asset (`native_rates_daily`); today, and yesterday until the ingest has passed it, are
 worked out on read and kept for 60 seconds, so a value of those days may be a minute old. Where a closed day has no stored rate yet
@@ -1135,7 +1545,7 @@ The sums of the balance changes of the account in the window, by change type, wi
 | `interval` | none | Without it the `rows` are per change type and asset; with `day`, `week` or `month` they are per bucket and change type. |
 | `format` | json | `csv`: file `<address> - balance change totals.csv`, the `rows`. |
 
-Every balance change of the window counts once, the fee rows (`transaction_cost`) included. A **change type** is one of the ten of
+Every balance change of the window counts once, the fee rows (`transaction_cost`) included. A **change type** is one of the eleven of
 `balance_changes`; the changes of transaction types the original never classified have none, and are grouped without a `change_type`
 key (as the objects of `balance_changes` leave it out). `in` is the sum of the positive changes, `out` the sum of the negative ones
 as a positive amount, `in_value` and `out_value` their values in the native currency (see Values above), `net_value` is `in_value -
@@ -1143,7 +1553,7 @@ out_value`, `count` the number of changes. An asset has no `issuer` key for the 
 `issuer` is the account itself.
 
 Change types come in this order: `transaction_cost`, `payment_destination`, `payment_source`, `exchange`, `intermediary`,
-`escrow_create`, `escrow_finish`, `escrow_cancel`, `paychannel_fund`, `paychannel_payout`, then the changes without one. `totals` has an
+`escrow_create`, `escrow_finish`, `escrow_cancel`, `paychannel_fund`, `paychannel_payout`, `clawback`, then the changes without one. `totals` has an
 entry for each type that has a change, in that order. `rows` without an `interval` are ordered by type, then by `in_value + out_value`,
 largest first, then by currency and issuer; with an `interval`, by date, then type, and only for the buckets and types that have a
 change.
@@ -1438,7 +1848,7 @@ Errors: the pair errors of the exchanges route, then 400 `invalid period - use: 
 
 ## Network
 
-`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`. `marker` is present only when there is a next page. `markets` has an object of its own, described with the route.
+`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`, and `nft_volume` the same with `coverage` after `result`. `marker` is present only when there is a next page. `markets` and `supply` have an object of their own, described with each route, and `supply/minted` answers `{ "result": "success", "coverage": {...}, "marker": "…", "count": n, "rows": [...] }` (the key order is `result, coverage, marker, count, rows`).
 
 ### `GET /v2/network/fees`
 
@@ -1507,7 +1917,7 @@ is accepted and means the same as none.
 ### `GET /v2/network/exchange_volume`, `payment_volume` and `amm_volume`
 
 The trade volume, the payment volume and the AMM volume of the network, converted to the native currency (or to a display currency). The
-trade and payment components come from the **markets config** of the network (`packages/shared/config/markets/{xrpl,xahau}.json`, or the file in
+trade and payment components come from the **markets config** of the network (`packages/shared/config/markets/<network>.json`, or the file in
 `GH_MARKETS_CONFIG`), a versioned list of trade markets and payment currencies that the syncer's aggregator works through; the
 list shipped for Xahau (version 3) was derived from a small sample of three days of Xahau history (one trade market, `EVR`/`XAH`, and
 three payment currencies; the `XXX` test token is left out): it is provisional and should be re-derived from a full-history node
@@ -1517,8 +1927,8 @@ Two modes, chosen by the parameters:
 
 - **Live** (neither `start` nor `end`): one row for a rolling period ending now. `live` is `hour`, `day`, `3day`, `7day` or
   `30day` for trades and for AMM volume, and `hour` or `day` for payments (default `day`; anything else is 400 `invalid period - use:
-  <list>`). The aggregator refreshes these every minute: twelve live sets in all (five periods for each of the trade volume and the AMM
-  volume, two for the payments).
+  <list>`). The aggregator refreshes these every minute: fifteen live sets in all (five periods for each of the trade volume and the AMM
+  volume, two for the payments, three for the [NFT volume](#get-v2networknft_volume)).
 - **Historical** (`start` or `end` given): one row per `interval` (`day`, `week` from Monday, `month`, UTC) for the days the
   aggregator has computed. A missing `start` is the epoch, a missing `end` is now. A bucket is a row when it starts within
   `start` and `end`, whole.
@@ -1596,6 +2006,135 @@ Errors: 400 as above, `invalid start date format`, `invalid end date format`, `i
 not reproduce `converted_amount`); `converted_amount` is always a string; historical rows carry `end_time` (the start of the
 next bucket, exclusive); the historical display currency uses each bucket's own native-to-display price. A day counts as final
 only once the ingest has passed it by an hour, so volumes follow the ingest rather than the wall clock.
+
+### `GET /v2/network/nft_volume`
+
+The volume of the sales of NFTs (XRPL) and URITokens (Xahau) on the network, **per collection**, in the native currency. GateHub extra
+(see [NFTs](#nfts) for the sales themselves). It is the contract of [`exchange_volume`](#get-v2networkexchange_volume-payment_volume-and-amm_volume)
+(the two modes, `interval`, `exchange_currency` and `exchange_issuer`, `limit`, `marker`, `format`, the errors and their order) with these differences:
+
+- **Live periods** are `day`, `7day` and `30day` (default `day`; anything else is 400 `invalid period - use: day, 7day, 30day`). The aggregator
+  refreshes the three sets every minute, with the others', and fills the daily sets of the closed days with `volume_backfill`, newest first.
+  An empty `start=` or `end=` is none, as for the other volumes.
+- **A component is a collection**: `{ issuer, taxon?, count, amount, rate, converted_amount }`, `taxon` the XRPL taxon (a URIToken's
+  collection is an issuer, so it has none). `amount` is the volume in the native currency of the collection's sales **that have a price in it**
+  that day (a native price is itself, an issued one is converted at the rate of the sale's UTC day, the rates of the other volumes), and `count`
+  those sales. `rate` is `"1.0000000"` and `converted_amount` equals `amount`, until `exchange_currency` shows them in another currency (then
+  `rate` and `converted_amount` follow the other metrics). Components are sorted by converted amount, the largest first. A sale priced in an
+  asset that has no rate that day is in no component.
+- **The `count` of the row is every sale of the window**, those with no rate included, so it can be more than the sum of the components'
+  counts. The row's `total` is the sum of the components' converted amounts.
+- **Exact sums.** The amounts, converted amounts and `total` of this metric are exact decimals, and so are their sums over days; the other
+  volumes add Float64 values.
+- Week and month rows add up the converted days, collection by collection. On a network with no sales the rows have no components.
+- `coverage` follows `result` ([Coverage](#coverage), as on every NFT answer), and is not in the CSV (`nft_volume.csv`). Its daily sets carry a
+  config version of their own, so a change of the markets config does not recompute them.
+
+Live row of `GET /v2/network/nft_volume?live=day`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "rows": [
+    {
+      "components": [
+        {
+          "issuer": "rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy",
+          "taxon": 0,
+          "count": 1,
+          "amount": "150",
+          "rate": "1.0000000",
+          "converted_amount": "150"
+        },
+        {
+          "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+          "taxon": 10,
+          "count": 1,
+          "amount": "10",
+          "rate": "1.0000000",
+          "converted_amount": "10"
+        },
+        {
+          "issuer": "rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB",
+          "taxon": 26,
+          "count": 1,
+          "amount": "0.000001",
+          "rate": "1.0000000",
+          "converted_amount": "0.000001"
+        }
+      ],
+      "count": 4,
+      "exchange": { "currency": "XRP" },
+      "total": "160.000001",
+      "exchange_rate": "1.0000000",
+      "start_time": "2026-10-24T04:52:12Z",
+      "end_time": "2026-10-25T04:52:12Z"
+    }
+  ]
+}
+```
+
+Historical rows of `GET /v2/network/nft_volume?start=2026-10-24&end=2026-10-25&interval=day` (the second day has no sale in the recorded ledgers):
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 2,
+  "rows": [
+    {
+      "components": [
+        {
+          "issuer": "rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy",
+          "taxon": 0,
+          "count": 1,
+          "amount": "150",
+          "rate": "1.0000000",
+          "converted_amount": "150"
+        },
+        {
+          "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+          "taxon": 10,
+          "count": 1,
+          "amount": "10",
+          "rate": "1.0000000",
+          "converted_amount": "10"
+        },
+        {
+          "issuer": "rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB",
+          "taxon": 26,
+          "count": 1,
+          "amount": "0.000001",
+          "rate": "1.0000000",
+          "converted_amount": "0.000001"
+        }
+      ],
+      "count": 4,
+      "exchange": { "currency": "XRP" },
+      "total": "160.000001",
+      "exchange_rate": "1.0000000",
+      "start_time": "2026-10-24T00:00:00Z",
+      "end_time": "2026-10-25T00:00:00Z"
+    },
+    {
+      "components": [],
+      "count": 0,
+      "exchange": { "currency": "XRP" },
+      "total": "0",
+      "exchange_rate": "1.0000000",
+      "start_time": "2026-10-25T00:00:00Z",
+      "end_time": "2026-10-26T00:00:00Z"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 the exchange currency's, as for the other volumes (`exchange currency must have an issuer`,
+`XRP cannot have an issuer` (`XAH` on Xahau), `invalid exchange issuer address`), then `invalid start date format`, `invalid end date format`,
+`invalid interval - use: day, week, month`, then `invalid marker` (with `start` or `end`) or `invalid period - use: day, 7day, 30day` (without);
+500 `error getting data`.
 
 ### `GET /v2/network/markets`
 
@@ -1787,6 +2326,218 @@ market that both routes show, the numbers can differ: the markets window starts 
 last 24 hours to the second); the markets rate of an asset comes from its native pair whether or not that pair is configured, where
 `exchange_volume` takes only the configured native markets; `network/markets` lists every pair that traded, `exchange_volume` the
 configured ones; and prices are in the canonical stored orientation of the pair.
+
+### `GET /v2/network/supply`
+
+The native supply of the network at one ledger: how much exists, how much was burned, how much is escrowed, how much circulates, how much sits in AMM pools and how much the
+accounts must keep as reserves, and on Xahau how much was minted, by source. It is an **addition** (not in the original, which had `/v2/network/xrp_distribution`, out of scope
+and answering 404, and no supply route; see [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#2-endpoints-kept-added-dropped)) and uses the contract layer of every route (API key,
+rate limit, `Cache-Control: private, max-age=60`, errors `{"result":"error","message"}`). It takes no parameter: the ones sent are ignored. The design is in the
+[spec](superpowers/specs/2026-10-24-supply-design.md).
+
+- **A snapshot, not a live figure.** The syncer's `supply` job computes every figure at one ledger, once an hour, and writes one row; the route serves the newest row, so an answer is up to
+  about an hour old, plus the time a cycle takes. `ledger_index` and `close_time` (`YYYY-MM-DDTHH:mm:ssZ`) are the ledger every figure is as of, `computed_at` when the row was written. Before the first snapshot exists the
+  answer is 404 `supply not computed yet`.
+- **Amounts** are exact decimal text in whole units of the native currency (`"64772465269.314"`: the drops divided by a million, trailing zeros dropped), summed in drops, so no float is
+  in the way; the total of the XRP Ledger is past 2^53 drops. Counts (`escrows`, `pools`, `accounts`, `owner_count`) are numbers. A key without a value is left out, never `null`: `minted`
+  is there only on a network that mints (Xahau), `amm` only where AMM exists (the XRP Ledger), `reserves` only when a reserve value is known at the snapshot ledger.
+- **The parts**, in the order the answer has them:
+
+  | Part | What it is |
+  | --- | --- |
+  | `total` | The native currency in existence after the snapshot ledger: the `total_coins` of its header. |
+  | `burned` | The currency destroyed. On the XRP Ledger only fees destroy coins and nothing creates any, so it is exactly 100 billion XRP less `total`: exact, from the header, and it needs no history, so it has no `coverage`. Xahau has no cap and its minting raises the total, so there it is the sum of the fees of every indexed ledger up to the snapshot ledger (each ledger's fee total), and has its `coverage`: a history that starts late leaves out the fees before it, so the network has burned more than the answer says. |
+  | `minted` | Xahau only: what the indexed ledgers created, `amount` being `rewards` + `import` + `genesis_mint`. A reward is minted by the `GenesisMint` that the reward hook of the genesis account emits for a `ClaimReward` (the claim itself mints nothing, and the governance members' share of a reward is in it); `genesis_mint` is every other `GenesisMint`; `import` is what an `Import` credited: the fee of the XRP Ledger transaction it carries, scaled by the burn-to-mint schedule of xahaud, and the starting bonus of an account the Import creates. The supply the network started with is not minted. Ledger by ledger, what was minted is the growth of `total_coins` plus the fees of the ledger. |
+  | `escrowed` | The native currency in open native escrows, and how many there are (`escrows`). Token escrows are not supply. |
+  | `circulating` | `total` less `escrowed`. It still counts the currency in AMM pools, in payment channels and held as reserves. It states the coverage of `escrowed`, since `total` needs none. |
+  | `amm` | XRP Ledger only: the native currency in the pools of automated market makers at the snapshot ledger, and the number of live pools with a native reserve above 0 (`pools`). |
+  | `reserves` | What the accounts must keep: `accounts` × `base` + `owner_count` × `increment`, at the reserve values in force at the snapshot ledger. `accounts` are the existing accounts, the pseudo-accounts of AMM pools (which keep no reserve) left out, and `owner_count` the sum of their owner counts. It is not the sum of the balances kept: a few accounts hold less than their requirement after paying fees. |
+
+- **Coverage.** Every part that is read from the indexed history ends with its own `coverage` (the last key of the part; [Coverage](#coverage)), and `total` and the XRPL `burned` have
+  none. The answer carries no `coverage` of its own. Each part states the feature it is read from, and the features are the ones of this table (the parser version is the first one
+  that writes the feature's rows):
+
+  | Part | Feature | Parser version | Starts at (XRP Ledger / Xahau) |
+  | --- | --- | --- | --- |
+  | `burned` (Xahau) | `fees` | 1 | the first ledger, 1 |
+  | `minted` (Xahau) | `mints` | 9 | the first ledger, 1 |
+  | `escrowed`, `circulating` | `escrows` | 7 | ledger 28,685,313, the `Escrow` amendment / the first ledger, 1 |
+  | `amm` (XRP Ledger) | `amm` | 2 | ledger 86,795,265, the `AMM` amendment |
+  | `reserves` | `account_states` | 3 | the first ledger, 32,570 / the first ledger, 1 |
+
+  `escrows` is the feature of the [ledger objects](#ledger-objects), whose escrow routes state the same coverage. The others are read from the same stored ledgers by parsers of their own: for `reserves` `complete` also means that the state tables hold the state of the first ledger, which the history fill provides (an account that has not changed since
+  `from_ledger_index` is not in the state tables, so while it is false `accounts` and `owner_count` count too few), and for `minted` that the ledgers hold their mints, which the parser of version 9 writes (ledgers written
+  by an older one are re-ingested, [backfill](backfill.md)). A testnet has no first ledger, so a part that starts there is never `complete`, and an amendment's part only when the
+  index holds its `EnableAmendment`. The coverage is the index's **at the time of the request**, where the figures are the snapshot's: when a re-ingest or the history fill makes a feature
+  `complete`, the part says so at once, and its figure follows at the next snapshot.
+- **Errors**: 401 and 429 as everywhere, 404 `supply not computed yet`, 500 `unable to retrieve supply` (when a read fails, the coverage included; no part is served without its coverage).
+  Errors are `no-store`.
+
+**The examples** are answers of the end-to-end suite (`apps/api/test/supply.e2e-spec.ts`, key order included; the snapshots are written by hand, `apps/api/test/support/supply-seed.ts`, with
+made-up figures of a plausible day). The XRPL one is read over a history that starts at ledger 28,685,313, the ledger Escrow was enabled in: the escrows and the AMM pools are complete, the
+reserves, which start at the first ledger, 32,570, are not. The Xahau one is read over a history from ledger 1.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer.
+
+Keys of the supply answer, in order: `result, ledger_index, close_time, computed_at, currency, total, burned, minted?, escrowed, circulating, amm?, reserves?`.
+
+Keys of burned, in order: `amount, coverage?`.
+
+Keys of minted, in order: `amount, rewards, import, genesis_mint, coverage`.
+
+Keys of escrowed, in order: `amount, escrows, coverage`.
+
+Keys of circulating, in order: `amount, coverage`.
+
+Keys of amm, in order: `amount, pools, coverage`.
+
+Keys of reserves, in order: `amount, accounts, owner_count, base, increment, coverage`.
+
+On the XRP Ledger:
+
+```json
+{
+  "result": "success",
+  "ledger_index": 107747456,
+  "close_time": "2026-10-24T21:00:00Z",
+  "computed_at": "2026-10-24T21:01:47Z",
+  "currency": "XRP",
+  "total": "99985312374.716318",
+  "burned": { "amount": "14687625.283682" },
+  "escrowed": {
+    "amount": "35212847105.402318",
+    "escrows": 12879,
+    "coverage": { "from_ledger_index": 28685313, "complete": true }
+  },
+  "circulating": {
+    "amount": "64772465269.314",
+    "coverage": { "from_ledger_index": 28685313, "complete": true }
+  },
+  "amm": {
+    "amount": "46218377.402915",
+    "pools": 14594,
+    "coverage": { "from_ledger_index": 28685313, "complete": true }
+  },
+  "reserves": {
+    "amount": "9810004",
+    "accounts": 6410280,
+    "owner_count": 16998620,
+    "base": "1",
+    "increment": "0.2",
+    "coverage": { "from_ledger_index": 28685313, "complete": false }
+  }
+}
+```
+
+On Xahau:
+
+```json
+{
+  "result": "success",
+  "ledger_index": 26603520,
+  "close_time": "2026-10-24T21:00:02Z",
+  "computed_at": "2026-10-24T21:00:31Z",
+  "currency": "XAH",
+  "total": "613401782.117306",
+  "burned": {
+    "amount": "2318.640227",
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  },
+  "minted": {
+    "amount": "49425551.616207",
+    "rewards": "41203318.512207",
+    "import": "8102233.104",
+    "genesis_mint": "120000",
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  },
+  "escrowed": {
+    "amount": "18406227.318004",
+    "escrows": 2140,
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  },
+  "circulating": {
+    "amount": "594995554.799302",
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  },
+  "reserves": {
+    "amount": "268973.2",
+    "accounts": 186412,
+    "owner_count": 412806,
+    "base": "1",
+    "increment": "0.2",
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  }
+}
+```
+
+### `GET /v2/network/supply/minted`
+
+The native currency created on each UTC day, by source, on a network that mints (Xahau): the history behind the `minted` part of [`GET /v2/network/supply`](#get-v2networksupply), a day to a row. It is an **addition** (not in the original; see
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#2-endpoints-kept-added-dropped)) and uses the contract layer of every route (API key, rate limit, `Cache-Control: private, max-age=60`, errors
+`{"result":"error","message"}`). The design is in the [spec](superpowers/specs/2026-10-24-supply-design.md).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `interval` | `day` | `day` is the only one; an empty value is `day`, anything else answers 400 `invalid interval`. |
+| `start` | the first day the mints are covered for | |
+| `end` | the newest ledger | |
+| `descending` | false | |
+| `limit` | 200 (max 1000) | |
+| `marker` | | The start of the last row's day, in unix seconds. |
+| `format` | json | `csv`: file `network minted.csv`. |
+
+- **A row is a UTC day.** `date` is its start (`YYYY-MM-DDT00:00:00Z`) and `amount` the sum of the three sources, which are the ones of the `minted` part of the supply: `rewards` (what a `ClaimReward` was paid), `import` (what an `Import` credited) and
+  `genesis_mint` (every other `GenesisMint`). Amounts are exact decimal text in whole units of the native currency (`"3.75"`, `"0.000007"`: drops divided by a million, trailing zeros dropped), added in drops, so a day past 2^53 drops is exact.
+- **Which days.** Every day from the first one whose ledgers the index holds whole, to the day of the newest ledger, is a row. A day on which nothing was minted is a row of zeros, so the list has no gaps, and the newest day is the running one, summed so far. The
+  first of them is the day **after** the one `coverage.from_ledger_index` closed in, which has ledgers before it that were stored without their mints (the ingest of parser version 9 writes them, [backfill](backfill.md)); when the coverage starts at the first
+  ledger of the network, 1, it is the day of the first ledger that has a close time: Xahau's ledger 1 is stored with the close time 0 (1970-01-01) and is no day. `start` and `end` only narrow the days: a day is a row when it **starts** at or after `start` and before the
+  end of the period `end` names (`end=2026-10-22` includes the 22nd), and a day whose coverage is missing is not a row, whatever `start` is.
+- **Coverage.** `coverage` stands right after `result`: the coverage of the feature `mints` (parser version 9; [Coverage](#coverage)). `from_ledger_index` is where the mints are indexed from, and `complete` says whether that is back to the network's first
+  ledger, so a `false` means the currency minted before it is in no row. With no ledger stored it is `{ "complete": false }` and the list is empty.
+- **Pages.** `marker` is the start of the last row's day and is there only when there is a next page; the next page begins with the day after it (before it, when `descending`). The `Link` header carries the URL of the next page.
+- **A network that cannot mint** (the XRP Ledger and its testnet) answers `coverage` with `complete` true, `count` 0 and `rows` `[]`: there is nothing to be missing. No mint table is read. With no ledger stored its `coverage` is `{ "complete": false }`, as on any network.
+- **CSV.** The columns are the keys of a row, in order: `date, amount, rewards, import, genesis_mint` (a row has every key). `coverage` and `marker` are not in the file; an empty page is an empty file.
+- **Errors**: 401 and 429 as everywhere come first; then, in this order and before anything is read, 400 `invalid start date format`, `invalid end date format`, `invalid interval`, `invalid marker`; and 500 `unable to retrieve minted supply`.
+
+**The examples** are answers of the end-to-end suite (`apps/api/test/supply-minted.e2e-spec.ts`, key order included; the ledgers and the mints are written by hand, `apps/api/test/support/supply-seed.ts`, with made-up figures): five days on Xahau from ledger
+1, mints on three of them, read with `limit=3`. The first page of a list has a `marker`, and its CSV is the three rows.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer.
+
+Keys of the minted answer, in order: `result, coverage, marker?, count, rows`.
+
+Keys of a minted day, in order: `date, amount, rewards, import, genesis_mint`.
+
+On Xahau, `GET /v2/network/supply/minted?limit=3`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 1, "complete": true },
+  "marker": "WzE3OTI2MjcyMDBd",
+  "count": 3,
+  "rows": [
+    { "date": "2026-10-20T00:00:00Z", "amount": "3.75", "rewards": "1.75", "import": "2", "genesis_mint": "0" },
+    { "date": "2026-10-21T00:00:00Z", "amount": "0", "rewards": "0", "import": "0", "genesis_mint": "0" },
+    { "date": "2026-10-22T00:00:00Z", "amount": "6", "rewards": "0", "import": "0", "genesis_mint": "6" }
+  ]
+}
+```
+
+The same page as a CSV file, `GET /v2/network/supply/minted?limit=3&format=csv`:
+
+```csv
+"date","amount","rewards","import","genesis_mint"
+"2026-10-20T00:00:00Z","3.75","1.75","2","0"
+"2026-10-21T00:00:00Z","0","0","0","0"
+"2026-10-22T00:00:00Z","6","0","0","6"
+```
+
+On the XRP Ledger, which mints nothing:
+
+```json
+{ "result": "success", "coverage": { "from_ledger_index": 32570, "complete": true }, "count": 0, "rows": [] }
+```
 
 ---
 
@@ -2098,6 +2849,2800 @@ Errors: 400 `invalid date format`; 500 `unable to retrieve positions`.
 
 ---
 
+## NFTs
+
+GateHub extras: the original predates NFTs, so none of these endpoints has a Ripple original. They serve the **NFTokens** of the XRP Ledger and
+the **URITokens** of Xahau, called NFTs below where the two behave alike: every event of one (mint, burn, modify, offers, sales, transfers),
+the offers that are still open, the NFTs an account holds and its history of them, the collections with their supply and holders, the sales with
+their prices, and the network's NFT sales volume. The design is in the
+[spec](superpowers/specs/2026-10-17-nft-data-design.md) and [ADR-0016](adr/0016-nft-and-uritoken-data.md); the rows are in
+[data-model](data-model.md#nft-tables-five-ledger-tables-migration-011).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these
+rules for the objects, whose shape and key order are ours and are pinned by tests:
+
+- **Coverage.** Every answer carries `coverage`, the key right after `result`, and it is not in the CSV: whether the NFT history the answer is read
+  from is whole ([Coverage](#coverage)). The detail, the history and the offers of one NFT state their own: complete when the NFT's mint is
+  indexed. The data of a network are the ledgers written by parser version 5 or later: **an NFT minted before the first of them has a history that
+  starts in the middle**, and `complete` says so.
+- **Two networks, one shape.** `kind` is `nftoken` (XRPL) or `uritoken` (Xahau). A key that does not exist for a kind is left out, never `null`:
+  `taxon`, `serial` and `transfer_fee` are decoded from an XRPL id, which a URIToken's (a hash of its issuer and URI) does not encode. An XRPL
+  id asked for on Xahau, and a URIToken id on XRPL, is `nft not found`. A collection is an issuer and a taxon on XRPL and an issuer alone on
+  Xahau, in the path (`/{issuer}/{taxon}`, `/{issuer}`) and in the objects (`taxon` is left out for Xahau); the other network's form is 404
+  `collection not found`.
+- **Ids and addresses.** An NFT id is 64 hexadecimal digits, upper-case in every answer; the routes accept any case. An address in a path
+  under `/v2/accounts` is not checked: one that is none holds nothing and has no events.
+- **Amounts** are exact decimal strings in whole units; `currency` and `amount_issuer` name the asset (the native currency has no issuer).
+  **`converted_amount`** and every `*_native` value are the price in the native currency (`XRP` or `XAH`) at the rate of the sale's UTC day
+  ([the daily rates](#get-v2networknft_volume)): text with at most 6 decimals, no trailing zeros and no exponent. A sale priced
+  in an asset that has no rate that day has no converted value, and counts in the sales counts and not in any volume. Times are
+  `YYYY-MM-DDTHH:mm:ssZ`, days `YYYY-MM-DDT00:00:00Z`. `flags` is the number the ledger holds (an XRPL NFT: `lsfBurnable` 1, `lsfOnlyXRP` 2,
+  `lsfTrustLine` 4, `lsfTransferable` 8, `lsfMutable` 16; a URIToken: `lsfBurnable` 1), `transfer_fee` the number in units of 1/100000
+  (`5000` is 5%), `uri` hex as on the ledger.
+- **Lists.** `limit` is 200 (maximum 1000), `marker` and `Link` are the usual ones, an unknown parameter is ignored, `format=csv` gives the
+  same columns on every page in the order of the keys (a nested object as `a.b`, a key the row has no value for as an empty cell). The
+  filters of a list are conditions of the read, not of the page: a page is as full as the list allows. **An empty `start=` or `end=` is 400**
+  here, unlike `/v2/payments` (`invalid start date format`).
+- **Reads** are of the committed ledgers only. The events of an NFT, its detail, its history and its offers are there when their ledger is
+  committed; **the aggregates** (an account's holdings, a collection's NFTs, holders and figures) are rebuilt by the syncer's aggregator
+  ([syncer](syncer.md#the-nft-jobs)): holdings within about a minute, collections and holders within about five. A freshly minted NFT is in
+  its history before it is in its collection's list.
+- **Cache-Control** is the usual `private, max-age=60`, and errors `no-store`.
+
+**The examples** are real answers over the recorded mainnet ledgers that the end-to-end suites seed (XRPL 107,874,617 to 107,886,233 and Xahau
+26,533,927 to 26,774,724; a few hours of each network), so their lists are short and their `coverage` is `complete: false`: nothing before the first
+of those ledgers is indexed, and no `EnableAmendment` is.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer. Each line is checked against the
+constant the route is served by (`apps/api/src/nft/api-reference.spec.ts`).
+
+Keys of the coverage, in order: `from_ledger_index?, complete`.
+
+Keys of an NFT, in order: `nft_id, kind, issuer, taxon?, serial?, flags, transfer_fee?, owner?, owner_since?, uri?, digest?, minted?, burned, burned_at?, sale_count, last_sale?`.
+
+Keys of a point, in order: `ledger_index, tx_hash, executed_time`.
+
+Keys of minted, in order: `ledger_index, tx_hash, executed_time, by, to`.
+
+Keys of burned_at, in order: `ledger_index, tx_hash, executed_time, by`.
+
+Keys of last_sale, in order: `amount, currency, amount_issuer?, converted_amount?, ledger_index, tx_hash, executed_time`.
+
+Keys of an NFT event, in order: `nft_id, kind, issuer, taxon?, serial?, ledger_index, tx_index, event_index, tx_hash, tx_type, executed_time, event, account?, from?, to?, offer_id?, is_sell_offer?, amount?, currency?, amount_issuer?, converted_amount?, destination?, expiration?, broker?, broker_fee?, royalty_est?, removed_by?, uri?`.
+
+Keys of an NFT sale, in order: `nft_id, kind, issuer, taxon?, serial?, ledger_index, tx_index, event_index, tx_hash, executed_time, seller, buyer, mode, amount, currency, amount_issuer?, converted_amount?, broker?, broker_fee?, royalty_est?`.
+
+Keys of an NFT offer, in order: `offer_id, is_sell_offer, owner, amount, currency, amount_issuer?, destination?, expiration?, created_ledger, created_tx_hash, created_time`.
+
+Keys of a collection, in order: `issuer, taxon?, kind, supply, holders, minted, burned, sales_count, volume_native, first_mint?, last_mint?, last_ledger`.
+
+Keys of a collection day, in order: `date, sales_count, volume_native, avg_price_native?, min_price_native?, mints, burns`.
+
+Keys of a holder, in order: `owner, held`.
+
+The answers: the key after `result` is `coverage`, and `marker` is there only when there is a next page.
+
+Keys of the NFT answer, in order: `result, coverage, nft`.
+
+Keys of the NFT history answer, in order: `result, coverage, count, marker?, events`.
+
+Keys of the NFT offers answer, in order: `result, coverage, count, marker?, offers`.
+
+Keys of the collections answer, in order: `result, coverage, total, count, marker?, collections`.
+
+Keys of the collection answer, in order: `result, coverage, collection`.
+
+Keys of the collection NFTs answer, in order: `result, coverage, count, marker?, nfts`.
+
+Keys of the holders answer, in order: `result, coverage, count, marker?, holders`.
+
+Keys of the sales answer, in order: `result, coverage, count, marker?, sales`.
+
+Keys of the stats answer, in order: `result, coverage, count, days`.
+
+Keys of an NFT volume component, in order: `issuer, taxon?, count, amount, rate, converted_amount`.
+
+Keys of the NFT volume answer, in order: `result, coverage, count, marker?, rows`.
+
+(The last two belong to [`GET /v2/network/nft_volume`](#get-v2networknft_volume), the NFT volume beside the other volumes; its row is the row of
+the other volumes.)
+
+What the fields say:
+
+- **NFT.** `owner` is the holder after the newest mint, sale or transfer, and is left out for a burned NFT and when no indexed event names one
+  (an NFT whose history starts after its mint, only offers seen); `owner_since` is where that happened. `minted` is the mint (`by` the account
+  that sent it, which is the issuer or a minter the issuer authorised; `to` the first owner) and is left out when the mint is not in the index;
+  `burned_at` is the burn (`by` the account that sent it). `uri` is the newest mint's or modify's, `digest` a URIToken's. `last_sale` is the
+  newest sale and `sale_count` all of them. A URIToken burned and minted again by the same issuer with the same URI is the same id (xahaud keys
+  it on both): its state follows the newest events, so it is `burned: false` again with the new owner.
+- **Event.** `event` is one of `mint`, `burn`, `modify` (an `NFTokenModify`: the new `uri`), `offer_create`, `offer_cancel`, `offer_removed`,
+  `sale` and `transfer` (an owner change with no price: a zero-amount accept, a Xahau `Remit`). `account` is who did it (for an offer event the
+  offer's owner, else the sender), `from` and `to` the owners before and after. `offer_id` names the offer (an XRPL `NFTokenOffer`; on Xahau the
+  URIToken id, since the offer is the entry's one sell offer), `is_sell_offer` is a boolean and is there on every event that names an offer (the
+  offer's own and the sale or transfer that accepted it). `offer_removed` has `removed_by`: `sale` (an accepted offer), `burn` (the NFT was
+  burned), `transfer` (a Xahau `Remit` moved the token) or `other` (deleted by another transaction: an `AccountDelete` of the offer's owner,
+  or a transaction that failed and still deleted it, as a `tecEXPIRED` `NFTokenAcceptOffer` deletes the expired offer it met; an offer its
+  owner or destination cancels with `NFTokenCancelOffer`, expired or not, is an `offer_cancel`).
+  `destination` and `expiration` are an offer's. In a transaction the events come in this order (`event_index`): the offers cancelled or
+  removed, then the mints, sales, transfers, burns and modifies, then the offers created, so a list newest first shows a sale above the offers
+  it removed and a mint's offer above the mint.
+- **Price of a sale.** The price is the accepted offer's amount; of a brokered sale (XRPL, a broker matched a buy and a sell offer) the buy
+  offer's, with the `broker` and its `broker_fee`; of a Xahau `URITokenBuy` what the buyer sent, which can be more than the asked amount.
+  **`royalty_est` is an estimate** of the issuer's cut: the price (less the broker fee) times the `transfer_fee`, in drops rounded down for the
+  native currency and to 16 significant digits for another. It is **left out when no royalty applies** (a fee of 0, the issuer is the seller
+  or the buyer, a URIToken has none) and is `"0"` when one applies and rounds to nothing.
+- **Collection.** `supply` is the NFTs of the collection that are not burned, `holders` the distinct accounts holding one, `minted` and
+  `burned` the mints and burns in the index (a collection minted before the coverage starts has supply but fewer mints), `sales_count` the
+  sales, `volume_native` their converted prices summed (exact text). `volume_native` uses the rates known when the collection was last
+  recomputed (a sale in an issued currency of today at the rate of the day so far) and is refreshed whenever the collection changes; the daily
+  figures of [`nft_volume`](#get-v2networknft_volume) are the settled ones. `first_mint` and `last_mint` are left out for a collection whose mints
+  all came before the coverage starts. `last_ledger` is the newest ledger that changed one of its NFTs. A collection row is written by the
+  aggregator some minutes after its NFTs change ([syncer](syncer.md#the-nft-jobs)): **a collection younger than that is 404 on its own route
+  and on its sub-routes**, as a new AMM pool is for a minute.
+
+### `GET /v2/nfts/{nft_id}`
+
+One NFT or URIToken, folded from its indexed events when asked (so it is fresh at the commit of its ledger, before the aggregates catch up).
+
+Errors, in the order they are checked: 400 `invalid nft id` (not 64 hexadecimal digits); 404 `nft not found` (the index has no event of it in a
+committed ledger); 500 `unable to retrieve nft`. No CSV.
+
+An XRPL NFT (`GET /v2/nfts/00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91`):
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "nft": {
+    "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+    "kind": "nftoken",
+    "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+    "taxon": 10,
+    "serial": 95234705,
+    "flags": 8,
+    "transfer_fee": 5000,
+    "owner": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+    "owner_since": {
+      "ledger_index": 107874617,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "executed_time": "2026-10-24T16:08:12Z"
+    },
+    "burned": false,
+    "sale_count": 1,
+    "last_sale": {
+      "amount": "10",
+      "currency": "XRP",
+      "converted_amount": "10",
+      "ledger_index": 107874617,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "executed_time": "2026-10-24T16:08:12Z"
+    }
+  }
+}
+```
+
+A URIToken on Xahau (`GET /v2/nfts/9613336614047483F3AEC00173139D88FE9BA70720CAC2B46E12711A71A9AAE9`): no `taxon`, `serial` or `transfer_fee`, and a `digest`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 26533927, "complete": false },
+  "nft": {
+    "nft_id": "9613336614047483F3AEC00173139D88FE9BA70720CAC2B46E12711A71A9AAE9",
+    "kind": "uritoken",
+    "issuer": "rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb",
+    "flags": 0,
+    "owner": "rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg",
+    "owner_since": {
+      "ledger_index": 26763778,
+      "tx_hash": "01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C",
+      "executed_time": "2026-10-24T15:36:02Z"
+    },
+    "digest": "772B38763E8E603AEE9BBB2026B8E9B97537ECC8867E46D042630C0B326B8736",
+    "burned": false,
+    "sale_count": 1,
+    "last_sale": {
+      "amount": "4200",
+      "currency": "XAH",
+      "converted_amount": "4200",
+      "ledger_index": 26763778,
+      "tx_hash": "01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C",
+      "executed_time": "2026-10-24T15:36:02Z"
+    }
+  }
+}
+```
+
+`coverage` is the NFT's own: `complete` is true when the NFT's first indexed event is its mint (in the example above the mint is before the
+first indexed ledger, so there is no `minted`, and the history of the NFT is not whole).
+
+### `GET /v2/nfts/{nft_id}/history`
+
+The events of one NFT, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `nft_id` (path) | | The 64 hex digits, in any case. |
+| `start` | the first ledger | Inclusive. |
+| `end` | the newest ledger | Inclusive at the precision written. |
+| `event` | all | A comma list of `mint`, `burn`, `modify`, `offer_create`, `offer_cancel`, `offer_removed`, `sale`, `transfer`; each member exactly as spelt, an empty one (`sale,`) is an error. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index, event_index)` of the last event. |
+| `format` | json | `csv`: file `<nft_id> - nft history.csv` (the id upper-case), every column of the event. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "events": [NftEvent, …] }`. The filters are conditions of the read, not of the
+page. The read is a range of the NFT's own rows, so its cost does not grow with the history of the network. A sale carries `converted_amount`. `GET /v2/nfts/00190BB8DAEF366CB05EE8DCC919EF9A1AA24DD22B3D62C9D848920A0669E96F/history?event=sale`, a brokered sale:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "events": [
+    {
+      "nft_id": "00190BB8DAEF366CB05EE8DCC919EF9A1AA24DD22B3D62C9D848920A0669E96F",
+      "kind": "nftoken",
+      "issuer": "rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy",
+      "taxon": 0,
+      "serial": 107604335,
+      "ledger_index": 107879497,
+      "tx_index": 49,
+      "event_index": 2,
+      "tx_hash": "0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C",
+      "tx_type": "NFTokenAcceptOffer",
+      "executed_time": "2026-10-24T21:30:41Z",
+      "event": "sale",
+      "account": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+      "from": "rfivr3BK17R28wnVwpQQhSDvo2A2fmnEje",
+      "to": "rLCscV9iDJpvje4ZCKxGjYAMNtBA1Ltauk",
+      "offer_id": "05BC61CFB58ABA8969C852FBF907CC687A442AD3ED64FB30EA41149ECD0F6780",
+      "is_sell_offer": true,
+      "amount": "150",
+      "currency": "XRP",
+      "converted_amount": "150",
+      "broker": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+      "broker_fee": "2.3835",
+      "royalty_est": "4.428495"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid nft id`, `invalid start date format`, `invalid end date format`, `invalid event`,
+`invalid marker`; 404 `nft not found`; 500 `unable to retrieve nft history`.
+
+### `GET /v2/nfts/{nft_id}/offers`
+
+The offers of the NFT that are open: created, and not since cancelled, accepted or removed (the NFT burned, its owner's account deleted, or
+an expired offer deleted by an accept that failed on it), worked out from its offer events, **newest first**. An offer that has expired is listed until a transaction removes it. A URIToken has
+at most one, the entry's.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `type` | both | `sell` (offers to sell the NFT) or `buy` (bids for it); empty is both. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(created_ledger, tx_index, event_index)` of the event that created the last offer. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "offers": [NftOffer, …] }`; no CSV. `GET /v2/nfts/000813886E50B2960CF48DCB644E85B412C660B4E1B01A87C283F9E6066AB54B/offers`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 2,
+  "offers": [
+    {
+      "offer_id": "3CD49EC73A6F77B3D365B97FEAC58825EE08F1342C25BBD53A6B34062E242A2E",
+      "is_sell_offer": false,
+      "owner": "rMTaAGVd77vAbzDv8qhoMgnZR1T5R3w6Wq",
+      "amount": "6.29",
+      "currency": "XRP",
+      "destination": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+      "expiration": "2026-10-25T05:22:08Z",
+      "created_ledger": 107886233,
+      "created_tx_hash": "8909E8347369B44ABBF43928670913097FC97C946D695F5DC17939759DBDD03E",
+      "created_time": "2026-10-25T04:52:11Z"
+    },
+    {
+      "offer_id": "D6697EB570D95FBE80C369A2CCD9CF21CE04258B04829638313820058FE8CAEE",
+      "is_sell_offer": true,
+      "owner": "rHhvUexKKSJZG9vuZKX2kNendG2TXoavG9",
+      "amount": "19.98",
+      "currency": "XRP",
+      "destination": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+      "created_ledger": 107886233,
+      "created_tx_hash": "BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9",
+      "created_time": "2026-10-25T04:52:11Z"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid nft id`, `invalid type`, `invalid marker`; 404 `nft not found`; 500 `unable to retrieve offers`.
+
+### `GET /v2/accounts/{address}/nfts`
+
+The NFTs the account holds now, grouped by collection (the issuer, then the taxon) and then by serial (on Xahau by id). Each is an NFT as the
+detail gives it, except that `last_sale` has no `converted_amount` in a list. An NFT the account sold or gave away, and a burned one, are not
+listed.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` (path) | | The holder; not checked. |
+| `issuer` | all | Only the NFTs of that issuer. |
+| `taxon` | all | Only the NFTs of that taxon of the issuer; **needs `issuer`**. On Xahau every URIToken has the taxon 0 of its key, so `taxon=0` is all of an issuer's URITokens and any other taxon none. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(issuer, taxon, serial, nft_id)` of the last NFT. |
+| `format` | json | `csv`: file `<address> - nfts.csv`, every key of the NFT, a nested object as `a.b` (`owner_since.ledger_index`). |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "nfts": [Nft, …] }`. `GET /v2/accounts/rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx/nfts?limit=1`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "nfts": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "flags": 8,
+      "transfer_fee": 5000,
+      "owner": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "owner_since": {
+        "ledger_index": 107874617,
+        "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+        "executed_time": "2026-10-24T16:08:12Z"
+      },
+      "burned": false,
+      "sale_count": 1,
+      "last_sale": {
+        "amount": "10",
+        "currency": "XRP",
+        "ledger_index": 107874617,
+        "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+        "executed_time": "2026-10-24T16:08:12Z"
+      }
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid issuer address`, `invalid taxon` (not a decimal number up to 4294967295, or a taxon with no
+`issuer`), `invalid marker`; 500 `unable to retrieve nfts`.
+
+### `GET /v2/accounts/{address}/nft_history`
+
+The events in which the account has a role (`role` below), oldest first: the mints it made or received, and as issuer, the mints, sales and burns
+of its NFTs; the sales and transfers it was a party to or brokered; the burns of what it held; and the offers it made or is the destination of
+(created, cancelled or removed). A `modify` names no account, so it is in no account's history (an NFT's own history has it). An event is
+listed once however many roles the account has in it; `account` in it is the account that did the event, not necessarily this one.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` (path) | | Not checked. |
+| `start`, `end` | | As for the history of an NFT. |
+| `event` | all | A comma list of events, as for the history of an NFT; `modify` is accepted and always gives nothing here (a modify names no account). |
+| `role` | any | A comma list of the roles the account has in an event: `issuer` (the issuer of a mint, burn or sale; not of an offer, so an issuer's history is not every offer on its NFTs), `minter` (the sender of a mint that is not the issuer), `from` and `to` (the owner before and after), `broker`, `offer_owner` (the owner of an offer created, cancelled or removed), `destination` (of an offer). |
+| `descending`, `limit`, `marker` | false, 200 (max 1000) | The marker is `(ledger_index, tx_index, event_index)`. |
+| `format` | json | `csv`: file `<address> - nft history.csv`, the columns of the NFT event. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "events": [NftEvent, …] }`. `GET /v2/accounts/rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx/nft_history?role=to&event=sale,transfer&limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "events": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "ledger_index": 107874617,
+      "tx_index": 299,
+      "event_index": 1,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "tx_type": "NFTokenAcceptOffer",
+      "executed_time": "2026-10-24T16:08:12Z",
+      "event": "sale",
+      "account": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "from": "rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz",
+      "to": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "offer_id": "D6DBB6452D44459FDA013C79708D2E699EA2340D5444AC1695FF621A80FDFBDE",
+      "is_sell_offer": true,
+      "amount": "10",
+      "currency": "XRP",
+      "converted_amount": "10",
+      "royalty_est": "0.5"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid event`, `invalid role`, `invalid marker`;
+500 `unable to retrieve nft history`.
+
+### `GET /v2/nft_collections`
+
+The collections in their current state, the biggest first. The newest row of every collection (some 40,000 on XRPL) is read and sorted for each
+request, so **those rows are kept for 60 seconds** in the API (the list of one issuer, a few rows, is read every time), and they are the rows the
+aggregator wrote ([above](#nfts)).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `issuer` | all | Only the collections of that issuer. |
+| `sort` | `volume` | `volume` (`volume_native`), `supply` or `holders`. |
+| `descending` | true | `false` for the smallest first; off only for `false`, in any case. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | The sort value, the issuer and the taxon of the last collection. |
+| `format` | json | `csv`: file `nft collections.csv`, every key of the collection, a nested one as `first_mint.ledger_index`. |
+
+`{ "result": "success", "coverage": …, "total": n, "count": n, "marker": "…", "collections": [Collection, …] }`. `total` is how many collections the
+filter matches, whatever the page. Ties are ordered by issuer and then taxon, ascending. `GET /v2/nft_collections?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "total": 25,
+  "count": 2,
+  "marker": "WzEwLCJyNFBQN2d3dVZmeHpMUFdGaUpYakxVdHZ6QTdGOTdDelQzIiwxMF0",
+  "collections": [
+    {
+      "issuer": "rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy",
+      "taxon": 0,
+      "kind": "nftoken",
+      "supply": 9,
+      "holders": 1,
+      "minted": 0,
+      "burned": 0,
+      "sales_count": 1,
+      "volume_native": "150",
+      "last_ledger": 107879497
+    },
+    {
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "kind": "nftoken",
+      "supply": 1,
+      "holders": 1,
+      "minted": 0,
+      "burned": 0,
+      "sales_count": 1,
+      "volume_native": "10",
+      "last_ledger": 107874617
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid issuer address`, `invalid sort`, `invalid marker`; 500 `unable to retrieve collections`.
+
+### `GET /v2/nft_collections/{issuer}/{taxon}` (XRPL) and `GET /v2/nft_collections/{issuer}` (Xahau)
+
+One collection, `{ "result": "success", "coverage": …, "collection": Collection }`; no CSV. `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "collection": {
+    "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+    "taxon": 10,
+    "kind": "nftoken",
+    "supply": 1,
+    "holders": 1,
+    "minted": 0,
+    "burned": 0,
+    "sales_count": 1,
+    "volume_native": "10",
+    "last_ledger": 107874617
+  }
+}
+```
+
+On Xahau (`GET /v2/nft_collections/rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb`) a collection is an issuer, so there is no `taxon`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 26533927, "complete": false },
+  "collection": {
+    "issuer": "rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb",
+    "kind": "uritoken",
+    "supply": 5,
+    "holders": 3,
+    "minted": 1,
+    "burned": 0,
+    "sales_count": 1,
+    "volume_native": "4200",
+    "first_mint": {
+      "ledger_index": 26689211,
+      "tx_hash": "3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426",
+      "executed_time": "2026-10-21T13:29:11Z"
+    },
+    "last_mint": {
+      "ledger_index": 26689211,
+      "tx_hash": "3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426",
+      "executed_time": "2026-10-21T13:29:11Z"
+    },
+    "last_ledger": 26771798
+  }
+}
+```
+
+Errors, in the order they are checked: 400 `invalid issuer address`, then on XRPL `invalid taxon` (not a decimal number up to 4294967295);
+404 `collection not found` (no such collection, **the other network's form of the path** (`/{issuer}` on XRPL, `/{issuer}/{taxon}` on Xahau), or a
+collection the aggregator has not counted yet); 500 `unable to retrieve collection`.
+
+### The lists of a collection: `…/nfts`, `…/holders`, `…/sales`, `…/stats`
+
+Each is on both forms of the path (`/v2/nft_collections/{issuer}/{taxon}/nfts` on XRPL, `/v2/nft_collections/{issuer}/nfts` on Xahau), and the literal
+words are matched before the taxon, so `nfts`, `holders`, `sales` and `stats` can never be read as one. They check the collection **last**,
+after the path and the rest of the request (a bad marker is a 400 even for a collection that does not exist): then the same 404
+`collection not found` as the collection itself. The checks of the path are 400 `invalid issuer address` and, on XRPL, `invalid taxon`.
+
+**`…/nfts`**: the NFTs of the collection by serial (on Xahau by id), burned ones left out.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `owner` | all | Only the NFTs of the collection this account holds (the address is not checked). |
+| `include_burned` | false | Boolean: also the burned NFTs. |
+| `limit`, `marker` | 200 (max 1000) | The marker is `(serial, nft_id)`. |
+| `format` | json | `csv`: file `<issuer>[ <taxon>] - nfts.csv`, the columns of the NFT. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "nfts": [Nft, …] }`, each NFT as in the holdings of an account (no
+`converted_amount` in `last_sale`). `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10/nfts?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "nfts": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "flags": 8,
+      "transfer_fee": 5000,
+      "owner": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "owner_since": {
+        "ledger_index": 107874617,
+        "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+        "executed_time": "2026-10-24T16:08:12Z"
+      },
+      "burned": false,
+      "sale_count": 1,
+      "last_sale": {
+        "amount": "10",
+        "currency": "XRP",
+        "ledger_index": 107874617,
+        "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+        "executed_time": "2026-10-24T16:08:12Z"
+      }
+    }
+  ]
+}
+```
+
+500 `unable to retrieve nfts`; the checks in order: the path, `invalid marker`, 404.
+
+**`…/holders`**: the accounts that hold NFTs of the collection and how many, **the most first, then by address**, as of the collection's last
+recompute. `limit`, `marker` (`held` and `owner` of the last holder), `format` (`csv`: `<issuer>[ <taxon>] - holders.csv`).
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "holders": [Holder, …] }`. `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10/holders?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "holders": [{ "owner": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx", "held": 1 }]
+}
+```
+
+500 `unable to retrieve holders`; the checks in order: the path, `invalid marker`, 404.
+
+**`…/sales`**: the sales of the collection's NFTs in the window, as the NFT sales of the network, oldest first. `start`, `end`, `descending`,
+`limit`, `marker` (`(ledger_index, tx_index, event_index)`), `format` (`csv`: `<issuer>[ <taxon>] - sales.csv`).
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "sales": [NftSale, …] }`; checks: the path, `invalid start date format`,
+`invalid end date format`, `invalid marker`, 404; 500 `unable to retrieve sales`. `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10/sales?limit=1`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "sales": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "ledger_index": 107874617,
+      "tx_index": 299,
+      "event_index": 1,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "executed_time": "2026-10-24T16:08:12Z",
+      "seller": "rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz",
+      "buyer": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "mode": "direct",
+      "amount": "10",
+      "currency": "XRP",
+      "converted_amount": "10",
+      "royalty_est": "0.5"
+    }
+  ]
+}
+```
+
+**`…/stats`**: one row per UTC day of the window on which the collection had a sale, a mint or a burn; a day with no row had no activity. The
+sales are converted as everywhere ([above](#nfts)); `avg_price_native` (the volume over the sales that have a converted price) and
+`min_price_native` are left out on a day with no such sale.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start` | **required** | Inclusive. Missing is 400 `start is required` (as `issuer is required`, `family is required`), empty is `invalid start date format`. |
+| `end` | now | Inclusive at the precision written. |
+| `descending` | false | Newest day first. |
+| `format` | json | `csv`: file `<issuer>[ <taxon>] - stats.csv`. |
+
+The window is **at most 366 days** (400 `invalid window - use at most 366 days`, checked before any read), so there is no `marker`: a year is at
+most 366 rows. `{ "result": "success", "coverage": …, "count": n, "days": [CollectionDay, …] }`. `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10/stats?start=2026-10-20&end=2026-10-27`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "days": [
+    {
+      "date": "2026-10-24T00:00:00Z",
+      "sales_count": 1,
+      "volume_native": "10",
+      "avg_price_native": "10",
+      "min_price_native": "10",
+      "mints": 0,
+      "burns": 0
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: the path, 400 `invalid start date format`, `start is required`, `invalid end date format`, `invalid window - use at most 366 days`;
+404 `collection not found`; 500 `unable to retrieve stats`.
+
+### `GET /v2/nft_sales`
+
+The sales of the network, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | all | As for the history of an NFT. |
+| `currency` | all | Only the sales priced in that currency: the native currency alone, or `CUR+issuer` as in [`/v2/payments/{currency}`](#get-v2paymentscurrency). In a query string a raw `+` arrives as a space, so `%2B` and a space both separate the currency from its issuer. |
+| `descending`, `limit`, `marker` | false, 200 (max 1000) | The marker is `(ledger_index, tx_index, event_index)`. |
+| `format` | json | `csv`: file `nft sales.csv`, every column of the NFT sale. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "sales": [NftSale, …] }`. A page is a range of the sales of the window, a few
+granules; **a `currency` that few sales are priced in is found by reading through the window until the page is full**, so the cost of its
+page grows with the sales of the window that are not in it, up to the whole window. Narrow such a request with `start` and `end`.
+`GET /v2/nft_sales?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 2,
+  "marker": "WzEwNzg3ODc3NSwxMDQsMV0",
+  "sales": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "ledger_index": 107874617,
+      "tx_index": 299,
+      "event_index": 1,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "executed_time": "2026-10-24T16:08:12Z",
+      "seller": "rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz",
+      "buyer": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "mode": "direct",
+      "amount": "10",
+      "currency": "XRP",
+      "converted_amount": "10",
+      "royalty_est": "0.5"
+    },
+    {
+      "nft_id": "000803E88ACAA32313BB87F729EF7DA56BD13C57BE46E3C8B0730F290481ED98",
+      "kind": "nftoken",
+      "issuer": "rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB",
+      "taxon": 26,
+      "serial": 75623832,
+      "ledger_index": 107878775,
+      "tx_index": 104,
+      "event_index": 1,
+      "tx_hash": "695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9",
+      "executed_time": "2026-10-24T20:42:30Z",
+      "seller": "rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB",
+      "buyer": "r47kUrvGHkHgxLi1KedaHzdUvbR9GTreEe",
+      "mode": "direct",
+      "amount": "0.000001",
+      "currency": "XRP",
+      "converted_amount": "0.000001"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked (those of `/v2/payments/{currency}`): 400 `invalid issuer address` (the issuer of `currency`), `invalid start date format`,
+`invalid end date format`, `currency is required`, `XRP cannot have an issuer` (`XAH` on Xahau), `issuer is required`, `invalid marker`;
+500 `unable to retrieve sales`.
+
+For `GET /v2/network/nft_volume` see [Network](#get-v2networknft_volume).
+
+**Differences from data.ripple.com**: none, the endpoints are new.
+
+---
+
+## Account names and tomls
+
+GateHub extras: the original has neither. They serve the names the explorer shows in place of addresses. `GET /v2/account_names` gives the
+**display name** of up to 100 addresses in one call, with the account's domain and the labels the operator put on the address;
+`GET /v2/toml/{domain}` gives what a domain's toml says, as the syncer last read it, through its `tomls` worker or the domain checker of its `validators` worker (the "How we know" of the explorer's
+account page). The design is in the [spec](superpowers/specs/2026-10-24-display-names-design.md) and
+[ADR-0017](adr/0017-display-names.md); the worker that reads the tomls is in [syncer](syncer.md#8a-the-tomls-worker), the tables in
+[data-model](data-model.md#account_domains-p7-order-by-account-migration-012).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `Cache-Control`), with these rules for the
+objects, whose shape and key order are ours and are pinned by tests:
+
+- **The display name** of an address is the first of these that applies:
+  1. **`verified`**: the address has an *account domain* and that domain's toml, as last read, lists the address under `[[ACCOUNTS]]` in
+     an entry that counts on this network. `text` is the entry's `desc` when it is 1 to 64 characters, else the domain (a longer `desc` is
+     not a name, and nothing is cut).
+  2. **`account`**: the name the operator gave the address (`account_name`, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md));
+     else the name the operator gave it on this network (`account_network_name`).
+  3. **`domain`**: the address has an account domain that nothing vouches for: its toml does not list the address, or could not be read, or has
+     not been read yet. `text` is the domain.
+  4. Otherwise there is no `display_name`.
+- **A `desc` can claim any name**, so `domain` is always in the answer beside a `verified` name, and a client shows it. `verified` says the
+  account names the domain and the domain lists the account; it does not say who runs either.
+- **The account domain** is the text of the account's `Domain` field when every byte is printable ASCII (0x21 to 0x7E, so no space), lower-cased
+  and well formed as rippled's `isProperlyFormedTomlDomain` reads it (4 to 128 characters, two or more labels of letters, digits and hyphens that
+  neither start nor end with a hyphen, and an alphabetic last label). A URL (`https://x.com`), a path, an IP address or an IPFS hash names no domain: the account has none, and so no `verified` or
+  `domain` name. It comes from the ledger's `AccountRoot` changes; a *deleted* account has none.
+- **A toml counts on a network** by its `network` keys. An `[[ACCOUNTS]]`, `[[CURRENCIES]]` or `[[VALIDATORS]]` entry counts when it has no
+  `network` or one of the network's names: XRPL `main`, `mainnet`; Xahau `main`, `mainnet`, `xahau`, `21337`; XRPL Testnet `testnet`; Xahau Testnet
+  `testnet`, `21338` (text, upper or lower case, or a bare integer). An entry for another network is stored and never served.
+- **Nothing is fetched on request.** Both routes read what the syncer stored: a domain is fetched when an account's `Domain` names
+  it, once a day (a failed one on its own schedule, [syncer](syncer.md#8a-the-tomls-worker)), or when a validator's verified manifest names it, every 6 hours (hourly after a transient failure, [syncer](syncer.md#domain-verification)), and a toml's text is parsed, never evaluated, and
+  nothing a toml holds (an icon, an attestation link, a `unl` URL) is ever followed. A **new** domain shows `domain`, not `verified`, until the
+  worker has read its toml (minutes after the account first names it, hours when the worker has a backlog).
+- **Freshness.** The names and labels are the sets of ADR-0014, reloaded every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s). The account domain is read
+  from `account_domains` at each call, and what the toml of that domain says of the address from `domain_tomls` (the newest row of each distinct
+  domain of the call, by key, only the entries of the addresses asked); each is kept 60 s per address, so a toml the worker reads shows within a
+  minute. When `domain_tomls` cannot be read, that answer has no `verified` and no `domain` name (unknown is not "not verified"): the names, the
+  labels and `domain` are served as always, and the next call reads it again. When `account_domains` cannot be read, the call is a 500.
+- **Coverage.** Neither route carries a `coverage` key (a lookup that lists nothing: [Coverage](#coverage)). The domains come from the account
+  history the parsers wrote, so **an account whose `Domain` was set before the state history starts and whose root has not changed since has no
+  account domain**, and so no verified name, until it changes (a payment received is enough) or the history is filled and ingested again
+  ([backfill](backfill.md#account-domains-seed)).
+- **Unknown parameters are ignored**, and neither route has `limit`, `marker`, `Link` or a CSV form: `format=csv` gives the JSON answer.
+- **Cache-Control** is the usual `private, max-age=60`, and errors `no-store`. 401 and 429 are the usual ones.
+
+### `GET /v2/account_names`
+
+The display names of up to 100 addresses, for a page of the explorer: one call for every address on it.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `addresses` | required | 1 to 100 classic addresses separated by `,` (no spaces: nothing is trimmed). Each is checked, and the case matters (base58). A repeated parameter: the first wins. A repeated **address is answered at each place** and counts towards the 100. |
+
+Errors, in the order they are checked: 400 `addresses is required` (missing or empty); 400 `too many addresses - at most 100` (101 or more
+elements, valid or not); 400 `invalid ripple address` (an empty element, an X-address, a bad checksum, anything else); 500
+`unable to retrieve account names` (the read of the account domains failed: there is no answer without them, and the explorer shows addresses).
+No other check, and no 404: any address is answered, **one that is no account on this network still has its name and labels** (they belong to
+the address) and no domain.
+
+Four addresses (`GET /v2/account_names?addresses=rrrrrrrrrrrrrrrrrrrpnkLzyT5b,rrrrrrrrrrrrrrrrrrrpnkW55rwD,rrrrrrrrrrrrrrrrrrrpnkjf2SSq,rrrrrrrrrrrrrrrrrrrpnkmG5Qdx`):
+a verified name with its domain, an operator's name with a network name and an advisory label, an unverified domain, and an address nothing names.
+
+```json
+{
+  "result": "success",
+  "count": 4,
+  "account_names": [
+    {
+      "address": "rrrrrrrrrrrrrrrrrrrpnkLzyT5b",
+      "display_name": { "text": "Northpeak Treasury", "kind": "verified" },
+      "domain": "northpeak.example"
+    },
+    {
+      "address": "rrrrrrrrrrrrrrrrrrrpnkW55rwD",
+      "display_name": { "text": "Harborline Exchange", "kind": "account" },
+      "account_name": "Harborline Exchange",
+      "account_network_name": "hot wallet",
+      "labels": {
+        "advisory": { "description": "Withdrawals paused since 2026-10-01", "url": "https://harborline.example/status" }
+      }
+    },
+    {
+      "address": "rrrrrrrrrrrrrrrrrrrpnkjf2SSq",
+      "display_name": { "text": "lowtide.example", "kind": "domain" },
+      "domain": "lowtide.example"
+    },
+    { "address": "rrrrrrrrrrrrrrrrrrrpnkmG5Qdx" }
+  ]
+}
+```
+
+An address with labels only, with all three labels, each with the keys the operator gave (`GET /v2/account_names?addresses=rrrrrrrrrrrrrrrrrrrpnkAqFzdM`):
+
+```json
+{
+  "result": "success",
+  "count": 1,
+  "account_names": [
+    {
+      "address": "rrrrrrrrrrrrrrrrrrrpnkAqFzdM",
+      "labels": {
+        "scam": {
+          "description": "Fake giveaway",
+          "source": "Harbor compliance desk",
+          "url": "https://harborline.example/reports/1"
+        },
+        "spam": { "description": "Dust payments", "source": "Harbor compliance desk" },
+        "advisory": { "description": "Named in a warning" }
+      }
+    }
+  ]
+}
+```
+
+Keys of the answer, in order: `result, count, account_names`.
+
+Keys of an entry, in order: `address, display_name?, domain?, account_name?, account_network_name?, labels?`.
+
+Keys of display_name, in order: `text, kind`.
+
+Keys of a label, in order: `description, source?, url?`.
+
+What the fields say:
+
+- **`account_names`** has one entry per address asked, **in the order asked**; `count` is their number. A key without a value is left out, never `null`:
+  an address nothing names is its `address` alone.
+- **`domain`** is the account domain whatever its state: the toml of the domain was read and lists the address exactly when `display_name.kind`
+  is `verified`. `account_name`, `account_network_name` and `labels` are served whenever they exist, whatever the display name is (a verified
+  account that the operator also named has both).
+- **`labels`** is the object of `account_labels` on [`GET /v2/accounts/{address}`](#get-v2accountsaddress) (the key is `labels` here, where the
+  account says `account_labels`): keyed by label in the order `scam`, `spam`, `advisory`, each with the keys `description`, `source` and `url` that the
+  operator gave. `source` and `url` are left out when there is none.
+
+**Differences from data.ripple.com**: none, the endpoint is new ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 79 to 83).
+
+### `GET /v2/toml/{domain}`
+
+What the store says of one domain's toml: the explorer's account page reads it for "How we know". The api never fetches: the row is the newest one
+the syncer stored, from the `tomls` worker or the validators' domain checker (kept 60 s in the api, a domain with no row too).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `domain` (path) | required | A domain as an account names it, `northpeak.example`. The case does not matter: it is lower-cased, and then must be a properly formed domain. |
+
+Errors, in the order they are checked: 400 `invalid domain` (not properly formed once lower-cased: a URL, a path, a port, an IP address, a single
+label such as `localhost`, an underscore, more than 128 characters); 404 `toml not found` (the store has no row for the domain: it was never checked,
+because no account and no validator named it while the workers ran, or its first check has not run yet); 500 `unable to retrieve toml`. A domain whose last check failed is
+**not** a 404: it answers with `status: "failed"`. Nor is a domain nobody names any more: the store keeps the row of every domain it checked, and
+the answer is its last check, however old (`checked` says when).
+
+A domain whose toml was read (`GET /v2/toml/northpeak.example`):
+
+```json
+{
+  "result": "success",
+  "toml": {
+    "domain": "northpeak.example",
+    "toml_url": "https://northpeak.example/.well-known/xrp-ledger.toml",
+    "status": "ok",
+    "checked": "2026-10-24T07:12:09.410Z",
+    "fetched": "2026-10-24T07:12:09.410Z",
+    "modified": "2026-10-02T00:00:00Z",
+    "accounts": [
+      { "address": "rrrrrrrrrrrrrrrrrrrpaEDEVjEj", "desc": "Northpeak Treasury" },
+      { "address": "rrrrrrrrrrrrrrrrrrrpaEPPn7z7", "desc": "Northpeak Payroll" }
+    ],
+    "currencies": [
+      { "code": "NPUSD", "issuer": "rrrrrrrrrrrrrrrrrrrpaEDEVjEj", "display_decimals": 2, "name": "Northpeak Dollar" }
+    ],
+    "principals": ["Mara Lindqvist", "Tomas Okafor"],
+    "validators": [
+      {
+        "public_key": "nHUCsRY4GY2nvLSb1kv8AL8Rt36c9icCuZmBUKwzmoATeRcFkVMu",
+        "owner_country": "NO",
+        "server_country": "DE",
+        "unl": "https://vl.ripple.com"
+      }
+    ]
+  }
+}
+```
+
+A check that failed, an hour after the toml of `blip.example` was read (a transient failure, within its grace): the answer says what failed
+and still carries what the last read said (`GET /v2/toml/blip.example`):
+
+```json
+{
+  "result": "success",
+  "toml": {
+    "domain": "blip.example",
+    "toml_url": "https://blip.example/.well-known/xrp-ledger.toml",
+    "status": "failed",
+    "reason": "http_status",
+    "status_code": 503,
+    "checked": "2026-10-20T11:00:00.250Z",
+    "fetched": "2026-10-20T10:00:00.250Z",
+    "modified": "2026-10-01T00:00:00Z",
+    "accounts": [{ "address": "rrrrrrrrrrrrrrrrrrrpaEDEVjEj", "desc": "Tidewater Treasury" }],
+    "principals": ["Ines Brandt"]
+  }
+}
+```
+
+A definite failure (here a 404 on the file) carries nothing but the check (`GET /v2/toml/gone.example`):
+
+```json
+{
+  "result": "success",
+  "toml": {
+    "domain": "gone.example",
+    "toml_url": "https://gone.example/.well-known/xrp-ledger.toml",
+    "status": "failed",
+    "reason": "http_status",
+    "status_code": 404,
+    "checked": "2026-10-20T11:00:00.250Z"
+  }
+}
+```
+
+Keys of toml, in order: `domain, toml_url, status, reason?, status_code?, checked, fetched?, modified?, expires?, accounts?, currencies?, principals?, validators?`.
+
+Keys of a toml account, in order: `address, desc?`.
+
+Keys of a toml currency, in order: `code, issuer?, display_decimals?, symbol?, name?, desc?`.
+
+Keys of a toml validator, in order: `public_key, owner_country?, server_country?, network?, unl?`.
+
+What the fields say:
+
+- **`toml_url`** is `https://{domain}/.well-known/xrp-ledger.toml`, on Xahau and Xahau Testnet `/.well-known/xahau.toml`. **`status`** is `ok` (the file was
+  fetched and read as TOML) or `failed`, and then **`reason`** is the safe fetcher's: `dns_error`, `connect_error`, `tls_error`, `timeout`,
+  `http_status` (with `status_code`, the HTTP status: a 5xx or a 429 is transient, any other 4xx is not), `too_large` (over 256 KiB),
+  `redirect_rejected`, `blocked_address` (the host resolves to a private address), `domain_invalid`, or `toml_invalid` (the file is not TOML).
+- **`checked`** is when the domain was last checked and **`fetched`** when the content was read (an instant of receipt,
+  `YYYY-MM-DDTHH:mm:ss.SSSZ`); `fetched` is left out when the toml has no content in effect. The content is what the last *good* read said, **in
+  effect after a transient failure until 24 hours after the re-read it missed** (a toml read OK is read again a day later, so up to 48 hours after
+  `fetched`); after a definite failure (a 404, a file that is not TOML, a file that is too large, a redirect to a bad place, a private address) or
+  after that grace it is gone, and the lists are left out.
+- **`modified`** and **`expires`** are wall times (`YYYY-MM-DDTHH:mm:ssZ`) from `[METADATA]`, in any form TOML or ISO writes a date (an offset
+  date-time, a local date-time read as UTC, a local date). `modified` is left out when the file gives none, a date before 2012-01-01 or more than a day
+  after the fetch. `expires` is kept whatever its value (an expired date is served as it is, and nothing is done with it), and a date outside 1970 to
+  2106 is no date.
+- **`accounts`** are the `[[ACCOUNTS]]` entries that count on this network, in file order: classic addresses with a valid checksum, an address once per
+  `network` (its first entry; so an address listed for a test network first keeps its entry for this one), at most 1,000. `desc` is the entry's
+  description cleaned (below) and left out when there is none, it is over 256 characters, or it holds an `@` (an email is no name).
+- **`currencies`** are the `[[CURRENCIES]]` entries that count, at most 200: `code` (1 to 40 characters), `issuer` when it is a classic address,
+  `display_decimals` when the file gives an integer from 0 to 30, and the text of `symbol`, `name` and `desc`. The other keys of an entry (an icon, an
+  attestation link, a custom key) stay in the store and are not served; a key that names an email or a social account (`contact_email`, `twitter`, `x`,
+  `telegram`, `support_handle`, ...) and a text that holds an `@` are not even stored.
+- **`principals`** are the names of the `[[PRINCIPALS]]` (at most 100 characters each, ten of them, no repeat), and **nothing else of a principal**: an
+  email and the social handles are never read, and a principal whose name holds an `@` is dropped.
+- **`validators`** are the `[[VALIDATORS]]` entries that count, at most 100: `public_key`, and `owner_country`, `server_country`, `network` and `unl` by the
+  same rules as `toml` on the [validator routes](#get-v2networkvalidators) (a country is an upper-case ISO 3166-1 alpha-2 code, `uk` read as `GB`; `unl` is an https URL of a list, text and never followed). A value the rules refuse is left out. **`[[SERVERS]]` and `[ORGANIZATION]` are never read.**
+- **Text is cleaned.** Every text of a toml loses its control and format characters, its bidirectional overrides and isolates among them (so that a
+  name cannot render as another), is then put in Unicode normal form C, has each run of white space made one space, and is trimmed; a text over its cap is
+  dropped, not cut.
+- **A file that is not valid TOML is `toml_invalid`, and one custom key can make it so**: the parser (`smol-toml`) refuses an integer it cannot hold
+  exactly (above 2^53 - 1 or below its negative), so `max_supply = 100000000000000000` anywhere in the file fails the whole file, and the domain shows
+  `failed` with no content. Write such a number as text or as a float.
+
+**Differences from data.ripple.com**: none, the endpoint is new ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 79 to 83).
+
+---
+
+## Ledger objects
+
+GateHub extras: the original served no object of the ledger by its ID. These endpoints serve **escrows**, **checks**, **payment channels** and the
+**delegations** of an account. An escrow, a check and a payment channel come with the history of the transactions that changed it: what it was
+when it was created, what every transaction since did to it, and what it is now (its `status`); a delegation is listed as it is now, with the
+transaction that made it and the one that changed it last. The design is in the
+[spec](superpowers/specs/2026-10-24-ledger-objects-delegation-design.md) and [ADR-0018](adr/0018-ledger-object-history.md); the rows are in
+[data-model](data-model.md).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these
+rules for the objects, whose shape and key order are ours and are pinned by tests:
+
+- **Coverage.** Every answer carries `coverage`, the key right after `result`, and it is not in the CSV: whether the history the answer is
+  read from is whole ([Coverage](#coverage)). The detail and the history of one object state its own: complete when the object's creation is
+  indexed. The data of a network are the ledgers written by parser version 7 or later: **an object created before the first of them has a
+  history that starts in the middle**, no `created`, and `complete` says so. An object that was created before that and has not been touched
+  since is not in the index at all: its route answers 404.
+- **As of.** After `coverage`, every answer has `ledger_index` and `close_time` (`YYYY-MM-DDTHH:mm:ssZ`): the newest committed ledger and when it
+  closed. The state of the object, its `history` and its `status` are as of that ledger, and `status` is worked out at that close time `T`
+  (rippled tests a transaction against the close time of the ledger before it, which is `T` for the next ledger). With no committed ledger the
+  answer is the 404 of the route.
+- **IDs and times.** An object ID is 64 hexadecimal digits, upper-case in every answer; the routes accept any case. Times (`finish_after`,
+  `cancel_after`, `expiration`, `time`) are `YYYY-MM-DDTHH:mm:ssZ`, converted from the ledger's own seconds.
+- **Amounts** are objects `{ "currency", "issuer"?, "value" }`: the native currency's code (`XRP`, `XAH`) with no issuer and its value in whole
+  units (drops divided by 1,000,000, exact decimal text); an issued token as on the ledger (the currency code as written there, 3 letters or 40
+  hex digits, its issuer, and the `value` text of the ledger); a multi-purpose token as `{ "currency": "<issuance ID>", "issuer", "value",
+  "mpt_issuance_id" }`, the 48 upper-case hex digits of the issuance ID in `currency` and again as the last key, the issuer read from the ID and
+  the `value` the raw integer units, never scaled. **This is the data API's MPT amount object**, in the ledger objects' answers; the [MPT routes](#mpt) serve an amount as its integer string beside the issuance ID. The scale and the ticker of a token are not
+  in an amount. A key an object has no value for is left out, never `null`.
+- **History** is the transactions that changed the object (a failed attempt that touched nothing is not in it), each an **event**: what
+  happened (`event`), the ledger and time, the transaction (`tx_hash`, `tx_type`, `result`), the `account` that sent it, the `delegate` that
+  sent it for the account when there is one, then the facts of its type. The detail of an object embeds its **newest 50 events, newest first**,
+  and `history_marker` when there are more: it continues at `/{id}/history?descending=true&marker=…`. A marker works for one route and one
+  direction.
+- **History routes** take `descending` (default false: oldest first), `limit` (200, maximum 1000), `marker` (`(ledger_index, tx_index)` of the
+  last event of the page) and `format=csv`, and send the `Link` header; an unknown parameter is ignored. A page past the end of an object that
+  has events is `count: 0`; an object with none is 404. The CSV has one row for each event and **the same columns on every page** whatever
+  the events of the page hold: the keys of an event in order, then those of its type, an amount's keys joined to its name with a dot
+  (`amount.currency`, `amount.issuer`, `amount.value`, `amount.mpt_issuance_id`), a key the event has no value for an empty cell.
+- **Reads** are of the committed ledgers only, from the rows the syncer wrote, each bounded by the object (its type and ID) and the ledger of
+  the answer: the cost of an answer does not grow with the history of the network.
+- **Cache-Control** is the usual `private, max-age=60`, and errors `no-store`. 401 and 429 are the usual ones.
+
+**Status.** `T` is the `close_time` of the answer. An object that is still in the ledger has a status that depends on the time; a deleted one
+has the status of the event that deleted it.
+
+| Object | Status |
+| --- | --- |
+| Escrow, in the ledger | `can_be_cancelled` if it has `cancel_after` and `T` is after it; else `pending` if it has `finish_after` and `T` is not after it; else `can_be_finished` (a conditional escrow without `finish_after` can be finished from its creation) |
+| Escrow, deleted | `finished` (by `EscrowFinish`), `cancelled` (by `EscrowCancel`) or `removed` (any other transaction) |
+| Check, in the ledger | `expired` if it has `expiration` and `T` is at or after it, else `open` |
+| Check, deleted | `cashed` (by `CheckCash`), `cancelled` (by `CheckCancel`) or `removed` |
+| Payment channel, in the ledger | `closing` if it has an `expiration`, or a `cancel_after` that `T` has reached; else `open` |
+| Payment channel, deleted | `closed` (by a claim that closed it) or `removed` |
+
+**The examples** are real answers over the recorded mainnet ledgers that the end-to-end suites seed (22 ledgers of the XRP Ledger, 102,145,584
+to 107,972,102, around escrows, checks, payment channels and delegations): the `close_time` is that of the newest of them, which is the time
+a `status` such as `can_be_cancelled` is worked out at, and the first of them is where the `coverage` starts.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer. Each line is checked against the
+constant the route is served by (`apps/api/src/ledger-objects/api-reference.spec.ts`).
+
+Keys of the coverage, in order: `from_ledger_index?, complete`.
+
+Keys of an amount, in order: `currency, issuer?, value, mpt_issuance_id?`.
+
+Keys of an event, in order: `event, ledger_index, time, tx_hash, tx_type, account, delegate?, result`.
+
+Keys of the extras of an escrow event, in order: `amount?, fulfillment?`.
+
+Keys of the extras of a check event, in order: `send_max?, expiration?, delivered?`.
+
+Keys of the extras of a payment channel event, in order: `amount, balance, amount_change?, balance_change?, expiration?, settle_delay?`.
+
+Keys of created, in order: `ledger_index, time, tx_hash`.
+
+Keys of updated, in order: `ledger_index, time, tx_hash`.
+
+Keys of removed, in order: `ledger_index, time, tx_hash, tx_type`.
+
+Keys of a permission, in order: `permission, kind, transaction_type?`.
+
+Keys of a delegation, in order: `delegation_id, account, authorize, permissions, updated, created?`.
+
+Keys of a ledger object, in order: `object_id, object_type, account, deleted, ledger_index`.
+
+Keys of an escrow, in order: `escrow_id, account, sequence?, destination, amount, finish_after?, cancel_after?, condition?, fulfillment?, destination_tag?, source_tag?, transfer_rate?, status, created?, removed?`.
+
+Keys of a check, in order: `check_id, account, sequence?, destination, send_max, expiration?, invoice_id?, destination_tag?, source_tag?, delivered?, status, created?, removed?`.
+
+Keys of a payment channel, in order: `channel_id, account, sequence?, destination, amount, balance, remaining, settle_delay, public_key, expiration?, cancel_after?, destination_tag?, source_tag?, status, opened_with?, funds, claims, created?, removed?`.
+
+Keys of the escrow answer, in order: `result, coverage, ledger_index, close_time, escrow, history, history_marker?`.
+
+Keys of the check answer, in order: `result, coverage, ledger_index, close_time, check, history, history_marker?`.
+
+Keys of the payment channel answer, in order: `result, coverage, ledger_index, close_time, payment_channel, history, history_marker?`.
+
+Keys of the history answer, in order: `result, coverage, ledger_index, close_time, count, marker?, history`.
+
+Keys of the delegations answer, in order: `result, coverage, ledger_index, close_time, count, marker?, delegations`.
+
+Keys of the ledger object answer, in order: `result, ledger_object`.
+
+### `GET /v2/escrows/{escrow_id}`
+
+One escrow as of the newest committed ledger, with its newest 50 events.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `escrow_id` (path) | | The 64 hex digits of the escrow's ID, in any case. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "escrow": {…}, "history": [Event, …], "history_marker": "…" }`.
+The escrow:
+
+- `account` is the owner (the account that created it) and `destination` the account that receives the amount; they are the same account for
+  an escrow to oneself. `sequence` is the escrow's own `Sequence`, else the sequence of the transaction that created it (a ticket's, for an
+  escrow made with a ticket); it is what makes the ID (see below), and is left out when no indexed row says it.
+- `amount` is the escrowed amount: XRP or XAH, an issued token, or (on the XRP Ledger, with the TokenEscrow amendment) a multi-purpose token,
+  as an [amount](#ledger-objects). `transfer_rate` is the ledger's number for a token escrow (`1000000000` is no fee).
+- `finish_after` and `cancel_after` are the two times of a timed escrow, `condition` the hex of the crypto-condition of a conditional one, and
+  `destination_tag` and `source_tag` the tags of the creating transaction; each is left out when the escrow has none.
+- `fulfillment` is the fulfillment of the transaction that finished a conditional escrow, once it is finished.
+- `status` is one of `pending`, `can_be_finished`, `can_be_cancelled`, `finished`, `cancelled`, `removed` (the table above).
+- `created` is `{ ledger_index, time, tx_hash }` of the transaction that created it, when that transaction is indexed (it is not for an
+  escrow created before the index starts), and `removed` is `{ ledger_index, time, tx_hash, tx_type }` of the transaction that deleted it,
+  once it is deleted.
+
+An event of an escrow has `event`: `create`, `finish`, `cancel`, `removed` (deleted by another transaction) or `update` (changed by a
+transaction no one expects), and adds `amount` to a `create` and `fulfillment` to a `finish`. `GET /v2/escrows/B95064B1A92F02EE009E6BDFB369CF476FB925BB8615456970E38774034A5D30`, a timed escrow of 0.5 XRP that is past its `cancel_after`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "escrow": {
+    "escrow_id": "B95064B1A92F02EE009E6BDFB369CF476FB925BB8615456970E38774034A5D30",
+    "account": "rNeJW71pMjKy42j5jn7vnWZAbmuU6SKs6V",
+    "sequence": 107896555,
+    "destination": "rGtW2dWHmHQ3f65pfbjYF5PbFbdZwgwuqW",
+    "amount": { "currency": "XRP", "value": "0.5" },
+    "finish_after": "2026-10-25T16:50:01Z",
+    "cancel_after": "2026-10-25T17:49:01Z",
+    "source_tag": 2610250016,
+    "status": "can_be_cancelled",
+    "created": {
+      "ledger_index": 107897249,
+      "time": "2026-10-25T16:49:20Z",
+      "tx_hash": "BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53"
+    }
+  },
+  "history": [
+    {
+      "event": "create",
+      "ledger_index": 107897249,
+      "time": "2026-10-25T16:49:20Z",
+      "tx_hash": "BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53",
+      "tx_type": "EscrowCreate",
+      "account": "rNeJW71pMjKy42j5jn7vnWZAbmuU6SKs6V",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "0.5" }
+    }
+  ]
+}
+```
+
+A finished escrow keeps its last state, its `removed`, and the events that made it: this 75,000 XRB escrow, created by its owner and finished by a
+bot (the `account` of the `finish` event is the sender of the transaction, not the owner). Its `status` no longer depends on the time:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "escrow": {
+    "escrow_id": "FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4",
+    "account": "rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm",
+    "sequence": 107945427,
+    "destination": "rHiwfnKJCwNePaTj8HmEYCx8G5NCsSEJSt",
+    "amount": { "currency": "XRB", "issuer": "rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa", "value": "75000" },
+    "finish_after": "2026-10-28T22:14:47Z",
+    "status": "finished",
+    "created": {
+      "ledger_index": 107945438,
+      "time": "2026-10-27T22:14:51Z",
+      "tx_hash": "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C"
+    },
+    "removed": {
+      "ledger_index": 107967068,
+      "time": "2026-10-28T22:14:51Z",
+      "tx_hash": "375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA",
+      "tx_type": "EscrowFinish"
+    }
+  },
+  "history": [
+    {
+      "event": "finish",
+      "ledger_index": 107967068,
+      "time": "2026-10-28T22:14:51Z",
+      "tx_hash": "375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA",
+      "tx_type": "EscrowFinish",
+      "account": "rPw6JAdM9BGwH4y4LxJQBDybaGNhFLCspU",
+      "result": "tesSUCCESS"
+    },
+    {
+      "event": "create",
+      "ledger_index": 107945438,
+      "time": "2026-10-27T22:14:51Z",
+      "tx_hash": "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C",
+      "tx_type": "EscrowCreate",
+      "account": "rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRB", "issuer": "rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa", "value": "75000" }
+    }
+  ]
+}
+```
+
+**Coverage.** The `coverage` of an escrow is the feature's `escrows` ([Coverage](#coverage)): the Escrow amendment's enable ledger (28,685,313 on
+the XRP Ledger, **when the ledger state lists the amendment**: Escrow is retired, and the API reports an enabling ledger only for an amendment
+the node's ledger state lists) or, on Xahau, which has had escrows since its genesis, its first ledger (1). It is the escrow's own when the
+escrow's creation is indexed. An escrow created before the index starts and finished after it (`8993DA09444641A6BDA272A292157A0E8AF79F040AA4E551C48257F493228455`
+is one, in the recorded ledgers) has `"complete": false` and no `created`; one created before it and not touched since is a 404. On a testnet
+`escrows` is complete only when the index holds the amendment's `EnableAmendment` and the history starts at or before it.
+
+Errors, in the order they are checked: 400 `invalid escrow id`; 404 `escrow not found`; 500 `unable to retrieve escrow`.
+
+### `GET /v2/escrows/{escrow_id}/history`
+
+The events of one escrow, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `escrow_id` (path) | | The 64 hex digits, in any case. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index)` of the last event. |
+| `format` | json | `csv`: file `<escrow_id> - escrow history.csv` (the ID upper-case), every column of the event. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "history": [Event, …] }`. The events are
+those of the detail, from the first or the last, with the `coverage` of the escrow; `marker` is the key of the last event of the page and is left
+out of the last page. `GET /v2/escrows/FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4/history?limit=1`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "count": 1,
+  "marker": "WzEwNzk0NTQzOCw5OF0",
+  "history": [
+    {
+      "event": "create",
+      "ledger_index": 107945438,
+      "time": "2026-10-27T22:14:51Z",
+      "tx_hash": "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C",
+      "tx_type": "EscrowCreate",
+      "account": "rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRB", "issuer": "rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa", "value": "75000" }
+    }
+  ]
+}
+```
+
+With `format=csv` the same escrow, newest first, is (`descending=true`):
+
+```text
+"event","ledger_index","time","tx_hash","tx_type","account","delegate","result","amount.currency","amount.issuer","amount.value","amount.mpt_issuance_id","fulfillment"
+"finish","107967068","2026-10-28T22:14:51Z","375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA","EscrowFinish","rPw6JAdM9BGwH4y4LxJQBDybaGNhFLCspU","","tesSUCCESS","","","","",""
+"create","107945438","2026-10-27T22:14:51Z","3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C","EscrowCreate","rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm","","tesSUCCESS","XRB","rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa","75000","",""
+```
+
+Errors, in the order they are checked: 400 `invalid escrow id`, `invalid marker`; 404 `escrow not found` (an escrow with no event, also for a
+`marker`); 500 `unable to retrieve escrow history`.
+
+### `GET /v2/accounts/{address}/escrows/{sequence}`
+
+The escrow an account created with a given sequence, answered **exactly as `GET /v2/escrows/{escrow_id}`** answers its ID, which is worked out from
+the owner and the sequence (a hash of the two, so no read comes before it). `sequence` is the `Sequence` of the `EscrowCreate` or, for one sent
+with a ticket, its `TicketSequence`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` (path) | | The owner: a classic address (an X-address is no address here). |
+| `sequence` (path) | | Digits, at most 4294967295. |
+
+Unlike the other routes under an account, the address is checked, as it is part of the ID. Errors, in the order they are checked: 400 `invalid ripple
+address`, `invalid sequence number` (the messages of [`GET /v2/accounts/{address}/transactions/{sequence}`](#get-v2accountsaddresstransactionssequence));
+404 `escrow not found`; 500 `unable to retrieve escrow`.
+
+### `GET /v2/checks/{check_id}`
+
+One check as of the newest committed ledger, with its newest 50 events.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `check_id` (path) | | The 64 hex digits of the check's ID, in any case. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "check": {…}, "history": [Event, …], "history_marker": "…" }`.
+The check:
+
+- `account` is the owner (the account that wrote the check and that the money is drawn from) and `destination` the account that can cash it.
+  `sequence` is the check's own `Sequence`, else the sequence of the transaction that created it; it is left out when no indexed row says it.
+- `send_max` is the most the check can be cashed for, as an [amount](#ledger-objects): XRP or XAH, or an issued token. `expiration`,
+  `invoice_id` (the `InvoiceID` of the creating transaction), `destination_tag` and `source_tag` are left out when the check has none.
+- `delivered` is what the cash delivered, once the check is cashed: the `DeliveredAmount` of the metadata of the `CheckCash` (an issued-token
+  cash and a cash with `DeliverMin` have one), else the amount the node served as delivered, else the `Amount` of the cash. It is never the
+  `DeliverMin`, which is only the least the casher accepts.
+- `status` is one of `open`, `expired`, `cashed`, `cancelled`, `removed` (the table above). A check is `expired` while it is still in the ledger
+  after its `expiration` (it stays there until a transaction deletes it); one that a third party cancelled after its expiration is `cancelled`.
+- `created` is `{ ledger_index, time, tx_hash }` of the transaction that wrote it, when that transaction is indexed, and `removed` is
+  `{ ledger_index, time, tx_hash, tx_type }` of the `CheckCash`, `CheckCancel` or other transaction that deleted it, once it is deleted.
+
+An event of a check has `event`: `create`, `cash`, `cancel`, `removed` (deleted by another transaction) or `update`, and adds `send_max` and
+`expiration` to a `create` and `delivered` to a `cash`. The `account` of a `cash` is the sender of the `CheckCash` (the destination), and of a
+`cancel` the sender of the `CheckCancel`: the source, the destination, or anyone once the check has expired.
+
+`GET /v2/checks/60FCB1E8C72A695CBB6BDF718D30AF2310A9BED6D3F6D92F54C0E429186D1A42`, a check for 1 RLUSD that nobody cashed before it expired:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "check": {
+    "check_id": "60FCB1E8C72A695CBB6BDF718D30AF2310A9BED6D3F6D92F54C0E429186D1A42",
+    "account": "r9CaVb4X1JVQoi6Q8Gw5cznAMRFARJDWyN",
+    "sequence": 106635339,
+    "destination": "rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ",
+    "send_max": {
+      "currency": "524C555344000000000000000000000000000000",
+      "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+      "value": "1"
+    },
+    "expiration": "2026-10-16T17:49:51Z",
+    "invoice_id": "AB9E9A322F4A89059C5402523B218CA53745DE3672A109BD14BB1A186640AD36",
+    "source_tag": 804681468,
+    "status": "expired",
+    "created": {
+      "ledger_index": 107698980,
+      "time": "2026-10-16T16:50:02Z",
+      "tx_hash": "CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326"
+    }
+  },
+  "history": [
+    {
+      "event": "create",
+      "ledger_index": 107698980,
+      "time": "2026-10-16T16:50:02Z",
+      "tx_hash": "CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326",
+      "tx_type": "CheckCreate",
+      "account": "r9CaVb4X1JVQoi6Q8Gw5cznAMRFARJDWyN",
+      "result": "tesSUCCESS",
+      "send_max": {
+        "currency": "524C555344000000000000000000000000000000",
+        "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+        "value": "1"
+      },
+      "expiration": "2026-10-16T17:49:51Z"
+    }
+  ]
+}
+```
+
+A cashed check keeps its last state, its `removed`, and `delivered`. This check was written before the index starts, so it has no `created`
+and its `coverage` says the history is not whole:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": false },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "check": {
+    "check_id": "AEE1BCC3B4C8EA870EF61879D9BCA66C07F6E717F8F80F6C93DEB7533C01A822",
+    "account": "r3f6bMRipu5zneH4k7ieERt4PGhXCJkVDH",
+    "sequence": 106641443,
+    "destination": "rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ",
+    "send_max": {
+      "currency": "524C555344000000000000000000000000000000",
+      "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+      "value": "1"
+    },
+    "expiration": "2026-10-16T22:55:21Z",
+    "invoice_id": "CAFA37B4E24B58A46C1E5FCADF76C5E6429F4B793473EA582C186DF795E38107",
+    "source_tag": 804681468,
+    "delivered": {
+      "currency": "524C555344000000000000000000000000000000",
+      "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+      "value": "0.438027"
+    },
+    "status": "cashed",
+    "removed": {
+      "ledger_index": 107703707,
+      "time": "2026-10-16T21:57:22Z",
+      "tx_hash": "3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330",
+      "tx_type": "CheckCash"
+    }
+  },
+  "history": [
+    {
+      "event": "cash",
+      "ledger_index": 107703707,
+      "time": "2026-10-16T21:57:22Z",
+      "tx_hash": "3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330",
+      "tx_type": "CheckCash",
+      "account": "rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ",
+      "result": "tesSUCCESS",
+      "delivered": {
+        "currency": "524C555344000000000000000000000000000000",
+        "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+        "value": "0.438027"
+      }
+    }
+  ]
+}
+```
+
+**Coverage.** The `coverage` of a check is the feature's `checks` ([Coverage](#coverage)): the Checks amendment's enable ledger (56,219,905 on the
+XRP Ledger, **when the ledger state lists the amendment**, as for escrows) or, on Xahau, its first ledger. It is the check's own when the check's
+creation is indexed, as for an escrow: a check written before the index starts and cashed or cancelled after it has `"complete": false` and no
+`created`, and one written before it and not touched since is a 404.
+
+Errors, in the order they are checked: 400 `invalid check id`; 404 `check not found`; 500 `unable to retrieve check`.
+
+### `GET /v2/checks/{check_id}/history`
+
+The events of one check, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `check_id` (path) | | The 64 hex digits, in any case. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index)` of the last event. |
+| `format` | json | `csv`: file `<check_id> - check history.csv` (the ID upper-case), every column of the event. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "history": [Event, …] }`, as the history of
+an escrow, with the events of a check and the `coverage` of the check. With `format=csv` the cashed check above is:
+
+```text
+"event","ledger_index","time","tx_hash","tx_type","account","delegate","result","send_max.currency","send_max.issuer","send_max.value","send_max.mpt_issuance_id","expiration","delivered.currency","delivered.issuer","delivered.value","delivered.mpt_issuance_id"
+"cash","107703707","2026-10-16T21:57:22Z","3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330","CheckCash","rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ","","tesSUCCESS","","","","","","524C555344000000000000000000000000000000","rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De","0.438027",""
+```
+
+Errors, in the order they are checked: 400 `invalid check id`, `invalid marker`; 404 `check not found` (a check with no event, also for a
+`marker`); 500 `unable to retrieve check history`.
+
+### `GET /v2/payment_channels/{channel_id}`
+
+One payment channel as of the newest committed ledger, with its newest 50 events.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `channel_id` (path) | | The 64 hex digits of the channel's ID, in any case. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "payment_channel": {…}, "history": [Event, …], "history_marker": "…" }`.
+The channel:
+
+- `account` is the owner (the source, which funds the channel) and `destination` the account that claims from it. `sequence` is the channel's own
+  `Sequence`, else the sequence of the transaction that created it; it is left out when no indexed row says it.
+- `amount` is what was deposited in all (the channel's funds, with every `PaymentChannelFund`), `balance` what was paid out to the destination so
+  far, and `remaining` their difference: what is left in the channel, or, once it is closed, what went back to the source. All three are
+  [amounts](#ledger-objects) in the channel's currency: XRP or XAH, or on Xahau an issued token (a token channel; its amounts are token amounts).
+  A channel whose node has no `Balance` (a new one on the XRP Ledger) has a `balance` of zero.
+- `settle_delay` is the seconds the source has to wait, after it asks to close the channel, before the channel closes while it holds unclaimed
+  funds: the time the destination has to claim. `public_key` is the hex of the key that signs the claims. `expiration` is set when the source
+  has asked to close the channel (or a fund set one); `cancel_after` is a fixed time after which the next transaction that touches the channel
+  closes it; `destination_tag` and `source_tag` are the tags of the creating transaction. A key is left out when the channel has none.
+- `status` is one of `open`, `closing`, `closed`, `removed` (the table above): a channel is `closing` from the moment it has an `expiration`, or
+  when the close time of the answer has reached its `cancel_after`, and `closed` once a claim or a fund deleted it.
+- `opened_with` is the deposit of the creating transaction, when that transaction is indexed. `funds` and `claims` count the events of the whole
+  history: the `fund` events, and the events that moved `balance` (the claims, a closing claim among them), each transaction once. They are not
+  the length of the embedded `history`, which holds 50 events at most.
+- `created` is `{ ledger_index, time, tx_hash }` of the transaction that opened it, when that transaction is indexed, and `removed` is
+  `{ ledger_index, time, tx_hash, tx_type }` of the transaction that deleted it, once it is deleted.
+
+An event of a channel has `event`: `create`, `fund`, `claim`, `close_request` (the source asked to close it: it has an `expiration` now),
+`renew` (the source took the `expiration` away), `close` (deleted by a claim or a fund), `removed` (deleted by another transaction) or `update`.
+Every event adds `amount` and `balance`, the channel's after the transaction, `amount_change` and `balance_change` when the transaction changed
+them (the difference after less before, in the channel's currency; a claim has a `balance_change`, a fund an `amount_change`), `expiration`
+when the channel has one after the transaction, and `settle_delay` to a `create`.
+
+`GET /v2/payment_channels/E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA`, a channel of 1 XRP claimed from once:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "payment_channel": {
+    "channel_id": "E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA",
+    "account": "rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM",
+    "sequence": 61531741,
+    "destination": "rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR",
+    "amount": { "currency": "XRP", "value": "1" },
+    "balance": { "currency": "XRP", "value": "0.032185" },
+    "remaining": { "currency": "XRP", "value": "0.967815" },
+    "settle_delay": 1209600,
+    "public_key": "03D63CA73239D94AAF52574A20E3BC26CBDB811CA55A5914FAA28836F079CE0DC3",
+    "status": "open",
+    "opened_with": { "currency": "XRP", "value": "1" },
+    "funds": 0,
+    "claims": 1,
+    "created": {
+      "ledger_index": 107624182,
+      "time": "2026-10-13T08:05:31Z",
+      "tx_hash": "E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127"
+    }
+  },
+  "history": [
+    {
+      "event": "claim",
+      "ledger_index": 107641123,
+      "time": "2026-10-14T02:25:30Z",
+      "tx_hash": "886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790",
+      "tx_type": "PaymentChannelClaim",
+      "account": "rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "1" },
+      "balance": { "currency": "XRP", "value": "0.032185" },
+      "balance_change": { "currency": "XRP", "value": "0.032185" }
+    },
+    {
+      "event": "create",
+      "ledger_index": 107624182,
+      "time": "2026-10-13T08:05:31Z",
+      "tx_hash": "E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127",
+      "tx_type": "PaymentChannelCreate",
+      "account": "rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "1" },
+      "balance": { "currency": "XRP", "value": "0" },
+      "settle_delay": 1209600
+    }
+  ]
+}
+```
+
+This channel was funded and asked to close before the index starts, so only three of its events are indexed and the `coverage` is not complete
+(and there is no `created`, `opened_with` or `sequence`). Its `expiration` makes it `closing`; a `renew` took the expiration away for a while,
+and the fund set a new one:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": false },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "payment_channel": {
+    "channel_id": "494E75E70AAFD8E655C4EBEA9541991367C038EC2251BEB4ABEBAC2AED8B0B7F",
+    "account": "rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu",
+    "destination": "rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR",
+    "amount": { "currency": "XRP", "value": "5.000002" },
+    "balance": { "currency": "XRP", "value": "5" },
+    "remaining": { "currency": "XRP", "value": "0.000002" },
+    "settle_delay": 1209600,
+    "public_key": "03A6C6BED4F26E1EBD97A7A4AE82560D3BA21C465F95A350FEAFC1BF17574CD306",
+    "expiration": "2026-10-09T06:04:58Z",
+    "status": "closing",
+    "funds": 1,
+    "claims": 0
+  },
+  "history": [
+    {
+      "event": "fund",
+      "ledger_index": 107220098,
+      "time": "2026-09-25T06:03:01Z",
+      "tx_hash": "0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE",
+      "tx_type": "PaymentChannelFund",
+      "account": "rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "5.000002" },
+      "balance": { "currency": "XRP", "value": "5" },
+      "amount_change": { "currency": "XRP", "value": "0.000001" },
+      "expiration": "2026-10-09T06:04:58Z"
+    },
+    {
+      "event": "renew",
+      "ledger_index": 107218583,
+      "time": "2026-09-25T04:25:22Z",
+      "tx_hash": "FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8",
+      "tx_type": "PaymentChannelClaim",
+      "account": "rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "5" },
+      "balance": { "currency": "XRP", "value": "0.002469" }
+    },
+    {
+      "event": "close_request",
+      "ledger_index": 107107437,
+      "time": "2026-09-20T05:20:31Z",
+      "tx_hash": "29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB",
+      "tx_type": "PaymentChannelClaim",
+      "account": "rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "5" },
+      "balance": { "currency": "XRP", "value": "0.002469" },
+      "expiration": "2026-10-04T05:20:30Z"
+    }
+  ]
+}
+```
+
+**Coverage.** The `coverage` of a channel is the feature's `payment_channels` ([Coverage](#coverage)): the PayChan amendment's enable ledger
+(28,685,313 on the XRP Ledger, **when the ledger state lists the amendment**, as for escrows) or, on Xahau, its first ledger. It is the
+channel's own when its creation is indexed, as for an escrow; the `funds` and `claims` of a channel without its creation count the events that
+are indexed.
+
+Errors, in the order they are checked: 400 `invalid channel id`; 404 `payment channel not found`; 500 `unable to retrieve payment channel`.
+
+### `GET /v2/payment_channels/{channel_id}/history`
+
+The events of one payment channel, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `channel_id` (path) | | The 64 hex digits, in any case. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index)` of the last event. |
+| `format` | json | `csv`: file `<channel_id> - payment channel history.csv` (the ID upper-case), every column of the event. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "history": [Event, …] }`, as the history of
+an escrow, with the events of a channel and the `coverage` of the channel; it has no `funds` and `claims`, which are the channel's.
+
+`GET /v2/payment_channels/E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA/history?limit=1`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "count": 1,
+  "marker": "WzEwNzYyNDE4Miw0NF0",
+  "history": [
+    {
+      "event": "create",
+      "ledger_index": 107624182,
+      "time": "2026-10-13T08:05:31Z",
+      "tx_hash": "E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127",
+      "tx_type": "PaymentChannelCreate",
+      "account": "rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "1" },
+      "balance": { "currency": "XRP", "value": "0" },
+      "settle_delay": 1209600
+    }
+  ]
+}
+```
+
+With `format=csv` the same channel, newest first, is (`descending=true`): the amounts are flattened, and the columns are the same on every page,
+whether it holds claims, funds or a creation:
+
+```text
+"event","ledger_index","time","tx_hash","tx_type","account","delegate","result","amount.currency","amount.issuer","amount.value","amount.mpt_issuance_id","balance.currency","balance.issuer","balance.value","balance.mpt_issuance_id","amount_change.currency","amount_change.issuer","amount_change.value","amount_change.mpt_issuance_id","balance_change.currency","balance_change.issuer","balance_change.value","balance_change.mpt_issuance_id","expiration","settle_delay"
+"claim","107641123","2026-10-14T02:25:30Z","886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790","PaymentChannelClaim","rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR","","tesSUCCESS","XRP","","1","","XRP","","0.032185","","","","","","XRP","","0.032185","","",""
+"create","107624182","2026-10-13T08:05:31Z","E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127","PaymentChannelCreate","rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM","","tesSUCCESS","XRP","","1","","XRP","","0","","","","","","","","","","","1209600"
+```
+
+Errors, in the order they are checked: 400 `invalid channel id`, `invalid marker`; 404 `payment channel not found` (a channel with no event, also
+for a `marker`); 500 `unable to retrieve payment channel history`.
+
+### `GET /v2/accounts/{address}/delegations`
+
+The delegations an account gave or holds, as of the newest committed ledger. A delegation (permission delegation, XLS-75) is an entry of the
+ledger by which an account (`account`) lets another (`authorize`, the delegate) send some transactions for it: the list of the transactions and
+of the granular permissions the delegate may use. Only the entries that are in the ledger are listed: an entry whose list was emptied (a
+`DelegateSet` with no permissions) is deleted and is gone from both sides, and one whose list was replaced shows the newest list.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` (path) | | The account: a classic address (an X-address is no address here). |
+| `direction` | `given` | `given`: the delegations the account gave (it is the `account` of the entry); `held`: those it holds (it is the `authorize`). Missing or empty is `given`. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index, delegation_id)` of the last delegation of the page. |
+| `format` | json | `csv`: file `<address> - delegations given.csv` / `<address> - delegations held.csv`, `permissions` one cell of names separated by a space. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "delegations": [Delegation, …] }`. A delegation:
+
+- `delegation_id` is the ID of the entry, which [`GET /v2/ledger_objects/{object_id}`](#get-v2ledger_objectsobject_id) says what it is. `account` is the
+  delegating account and `authorize` the delegate.
+- `permissions` are what the delegate may do, in the order the entry lists them: `{ "permission", "kind", "transaction_type"? }`. `kind` is
+  `transaction` when `permission` is the name of a transaction type (`Payment`), `granular` when it is one of the 12 granular permissions
+  (`TrustlineAuthorize`, which also gives the `transaction_type` it narrows, `TrustSet`), and `unknown` for a value that is neither, which is
+  written as its number.
+- `updated` is `{ ledger_index, time, tx_hash }` of the transaction that changed the entry last (the one that made it, when none changed it
+  since). `created` is the same for the transaction that made the entry as it is now, and is left out when that transaction is not indexed. An
+  entry that was deleted and made again under the same ID (the same two accounts) has the creation of the newest.
+- The list is ordered by `updated`, the entry changed last first, and then by `delegation_id`; there is no `descending`. The `marker` holds the
+  place and ID of the last delegation of the page, and the page after it starts with the next in that order. The `Link` header is sent.
+
+The `coverage` is that of the delegations ([Coverage](#coverage)): complete when the first ledger of the index is not after the ledger the
+amendment was enabled in. An entry is listed whether or not its creation is indexed.
+
+**The size of an account.** The delegations are read from the index of the account (an account with 10,000 or fewer in the direction is
+served; a deleted entry is not counted), and an account that has more is answered 500 `unable to retrieve delegations` and logged: the
+list is a guard, not a page.
+
+`GET /v2/accounts/rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL/delegations`, an account that authorized one other for its offers (`OfferCreate` and `OfferCancel`):
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "count": 1,
+  "delegations": [
+    {
+      "delegation_id": "E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851",
+      "account": "rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL",
+      "authorize": "rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK",
+      "permissions": [
+        { "permission": "OfferCreate", "kind": "transaction" },
+        { "permission": "OfferCancel", "kind": "transaction" }
+      ],
+      "updated": {
+        "ledger_index": 107558036,
+        "time": "2026-10-10T09:03:20Z",
+        "tx_hash": "4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66"
+      },
+      "created": {
+        "ledger_index": 107558036,
+        "time": "2026-10-10T09:03:20Z",
+        "tx_hash": "4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66"
+      }
+    }
+  ]
+}
+```
+
+With `direction=held` the delegate sees the same entry (`GET /v2/accounts/rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK/delegations?direction=held&format=csv`).
+The permission names are in one cell, and a delegation that has no `created` has its three columns empty:
+
+```text
+"delegation_id","account","authorize","permissions","updated.ledger_index","updated.time","updated.tx_hash","created.ledger_index","created.time","created.tx_hash"
+"E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851","rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL","rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK","OfferCreate OfferCancel","107558036","2026-10-10T09:03:20Z","4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66","107558036","2026-10-10T09:03:20Z","4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66"
+```
+
+**Xahau has no delegation**: its answer is the empty list with the `coverage` of a feature the network cannot have (`complete: true`), and no table is
+read. `GET /v2/accounts/rKqZCLrHu8dMPj444xPrDQCXUpZr6U2VWi/delegations` on Xahau:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 8852809, "complete": true },
+  "ledger_index": 26399329,
+  "close_time": "2026-10-09T12:49:32Z",
+  "count": 0,
+  "delegations": []
+}
+```
+
+Errors, in the order they are checked: 400 `invalid ripple address`, `invalid direction`, `invalid marker`; 500 `unable to retrieve delegations` (also for
+an account with more than 10,000 delegations in the ledger in the direction, and when no ledger is committed).
+
+### `GET /v2/ledger_objects/{object_id}`
+
+Which kind of object an ID is: of the objects this section serves, the type, the owner, and whether the newest row of the object deleted it.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `object_id` (path) | | The 64 hex digits of the ID, in any case. |
+
+`{ "result": "success", "ledger_object": { "object_id", "object_type", "account", "deleted", "ledger_index" } }`. This is a lookup, not an object: it
+has no `coverage`, and no `ledger_index` or `close_time` of the answer beside `result` and `ledger_object`.
+
+- `object_type` is the entry type of the ledger: `Escrow`, `Check`, `PayChannel` (a payment channel) or `Delegate` (a delegation). The ID is the
+  one the route of that type takes: [`/v2/escrows/{escrow_id}`](#get-v2escrowsescrow_id), [`/v2/checks/{check_id}`](#get-v2checkscheck_id),
+  [`/v2/payment_channels/{channel_id}`](#get-v2payment_channelschannel_id), and a delegation's `delegation_id` in [the list above](#get-v2accountsaddressdelegations).
+- `account` is the owner of the object (for a delegation, the account that gave it), `deleted` is `true` when the newest row of the object, up
+  to the newest committed ledger, deleted it, and `ledger_index` is the ledger of that row.
+- An object that was created before the index starts and has not been touched since is not known: its ID is 404 like any ID that is none.
+
+`GET /v2/ledger_objects/E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851`, the delegation above:
+
+```json
+{
+  "result": "success",
+  "ledger_object": {
+    "object_id": "E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851",
+    "object_type": "Delegate",
+    "account": "rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL",
+    "deleted": false,
+    "ledger_index": 107558036
+  }
+}
+```
+
+`GET /v2/ledger_objects/FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4`, an escrow that was finished:
+
+```json
+{
+  "result": "success",
+  "ledger_object": {
+    "object_id": "FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4",
+    "object_type": "Escrow",
+    "account": "rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm",
+    "deleted": true,
+    "ledger_index": 107967068
+  }
+}
+```
+
+Errors, in the order they are checked: 400 `invalid ledger object id`; 404 `ledger object not found` (an ID with no row in a committed ledger, and
+every ID when no ledger is committed); 500 `unable to retrieve ledger object`.
+
+**Differences from data.ripple.com**: none, the endpoints are new. The original's `GET /v2/accounts/{address}/escrows` (the list of an account) is
+not served and answers 404 ([Compatibility](#compatibility)).
+
+---
+
+## Tokens
+
+GateHub extras: the original served no list of tokens (its `/v2/currencies` and `/v2/gateways` are not served, [Compatibility](#compatibility)). The MPT issuances are in [their own section](#mpt), `kind=mpt` of the list among them. These four routes serve the **issued
+tokens** of the network, the currencies issued on trust lines: the tokens ranked by the number of their holders, one token with the settings of its issuer, its toml entry, its
+markets and its price, the holders of a token by balance, and the payments that delivered a token. The tokens, their holders and their supply are an aggregate that the syncer's
+`tokens` job keeps current from the state history ([syncer](syncer.md#the-tokens-job), [ADR-0019](adr/0019-issued-tokens-from-state-history.md), the rows in
+[data-model](data-model.md#issued-tokens-migration-014)); the design is in the [spec](superpowers/specs/2026-10-24-issued-tokens-design.md). The transfers are read from the ledgers
+at query time, as `/v2/payments` is.
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these rules, whose shapes and key orders are ours
+and are pinned by tests:
+
+- **What a token is.** A trust line between two accounts in a currency has a balance from each side. From the side of the issuer of the token (C, I), the other account H of a line
+  **holds** the token when the balance is below 0 (H's balance is its negation). The line **counts** when H holds the token, or its balance is 0 and H's own limit is above 0.
+
+  | Term | Rule |
+  | --- | --- |
+  | **holders** | the lines that count with a balance above 0 |
+  | **trust lines** | the lines that count, the zero balances included (`trust_lines - holders` is the number of those) |
+  | **supply** | the exact sum of the holders' balances: the issuer's obligations, as `gateway_balances` of the node gives them. It is the supply of the token, not the circulating supply of the native currency |
+  | **token** | a currency with its issuer, with at least one line that counts |
+
+  A line with both limits above 0 and a zero balance counts for the tokens of both its accounts. A frozen line counts, and so does the reserve line of an AMM pool (the pool is a
+  holder). **A currency of an AMM's LP token (`03` and 38 hex digits) is not a token here**: it counts for nothing, is never listed and its detail and holders are 404 (the pool's page is
+  [`/v2/amm/pools`](#amm)); its transfers are listed all the same.
+- **Coverage.** Every answer carries `coverage`, the key right after `result`, and it is not in the CSV ([Coverage](#coverage)). The list, the detail and the holders state the feature
+  `issued_tokens`, whose rows are the state tables written by parser version 3 or later; the transfers state `token_transfers`, whose rows are the payments of every stored ledger (parser
+  version 1). Both are features without an amendment: they start at the first ledger of the network (**32,570** on the XRP Ledger, **1** on Xahau), and a testnet, which has no first
+  ledger, is never `complete`. For `issued_tokens` `complete` also means that the state tables hold the state of that first ledger, which the history fill provides: a trust line that has
+  not changed since `from_ledger_index` is not known, so while `complete` is false a token, a holder or an issuer's settings can be missing, and a token whose lines have not
+  changed since then is a 404. The coverage of the state tables is the one that decides whether the aggregate is built again: filling the history further back builds a new generation
+  of it ([operations](operations.md#issued-tokens)).
+- **As of.** The list, the detail and the holders name `ledger_index` and `close_time` (`YYYY-MM-DDTHH:mm:ssZ`) after the coverage: the ledger the live generation of the aggregate is
+  through, and when it closed. Everything in the answer is as of that ledger, except the price, the volume and the markets, which are the newest sets of
+  [`/v2/network/markets`](#get-v2networkmarkets) (kept 30 seconds). The generation is read every 5 seconds and the job keeps it within a few ledgers of the head, so an answer is
+  about a minute behind the ledger chain at most (the alert is 300 ledgers). The transfers have no ledger of their own: they are the payments of the committed ledgers.
+- **Before the first generation exists** (a new database, or a first build under way) the list answers `{ "result": "success", "coverage": …, "kind": "issued", "count": 0, "tokens": [] }`
+  and the detail and the holders answer 404; the transfers do not depend on it.
+- **The token in a path** is one segment, `{currency}.{issuer}`, split at its **last** `.`, `+` or `|` (an address has none, so a text code may hold one): the code before it, the issuer
+  after it. The code is a 3-character code of the ledger's set (letters, digits and ``? ! @ # $ % ^ & * < > ( ) { } [ ] |``), upper-cased as the payments routes do; 40
+  hex digits, in any case (a hex that is the standard form of a 3-character code is that code); or a text of 4 to 20 printable ASCII characters (a space included), taken as its 40 hex digits padded
+  with zeros. Anything else, a 3-character code outside the set included, is 400 `invalid currency`. A currency the ledger
+  holds in lower case (`usd`) cannot be reached: `usd` names `USD`. `code` in answers is the reverse: the 3-character code, or the text of the hex when its bytes, the trailing zeros
+  dropped, are printable ASCII, and left out otherwise (a demurrage currency has none). `a.b.c` and `A.B.C` are two currencies (only a 3-character code is upper-cased). The native
+  code with an issuer is 400 (`XRP cannot have an issuer`, `XAH` on Xahau); on Xahau an issued `XRP` is a currency like any other.
+- **Order and `rank`.** The list is ordered by `holders` descending, then `issuer`, then `currency`; `rank` is the place of a token in that order among the tokens the filters select
+  (1 on the first, not restarting on a page). The holders of a token are ordered by balance descending, then by address, and each page ranks over the **whole** list, so `rank`
+  is the same whichever page the holder is on. The ranking of the list is rebuilt every minute, and its marker is a cursor into the ranking, as the marker of
+  [`/v2/amm/pools`](#get-v2ammpools) is: a token can move between two pages from one minute to the next, and the pages concatenate to the unpaged list only while the ranking does not change.
+- **Amounts.** `supply`, `balance`, `limit`, `volume`, `counter_volume`, `native_volume` and `amount` are exact decimal text in whole units. `share` is the balance over the supply of the
+  token, exact, rounded half up to 6 decimals (`"0.117300"`). `price`, `last` are 8 significant digits, as `last` of `network/markets`; a price below 0.000001 or from 100,000,000 up comes as
+  exponent text (`"9.9000000e-7"`, `"1.2345679e+8"`), which every decimal parser reads. `price_change` and `change` are percent, 2 decimals, half up (`"-20.00"`). A key that has no
+  value is left out, never `null`; counts and ranks are numbers; flags are booleans.
+- **No node fallback.** The API serves what the index holds. A token the index does not know answers 404 `token not found`, and the explorer shows it from the node with a note
+  of the coverage; `gateway_balances` is heavy for a big issuer and gives no holders.
+- **Reads** are of one partition of the aggregate (the live generation) or of the token's key prefix in it, and of the committed ledgers only: the cost of an answer does not grow
+  with the history of the network.
+- **Cache-Control** is the usual `private, max-age=60`, and errors `no-store`. 401 and 429 are the usual ones.
+
+**The examples** are real answers of the end-to-end suites, key order included. The list, the detail and the holders are those of a synthetic world (`apps/api/test/support/tokens-seed.ts`:
+the rows the `tokens` job writes, put in the tables directly, three generations side by side), whose markets are the sets of the markets world of the suites, so a `price_time` is
+that of 2020-07-02 and the ledger numbers are made up; the transfers are the payments of real ledgers of the XRP Ledger that the suites seed (the recorded path payments,
+107,872,476 to 107,873,045), so their `coverage` is the one that seed gives.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer. Each line is checked against the constant the route is served by
+(`apps/api/src/tokens/api-reference.spec.ts`).
+
+Keys of the coverage, in order: `from_ledger_index?, complete`.
+
+Keys of the list answer, in order: `result, coverage, kind, ledger_index?, close_time?, totals?, total?, total_below?, count, marker?, tokens`.
+
+Keys of the totals, in order: `tokens, tokens_with_10_holders, holders?, native_volume?`.
+
+Keys of an issued token row, in order: `rank, currency, code?, issuer, holders, trust_lines, supply, price?, price_change?, price_time?, native_volume?, trades?, domain?, listed, name?`.
+
+Keys of the token answer, in order: `result, coverage, ledger_index, close_time, token`.
+
+Keys of a token, in order: `currency, code?, issuer, holders, trust_lines, supply, price?, price_change?, price_time?, native_volume?, trades?, domain?, toml_url?, listed, toml?, issuer_settings?, markets, last_ledger`.
+
+Keys of toml, in order: `name?, desc?, icon?, symbol?, display_decimals?, asset_class?, asset_subclass?, attestation?`.
+
+Keys of issuer_settings, in order: `transfer_fee, global_freeze, no_freeze, allow_trust_line_clawback, require_auth, default_ripple`.
+
+Keys of a market, in order: `counter_currency, counter_issuer?, count, volume, counter_volume, native_volume?, last, change?, last_time, amm_pool?`.
+
+Keys of the holders answer, in order: `result, coverage, ledger_index, close_time, supply, count, marker?, holders`.
+
+Keys of a holder, in order: `rank, holder, balance, share, limit, frozen, authorized`.
+
+Keys of the transfers answer, in order: `result, coverage, count, marker?, transfers`.
+
+Keys of a transfer, in order: `hash, ledger_index, executed_time, source, destination, amount, source_tag?, destination_tag?`.
+
+### `GET /v2/tokens`
+
+The issued tokens of the network, the most held first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `kind` | `issued` | The kind of token: `issued`, what this section describes, or `mpt`, the MPT issuances ([`GET /v2/tokens?kind=mpt`](#get-v2tokenskindmpt)), with this route's envelope and parameters and a row, totals and search of their own. Anything else answers 400 `invalid kind - use: issued, mpt`. `kind` is echoed in every answer and is part of the marker (a marker of one kind is `invalid marker` for another). |
+| `min_holders` | 0 | Only the tokens with at least this many holders: plain digits, 0 to 1,000,000,000, else 400 `invalid min_holders`. |
+| `q` | | A search, trimmed, 1 to 64 characters (else 400 `invalid search`; an empty one is none). |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `tokens.csv`, the tokens flattened (the `tokens` only, without `coverage` and the counts). |
+
+**Search.** `q` a classic address: the tokens of that issuer. Anything else matches a token when its `code`, `name` or `domain` contains `q` (case-insensitive), its currency is `q` (40 hex digits,
+in any case) or its issuer starts with `q`. It does not match the display name of the issuer (that is [`/v2/account_names`](#account-names-and-tomls)).
+
+**Counts.** `total` is the number of tokens the filters select, on all pages. `total_below`, when `min_holders` is above 0, is the number that match `q` (or all tokens without `q`) but have
+fewer than `min_holders` holders: the "Show all (48,206 hidden)" of a board. `totals` describe the whole kind, **whatever the filters**: `tokens` (every token), `tokens_with_10_holders` (a
+fixed floor of 10, whatever `min_holders` is), `holders` (the distinct accounts that hold any token of the generation, counted by the job about every ten minutes; **left out while it has not
+counted them**, never a false 0) and `native_volume` (the `total_native_volume` of the `day` set of [`/v2/network/markets`](#get-v2networkmarkets), every pair; left out while there is no set).
+
+`GET /v2/tokens?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "kind": "issued",
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "totals": {
+    "tokens": 15,
+    "tokens_with_10_holders": 9,
+    "holders": 4321,
+    "native_volume": "243.5"
+  },
+  "total": 15,
+  "count": 2,
+  "marker": "WyJpc3N1ZWQiLDYwLCJyTXdqWWVkamM3cXF0S1lWTGlBY2NKU21Dd2loNExuRTJxIiwiVVNEIl0",
+  "tokens": [
+    {
+      "rank": 1,
+      "currency": "USD",
+      "code": "USD",
+      "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "holders": 120,
+      "trust_lines": 150,
+      "supply": "7320",
+      "price": "0.40000000",
+      "price_change": "-20.00",
+      "price_time": "2020-07-02T10:42:17Z",
+      "native_volume": "150",
+      "trades": 35,
+      "domain": "northpeak.example",
+      "listed": true,
+      "name": "Northpeak USD"
+    },
+    {
+      "rank": 2,
+      "currency": "USD",
+      "code": "USD",
+      "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
+      "holders": 60,
+      "trust_lines": 61,
+      "supply": "1860",
+      "native_volume": "0",
+      "trades": 0,
+      "domain": "bluewave.example",
+      "listed": true,
+      "name": "Bluewave Dollar"
+    }
+  ]
+}
+```
+
+With `min_holders` and a search (`/v2/tokens?min_holders=10&q=north&limit=5`), `total_below` is there and `totals` are the same:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "kind": "issued",
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "totals": {
+    "tokens": 15,
+    "tokens_with_10_holders": 9,
+    "holders": 4321,
+    "native_volume": "243.5"
+  },
+  "total": 2,
+  "total_below": 0,
+  "count": 2,
+  "tokens": [
+    {
+      "rank": 1,
+      "currency": "USD",
+      "code": "USD",
+      "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "holders": 120,
+      "trust_lines": 150,
+      "supply": "7320",
+      "price": "0.40000000",
+      "price_change": "-20.00",
+      "price_time": "2020-07-02T10:42:17Z",
+      "native_volume": "150",
+      "trades": 35,
+      "domain": "northpeak.example",
+      "listed": true,
+      "name": "Northpeak USD"
+    },
+    {
+      "rank": 2,
+      "currency": "4E50555344000000000000000000000000000000",
+      "code": "NPUSD",
+      "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
+      "holders": 40,
+      "trust_lines": 41,
+      "supply": "840",
+      "native_volume": "0",
+      "trades": 0,
+      "domain": "northpeak.example",
+      "listed": true,
+      "name": "Northpeak Dollar"
+    }
+  ]
+}
+```
+
+The row of a token:
+
+- `rank`, `currency` (the ledger's form: the 3 characters or 40 upper-case hex digits), `code?` (see the path), `issuer`.
+- `holders`, `trust_lines` and `supply` as defined above.
+- `price?`, `price_change?` and `price_time?`: the last trade against the native currency in the `day` set of the markets, with its change in percent and its time; else the last trade in
+  the `30day` set, with its time and **no change**; else absent (a token that has not traded against the native currency in 30 days has no price).
+- `native_volume?` and `trades?`: the sum, over the pairs of the `day` set that have the token on a side, of the native volume (the pairs that have one) and of the trade count. `"0"` and 0
+  for a token with no pair; both absent while there is no `day` set.
+- `domain?` (the issuer's account domain, in lower case), `listed` (the issuer's toml lists the token, below) and `name?` (the name the toml gives it).
+
+**Listed.** A token is `listed` when the toml of the issuer's own account domain has a `[[CURRENCIES]]` entry that counts on this network, names the token's issuer and has the token's
+code: two-way, the account and its domain, and the domain's toml and the account. An entry in another domain's toml does not list the token. The tomls are those the syncer
+fetched ([Account names and tomls](#account-names-and-tomls)). A change of one shows after the syncer has read it again (its own schedule) and the sweep of the `tokens` job has met the token: within
+tens of minutes on the XRP Ledger (an estimate, not a measurement), not at once ([operations](operations.md#issued-tokens)).
+
+**No generation.** `{"result":"success","coverage":{…},"kind":"issued","count":0,"tokens":[]}`, with the keys of the list that it has:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "complete": false
+  },
+  "kind": "issued",
+  "count": 0,
+  "tokens": []
+}
+```
+
+**CSV.** The columns are the keys of a row, in their order, whatever the page holds; a key a row has no value for is an empty cell and a flag is `true` or `false`. A page without a row is an empty
+file.
+
+```text
+"rank","currency","code","issuer","holders","trust_lines","supply","price","price_change","price_time","native_volume","trades","domain","listed","name"
+"1","USD","USD","rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B","120","150","7320","0.40000000","-20.00","2020-07-02T10:42:17Z","150","35","northpeak.example","true","Northpeak USD"
+"2","USD","USD","rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q","60","61","1860","","","","0","0","bluewave.example","true","Bluewave Dollar"
+"3","EUR","EUR","rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B","60","60","1860","","","","25","35","","false",""
+```
+
+Errors, in the order they are checked: 400 `invalid kind - use: issued, mpt`, `invalid min_holders`, `invalid search`, `invalid marker`; 500 `unable to retrieve tokens`. A 400 comes before any read.
+A generation whose newest ledger is not stored yet answers 500 as well (it can for a moment during a `--reprocess` of the newest ledgers): the answer names the ledger it is as of, and no other is
+invented in its place.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{currency}.{issuer}`
+
+One issued token as of the ledger of the live generation. No CSV.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `currency.issuer` (path) | | The token, as above. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "token": {…} }`. The token has the keys of a row of the list, without `rank`, and these:
+
+- `holders` and `trust_lines` are those of the token's own row, as the list shows them.
+- `toml_url?` is `https://{domain}{path}` of the toml of the issuer's domain (`/.well-known/xrp-ledger.toml`, `/.well-known/xahau.toml` on Xahau), there whenever `domain` is, listed or not.
+- `toml?` is what the toml says of the token: `name`, `desc`, `icon`, `symbol`, `display_decimals` (a whole number 0 to 30), `asset_class`, `asset_subclass` and `attestation`, each as the toml gives
+  it (text), the fields of the xrp-ledger.toml reference and of the XLS-26 draft; others are not served, and a URL among them is text, never fetched. Left out when the token is not listed, and when the listed entry has none of these fields.
+- `issuer_settings?` are the settings of the issuer's account as of the ledger: `transfer_fee` (a percent, exact: a `TransferRate` of 1,002,000,000 is `"0.2"`, and none is `"0"`), and the flags
+  by the names of the network (the XRP Ledger and Xahau number the bits differently; `AllowTrustLineClawback` is `0x80000000` on the first and `0x1000` on Xahau): `global_freeze`,
+  `no_freeze`, `allow_trust_line_clawback`, `require_auth`, `default_ripple`. **Left out while the issuer has no row in the state tables** (its settings are unknown, not off).
+- `markets` are the pairs of the `day` set with the token on a side, **turned so that the token is the base**: `counter_currency` (and `counter_issuer`, absent for the native currency), `count`,
+  `volume` (the token's side), `counter_volume` (the other), `native_volume?`, `last` (the other asset per token: the stored rate, or its inverse), `change?` (percent, from the open and the last
+  in that orientation), `last_time` and `amm_pool?` (when the set has it). Ordered by `native_volume` descending (a pair without one last), then `count`, at most 20; `[]` for a token with no pair.
+- `last_ledger` is the newest ledger in which one of the token's lines changed.
+
+A listed token on a network whose issuer has settings, with its markets:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "token": {
+    "currency": "USD",
+    "code": "USD",
+    "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+    "holders": 120,
+    "trust_lines": 150,
+    "supply": "7320",
+    "price": "0.40000000",
+    "price_change": "-20.00",
+    "price_time": "2020-07-02T10:42:17Z",
+    "native_volume": "150",
+    "trades": 35,
+    "domain": "northpeak.example",
+    "toml_url": "https://northpeak.example/.well-known/xrp-ledger.toml",
+    "listed": true,
+    "toml": {
+      "name": "Northpeak USD"
+    },
+    "issuer_settings": {
+      "transfer_fee": "0",
+      "global_freeze": false,
+      "no_freeze": false,
+      "allow_trust_line_clawback": true,
+      "require_auth": false,
+      "default_ripple": true
+    },
+    "markets": [
+      {
+        "counter_currency": "XRP",
+        "count": 13,
+        "volume": "130",
+        "counter_volume": "65",
+        "native_volume": "65",
+        "last": "0.40000000",
+        "change": "-20.00",
+        "last_time": "2020-07-02T10:42:17Z",
+        "amm_pool": false
+      },
+      {
+        "counter_currency": "ZZZ",
+        "counter_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+        "count": 12,
+        "volume": "120",
+        "counter_volume": "240",
+        "native_volume": "60",
+        "last": "2.0000000",
+        "change": "0.00",
+        "last_time": "2020-07-02T04:11:00Z",
+        "amm_pool": false
+      },
+      {
+        "counter_currency": "EUR",
+        "counter_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+        "count": 10,
+        "volume": "50",
+        "counter_volume": "40",
+        "native_volume": "25",
+        "last": "0.80000000",
+        "change": "0.00",
+        "last_time": "2020-07-02T05:09:00Z",
+        "amm_pool": false
+      }
+    ],
+    "last_ledger": 107899990
+  }
+}
+```
+
+A token with a toml entry (`NPUSD` has a 40-hex currency and a `code`) and no pair in the day set:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "token": {
+    "currency": "4E50555344000000000000000000000000000000",
+    "code": "NPUSD",
+    "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
+    "holders": 40,
+    "trust_lines": 41,
+    "supply": "840",
+    "native_volume": "0",
+    "trades": 0,
+    "domain": "northpeak.example",
+    "toml_url": "https://northpeak.example/.well-known/xrp-ledger.toml",
+    "listed": true,
+    "toml": {
+      "name": "Northpeak Dollar",
+      "desc": "A US dollar stablecoin",
+      "display_decimals": 2,
+      "asset_class": "Fiat-backed stablecoin",
+      "attestation": "https://northpeak.example/attestations/2026-09.pdf"
+    },
+    "issuer_settings": {
+      "transfer_fee": "0.2",
+      "global_freeze": false,
+      "no_freeze": true,
+      "allow_trust_line_clawback": false,
+      "require_auth": true,
+      "default_ripple": false
+    },
+    "markets": [],
+    "last_ledger": 107899990
+  }
+}
+```
+
+An issuer with no row in the state tables has no `issuer_settings`, and a token that is not listed has no `toml`:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "token": {
+    "currency": "OLD",
+    "code": "OLD",
+    "issuer": "rrrrrrrrrrrrrrrrrrrY1d5fYNE",
+    "holders": 8,
+    "trust_lines": 9,
+    "supply": "40",
+    "native_volume": "0",
+    "trades": 0,
+    "listed": false,
+    "markets": [],
+    "last_ledger": 107899990
+  }
+}
+```
+
+Errors, in the order they are checked: 400 `invalid currency`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid issuer address`; 404 `token not found` (no line counts, an LP token
+(without a read), a token whose lines have not changed since the coverage starts, or no generation yet); 500 `unable to retrieve token`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{currency}.{issuer}/holders`
+
+The accounts that hold the token, the largest balance first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `currency.issuer` (path) | | The token, as above. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `<code or currency> <issuer> - holders.csv` (the same for every spelling of the token), the holders flattened, without `coverage`, `supply` and the counts. |
+
+The lines of the token with a balance above 0, ordered by balance descending, then by holder. The order is made on the balance as a double (a `Float64`), not on its exact text: two balances that are different
+texts and the same double (`9007199254740992` and `9007199254740993`) are tied and come in the order of their holders, and the marker is that double and the holder of the last row. `rank` is the holder's place among **all** the
+holders. `supply` is the token's, `limit` the holder's limit (exact text), `frozen` and `authorized` the issuer's freeze and authorization of the line, and `share` as above.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "supply": "840",
+  "count": 3,
+  "marker": "WzM4LjUsInJycnJycnJycnJycnJycnJycmNKWTJ2YU5uWCJd",
+  "holders": [
+    {
+      "rank": 1,
+      "holder": "rrrrrrrrrrrrrrrrrrcJYjXAZjD",
+      "balance": "40.5",
+      "share": "0.048214",
+      "limit": "1000000",
+      "frozen": false,
+      "authorized": false
+    },
+    {
+      "rank": 2,
+      "holder": "rrrrrrrrrrrrrrrrrrcJYdToyGA",
+      "balance": "39.5",
+      "share": "0.047024",
+      "limit": "1000000",
+      "frozen": false,
+      "authorized": false
+    },
+    {
+      "rank": 3,
+      "holder": "rrrrrrrrrrrrrrrrrrcJY2vaNnX",
+      "balance": "38.5",
+      "share": "0.045833",
+      "limit": "1000000",
+      "frozen": false,
+      "authorized": false
+    }
+  ]
+}
+```
+
+CSV (the `Link` header carries the next page as for every list):
+
+```text
+"rank","holder","balance","share","limit","frozen","authorized"
+"1","rrrrrrrrrrrrrrrrrrcJYjXAZjD","40.5","0.048214","1000000","false","false"
+"2","rrrrrrrrrrrrrrrrrrcJYdToyGA","39.5","0.047024","1000000","false","false"
+"3","rrrrrrrrrrrrrrrrrrcJY2vaNnX","38.5","0.045833","1000000","false","false"
+```
+
+Errors, in the order they are checked: 400 `invalid currency`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid issuer address`, `invalid marker`, all before any read; 404 `token not found`
+(as the detail); 500 `unable to retrieve holders`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{currency}.{issuer}/transfers`
+
+The payments that delivered the token, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `currency.issuer` (path) | | The token, as above. |
+| `start` | the beginning | |
+| `end` | the newest ledger | |
+| `descending` | false | |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `<code or currency> <issuer> - transfers.csv`, a column for each key of a transfer; a tag a transfer does not have is an empty cell. |
+
+These are the successful `Payment` transactions between two different accounts that delivered the currency of this issuer, read as
+[`/v2/payments/{currency}`](#get-v2paymentscurrency) reads them (the same window, `descending`, `limit` and marker, with their rules and messages), with the delivered amount: **a payment to oneself is
+not a transfer** (it is not a payment, [Payments](#payments); it is a [path payment](#path-payments)). `amount` is the amount the payment delivered, not the one it asked for. The issuer is the
+issuer of the delivered amount. A tag of `0` is a tag and is served.
+
+**No 404.** The list does not look the token up: a token nobody was paid in, one the aggregate does not know and an LP token list the transfers they have, and no transfers is `count: 0`
+(an empty file in CSV). The `coverage` is that of the payments of the ledgers (`token_transfers`), not of the state tables, so the two can differ for one token.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 11999941,
+    "complete": false
+  },
+  "count": 2,
+  "marker": "WzEwNzg3MzAyNCw1XQ",
+  "transfers": [
+    {
+      "hash": "2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3",
+      "ledger_index": 107872476,
+      "executed_time": "2026-10-24T13:45:51Z",
+      "source": "rajCZLPm7AnGJrQRwiuJHN1xZw5KLAvQTe",
+      "destination": "raJmzfum8TF4eR4cBkSiMAmKJHwAQKNZNT",
+      "amount": "0.2121364558499999"
+    },
+    {
+      "hash": "3EBBB8672ADA7B5EADBE3878740346DD60B667D4919E1084D2E140238F0D2044",
+      "ledger_index": 107873024,
+      "executed_time": "2026-10-24T14:21:42Z",
+      "source": "rfaF3eu2m192LkHKdxRfzd68oEC1paa57",
+      "destination": "rMPwy3Ntx56Nyc2fKGNm7VRWdmpHSB92Z7",
+      "amount": "0.002",
+      "source_tag": 804681468
+    }
+  ]
+}
+```
+
+A destination tag of 0 (`/v2/tokens/Sanctum.rNcqT1tds4vdroichNKuTh3Ppd8KAdFHnN/transfers`):
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 11999941,
+    "complete": false
+  },
+  "count": 1,
+  "transfers": [
+    {
+      "hash": "196DF224FABA0748314F72CBC788299024E5953465772E395AD3BA9A26A3335A",
+      "ledger_index": 107873045,
+      "executed_time": "2026-10-24T14:23:10Z",
+      "source": "rfLquFDGTFnvzb5C3Pf9BsgukRBa6DdtZe",
+      "destination": "rNcqT1tds4vdroichNKuTh3Ppd8KAdFHnN",
+      "amount": "0.0000000074",
+      "destination_tag": 0
+    }
+  ]
+}
+```
+
+CSV:
+
+```text
+"hash","ledger_index","executed_time","source","destination","amount","source_tag","destination_tag"
+"2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3","107872476","2026-10-24T13:45:51Z","rajCZLPm7AnGJrQRwiuJHN1xZw5KLAvQTe","raJmzfum8TF4eR4cBkSiMAmKJHwAQKNZNT","0.2121364558499999","",""
+"3EBBB8672ADA7B5EADBE3878740346DD60B667D4919E1084D2E140238F0D2044","107873024","2026-10-24T14:21:42Z","rfaF3eu2m192LkHKdxRfzd68oEC1paa57","rMPwy3Ntx56Nyc2fKGNm7VRWdmpHSB92Z7","0.002","804681468",""
+```
+
+Errors, in the order they are checked: 400 `invalid currency`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid issuer address`, then those of `/v2/payments`: `invalid start date format`,
+`invalid end date format`, `invalid marker`; 500 `unable to retrieve transfers`. A 400 comes before any read, and the coverage is read after the page.
+
+**Differences from data.ripple.com**: none, the endpoint is new. Its relation to `/v2/payments/{currency}`: the same payments from the same table, in the same order, window and paging, in a smaller row:
+the hash, the ledger and time, the two parties, the delivered amount and the tags, where `/v2/payments` serves the balance changes and the fee as well.
+
+---
+
+## MPT
+
+GateHub extras: the original knew no MPTokens (XLS-33). These routes serve the **MPT issuances** of the network: one issuance with its metadata, a lookup of several, the holders of an issuance by balance and its transfers, the issuances ranked by holders ([`GET /v2/tokens?kind=mpt`](#get-v2tokenskindmpt)) and the holdings of an account ([`GET /v2/accounts/{address}/mpt`](#get-v2accountsaddressmpt)). The issuances and their holders are aggregates that the syncer's `mpt_state` job keeps current from the state rows of the ledgers ([syncer](syncer.md)); the transfers are read from the ledgers. The design is in the [spec](superpowers/specs/2026-10-17-mpt-data-design.md).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these rules, whose shapes and key orders are ours and are pinned by tests:
+
+- **An MPT is its issuance ID**: 48 hex digits, in either case on a route and in upper case in an answer. It is `Sequence (4 bytes) | Issuer (20 bytes)`, so the ID names its issuer. A route that names an issuance checks the ID first: 400 `invalid mpt issuance id`. In every `(currency, issuer)` column and answer of the other routes an MPT is `currency` = the ID and `issuer` = the issuer the ID holds ([`/v2/payments`](#payments), [balance changes](#get-v2accountsaddressbalance_changes)), and such an asset is written `<48hex>` or `<48hex>+<issuer>`.
+- **Amounts are the ledger's integer units, never scaled**, as strings of digits beside the ID (an amount reaches 2^63 − 1, past what a JSON number holds). `asset_scale` says how to show them; the scale and the ticker of an ID are what [`GET /v2/mpt?ids=`](#get-v2mptids) is for. Counts are numbers.
+- **Flags are named booleans**, the bits of the ledger's `UInt32`; a new flag is a new key.
+- **`coverage`** is the key right after `result` on every answer that lists or describes an issuance, never in a CSV: `from_ledger_index` is where the rows of the parser that writes MPT data start, one above the newest stored ledger an older parser wrote, else the oldest stored ledger, and `complete` says that is at or below the ledger `MPTokensV1` was enabled in (99226369 on the XRP Ledger; on XRPL Testnet only an indexed `EnableAmendment` counts, so the sandbox answers `complete: false` unless it indexed that ledger). Until a reprocess reaches that ledger (`--reprocess` from 99226369, [backfill](backfill.md)) an issuance whose node has not changed since the deploy has no known state: `/v2/mpt/{issuanceId}` is a 404 and the list leaves it out, while its holders and transfers are still served.
+- **Xahau and Xahau Testnet have no MPT**, and no route reads an MPT table there: `/v2/mpt/{issuanceId}`, its holders and its transfers answer 404 `issuance not found`, `/v2/mpt?ids=` the bare IDs, and `kind=mpt` and `/v2/accounts/{address}/mpt` an empty list with `complete: true`.
+
+### `GET /v2/mpt/{issuanceId}`
+
+One issuance, as of the last run of the job.
+
+<!-- mpt-example GET /v2/mpt/0000012A000000000000000000000000000000000000A001 -->
+
+```json
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "issuance": {
+    "mpt_issuance_id": "0000012A000000000000000000000000000000000000A001",
+    "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+    "sequence": 298,
+    "ticker": "HTF",
+    "name": "Harborline Treasury Fund",
+    "asset_scale": 2,
+    "maximum_amount": "5000000000",
+    "outstanding_amount": "1820451120",
+    "escrowed_amount": "84411120",
+    "locked_amount": "124000000",
+    "locked_holders": 1,
+    "holders": 3,
+    "transfer_fee": 100,
+    "flags": {
+      "locked": false,
+      "can_lock": true,
+      "require_auth": true,
+      "can_escrow": false,
+      "can_trade": true,
+      "can_transfer": true,
+      "can_clawback": true
+    },
+    "metadata": {
+      "ticker": "HTF",
+      "name": "Harborline Treasury Fund",
+      "desc": "A tokenized treasury fund.",
+      "icon": "harborline.example/htf/icon.png",
+      "asset_class": "rwa",
+      "asset_subclass": "treasury",
+      "issuer_name": "Harborline Capital",
+      "uris": [{"uri": "harborline.example/htf", "category": "website", "title": "Fund page"}]
+    },
+    "metadata_hex": "7B227469636B6572223A22485446222C226E616D65223A22486172626F726C696E652054726561737572792046756E64222C2264657363223A224120746F6B656E697A65642074726561737572792066756E642E222C2269636F6E223A22686172626F726C696E652E6578616D706C652F6874662F69636F6E2E706E67222C2261737365745F636C617373223A22727761222C2261737365745F737562636C617373223A227472656173757279222C226973737565725F6E616D65223A22486172626F726C696E65204361706974616C222C2275726973223A5B7B22757269223A22686172626F726C696E652E6578616D706C652F687466222C2263617465676F7279223A2277656273697465222C227469746C65223A2246756E642070616765227D5D7D",
+    "metadata_conforms": true,
+    "created_ledger": 99412004,
+    "created_time": "2025-10-09T11:20:31Z",
+    "created_tx_hash": "0000000000000000000000000000000000000000000000000000000005ECE824",
+    "last_ledger": 107795512,
+    "destroyed": false
+  }
+}
+```
+
+Keys of the issuance answer, in order: `result, coverage, issuance`.
+
+Keys of an issuance, in order: `mpt_issuance_id, issuer, sequence, ticker?, name?, asset_scale, maximum_amount?, outstanding_amount, escrowed_amount, locked_amount, locked_holders, holders, transfer_fee, flags, metadata?, metadata_hex?, metadata_conforms?, created_ledger?, created_time?, created_tx_hash?, last_ledger, destroyed`.
+
+Keys of flags, in order: `locked, can_lock, require_auth, can_escrow, can_trade, can_transfer, can_clawback`.
+
+Keys of metadata, in order: `ticker?, name?, desc?, icon?, asset_class?, asset_subclass?, issuer_name?, uris?, additional_info?`.
+
+Keys of an item of uris, in order: `uri, category?, title?`.
+
+`ticker` and `name` come from the metadata, cut to 16 and 128 characters, and are left out when there are none. `maximum_amount` is left out when the issuance sets none (the ledger's limit is 2^63 − 1). `escrowed_amount` is the node's `LockedAmount`. `locked_amount` and `locked_holders` count what cannot move: everything when the issuance is locked, else the holders locked on their own, and in either case only balances above 0. `metadata` is the decoded object, read leniently because an issuer may write what it likes: the long and the short keys of XLS-89 and an early draft's `urls` all read as these keys, and a field of the wrong type or an unknown key is dropped. It is left out when the hex is not at most 1024 bytes of UTF-8 holding a JSON object, while `metadata_hex` is served whenever the issuance has metadata, and `metadata_conforms` says whether every rule of XLS-89 holds of the decoded object. The `created_*` keys are there when the creation is in the coverage. A destroyed issuance is served, with `destroyed: true`. No CSV.
+
+Errors, in the order they are checked: 400 `invalid mpt issuance id`; 404 `issuance not found` (there is none, its state is outside the coverage or newer than the last run of the job, or the network has no MPT); 500 `unable to retrieve issuance`.
+
+### `GET /v2/mpt?ids=`
+
+A summary of each of 1 to 100 issuances, `ids` being a comma list, in the order asked, duplicates too. An ID with no row or with no known state is the ID alone, and so is every ID on a network without MPT. It has no `coverage` (it lists nothing), no paging and no CSV.
+
+<!-- mpt-example GET /v2/mpt?ids=0000012A000000000000000000000000000000000000A001,00000130000000000000000000000000000000000000A001 -->
+
+```json
+{
+  "result": "success",
+  "count": 2,
+  "issuances": [
+    {
+      "mpt_issuance_id": "0000012A000000000000000000000000000000000000A001",
+      "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "ticker": "HTF",
+      "name": "Harborline Treasury Fund",
+      "asset_scale": 2,
+      "maximum_amount": "5000000000",
+      "outstanding_amount": "1820451120",
+      "holders": 3,
+      "transfer_fee": 100,
+      "flags": {
+        "locked": false,
+        "can_lock": true,
+        "require_auth": true,
+        "can_escrow": false,
+        "can_trade": true,
+        "can_transfer": true,
+        "can_clawback": true
+      },
+      "destroyed": false
+    },
+    {"mpt_issuance_id": "00000130000000000000000000000000000000000000A001"}
+  ]
+}
+```
+
+Keys of the lookup answer, in order: `result, count, issuances`.
+
+Keys of an issuance summary, in order: `mpt_issuance_id, issuer, ticker?, name?, asset_scale, maximum_amount?, outstanding_amount, holders, transfer_fee, flags, destroyed`.
+
+Errors, in the order they are checked: 400 `ids is required`, `too many ids` (more than 100, whatever they are), `invalid mpt issuance id` (an empty element too); 500 `unable to retrieve issuances`.
+
+### `GET /v2/mpt/{issuanceId}/holders`
+
+The balances of an issuance, as of the last run of the job, the largest first. A balance is `amount + escrowed_amount`: what the holder can move, and what it has in escrow. Equal balances go by the holder's address.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `include_zero` | false | Boolean: also the holders with nothing (an authorized, empty balance). |
+| `limit`, `marker` | 200 (max 1000) | The marker holds the balance and the holder of the last row. |
+| `format` | json | `csv`: file `<issuanceId> - holders.csv`, its columns the keys of a holder, without `coverage`. |
+
+<!-- mpt-example GET /v2/mpt/0000012A000000000000000000000000000000000000A001/holders?limit=1 -->
+
+```json
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "count": 1,
+  "marker": "WyIxMDg0NDExMTIwIiwicnJycnJycnJycnJycnJycnJycnBXZWpCY2V3SyJd",
+  "holders": [
+    {
+      "holder": "rrrrrrrrrrrrrrrrrrrpWejBcewK",
+      "amount": "1000000000",
+      "escrowed_amount": "84411120",
+      "locked": false,
+      "authorized": true
+    }
+  ]
+}
+```
+
+Keys of the holders answer, in order: `result, coverage, count, marker?, holders`.
+
+Keys of a holder, in order: `holder, amount, escrowed_amount, locked, authorized`.
+
+`locked` is true when the balance cannot move: the holder's own `lsfMPTLocked`, or the issuance's. `authorized` is the holder's `lsfMPTAuthorized`, which means something when the issuance requires it. A holder whose token is deleted (it opted out) is not listed. The holders of an issuance whose state is not known are served all the same, with `locked` from their own flag alone, as the explorer shows the node beside them.
+
+Errors, in the order they are checked: 400 `invalid mpt issuance id`, `invalid marker`; 404 `issuance not found` (it has no row, or the network has no MPT); 500 `unable to retrieve holders`.
+
+### `GET /v2/mpt/{issuanceId}/transfers`
+
+What the successful transactions moved, clawed back, locked or unlocked of an issuance, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `kind` | all | A comma list of `payment`, `clawback`, `lock`, `unlock`, `escrow_create`, `escrow_finish`, `escrow_cancel`. A mint is a `payment` from the issuer and a redemption a `payment` to it, as on the ledger. |
+| `account` | all | Only the rows with this account as source or destination (not validated, as the AMM lists' `account`). |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | The marker holds `ledger_index, tx_index`. |
+| `format` | json | `csv`: file `<issuanceId> - transfers.csv`, its columns the keys of a transfer, an empty cell for what a row has not, without `coverage`. |
+
+<!-- mpt-example GET /v2/mpt/0000012A000000000000000000000000000000000000A001/transfers?kind=payment&limit=2 -->
+
+```json
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "count": 2,
+  "marker": "WzEwNzAwMDAwMiwxXQ",
+  "transfers": [
+    {
+      "ledger_index": 107000001,
+      "tx_index": 3,
+      "tx_hash": "00000000000000000000000000000000000000000000000000000018E9B271EB",
+      "executed_time": "2026-09-01T00:00:00Z",
+      "tx_type": "Payment",
+      "kind": "payment",
+      "source": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "destination": "rrrrrrrrrrrrrrrrrrrpWe7f1TnJ",
+      "amount": "1000000000"
+    },
+    {
+      "ledger_index": 107000002,
+      "tx_index": 1,
+      "tx_hash": "00000000000000000000000000000000000000000000000000000018E9B275D1",
+      "executed_time": "2026-09-02T00:00:00Z",
+      "tx_type": "Payment",
+      "kind": "payment",
+      "source": "rrrrrrrrrrrrrrrrrrrpWeX6wxTJ",
+      "destination": "rrrrrrrrrrrrrrrrrrrpWejBcewK",
+      "amount": "2500000",
+      "fee": "2500"
+    }
+  ]
+}
+```
+
+Keys of the transfers answer, in order: `result, coverage, count, marker?, transfers`.
+
+Keys of a transfer, in order: `ledger_index, tx_index, tx_hash, executed_time, tx_type, kind, source?, destination?, amount, fee?`.
+
+`source` and `destination` are left out when there is none (a lock of every balance has no destination); `fee`, the transfer fee burned, only above 0. A lock's `amount` is the holder's balance after it, or the issuance's outstanding amount. The transfers of an issuance whose state is not known are served all the same.
+
+Errors, in the order they are checked: 400 `invalid mpt issuance id`, `invalid start date format`, `invalid end date format`, `invalid kind - use: payment, clawback, lock, unlock, escrow_create, escrow_finish, escrow_cancel`, `invalid marker`; 404 `issuance not found` (it has no row, or the network has no MPT); 500 `unable to retrieve transfers`.
+
+Both lists can be exported ([`POST /v2/exports`](#exports)), as every list with a CSV form can.
+
+### `GET /v2/tokens?kind=mpt`
+
+The route, the parameters, the envelope and the order of [`GET /v2/tokens`](#get-v2tokens), for the MPT issuances: those whose state is known and that are not destroyed, the most held first, then by issuer, then by ID. `rank` is the place of an issuance in that order among those the filters select. `ledger_index` and `close_time` are the newest committed ledger when the list is read; the aggregates trail it by at most a run of the job.
+
+**Search.** `q` a classic address: the issuances of that issuer. 48 hex digits, in any case: that issuance. Anything else matches an issuance when its `ticker` or `name` contains `q` (case-insensitive), its issuer starts with `q`, or, for 8 hex digits or more, its ID starts with `q`.
+
+**Counts.** `total` is the number of issuances the filters select, on all pages; `total_below`, when `min_holders` is above 0, the number that match `q` but have fewer holders. `totals` describe the whole kind, **whatever the filters**: `issuances` (known and live, whatever their holders), `holders` (the distinct accounts with a positive balance of at least one of them) and `transfers_24h` (every MPT payment of the day before the head, of any issuance).
+
+**The day.** `transfers_24h` of a row counts the `payment` transfers of its issuance, each once, in the ledgers that closed in the 24 hours before the newest committed ledger closed: `(close_time - 86400, close_time]`. A lock or an escrow is not a payment; a mint and a redemption are.
+
+**Nothing to list.** With no issuance, and on a network without MPT, the answer is the whole envelope at the newest committed ledger, `total: 0`, zero `totals` and no rows. With no committed ledger it is `{ "result": "success", "coverage": …, "kind": "mpt", "count": 0, "tokens": [] }`.
+
+<!-- mpt-example GET /v2/tokens?kind=mpt&limit=2 -->
+
+```json
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "kind": "mpt",
+  "ledger_index": 107795512,
+  "close_time": "2026-10-24T14:20:01Z",
+  "totals": {"issuances": 4, "holders": 9, "transfers_24h": 3},
+  "total": 4,
+  "count": 2,
+  "marker": "WyJtcHQiLDMsInJycnJycnJycnJycnJycnJycnJwNGdKemQ0ZjIiLCIwMDAwMDEyQTAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMEEwMDEiXQ",
+  "tokens": [
+    {
+      "rank": 1,
+      "mpt_issuance_id": "0000012B000000000000000000000000000000000000A001",
+      "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "asset_scale": 0,
+      "outstanding_amount": "18014398509482023",
+      "holders": 6,
+      "transfer_fee": 0,
+      "flags": {
+        "locked": false,
+        "can_lock": false,
+        "require_auth": false,
+        "can_escrow": false,
+        "can_trade": false,
+        "can_transfer": false,
+        "can_clawback": false
+      },
+      "transfers_24h": 1
+    },
+    {
+      "rank": 2,
+      "mpt_issuance_id": "0000012A000000000000000000000000000000000000A001",
+      "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "ticker": "HTF",
+      "name": "Harborline Treasury Fund",
+      "asset_scale": 2,
+      "maximum_amount": "5000000000",
+      "outstanding_amount": "1820451120",
+      "holders": 3,
+      "transfer_fee": 100,
+      "flags": {
+        "locked": false,
+        "can_lock": true,
+        "require_auth": true,
+        "can_escrow": false,
+        "can_trade": true,
+        "can_transfer": true,
+        "can_clawback": true
+      },
+      "transfers_24h": 2
+    }
+  ]
+}
+```
+
+Keys of an MPT row, in order: `rank, mpt_issuance_id, issuer, ticker?, name?, asset_scale, maximum_amount?, outstanding_amount, holders, transfer_fee, flags, transfers_24h`.
+
+Keys of the MPT totals, in order: `issuances, holders, transfers_24h`.
+
+`format=csv` is `tokens.csv`, the rows alone, with the same columns on every page: the keys of a row, `flags` as `flags.locked` and so on, and an empty cell where a row has no value. `ticker` and `name` are what an issuer wrote, so in a CSV each has a leading `'` when it starts with `=`, `+`, `-`, `@`, a tab or a CR, and `'` for each `"`; the JSON answers serve them as written.
+
+Errors, in the order they are checked: D6's, 400 `invalid kind - use: issued, mpt`, `invalid min_holders`, `invalid search`, `invalid marker` (a marker of `issued` too); 500 `unable to retrieve tokens`. A 400 comes before any read.
+
+### `GET /v2/accounts/{address}/mpt`
+
+The MPTs an account holds, at the newest committed ledger, by issuance ID. The balances are read from the ledgers, so they are as of `ledger_index` and not of the last run of the job.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `include_zero` | false | Boolean: also a balance of nothing. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | The ID of the last row of the page before. |
+| `format` | json | `csv`: file `<address> - mpt.csv`, its columns the keys of a holding, an empty cell for what a row has not, without `coverage`; `ticker` and `name` as in [the CSV of `kind=mpt`](#get-v2tokenskindmpt). |
+
+<!-- mpt-example GET /v2/accounts/rrrrrrrrrrrrrrrrrrrpWe7f1TnJ/mpt?limit=1 -->
+
+```json
+{
+  "result": "success",
+  "coverage": {"from_ledger_index": 99226369, "complete": true},
+  "ledger_index": 107795512,
+  "close_time": "2026-10-24T14:20:01Z",
+  "count": 1,
+  "marker": "0000012A000000000000000000000000000000000000A001",
+  "mpt": [
+    {
+      "mpt_issuance_id": "0000012A000000000000000000000000000000000000A001",
+      "issuer": "rrrrrrrrrrrrrrrrrrrp4gJzd4f2",
+      "ticker": "HTF",
+      "name": "Harborline Treasury Fund",
+      "asset_scale": 2,
+      "amount": "612040000",
+      "escrowed_amount": "0",
+      "locked": false,
+      "authorized": true
+    }
+  ]
+}
+```
+
+Keys of the MPT holdings answer, in order: `result, coverage, ledger_index?, close_time?, count, marker?, mpt`.
+
+Keys of a holding, in order: `mpt_issuance_id, issuer, ticker?, name?, asset_scale?, amount, escrowed_amount, locked, authorized`.
+
+`issuer` comes from the ID. `ticker`, `name` and `asset_scale` come from the issuance when its state is known. `locked` and `authorized` are as on [the holders](#get-v2mptissuanceidholders). A token the account deleted (it opted out) is not listed, `include_zero` or not. With no committed ledger there is no `ledger_index` to name, and the list is empty; on a network without MPT it is empty and `complete: true`. The list can be exported, as every list with a CSV form can.
+
+Errors, in the order they are checked: 400 `invalid ripple address`, `invalid marker`; 500 `unable to retrieve mpt holdings`.
+
+---
+
 ## Validations
 
 ### `GET /v2/ledgers/{ledger_hash}/validations` and `GET /v2/ledger/{ledger_hash}/validations`
@@ -2169,7 +5714,8 @@ one written here and is pinned by tests.
 
 - The syncer's `validations` collector writes the validations, the manifests (the signing key of every validator, its domain) and when each validator
   was first and last seen.
-- The syncer's `validators` worker fetches the validator lists of the publishers (`GH_UNL_PUBLISHERS`), checks the domains of the validators,
+- The syncer's `validators` worker fetches the validator lists of the publishers (`GH_UNL_PUBLISHERS`), stores the fixed list
+  (`GH_UNL_VALIDATORS`, the trusted set of Xahau Testnet, which has no publisher) as the list of the publisher `local`, checks the domains of the validators,
   polls the ledger state of the node (the enabled amendments and their majorities, the negative UNL, the fees) every minute, and computes the voting
   rounds (what each validator voted at each voting ledger, 256 ledgers apart) and the agreement of each validator per UTC hour.
 - A **validator directory** is built from those tables, one build at a time per replica, and kept for up to 10 seconds (counted from the start of the
@@ -2232,8 +5778,8 @@ Keys of a publisher, in order: `id, url, public_key, status, sequence, version, 
 | --- | --- |
 | `ledger_index`, `close_time` | The newest committed ledger of the index. Without one, the ledger of the newest ledger state and no `close_time`; without either, both are absent. |
 | `validators` | `seen_24h`: validators seen in the last 24 hours (a signing key counts for its master); `unl_seen_24h`: of those on the trusted UNL; `others_seen_24h`: the rest; `all`: the trusted UNL together with those seen in 24 hours. |
-| `unl` | `trusted`: validators named by at least `threshold` of the lists in use; `threshold`: how many lists must name one (absent while no publisher is known); `publishers`: one entry per configured publisher, by `id`. |
-| publisher | `id` is the URL without scheme (`vl.ripple.com`); `public_key` the key it is configured with (66 hex digits); `status`: `ok` (a current list), `expired` (only an expired list, which is still used: a flagged old UNL is better than none) or `unavailable` (no list in use: none was ever fetched, or all the stored ones were served under a key the publisher no longer uses). With a list: its `sequence`, `version` (1 or 2), `expiration`, when it was `fetched`, the number of `validators` on it and how many of them were seen in 24 hours (`seen_24h`). `last_error` (the reason code) and `last_error_at` are there when the newest attempt to fetch the list failed, whatever the status. |
+| `unl` | `trusted`: validators named by at least `threshold` of the lists in use; `threshold`: how many lists must name one (absent while no publisher is known); `publishers`: one entry per configured publisher, and `local` when the fixed list is not empty, by `id`. |
+| publisher | `id` is the URL without scheme (`vl.ripple.com`); `public_key` the key it is configured with (66 hex digits); `status`: `ok` (a current list), `expired` (only an expired list, which is still used: a flagged old UNL is better than none) or `unavailable` (no list in use: none was ever fetched, or all the stored ones were served under a key the publisher no longer uses). With a list: its `sequence`, `version` (1 or 2), `expiration`, when it was `fetched`, the number of `validators` on it and how many of them were seen in 24 hours (`seen_24h`). `last_error` (the reason code) and `last_error_at` are there when the newest attempt to fetch the list failed, whatever the status. `local` is the fixed list of `GH_UNL_VALIDATORS`: its `url` and `public_key` are empty text, it has no `expiration` (a fixed list does not expire) and no `last_error` (nothing fetches it), and its `version` is 1. |
 | `quorum` | `value`: the validations a ledger needs, derived with rippled's rule over the trusted UNL and the negative UNL, max(⌈0.8 × (`unl_size` − `negative_unl`)⌉, ⌈0.6 × `unl_size`⌉); `unl_size`: the trusted validators; `negative_unl`: how many of them are on the negative UNL. `node` is the quorum the node reports, only when it reports one above 0 (public nodes report 0). With no trusted validator `value` is 0. |
 | `negative_unl` | The validators disabled now, `{validation_public_key, first_ledger}`; an empty list when none. `negative_unl_pending` is there only when a validator is about to be disabled or re-enabled: `{to_disable?, to_reenable?}`. |
 | `fees` | `base_fee`, `reserve_base`, `reserve_inc` in whole units: those the node reported in the newest ledger state, else those in force at the newest voting round. |
@@ -2244,6 +5790,19 @@ Keys of a publisher, in order: `id, url, public_key, status, sequence, version, 
 | `agreement_through` | The end of the newest final hour of agreement. |
 | `votes_through_ledger` | The newest voting ledger whose votes are computed. |
 | `updated` | When the directory this answer comes from was built. |
+
+On Xahau Testnet, which has no publisher and trusts a fixed list of four validators, the `unl` of the summary is:
+
+```json
+"unl": {
+  "trusted": 4,
+  "threshold": 1,
+  "publishers": [
+    { "id": "local", "url": "", "public_key": "", "status": "ok", "sequence": 1, "version": 1,
+      "fetched": "2026-11-02T10:00:00.000Z", "validators": 4, "seen_24h": 4 }
+  ]
+}
+```
 
 An empty database answers 200 with `result`, `validators` (all 0), `unl` (`trusted` 0, no `publishers`), `quorum` (all 0), `negative_unl` (empty),
 `versions` (empty), `versions_unknown` (both 0) and `updated`.
@@ -2264,11 +5823,12 @@ board.
 | `publisher` | | The `id` of a publisher of the [summary](#get-v2networkvalidatorssummary): only the validators on its list in use. Any other value answers 400 `invalid publisher`. |
 | `amendment` | | The name or the ID (64 hex digits, either case) of an amendment: only the validators whose vote record names it. A name is matched as `GET /v2/network/amendments/{name}` matches it; a name no amendment has, and text that is neither a name nor an ID, answers 400 `invalid amendment`. An ID nobody voted for lists no validator. |
 | `q` | | A part of the `domain`, the `validation_public_key` or the `signing_key`, in any case. More than 100 characters answers 400 `invalid search`. |
+| `country` | | An ISO 3166-1 alpha-2 code, any case (`uk` is `GB`): only the validators whose `toml.server_country` is it. `unknown`, any case: only those without one. Anything else: 400 `invalid country`. |
 | `limit` | 200 (max 1000) | The size of a page. Smaller than 1 or not a number is the default. |
 | `marker` | | From the previous page. Anything that is not a marker of this list answers 400 `invalid marker`. |
 | `format` | `json` | `csv`: the rows as a CSV file named `validators.csv`, the nested objects flattened (`agreement_24h.score`, `unl_lists[0]`, `amendment_votes.yes[0].id`), one column for each key any row has, in the order they first appear. |
 
-The parameters are checked in this order: `scope`, `publisher`, `amendment`, `q`, `marker`. An empty parameter is a missing one, a repeated one counts once (the
+The parameters are checked in this order: `scope`, `publisher`, `amendment`, `q`, `country`, `marker`. An empty parameter is a missing one, a repeated one counts once (the
 first), and parameters that are not listed are ignored. The filters and the scope apply together.
 
 **Order.** The validators with a domain come first, by domain in lower case, then by master key; then the others, by master key. A `marker` is the place of
@@ -2357,7 +5917,9 @@ Link: <https://xrpl.data.example.com/v2/network/validators?limit=2&marker=WzAsIn
 
 Keys of the validators answer, in order: `result, count, marker, validators`.
 
-Keys of a validator row, in order: `validation_public_key, domain, current_index, agreement_1h, agreement_24h, partial, unl, agreement_30d, signing_key, domain_verification, unl_lists, negative_unl, version, version_build, version_latest, server_version, fee_vote, amendment_votes, first_seen, last_seen`.
+Keys of a validator row, in order: `validation_public_key, domain, current_index, agreement_1h, agreement_24h, partial, unl, agreement_30d, signing_key, domain_verification, unl_lists, negative_unl, version, version_build, version_latest, server_version, fee_vote, amendment_votes, first_seen, last_seen, toml`.
+
+Keys of toml on a validator row, in order: `owner_country, server_country, network, unl`.
 
 Keys of an agreement window, in order: `missed, total, score, incomplete, partial`.
 
@@ -2379,11 +5941,12 @@ Keys of a yes entry, in order: `id, name`.
 | `unl` | The validator is on the trusted UNL: named by at least `threshold` of the lists in use. |
 | `signing_key` | The signing key of the newest manifest. Absent without a manifest. |
 | `domain_verification` | Absent when the row has no `domain`. `status` is `verified`, `unverified` or `pending` (not checked yet). `reason` (the code) is there for `unverified` only, and `status_code` for its `http_status`. `toml_url` is the address the file is checked at (`/.well-known/xrp-ledger.toml`, on Xahau `/.well-known/xahau.toml`). `checked` is when the domain was last checked (absent while `pending`) and `verified` the last time it verified. `accounts` comes last, only for `verified`: the addresses of the `[[ACCOUNTS]]` of the file that verified, absent when it lists none. |
-| `unl_lists` | The ids of the publishers whose list in use names the validator, sorted. Empty off the UNL. `negative_unl` is true while it is on the negative UNL. |
+| `unl_lists` | The ids of the publishers whose list in use names the validator, sorted; `local` is the fixed list of `GH_UNL_VALIDATORS`. Empty off the UNL. `negative_unl` is true while it is on the negative UNL. |
 | `version`, `version_build`, `version_latest`, `server_version` | The software version in the newest `sfServerVersion` of the last 30 days (only a validation of a voting ledger carries one): `version` as the summary writes it (`3.4.1`, `-rcN`, `-bN`; on Xahau the year counts from 2023), `version_build` the build number after it (Xahau, when not 0), `version_latest` whether it is at least `latest_version` of the summary, `server_version` the number as reported, decimal text. All absent for a validator that reported none; an unrecognised number has `server_version` only. |
 | `fee_vote` | The fees the validator votes for, in whole units, in its vote record: the newest full vote within 24 hours before the newest stored voting round, whether the validator is trusted or not. A fee the validation left out is the fee in force at that round. `ledger_index` is that round's voting ledger. Absent without a record. |
 | `amendment_votes` | The amendments the record votes yes for, in the order of the record: `{id, name}`, `name` when the amendments know one. Absent without a record. |
 | `first_seen`, `last_seen` | When this deployment first and last saw the validator (a signing key's sightings are its master's). Absent for a member of a list that was never seen. |
+| `toml` | What the `[[VALIDATORS]]` entry that lists the master key says, in the file that verified the domain: `owner_country` and `server_country` (upper-case ISO 3166-1 alpha-2 codes or `XK`; `uk` in a file is `GB`), `network` (as the file says it, lower case: `main`, `testnet`, `21337`) and `unl` (an https URL). These are the file's claims: nothing checks them and nothing fetches the URL, and a `network` naming another network is shown as it is. Present when the domain is `verified` and was read by this release's checker; absent otherwise (no domain, `pending`, `unverified`, or verified before and not read again yet: at most about an hour after the deploy while the site answers; while it keeps failing transiently, until it recovers or the 24 h grace ends). `{}` when the entry gives none of the four. A key is absent when the file gives no valid value. In the CSV the columns are `toml.owner_country`, `toml.server_country`, `toml.network` and `toml.unl`, and a row whose `toml` is `{}` writes `[Object]` in a column `toml`. |
 
 A member of the UNL that was never seen is a row too, with what its lists and its manifest give:
 
@@ -2403,7 +5966,7 @@ A member of the UNL that was never seen is a row too, with what its lists and it
 The list is built on the assembly of the amendments (it names the amendments, and holds the directory it was built on), so an answer can be up to about 20
 seconds old; `Cache-Control: private, max-age=30`.
 
-Errors: 400 `invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid marker`; 500 `unable to retrieve validator(s)`.
+Errors: 400 `invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid country`, `invalid marker`; 500 `unable to retrieve validator(s)`.
 
 **Differences from data.ripple.com**:
 
@@ -2413,15 +5976,59 @@ Errors: 400 `invalid scope`, `invalid publisher`, `invalid amendment`, `invalid 
 | No paging | `limit` (200, max 1000), `marker`, `Link` |
 | Sorted by chain, UNL first, 24 h score, domain, key | Domain-first alphabetical, then key (the board's order) |
 | Row `{validation_public_key, domain, chain, current_index, agreement_1h, agreement_24h, partial, unl}` | The same keys in the same order, without `chain` (one network per deployment), then the new ones; agreement objects keep `{missed, total, score, incomplete}` and add `partial`; `agreement_30d` added |
-| `unl` = on Ripple's main or altnet list | `unl` = on the trusted UNL of the configured publishers; `unl_lists` names them |
+| `unl` = on Ripple's main or altnet list | `unl` = on the trusted UNL of the configured publishers (and of the fixed list `local`, `GH_UNL_VALIDATORS`); `unl_lists` names them |
 | `domain` from its own domain check | `domain` from the validator's manifest, `domain_verification` says whether the TOML confirms it |
 | Agreement against the ledgers its chain logic saw | Against the indexed validated chain, full validations only, unobserved ledgers left out |
 | Messages `Validator not found`, `unable to retrieve validator(s)`; CSV `validators.csv` | Kept; new 400s for the new parameters |
 | `/manifests`, `/reports`, `/validator_reports`, `/rippled_versions` | Still 404 |
+| No countries, no `toml`, no `country` filter | `toml` on the rows, `country` on the list, and `/v2/network/validators/countries` |
+
+### `GET /v2/network/validators/countries`
+
+The validators of a scope per server country: how many name each country as the `server_country` of their verified toml, and how many of them are on the trusted UNL. The original had no such route.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `scope` | `unl` | As the list's: `unl`, the trusted UNL; `all`, the trusted UNL and every validator seen in the last 24 hours. Anything else: 400 `invalid scope`. |
+
+Other parameters are ignored. JSON only: `format=csv` changes nothing.
+
+```json
+{
+  "result": "success",
+  "scope": "all",
+  "validators": 142,
+  "unl": 35,
+  "located": 125,
+  "unknown": {"validators": 17, "unl": 1},
+  "count": 22,
+  "countries": [
+    {"country": "US", "validators": 27, "unl": 6},
+    {"country": "DE", "validators": 16, "unl": 5},
+    {"country": "NL", "validators": 10, "unl": 3}
+  ],
+  "updated": "2026-10-24T15:42:53.002Z"
+}
+```
+
+(Three of the 22 countries shown.)
+
+- `validators`: the scope's validators, the rows of the list with the same `scope` and no filter. `unl`: of them on the trusted UNL.
+- `located`: of them with a `toml.server_country`. `unknown`: the others (no domain, a domain not verified or not read yet, no valid `server_country`), with how many of them are on the UNL. `located + unknown.validators = validators`.
+- `countries`: one entry per code with at least one validator, `validators` descending, then `unl` descending, then `country`. `count` is its length. Every count is what the list gives with the same `scope` and `country`.
+- `updated`: when the directory was built, the summary's `updated`.
+
+Keys of the countries answer, in order: `result, scope, validators, unl, located, unknown, count, countries, updated`.
+
+Keys of a country, in order: `country, validators, unl`.
+
+Keys of unknown, in order: `validators, unl`.
+
+`Cache-Control: private, max-age=30`, while `GH_CACHE_CONTROL` is not empty. Errors: 400 `invalid scope`; 500 `unable to retrieve validator(s)`.
 
 ### `GET /v2/network/validators/{key}`
 
-One validator: the object of the list, with its vote on every amendment still being decided, its manifest and its agreement of each of the last 30 days. JSON only:
+One validator: the object of the list, with its vote on every amendment still being decided, the facts of its domain's toml, its manifest and its agreement of each of the last 30 days. JSON only:
 `format` and the parameters of the list are ignored.
 
 `key` is a master key (`nH...`) or a signing key (`n9...`), base58, or 66 hex digits starting `02`, `03` or `ED`, in either case (as the validator lists and the negative UNL
@@ -2487,11 +6094,16 @@ Keys of the validator answer after the row, in order: `manifest, daily_agreement
 
 Keys of manifest, in order: `sequence, signing_key, signing_keys_seen, domain`.
 
+Keys of toml on the validator answer, in order: `owner_country, server_country, network, unl, principals, modified, accounts_listed, currencies, currencies_listed, fetched`.
+
+Keys of a toml currency, in order: `code, issuer`.
+
 Keys of a daily agreement, in order: `date, missed, total, score, incomplete, partial`.
 
 | Key | Meaning |
 | --- | --- |
 | `amendment_votes` | Always there. `yes` is the list's (the amendments the record votes yes for, enabled ones included). `votes` has one entry for each amendment whose status is `voting`, `majority` or `unknown`, in the order of `GET /v2/network/amendments`: `{id, name, status, vote}`, `vote` being `yes` or `no` as the record says. An `unknown` amendment (an ID the node lists without a name and nobody voted for) is in it too, without a `name`. A validator without a record has `vote` `none` for all of them, an empty `yes` and no `ledger_index`. |
+| `toml` | The row's `toml`, followed by what the [toml store](#get-v2tomldomain) holds of the validator's domain, when the row has `toml` and that content is in effect (it stays through a transient failure and goes after a definite one): `principals` (the names, at most 10, in file order; absent when none), `modified` (`YYYY-MM-DDTHH:mm:ssZ`, the file's `[METADATA].modified`; absent when none), `accounts_listed` (the distinct `[[ACCOUNTS]]` addresses, whatever their network; absent when 0), `currencies` (the `[[CURRENCIES]]` entries that count on this network, the first 10, `issuer` absent when the entry names none; absent when none), `currencies_listed` (their whole number; absent when 0) and `fetched` (`YYYY-MM-DDTHH:mm:ss.SSSZ`, when that content was read). The store's row is read by key and kept 60 s, so these facts can be a check newer or older than the row's: they are the domain's, not the validator's. A read of the store that fails answers 500. A name is the domain's own publication, served as the toml says it; emails are never read. |
 | `manifest` | The newest manifest: its `sequence`, the `signing_key` it names, `signing_keys_seen`, the distinct signing keys stored for the master key (one less than that is how often the key was rotated), and its `domain` (absent as `domain` of the row is). Absent without a manifest. |
 | `daily_agreement` | The 30 UTC days ending with the day of the newest final hour of agreement, the oldest first: `{date, missed, total, score, incomplete, partial}` as an agreement window, with `date` as `YYYY-MM-DD`. A day whose 24 hours are not all final is `incomplete`; one with no data has `total` 0 and no `score`. An empty list while no hour of agreement is final. |
 | `result` | `success`, last. |
@@ -2753,7 +6365,7 @@ only when they have a value, and `ledger_index`, `round` and `next_flag_ledger` 
 | Key | Meaning |
 | --- | --- |
 | `ledger_index` | The newest committed ledger of the index: the summary's. |
-| `rules` | The rules of the network: `threshold_percent` (80: an amendment needs more than that share of the trusted validators), `majority_hold_seconds` (how long it must hold its majority before it is enabled: 1,209,600 on XRPL, 432,000 on Xahau) and `flag_interval` (256). |
+| `rules` | The rules of the network: `threshold_percent` (80: an amendment needs more than that share of the trusted validators), `majority_hold_seconds` (how long it must hold its majority before it is enabled: 1,209,600 on XRPL, 432,000 on Xahau, 1,800 on XRPL Testnet, inferred from seven amendments that the testnet enabled three flag ledgers after they gained a majority, and 432,000 on Xahau Testnet, the node software's default) and `flag_interval` (256). |
 | `round` | The newest voting round stored: its voting `ledger_index`, `date` (its close time), `unl_size` (the validators on the UNL), `trusted` (the ones of them with a vote record, the ones that count), `threshold` (the votes an amendment has to exceed: max(1, ⌊`trusted` × 80 / 100⌋)), `needed` (the votes that pass: `threshold` + 1, and 1 when `trusted` is 1 or less) and `observed` (the validators of the UNL whose full validation of the voting ledger was seen). Absent while no round is stored. |
 | `next_flag_ledger` | The summary's: the next multiple of 256 and the voting ledger before it, and when it is expected. |
 | `counts` | How many amendments there are of each status, all of them, whatever `status` asks for. |
@@ -2762,12 +6374,12 @@ only when they have a value, and `ledger_index`, `round` and `next_flag_ledger` 
 | `id` | The ID: 64 hex digits, upper case. It is the SHA-512Half of the name. |
 | `name` | The name of the amendment: the one in the metadata file, else the one the node gives (the node may not know a name: public nodes lack the one of an amendment that is new), else absent. |
 | `status` | One of the five below. |
-| `retired` | `true` for a name of the metadata file that is retired (Xahau: behaviour that is always on although the ledger does not list the name). |
-| `introduced`, `xls`, `xls_url`, `description` | From the metadata file (names, descriptions and links of the standards: `GH_AMENDMENTS_CONFIG`, a file per network that ships with the API): the software version that introduced it (a rippled version on XRPL, a xahaud date version on Xahau), the standard (`XLS-30`) and its address, which always lies under `https://github.com/XRPLF/XRPL-Standards/`, and one line about it. Absent for an amendment the file does not have. |
+| `retired` | `true` for a name of the metadata file that is retired: behaviour that is always on (rippled's `XRPL_RETIRE` amendments and xahaud's retired list), which a ledger begun after the retirement no longer lists. On XRPL the ledger still lists the 15 retired names, so their rows are as they were with `retired: true` added; on Xahau, XRPL Testnet and Xahau Testnet the ledger lacks them, and the row is `enabled` with no `enabled` object. |
+| `introduced`, `xls`, `xls_url`, `description` | From the metadata file (names, descriptions and links of the standards: `GH_AMENDMENTS_CONFIG`, a file per family that ships with the API: `xrpl.json` for the XRP Ledger and XRPL Testnet, `xahau.json` for Xahau and Xahau Testnet): the software version that introduced it (a rippled version on XRPL, a xahaud date version on Xahau), the standard (`XLS-30`) and its address, which always lies under `https://github.com/XRPLF/XRPL-Standards/`, and one line about it. Absent for an amendment the file does not have. |
 | `node_supported` | Whether the node says it supports the amendment, when it lists it. |
 | `votes` | For an amendment that is `majority`, `voting` or `unknown`, when a round is stored: what the newest round says. `ledger_index` is its voting ledger, `yes` the trusted validators with the amendment in their vote record (0 when the round has no tally of it), `trusted` and `needed` as in `round`, `pct` = `yes` / `trusted` × 100 to two decimals, rounded half up (0 when `trusted` is 0). |
 | `majority` | For an amendment that has a majority: `since`, the close time of the ledger that recorded it; `ledger_index` and `tx_hash`, of the newest indexed `EnableAmendment` that gave it the majority (absent when none is indexed: the majority was gained before the indexed history, or the index has not reached that ledger yet; and absent when a `lost_majority` or an enabling of the amendment is indexed after it: the majority it has now was regained and its transaction is not indexed yet); `expected_activation`, `since` plus the hold. It is enabled by the first flag ledger after that, in the ledger after the flag ledger. |
-| `enabled` | For an enabled amendment: `ledger_index`, `date` (the close time) and `tx_hash` of the indexed `EnableAmendment` that enabled it, with `source` `ledger`; else what the metadata file says, `ledger_index` and `date` (a day, `YYYY-MM-DD`; either may be missing), with `source` `metadata`; else none. A retired name has one only when the ledger has it. |
+| `enabled` | For an enabled amendment: `ledger_index`, `date` (the close time) and `tx_hash` of the indexed `EnableAmendment` that enabled it, with `source` `ledger`; else what the metadata file says, `ledger_index` and `date` (a day, `YYYY-MM-DD`; either may be missing), with `source` `metadata`; else none. A retired name has one only when the ledger has it. On XRPL Testnet and Xahau Testnet the file is the one of their family, and its `enabled` entries (mainnet's ledgers and days) are not used: an amendment there has an `enabled` object only from an indexed `EnableAmendment`, and none says `metadata`. |
 
 **Status.** The first row that matches:
 
@@ -2913,6 +6525,119 @@ Errors, in the order they are checked: 400 `family is required`, `invalid start 
 the syncer's aggregator keeps (the last two hours every minute, plus any range ingest rewrote); right after a long outage or
 on a database with years of history the current hour can lag until the aggregator has caught up
 (`syncer_aggregator_stats_lag_seconds`).
+
+---
+
+## Exports
+
+An **export** is a file of a whole list, made in the background and downloaded once it is ready. Any route with a CSV form can be
+exported (the routes that say `format` … `csv` above): a route that gets a CSV form later can be exported with no other change. The
+exporter of the network makes the file by walking the list's own pages through this api, with an API key of its own, so the file
+is the list. Exports need the storage bucket of the deployment (`GH_EXPORT_BUCKET`, see [configuration](configuration.md)); without
+it both routes answer 503 `exports are not available`. Neither answer is cached (`Cache-Control: no-store`).
+
+### `POST /v2/exports`
+
+Asks for an export. The body is JSON:
+
+| Field | Meaning |
+| --- | --- |
+| `path` | The list, as its own `GET` would name it: `/v2/…` with its parameters (`/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01&type=Payment`). `format`, `limit` and `marker` in it make no difference: the export is the whole list. |
+| `format` | `csv` or `pdf` (see [PDF](#pdf)). |
+
+A **list over time** (a route that takes `start` and `end`) must name both. A list at a point in time (`/balances`, `/orders`)
+may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`) names none. The other
+parameters are not checked here: a list that refuses them makes a failed export, which says why.
+
+**Limits.** An API key may have at most **3** exports queued or running at once (`GH_EXPORT_MAX_JOBS_PER_KEY`); one more
+answers 429, and an export that is done or has failed frees its place. An export holds at most **1,000,000 rows as CSV** and
+**10,000 as PDF** (`GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`). Where the list counts its rows up front, an export above
+the cap is refused at once with 400; today that is the account transactions by time (`/v2/accounts/{address}/transactions` with
+its window, `type` and `result`; not the list by sequence). Any other export is held to the cap as it is made: the exporter stops
+at the page that passes it, and the export fails with the same message.
+
+The answer is 202:
+
+```json
+{ "result": "success", "id": "6f1c0e9b2d4a4c1f8e3b5a7d9c2e4f60", "status": "queued" }
+```
+
+The `id` is 128 random bits (32 hex digits): only the API key that asked can read the export. The job keeps the SHA-256 of that
+key, never the key; with authentication off (no `GH_API_KEYS`, development only) a request without a key owns its exports.
+
+Errors, in the order they are checked: 503 `exports are not available`; 400 `invalid path` (no `path`, or not one starting
+with `/v2/`), `path is not exportable` (no route with a CSV form has this path), `start and end are required`, `invalid format`;
+429 `too many exports in progress: at most 3 per API key`; 400 `the list has more than 1000000 rows, the most a CSV export
+holds: narrow the window` (for a PDF: `the list has more than 10000 rows, the most a PDF export holds: narrow the window or use
+CSV`); 500 `unable to create the export`. The 429 is the body of every error (`{"result":"error","message":…}`), not the rate
+limit's `{"error":…}`.
+
+### `GET /v2/exports/{id}`
+
+The state of an export:
+
+```json
+{ "result": "success", "id": "6f1c0e9b2d4a4c1f8e3b5a7d9c2e4f60", "status": "done", "format": "csv",
+  "path": "/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01", "created": "2024-07-02T08:00:00Z",
+  "finished": "2024-07-02T08:00:41Z", "rows": 15230, "url": "https://storage.googleapis.com/…" }
+```
+
+Key order: `result, id, status, format, path, created, finished?, rows?, error?, url?`. `status` is `queued`, `running`, `done`
+or `failed`. `finished` is there when the export is done or has failed; `rows` (the data rows of the file) and `url` when it is
+done; `error` when it has failed, and says why: the list's own answer (`the list answered 400: invalid transaction type`), `the
+list did not answer a CSV`, `the list's CSV could not be read`, `the list could not be read`, `a page of the list took longer
+than 60 s`, `the list has more than 1000000 rows, the most a CSV export holds: narrow the window` (the row cap, with the PDF
+wording for a PDF), `the file could not be stored`, or `the exporter stopped while it made this export: ask for it again`.
+
+`url` downloads the file for **15 minutes**; each request makes a new one. A `csv` file is the CSV the list's route would give for
+the whole list in one page: one header, the columns of every row in the order they first appear, a missing cell empty; an
+empty list is an empty file. It downloads under the list's own file name (`<address> - transactions.csv`). A `pdf` file is a document of the same rows
+([PDF](#pdf)). An export and its
+file are kept **7 days** after it was asked for; then the id is not found.
+
+Errors: 503 `exports are not available`; 404 `export not found` (an id that does not exist, or the export of another API
+key: the two are not told apart); 500 `unable to retrieve the export`.
+
+Exports run one at a time per network, in the order they were asked for.
+
+#### PDF
+
+A `pdf` export is a document of the same list, laid out for paper: landscape A4, rendered by the exporter with `pdfkit`. It
+downloads as `application/pdf` under the list's own file name with `.pdf` (`<address> - transactions.pdf`). It starts with a
+header, one line each:
+
+- the list's file name (`<address> - transactions`) as the title;
+- for an account's list (`/v2/accounts/{address}/…`): `Address:`, and the `Account name:`, `Account network name:` and one
+  `Label <label>: <description> (<source>, <url>)` per label that [`/v2/accounts/{address}`](#get-v2accountsaddress) serves for
+  it, read through the api like the rows (an address without an activation on the network has none);
+- `Network:` (`XRP Ledger`, `Xahau`, `XRPL Testnet` or `Xahau Testnet`), `List:` (the `path` as asked);
+- `Window: <start> to <end>` (`, newest first` with `descending=true`), or for a list at a point in time `At:` the ledger or date
+  it names;
+- `Ledgers: <lowest> to <highest>`: the ledgers of its rows (`ledger_index`); `none (no rows)`, or `not given by the list` for a
+  list whose rows have no ledger;
+- `Rows:` and `Made:` (the time, UTC, to the second).
+
+Then a table of the columns chosen for the list, the CSV's column names with spaces for `_`, repeated at the top of every page;
+a value too wide for its column wraps (a transaction hash takes two lines). The CSV keeps every column. The chosen columns:
+
+| List | Columns |
+| --- | --- |
+| `/v2/accounts/{address}/transactions` | `ledger_index, executed_time, tx_type, result, counterparty, amount, currency, issuer, fee, flags_changed, hash` |
+| `/v2/payments[/{currency}]`, `/v2/accounts/{address}/payments` | `executed_time, ledger_index, source, destination, destination_tag, delivered_amount, currency, issuer, tx_hash` |
+| `/v2/accounts/{address}/exchanges[/{base}[/{counter}]]` | `executed_time, ledger_index, base_amount, base_currency, base_issuer, counter_amount, counter_currency, counter_issuer, rate, buyer, seller, tx_hash` |
+| `/v2/accounts/{address}/balance_changes` | `executed_time, ledger_index, change_type, currency, counterparty, amount_change, final_balance, tx_hash` |
+| `/v2/accounts/{address}/balances` | `currency, counterparty, value` |
+| `/v2/accounts/{address}/trustlines` | every column: `currency, counterparty, balance, limit, limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out` |
+| `/v2/accounts` | `inception, ledger_index, account, parent, initial_balance, tx_hash` |
+| `/v2/path_payments`, `/v2/accounts/{address}/path_payments` | `executed_time, ledger_index, source, destination, delivered_amount, currency, issuer, source_amount, source_currency, offers_crossed, hash` |
+| any other list | its first 8 columns, of equal width |
+
+Every page ends with `Page n of m`. An empty list makes a one-page document whose table says `The list has no rows.` The
+standard PDF fonts write Latin-1 only: any other character (in a name or a currency, say) is written `?`; the CSV has it as it
+is. Opening and closing balances are not in the document.
+
+**Differences from data.ripple.com**: the original has no exports; these routes are new
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
 
 ---
 

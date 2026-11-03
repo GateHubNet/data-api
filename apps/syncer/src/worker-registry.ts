@@ -3,6 +3,7 @@ import { AggregatorModule } from './aggregator/aggregator.module';
 import { WORKER_NAMES, WorkerName } from './config/syncer.config';
 import { FeesModule } from './fees/fees.module';
 import { IngestModule } from './ingest/ingest.module';
+import { TomlsModule } from './tomls/tomls.module';
 import { ValidationsModule } from './validations/validations.module';
 import { ValidatorsModule } from './validators/validators.module';
 
@@ -24,9 +25,10 @@ export const WORKER_MODULES: WorkerModuleRegistry = {
   validations: ValidationsModule,
   aggregator: AggregatorModule,
   validators: ValidatorsModule,
+  tomls: TomlsModule,
 };
 
-/** The workers that read from the shared node client (`NODE_CLIENT`). The validations collector makes its own. */
+/** The workers that read from the shared node client (`NODE_CLIENT`). The validations collector makes its own, the tomls worker has none. */
 export const NODE_CLIENT_WORKERS: ReadonlySet<WorkerName> = new Set<WorkerName>(['ingest', 'fee_stats', 'validators']);
 
 /** Whether one of the enabled workers reads from the shared node client: only then does the app make one (ruling R99). */

@@ -104,6 +104,41 @@ describe('parseAsset', () => {
   });
 });
 
+describe('parseAsset of an MPT', () => {
+  /** A recorded issuance ID (`payment_transfer_fee`) and the issuer it holds. */
+  const ID = '0598F6E09E30A809E63A1F02DE789586D2F4FDA9EF5200E3';
+  const ISSUER = 'rERShrtUSEXkrwtTpugPV4v8E787vpx1kb';
+
+  it('parses the MPT asset syntax', () => {
+    const asset = { currency: ID, issuer: ISSUER };
+    expect(parseAsset(ID.toLowerCase(), 'XRP')).toStrictEqual(asset);
+    expect(parseAsset(ID, 'XRP')).toStrictEqual(asset);
+    // an empty issuer is none, as for any currency
+    expect(parseAsset(`${ID}+`, 'XRP')).toStrictEqual(asset);
+    for (const separator of ['+', '|', '.']) {
+      expect(parseAsset(`${ID.toLowerCase()}${separator}${ISSUER}`, 'XRP')).toStrictEqual(asset);
+    }
+    expect(badRequestMessage(() => parseAsset(`${ID}+${BITSTAMP}`, 'XRP'))).toBe('issuer does not match mpt issuance');
+    expect(badRequestMessage(() => parseAsset(`${ID}+rBad`, 'XRP'))).toBe('invalid issuer address');
+    expect(badRequestMessage(() => parseAsset(`${ID}+rBad`, 'XRP', 'base'))).toBe('invalid base issuer address');
+    expect(badRequestMessage(() => parseAsset(`${ID}+${X_ADDRESS}`, 'XRP'))).toBe('invalid issuer address');
+  });
+
+  it('takes the ID the same way on Xahau, where it matches nothing', () => {
+    expect(parseAsset(ID.toLowerCase(), 'XAH')).toStrictEqual({ currency: ID, issuer: ISSUER });
+  });
+
+  it('keeps every other length an issued currency: 40 hex digits, 47, 49 and 0x… need an issuer', () => {
+    for (const code of ['A'.repeat(40), ID.slice(0, 47), `${ID}0`, `0x${ID.slice(0, 46)}`]) {
+      expect(badRequestMessage(() => parseAsset(code, 'XRP'))).toBe('issuer is required');
+      expect(parseAsset(`${code}+${BITSTAMP}`, 'XRP')).toStrictEqual({
+        currency: code.toUpperCase(),
+        issuer: BITSTAMP,
+      });
+    }
+  });
+});
+
 describe('parseAssetPair', () => {
   it('parses both sides', () => {
     expect(parseAssetPair(`usd+${BITSTAMP}`, 'xrp', 'XRP')).toStrictEqual({

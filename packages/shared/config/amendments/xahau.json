@@ -1,6 +1,6 @@
 {
   "network": "xahau",
-  "updated": "2026-10-19",
+  "updated": "2026-10-26",
   "amendments": [
     { "name": "AMM", "obsolete": true },
     { "name": "AMMClawback", "obsolete": true },
@@ -148,6 +148,7 @@
     { "name": "fixTakerDryOfferRemoval" },
     { "name": "fixTrustLinesToSelf", "introduced": "2026.6.21" },
     { "name": "fixUniversalNumber" },
+    { "name": "fixXahauTestnetGenesis", "obsolete": true },
     { "name": "fixXahauV1", "introduced": "2023.12.29", "enabled": { "ledger_index": 2060289, "date": "2024-01-10" } },
     { "name": "fixXahauV2", "introduced": "2024.1.25", "enabled": { "ledger_index": 2718721, "date": "2024-02-03" } },
     { "name": "fixXahauV3", "introduced": "2025.2.6", "enabled": { "ledger_index": 12125185, "date": "2025-02-16" } },
@@ -205,7 +206,7 @@
     { "name": "TickSize", "retired": true },
     { "name": "Touch", "introduced": "2025.5.1", "enabled": { "ledger_index": 14259201, "date": "2025-05-18" } },
     { "name": "TrustSetAuth", "retired": true },
-    { "name": "URIToken" },
+    { "name": "URIToken", "enabled": { "ledger_index": 1, "date": "2023-10-30" } },
     { "name": "XahauGenesis", "enabled": { "ledger_index": 3, "date": "2023-10-30" } },
     { "name": "XChainBridge", "obsolete": true },
     { "name": "XRPFees" },

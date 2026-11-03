@@ -5,6 +5,7 @@ import { DirectoryEntry, DomainState, RecordRow } from './directory';
 import {
   AGREEMENT_KEYS,
   buildValidatorsBody,
+  CURRENCY_KEYS,
   DAILY_KEYS,
   DETAIL_AMENDMENT_VOTES_KEYS,
   DETAIL_TAIL_KEYS,
@@ -13,6 +14,8 @@ import {
   LIST_BODY_KEYS,
   MANIFEST_KEYS,
   ROW_AMENDMENT_VOTES_KEYS,
+  TOML_DETAIL_KEYS,
+  TOML_KEYS,
   VALIDATOR_ROW_KEYS,
   validatorDetail,
   validatorRow,
@@ -86,6 +89,8 @@ const FULL: DirectoryEntry = {
   signingKey: 'n9Signing',
   manifest: { sequence: 4, signingKey: 'n9Signing', signingKeysSeen: 4, domain: 'northpeak.example' },
   domainState: VERIFIED,
+  toml: { ownerCountry: 'NO', serverCountry: 'DE', network: 'main', unl: 'https://vl.ripple.com' },
+  serverCountry: 'DE',
   currentIndex: 107_748_183,
   partial: false,
   agreement1h: window({ missed: 0, total: 921, score: '1.0000', partial: 0 }),
@@ -144,7 +149,9 @@ describe('the key constants', () => {
       'amendment_votes',
       'first_seen',
       'last_seen',
+      'toml',
     ]);
+    expect([...TOML_KEYS]).toEqual(['owner_country', 'server_country', 'network', 'unl']);
     expect([...AGREEMENT_KEYS]).toEqual(['missed', 'total', 'score', 'incomplete', 'partial']);
     expect([...DOMAIN_VERIFICATION_KEYS]).toEqual([
       'status',
@@ -197,6 +204,24 @@ describe('validatorRow', () => {
       },
       first_seen: '2026-07-21T15:42:53.000Z',
       last_seen: '2026-10-19T15:42:50.204Z',
+      toml: { owner_country: 'NO', server_country: 'DE', network: 'main', unl: 'https://vl.ripple.com' },
+    });
+  });
+
+  it('has toml last, after last_seen', () => {
+    const keys = Object.keys(validatorRow(FULL, AMENDMENTS));
+    expect(keys.slice(-2)).toEqual(['last_seen', 'toml']);
+    expect(Object.keys(validatorRow(FULL, AMENDMENTS).toml ?? {})).toEqual([...TOML_KEYS]);
+  });
+
+  it('leaves toml out without facts, writes {} for empty facts, and every key it has', () => {
+    expect(validatorRow({ ...FULL, toml: undefined }, AMENDMENTS)).not.toHaveProperty('toml');
+    expect(validatorRow({ ...FULL, toml: {} }, AMENDMENTS).toml).toEqual({});
+    expect(
+      validatorRow({ ...FULL, toml: { serverCountry: 'FI', unl: 'https://vl.example' } }, AMENDMENTS).toml,
+    ).toEqual({
+      server_country: 'FI',
+      unl: 'https://vl.example',
     });
   });
 
@@ -489,6 +514,86 @@ describe('buildValidatorsBody', () => {
 
   it('is an empty list when nothing matches', () => {
     expect(buildValidatorsBody([], undefined, AMENDMENTS)).toEqual({ result: 'success', count: 0, validators: [] });
+  });
+});
+
+describe('the toml of validatorDetail', () => {
+  const ISSUER = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+  const STORE = {
+    principals: ['Mara Lindqvist', 'Tomas Okafor'],
+    modified: Date.UTC(2026, 9, 2) / 1000,
+    accountsListed: 3,
+    currencies: [{ code: 'USD', issuer: ISSUER }],
+    fetchedAt: Date.UTC(2026, 9, 24, 12, 0, 4, 511) / 1000,
+  };
+  const ROW_TOML = { owner_country: 'NO', server_country: 'DE', network: 'main', unl: 'https://vl.ripple.com' };
+
+  it('states its keys', () => {
+    expect([...TOML_DETAIL_KEYS]).toEqual([
+      'owner_country',
+      'server_country',
+      'network',
+      'unl',
+      'principals',
+      'modified',
+      'accounts_listed',
+      'currencies',
+      'currencies_listed',
+      'fetched',
+    ]);
+    expect([...CURRENCY_KEYS]).toEqual(['code', 'issuer']);
+  });
+
+  it("adds the domain's facts after the row's toml, in TOML_DETAIL_KEYS order", () => {
+    const { toml } = validatorDetail(FULL, AMENDMENTS, STORE);
+    expect(toml).toEqual({
+      ...ROW_TOML,
+      principals: ['Mara Lindqvist', 'Tomas Okafor'],
+      modified: '2026-10-02T00:00:00Z',
+      accounts_listed: 3,
+      currencies: [{ code: 'USD', issuer: ISSUER }],
+      currencies_listed: 1,
+      fetched: '2026-10-24T12:00:04.511Z',
+    });
+    expect(Object.keys(toml ?? {})).toEqual([...TOML_DETAIL_KEYS]);
+    expect(Object.keys(toml?.currencies?.[0] ?? {})).toEqual([...CURRENCY_KEYS]);
+  });
+
+  it('leaves out empty principals and currencies, zero counts and a null modified', () => {
+    const { toml } = validatorDetail(FULL, AMENDMENTS, {
+      principals: [],
+      modified: null,
+      accountsListed: 0,
+      currencies: [],
+      fetchedAt: STORE.fetchedAt,
+    });
+    expect(toml).toEqual({ ...ROW_TOML, fetched: '2026-10-24T12:00:04.511Z' });
+  });
+
+  it('cuts the currencies at 10 and counts them all', () => {
+    const currencies = Array.from({ length: 12 }, (_, i) => ({ code: `C${i}`, issuer: ISSUER }));
+    const { toml } = validatorDetail(FULL, AMENDMENTS, { ...STORE, currencies });
+    expect(toml?.currencies).toEqual(currencies.slice(0, 10));
+    expect(toml?.currencies_listed).toBe(12);
+  });
+
+  it("writes an issuer of '' as no issuer", () => {
+    const { toml } = validatorDetail(FULL, AMENDMENTS, { ...STORE, currencies: [{ code: 'USD', issuer: '' }] });
+    expect(toml?.currencies).toEqual([{ code: 'USD' }]);
+  });
+
+  it("is the row's toml alone without facts", () => {
+    expect(validatorDetail(FULL, AMENDMENTS).toml).toEqual(ROW_TOML);
+  });
+
+  it('has no toml for a row without toml, whatever facts it is given', () => {
+    expect(validatorDetail({ ...FULL, toml: undefined }, AMENDMENTS, STORE)).not.toHaveProperty('toml');
+  });
+
+  it('keeps toml in its place, after last_seen and before the tail', () => {
+    const keys = Object.keys(validatorDetail(FULL, AMENDMENTS, STORE));
+    expect(keys.indexOf('toml')).toBe(keys.indexOf('last_seen') + 1);
+    expect(keys[keys.indexOf('toml') + 1]).toBe('manifest');
   });
 });
 

@@ -1,7 +1,144 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { getNetworkProfile, loadMarketsConfig } from './network-profile';
+import { assertValidMarketsConfig } from '../aggregate/volume.job';
+import { assertValidDatabaseName } from '../clickhouse/clickhouse.config';
+import {
+  getNetworkProfile,
+  isNetworkName,
+  loadMarketsConfig,
+  NETWORK_NAMES,
+  networkChoiceText,
+  networkLogText,
+  NetworkName,
+  NetworkProfile,
+} from './network-profile';
+
+const XRPL_PUBLISHERS =
+  'https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,' +
+  'https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1';
+const XAHAU_PUBLISHERS = 'https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8';
+const XRPL_TESTNET_PUBLISHERS =
+  'https://vl.altnet.rippletest.net=ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860';
+const XAHAU_TESTNET_VALIDATORS =
+  'nHBoJCE3wPgkTcrNPMHyTJFQ2t77EyCAqcBRspFCpL6JhwCm94VZ,nHUVv4g47bFMySAZFUKVaXUYEmfiUExSoY4FzwXULNwJRzju4XnQ,' +
+  'nHBvr8avSFTz4TFxZvvi4rEJZZtyqE3J6KAAcVWVtifsE7edPM7q,nHUH3Z8TRU57zetHbEPr1ynyrJhxQCwrJvNjr4j1SMjYADyW1WWe';
+
+/** One row per network with every field of the profile table of the spec (section 1). */
+const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
+  [
+    'xrpl',
+    {
+      name: 'xrpl',
+      family: 'xrpl',
+      kind: 'mainnet',
+      displayName: 'XRP Ledger',
+      networkId: 0,
+      acceptedNodeNetworkIds: [undefined, 0],
+      nativeCurrency: 'XRP',
+      defaultDatabase: 'xrpl',
+      defaultNodeEndpoints: ['wss://s2.ripple.com', 'wss://xrplcluster.com'],
+      partialPaymentFixLedger: 4594094,
+      firstLedger: 32570,
+      hasDelegation: true,
+      hasAmm: true,
+      hasMinting: false,
+      hasMpt: true,
+      software: 'rippled',
+      tomlPath: '/.well-known/xrp-ledger.toml',
+      tomlNetworkNames: ['main', 'mainnet'],
+      defaultUnlPublishers: XRPL_PUBLISHERS,
+      defaultUnlValidators: '',
+      majorityHoldSeconds: 1_209_600,
+      amendmentThresholdPercent: 80,
+      flagInterval: 256,
+    },
+  ],
+  [
+    'xahau',
+    {
+      name: 'xahau',
+      family: 'xahau',
+      kind: 'mainnet',
+      displayName: 'Xahau',
+      networkId: 21337,
+      acceptedNodeNetworkIds: [21337],
+      nativeCurrency: 'XAH',
+      defaultDatabase: 'xahau',
+      defaultNodeEndpoints: ['wss://xahau.network'],
+      partialPaymentFixLedger: 0,
+      firstLedger: 1,
+      hasDelegation: false,
+      hasAmm: false,
+      hasMinting: true,
+      hasMpt: false,
+      software: 'xahaud',
+      tomlPath: '/.well-known/xahau.toml',
+      tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
+      defaultUnlPublishers: XAHAU_PUBLISHERS,
+      defaultUnlValidators: '',
+      majorityHoldSeconds: 432_000,
+      amendmentThresholdPercent: 80,
+      flagInterval: 256,
+    },
+  ],
+  [
+    'xrpl-testnet',
+    {
+      name: 'xrpl-testnet',
+      family: 'xrpl',
+      kind: 'testnet',
+      displayName: 'XRPL Testnet',
+      networkId: 1,
+      acceptedNodeNetworkIds: [1],
+      nativeCurrency: 'XRP',
+      defaultDatabase: 'xrpl_testnet',
+      defaultNodeEndpoints: ['wss://s.altnet.rippletest.net:51233', 'wss://testnet.xrpl-labs.com'],
+      partialPaymentFixLedger: 0,
+      firstLedger: undefined,
+      hasDelegation: true,
+      hasAmm: true,
+      hasMinting: false,
+      hasMpt: true,
+      software: 'rippled',
+      tomlPath: '/.well-known/xrp-ledger.toml',
+      tomlNetworkNames: ['testnet'],
+      defaultUnlPublishers: XRPL_TESTNET_PUBLISHERS,
+      defaultUnlValidators: '',
+      majorityHoldSeconds: 1_800,
+      amendmentThresholdPercent: 80,
+      flagInterval: 256,
+    },
+  ],
+  [
+    'xahau-testnet',
+    {
+      name: 'xahau-testnet',
+      family: 'xahau',
+      kind: 'testnet',
+      displayName: 'Xahau Testnet',
+      networkId: 21338,
+      acceptedNodeNetworkIds: [21338],
+      nativeCurrency: 'XAH',
+      defaultDatabase: 'xahau_testnet',
+      defaultNodeEndpoints: ['wss://xahau-test.net'],
+      partialPaymentFixLedger: 0,
+      firstLedger: undefined,
+      hasDelegation: false,
+      hasAmm: false,
+      hasMinting: true,
+      hasMpt: false,
+      software: 'xahaud',
+      tomlPath: '/.well-known/xahau.toml',
+      tomlNetworkNames: ['testnet', '21338'],
+      defaultUnlPublishers: '',
+      defaultUnlValidators: XAHAU_TESTNET_VALIDATORS,
+      majorityHoldSeconds: 432_000,
+      amendmentThresholdPercent: 80,
+      flagInterval: 256,
+    },
+  ],
+];
 
 describe('network profiles', () => {
   const saved = { GH_NETWORK: process.env.GH_NETWORK, GH_MARKETS_CONFIG: process.env.GH_MARKETS_CONFIG };
@@ -36,14 +173,45 @@ describe('network profiles', () => {
       expect(getNetworkProfile('xahau').defaultNodeEndpoints).toEqual(['wss://xahau.network']);
     });
 
+    it('lists the four networks in their order', () =>
+      expect(NETWORK_NAMES).toEqual(['xrpl', 'xahau', 'xrpl-testnet', 'xahau-testnet']));
+
+    it.each(FOUR)('has the §1 values of %s', (name, values) => {
+      const profile = getNetworkProfile(name);
+      expect(profile).toMatchObject(values);
+      expect(profile.acceptedNodeNetworkIds).toEqual(values.acceptedNodeNetworkIds);
+    });
+
+    it('names the toml `network` values that count on each network (spec 3.4), in lower case', () =>
+      expect(Object.fromEntries(NETWORK_NAMES.map((n) => [n, getNetworkProfile(n).tomlNetworkNames]))).toEqual({
+        xrpl: ['main', 'mainnet'],
+        xahau: ['main', 'mainnet', 'xahau', '21337'],
+        'xrpl-testnet': ['testnet'],
+        'xahau-testnet': ['testnet', '21338'],
+      }));
+
+    it('gives every network a CTID id of its own', () =>
+      expect(new Set(NETWORK_NAMES.map((n) => getNetworkProfile(n).networkId)).size).toBe(4));
+
+    it('names a valid database of its own for every network', () => {
+      const names = NETWORK_NAMES.map((n) => getNetworkProfile(n).defaultDatabase);
+      for (const name of names) expect(assertValidDatabaseName(name)).toBe(name);
+      expect(new Set(names).size).toBe(4);
+    });
+
+    it('throws on a network it does not know', () =>
+      expect(() => getNetworkProfile('xrpl-devnet')).toThrow('Unknown GH_NETWORK "xrpl-devnet"'));
+
+    it('reads GH_NETWORK for a testnet', () => {
+      process.env.GH_NETWORK = 'xahau-testnet';
+      expect(getNetworkProfile().name).toBe('xahau-testnet');
+    });
+
     it('has the validator and amendment values of each network', () => {
-      const xrplPublishers =
-        'https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,' +
-        'https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1';
       expect(getNetworkProfile('xrpl')).toMatchObject({
         software: 'rippled',
         tomlPath: '/.well-known/xrp-ledger.toml',
-        defaultUnlPublishers: xrplPublishers,
+        defaultUnlPublishers: XRPL_PUBLISHERS,
         majorityHoldSeconds: 1_209_600,
         amendmentThresholdPercent: 80,
         flagInterval: 256,
@@ -51,11 +219,54 @@ describe('network profiles', () => {
       expect(getNetworkProfile('xahau')).toMatchObject({
         software: 'xahaud',
         tomlPath: '/.well-known/xahau.toml',
-        defaultUnlPublishers: 'https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8',
+        defaultUnlPublishers: XAHAU_PUBLISHERS,
         majorityHoldSeconds: 432_000,
         amendmentThresholdPercent: 80,
         flagInterval: 256,
       });
+    });
+
+    it('firstLedger is 32570 on xrpl, 1 on xahau and undefined on both testnets', () => {
+      expect(getNetworkProfile('xrpl').firstLedger).toBe(32570);
+      expect(getNetworkProfile('xahau').firstLedger).toBe(1);
+      expect(getNetworkProfile('xrpl-testnet').firstLedger).toBeUndefined();
+      expect(getNetworkProfile('xahau-testnet').firstLedger).toBeUndefined();
+    });
+
+    it('has the firstLedger key on all four profiles, undefined or not', () => {
+      for (const name of NETWORK_NAMES) {
+        // `Object.hasOwn` is ES2022, past the ES2021 library of the repo's TypeScript
+        expect(Object.prototype.hasOwnProperty.call(getNetworkProfile(name), 'firstLedger')).toBe(true);
+      }
+    });
+
+    it('hasDelegation is true on xrpl and its testnet and false on Xahau and its testnet', () => {
+      expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasDelegation)).toEqual([true, false, true, false]);
+    });
+
+    it('says which networks have AMM and which mint', () => {
+      // NETWORK_NAMES order: xrpl, xahau, xrpl-testnet, xahau-testnet
+      expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasAmm)).toEqual([true, false, true, false]);
+      expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasMinting)).toEqual([false, true, false, true]);
+    });
+
+    it('has the hasAmm and hasMinting keys on all four profiles', () => {
+      for (const name of NETWORK_NAMES) {
+        for (const key of ['hasAmm', 'hasMinting']) {
+          expect(Object.prototype.hasOwnProperty.call(getNetworkProfile(name), key)).toBe(true);
+        }
+      }
+    });
+
+    it('hasMpt is true on xrpl and its testnet and false on Xahau and its testnet', () => {
+      // NETWORK_NAMES order: xrpl, xahau, xrpl-testnet, xahau-testnet
+      expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasMpt)).toEqual([true, false, true, false]);
+    });
+
+    it('has the hasMpt key on all four profiles', () => {
+      for (const name of NETWORK_NAMES) {
+        expect(Object.prototype.hasOwnProperty.call(getNetworkProfile(name), 'hasMpt')).toBe(true);
+      }
     });
 
     it('defaults to xrpl when GH_NETWORK is unset', () => {
@@ -91,6 +302,21 @@ describe('network profiles', () => {
     it('does not resolve inherited object keys as networks', () => {
       expect(() => getNetworkProfile('constructor')).toThrow('Unknown GH_NETWORK "constructor"');
       expect(() => getNetworkProfile('__proto__')).toThrow('Unknown GH_NETWORK "__proto__"');
+    });
+  });
+
+  describe('isNetworkName, networkChoiceText and networkLogText', () => {
+    it('tells a network name from anything else', () => {
+      expect(NETWORK_NAMES.every(isNetworkName)).toBe(true);
+      expect(['bitcoin', 'XRPL', '', 'constructor', undefined].some(isNetworkName)).toBe(false);
+    });
+
+    it('words the choice and the boot line', () => {
+      expect(networkChoiceText('GH_NETWORK')).toBe(
+        'GH_NETWORK must be one of xrpl, xahau, xrpl-testnet, xahau-testnet',
+      );
+      expect(networkLogText(getNetworkProfile('xrpl'))).toBe('network=xrpl');
+      expect(networkLogText(getNetworkProfile('xahau-testnet'))).toBe('network=xahau-testnet kind=testnet');
     });
   });
 
@@ -171,6 +397,34 @@ describe('network profiles', () => {
         expect.objectContaining({ Import: expect.any(Number), ClaimReward: expect.any(Number) }),
       );
     });
+
+    // A testnet runs newer builds first, so each one bundles the server_definitions of its own node, not mainnet's.
+    type Definitions = {
+      TRANSACTION_TYPES: Record<string, number>;
+      LEDGER_ENTRY_FLAGS?: { AccountRoot?: Record<string, number> };
+    };
+
+    it('bundles the definitions of XRPL Testnet: XRPL types with AMM, no ClaimReward', () => {
+      const d = getNetworkProfile('xrpl-testnet').definitionsFallback() as unknown as Definitions;
+      expect(d.TRANSACTION_TYPES).toEqual(
+        expect.objectContaining({ Payment: expect.any(Number), AMMCreate: expect.any(Number) }),
+      );
+      expect(d.TRANSACTION_TYPES).not.toHaveProperty('ClaimReward');
+      expect(d.LEDGER_ENTRY_FLAGS?.AccountRoot).toBeDefined();
+    });
+
+    it('bundles the definitions of Xahau Testnet: Import and ClaimReward', () => {
+      const d = getNetworkProfile('xahau-testnet').definitionsFallback() as unknown as Definitions;
+      expect(d.TRANSACTION_TYPES).toEqual(
+        expect.objectContaining({
+          Payment: expect.any(Number),
+          Import: expect.any(Number),
+          ClaimReward: expect.any(Number),
+        }),
+      );
+      // like xahaud's mainnet file, it names no ledger entry flags: Xahau's account flags are kept by hand
+      expect(d.LEDGER_ENTRY_FLAGS).toBeUndefined();
+    });
   });
 
   describe('loadMarketsConfig', () => {
@@ -207,6 +461,12 @@ describe('network profiles', () => {
           { currency: 'RVN', issuer: 'rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb' },
         ],
       });
+    });
+
+    it.each(['xrpl-testnet', 'xahau-testnet'])('ships empty markets for %s, which the volume jobs accept', (name) => {
+      const markets = loadMarketsConfig(getNetworkProfile(name));
+      expect(markets).toEqual({ version: 1, tradeMarkets: [], paymentCurrencies: [] });
+      expect(() => assertValidMarketsConfig(markets, getNetworkProfile(name).nativeCurrency)).not.toThrow();
     });
 
     it('honours the GH_MARKETS_CONFIG env path', () => {

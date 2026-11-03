@@ -51,6 +51,10 @@ http {
   # One deployment per network, one host name per network: the API answers the same /v2/... paths on every host.
   #   xrpl.data.<domain>  -> the XRPL deployment (database `xrpl`)
   #   xahau.data.<domain> -> the Xahau deployment (database `xahau`)
+  # The domain is gatehub.net in production and sandbox.gatehub.net in the sandbox, a stack of its own on its own host, where the two
+  # deployments are XRPL Testnet (xrpl.data.sandbox.gatehub.net, database `xrpl_testnet`) and Xahau Testnet
+  # (xahau.data.sandbox.gatehub.net, database `xahau_testnet`). The patterns below match both: the host selects the slot, and the
+  # slot's XRPL_NETWORK / XAHAU_NETWORK the network.
   map $host $api_upstream {
     default           "";
     ~^xrpl\.data\.    http://api-xrpl:3001;

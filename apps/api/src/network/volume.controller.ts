@@ -1,6 +1,7 @@
 import {
   LivePeriod,
   NetworkProfile,
+  NFT_LIVE_PERIODS,
   PAYMENT_LIVE_PERIODS,
   TRADE_LIVE_PERIODS,
   VolumeMetric,
@@ -13,6 +14,7 @@ import type { Request, Response } from 'express';
 import { isValidClassicAddress } from 'ripple-address-codec';
 import { Csv } from '../common/csv.interceptor';
 import { badRequest } from '../common/errors';
+import { Coverage, FeatureCoverageService } from '../common/feature-coverage.service';
 import { setLinkHeader } from '../common/pagination';
 import { endExclusive, first, limitParam, parseDate, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
@@ -31,10 +33,20 @@ interface VolumeBody {
   rows: VolumeRow[];
 }
 
+/** The answer of the NFT volume: the body of the others, with `coverage` as the key after `result` (`NFT_VOLUME_BODY_KEYS`). */
+interface NftVolumeBody {
+  result: 'success';
+  coverage: Coverage;
+  count: number;
+  marker?: string;
+  rows: VolumeRow[];
+}
+
 /**
  * `GET /v2/network/exchange_volume`, `GET /v2/network/payment_volume` (`api/routes/network/getMetric.js` of the develop
- * branch of the original, which has the historical mode) and `GET /v2/network/amm_volume` (new, the same route for the swaps
- * against the AMM pools): the trade volume, the payment volume and the AMM volume of the network, converted
+ * branch of the original, which has the historical mode), `GET /v2/network/amm_volume` (new, the same route for the swaps
+ * against the AMM pools) and `GET /v2/network/nft_volume` (new, the same route for the sales of NFTs, a component per
+ * collection): the trade volume, the payment volume, the AMM volume and the NFT volume of the network, converted
  * to the native currency or to a display currency. With neither `start` nor `end` it is the live row of a rolling period
  * (`live`, default `day`); with either, a row per day, week or month.
  *
@@ -45,6 +57,7 @@ interface VolumeBody {
 export class VolumeController {
   constructor(
     private readonly volumes: VolumeService,
+    private readonly coverage: FeatureCoverageService,
     @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
   ) {}
 
@@ -169,6 +182,56 @@ export class VolumeController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<VolumeBody> {
     return this.rows('amm_volume', TRADE_LIVE_PERIODS, query, req, res);
+  }
+
+  @Get('nft_volume')
+  @RippleRoute(FAILURE)
+  @Csv('nft_volume', 'rows')
+  @ApiOperation({
+    summary: 'Get the volume of the NFT sales on the network',
+    description:
+      'The sales of NFTs (XRPL) and URITokens (Xahau), per collection, in the native currency: per collection its `issuer` and ' +
+      '`taxon` (XRPL only), the number of its sales that have a price in the native currency (`count`), the volume of them ' +
+      '(`amount`), the rate (1, as the amount is in the native currency) and `converted_amount`. A sale priced in an asset with ' +
+      'no rate that day is not in a component; the `count` of the row is every sale of the window, those too. Components are ' +
+      'listed by converted amount, the largest first; a window without sales is a row with no components. Without `start` and ' +
+      '`end`, the live row of the rolling period `live` (day, 7day, 30day; default day). With them, a row per `interval` (day, ' +
+      'week from Monday, month, UTC) for the days that were computed: a bucket is a row when it starts within `start` and ' +
+      '`end`, whole. `exchange_currency` / `exchange_issuer` show the amounts in another currency, as for the exchange ' +
+      'volume. `coverage` states whether the NFT history is whole.',
+  })
+  @ApiQuery({
+    name: 'live',
+    required: false,
+    enum: NFT_LIVE_PERIODS,
+    description: 'Default: day. Ignored with start or end.',
+  })
+  @ApiQuery({ name: 'start', required: false, description: 'Start time of the historical rows. Default: the epoch.' })
+  @ApiQuery({ name: 'end', required: false, description: 'End time of the historical rows. Default: now.' })
+  @ApiQuery({ name: 'interval', required: false, enum: VOLUME_INTERVALS, description: 'Default: day.' })
+  @ApiQuery({ name: 'exchange_currency', required: false, description: 'Default: the native currency.' })
+  @ApiQuery({
+    name: 'exchange_issuer',
+    required: false,
+    description: 'Required for every currency but the native one.',
+  })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
+  @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
+  @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
+  async nftVolume(
+    @Query() query: QueryParams,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<NftVolumeBody> {
+    // the checks and the read are the other metrics': a bad request is answered before the coverage is asked for
+    const body = await this.rows('nft_volume', NFT_LIVE_PERIODS, query, req, res);
+    return {
+      result: body.result,
+      coverage: await this.coverage.coverage('nfts'),
+      count: body.count,
+      ...(body.marker !== undefined && { marker: body.marker }),
+      rows: body.rows,
+    };
   }
 
   private async rows(

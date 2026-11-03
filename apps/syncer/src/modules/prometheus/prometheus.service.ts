@@ -56,6 +56,22 @@ const metrics = {
     help: 'Pools of AMM transactions the parser could make no swap, liquidity or governance row for, or whose assets it could not tell (spec §2.3), over the ledgers written by the live ingest and by range-ingest runs of this process.',
     registers: [registry],
   }),
+  nftSkippedTotal: new Counter({
+    name: 'syncer_nft_skipped_total',
+    help: 'NFT and URIToken events the parser dropped because their amount is an MPT amount or not an amount at all (spec §2.5), over the ledgers written by the live ingest and by range-ingest runs of this process.',
+    registers: [registry],
+  }),
+  objectsUnclassifiedTotal: new Counter({
+    name: 'syncer_objects_unclassified_total',
+    help: 'Changes of an escrow, check, payment channel or delegation that no event of the object history expects (the event update, spec section 2.2), over the ledgers written by the live ingest and by range-ingest runs of this process.',
+    registers: [registry],
+  }),
+  parserAnomaliesTotal: new Counter({
+    name: 'syncer_parser_anomalies_total',
+    help: 'Things a parser found in a ledger that the network cannot produce and stored in a safe form, by kind (import_minted_negative: a Xahau Import whose minted drops came out below 0 and were stored as 0; mpt_unreadable: an MPT amount that is not a UInt64, stored as 0, or a node skipped because its ID cannot be made), over the ledgers written by the live ingest and by range-ingest runs of this process.',
+    labelNames: ['kind'],
+    registers: [registry],
+  }),
   validationsFlushedTotal: new Counter({
     name: 'syncer_validations_flushed_total',
     help: 'Validation rows flushed to ClickHouse.',
@@ -132,6 +148,66 @@ const metrics = {
     help: 'Heavy accounts whose coverage does not yet reach from first_day to the newest final day.',
     registers: [registry],
   }),
+  nftStateLagLedgers: new Gauge({
+    name: 'syncer_nft_state_lag_ledgers',
+    help: 'Ledgers between the newest committed ledger and the live cursor of the nft_state job.',
+    registers: [registry],
+  }),
+  nftDirtyLedgers: new Gauge({
+    name: 'syncer_nft_dirty_ledgers',
+    help: 'Ledgers in the ranges of nft_dirty that the nft_state job has still to rebuild the NFTs of.',
+    registers: [registry],
+  }),
+  nftCollectionsPending: new Gauge({
+    name: 'syncer_nft_collections_pending',
+    help: 'NFT collections queued for the nft_collections job to compute again.',
+    registers: [registry],
+  }),
+  escrowsLagLedgers: new Gauge({
+    name: 'syncer_escrows_lag_ledgers',
+    help: 'Ledgers between the newest committed ledger and the watermark of the escrows job (the through_ledger of its sentinel).',
+    registers: [registry],
+  }),
+  escrowsOpen: new Gauge({
+    name: 'syncer_escrows_open',
+    help: 'Open native escrows, as the sentinel of the escrows job counts them.',
+    registers: [registry],
+  }),
+  tokensLive: new Gauge({
+    name: 'syncer_tokens_live',
+    help: "1 when a live generation of the issued tokens exists, else 0. Gates the explorer's TOKENS switch.",
+    registers: [registry],
+  }),
+  tokensLagLedgers: new Gauge({
+    name: 'syncer_tokens_lag_ledgers',
+    help: 'Ledgers between the newest committed ledger and the through_ledger of the live generation of the issued tokens (0 without one).',
+    registers: [registry],
+  }),
+  tokensBuilding: new Gauge({
+    name: 'syncer_tokens_building',
+    help: '1 while a generation of the issued tokens builds, else 0. The account cursor of its pass is logged at each batch.',
+    registers: [registry],
+  }),
+  tokensRepairLedgers: new Gauge({
+    name: 'syncer_tokens_repair_ledgers',
+    help: 'through_ledger less repair_from of the live generation of the issued tokens: the ledgers its repair applies again, 0 without a repair.',
+    registers: [registry],
+  }),
+  mptStateLagLedgers: new Gauge({
+    name: 'syncer_mpt_state_lag_ledgers',
+    help: 'Ledgers between the committed head and the mpt_state cursor',
+    registers: [registry],
+  }),
+  supplySnapshotAgeSeconds: new Gauge({
+    name: 'syncer_supply_snapshot_age_seconds',
+    help: 'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); no sample until it has seen one. Alert above 3 hours.',
+    registers: [registry],
+  }),
+  supplyCycleSeconds: new Gauge({
+    name: 'syncer_supply_cycle_seconds',
+    help: 'Wall-clock seconds the last finished supply cycle took, from its start to the write of its snapshot row; no sample until the first one.',
+    registers: [registry],
+  }),
   validatorsUnlFetchesTotal: new Counter({
     name: 'syncer_validators_unl_fetches_total',
     help: 'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
@@ -153,6 +229,18 @@ const metrics = {
   validatorsDomainChecksTotal: new Counter({
     name: 'syncer_validators_domain_checks_total',
     help: 'Domain checks of validators, by outcome (verified, or the reason code of the failure).',
+    labelNames: ['outcome'],
+    registers: [registry],
+  }),
+  validatorsTomlFieldsTotal: new Counter({
+    name: 'syncer_validators_toml_fields_total',
+    help: "Per verified domain check, what the validator's toml entry gave, by field (owner_country, server_country, network, unl) and outcome (read, absent, invalid).",
+    labelNames: ['field', 'outcome'],
+    registers: [registry],
+  }),
+  validatorsTomlStoreWritesTotal: new Counter({
+    name: 'syncer_validators_toml_store_writes_total',
+    help: 'Writes of the domain checker to the per-domain toml store, by outcome (ok, error). A failed write does not fail the pass.',
     labelNames: ['outcome'],
     registers: [registry],
   }),
@@ -189,7 +277,46 @@ const metrics = {
     labelNames: ['table'],
     registers: [registry],
   }),
+  tomlsChecksTotal: new Counter({
+    name: 'syncer_tomls_checks_total',
+    help: 'Checks of the toml of a domain, by outcome (ok, or the reason code of the failure).',
+    labelNames: ['outcome'],
+    registers: [registry],
+  }),
+  tomlsDomains: new Gauge({
+    name: 'syncer_tomls_domains',
+    help: 'Domains accounts name, by the status of their toml after the last pass (ok, failed, unchecked).',
+    labelNames: ['status'],
+    registers: [registry],
+  }),
+  tomlsDue: new Gauge({
+    name: 'syncer_tomls_due',
+    help: 'Domains due and not checked yet at the end of the last pass.',
+    registers: [registry],
+  }),
+  tomlsDiscoverySeconds: new Gauge({
+    name: 'syncer_tomls_discovery_seconds',
+    help: 'Duration of the last discovery read, in seconds.',
+    registers: [registry],
+  }),
 };
+
+// A labelled counter has no series until its first `inc`, and `increase()` of a series that first shows at its value is 0: the first
+// Import the parser clamps would raise no alert. The series of each kind starts at 0, as the unlabelled counters above do.
+metrics.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, 0);
+metrics.parserAnomaliesTotal.inc({ kind: 'mpt_unreadable' }, 0);
+// the alert is an increase(), and a series that first shows at its value has none: its first failure would raise nothing
+metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'ok' }, 0);
+metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'error' }, 0);
+// the same: an issuance set aside moves no lag, and its errors are all that say so, up to an hour apart
+metrics.aggregatorErrorsTotal.inc({ job: 'mpt_state' }, 0);
+metrics.aggregatorErrorsTotal.inc({ job: 'mpt_state_dirty' }, 0);
+
+// prom-client gives a gauge without labels a sample of 0 when it is registered. These two are not known until the supply job has seen
+// a snapshot, or written a row: a 0 would read as a snapshot that has just been written, and no alert could fire on a job that
+// never writes one. So they start without a sample (the HELP and TYPE lines stay, `absent()` is true), and a `set` brings it.
+metrics.supplySnapshotAgeSeconds.remove();
+metrics.supplyCycleSeconds.remove();
 
 // Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
 nodeThrottle.on('pause', (pause: ThrottlePause) => metrics.nodeRateLimitedTotal.inc({ endpoint: pause.host }));
@@ -213,6 +340,9 @@ export class PrometheusService implements OnModuleInit {
   readonly ingestHaltsTotal = metrics.ingestHaltsTotal;
   readonly nodeRateLimitedTotal = metrics.nodeRateLimitedTotal;
   readonly ammUnclassifiedTotal = metrics.ammUnclassifiedTotal;
+  readonly nftSkippedTotal = metrics.nftSkippedTotal;
+  readonly objectsUnclassifiedTotal = metrics.objectsUnclassifiedTotal;
+  readonly parserAnomaliesTotal = metrics.parserAnomaliesTotal;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
   readonly validationsErrorsTotal = metrics.validationsErrorsTotal;
   readonly validationsDroppedTotal = metrics.validationsDroppedTotal;
@@ -227,16 +357,34 @@ export class PrometheusService implements OnModuleInit {
   readonly ratesDailyMissingDays = metrics.ratesDailyMissingDays;
   readonly accountRollupsHeavyAccounts = metrics.accountRollupsHeavyAccounts;
   readonly accountRollupsPendingAccounts = metrics.accountRollupsPendingAccounts;
+  readonly nftStateLagLedgers = metrics.nftStateLagLedgers;
+  readonly nftDirtyLedgers = metrics.nftDirtyLedgers;
+  readonly nftCollectionsPending = metrics.nftCollectionsPending;
+  readonly escrowsLagLedgers = metrics.escrowsLagLedgers;
+  readonly escrowsOpen = metrics.escrowsOpen;
+  readonly tokensLive = metrics.tokensLive;
+  readonly tokensLagLedgers = metrics.tokensLagLedgers;
+  readonly mptStateLagLedgers = metrics.mptStateLagLedgers;
+  readonly tokensBuilding = metrics.tokensBuilding;
+  readonly tokensRepairLedgers = metrics.tokensRepairLedgers;
+  readonly supplySnapshotAgeSeconds = metrics.supplySnapshotAgeSeconds;
+  readonly supplyCycleSeconds = metrics.supplyCycleSeconds;
   readonly validatorsUnlFetchesTotal = metrics.validatorsUnlFetchesTotal;
   readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
   readonly validatorsUnlSize = metrics.validatorsUnlSize;
   readonly validatorsDomainChecksTotal = metrics.validatorsDomainChecksTotal;
+  readonly validatorsTomlFieldsTotal = metrics.validatorsTomlFieldsTotal;
+  readonly validatorsTomlStoreWritesTotal = metrics.validatorsTomlStoreWritesTotal;
   readonly validatorsNodePollsTotal = metrics.validatorsNodePollsTotal;
   readonly validatorsJobsTotal = metrics.validatorsJobsTotal;
   readonly validatorsAgreementLagSeconds = metrics.validatorsAgreementLagSeconds;
   readonly validatorsRoundsLagLedgers = metrics.validatorsRoundsLagLedgers;
   readonly amendmentsWithoutMetadata = metrics.amendmentsWithoutMetadata;
   readonly validatorValidationsFlushedTotal = metrics.validatorValidationsFlushedTotal;
+  readonly tomlsChecksTotal = metrics.tomlsChecksTotal;
+  readonly tomlsDomains = metrics.tomlsDomains;
+  readonly tomlsDue = metrics.tomlsDue;
+  readonly tomlsDiscoverySeconds = metrics.tomlsDiscoverySeconds;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

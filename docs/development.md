@@ -45,19 +45,24 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 | Path | Package | Role |
 | --- | --- | --- |
 | `apps/api` | `@gatehub/data-api-service` | NestJS REST API: the `/v2` Ripple-compatible endpoints over ClickHouse, plus live-node lookups (balances, orders) |
-| `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the five workers `ingest`, `validations`, `fee_stats`, `aggregator` and `validators`, and the `range-ingest` CLI |
+| `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the six workers `ingest`, `validations`, `fee_stats`, `aggregator`, `validators` and `tomls`, and the `range-ingest` CLI |
+| `apps/exporter` | `@gatehub/data-exporter` | NestJS worker, one per network: takes the queued export jobs and makes each file (CSV, or PDF with `pdfkit`) by walking the list's CSV pages through the api, then uploads it to Google Cloud Storage ([architecture](architecture.md#exporter-appsexporter-gatehubdata-exporter)); its e2e test is `apps/api/test/exports.e2e-spec.ts`, against the api harness |
 | `packages/shared` | `@gatehub/data-api-shared` | ClickHouse client and migration runner, the `Table` enum and row types, parsers, `buildLedgerRows` / `LedgerWriter`, the `NodeClient`, `RatesService`, the aggregation jobs, the network profiles |
 
 `packages/shared` in more detail:
 
-- `src/network/`: `NetworkProfile` for `xrpl` and `xahau`; `config/definitions/<network>.json` (binary-codec definitions, a fallback for when
-  the node cannot supply `server_definitions`) and `config/markets/<network>.json` (volume markets) ship next to `dist/`.
+- `src/network/`: `NetworkProfile` for the four networks, `xrpl`, `xahau`, `xrpl-testnet` and `xahau-testnet` (`NETWORK_NAMES`; each profile also
+  names its `family`, `xrpl` or `xahau`, and its `kind`, `mainnet` or `testnet`). Three kinds of files ship next to `dist/`: **per network**,
+  `config/definitions/<network>.json` (binary-codec definitions, a fallback for when the node cannot supply `server_definitions`) and
+  `config/markets/<network>.json` (volume markets; the testnets' are empty); **per family**, `config/amendments/<family>.json` (`xrpl.json`,
+  `xahau.json`: the amendment metadata, which a testnet reads without its `enabled` entries). A new network is a code change: one profile and
+  its files.
 - `src/clickhouse/`: `clickhouse.service.ts` (typed wrapper: bound parameters, per-query guards, synchronous inserts with dedup tokens),
   `clickhouse.config.ts`, `migrate.ts`, `tables.ts` (the `Table` enum), `rows.ts` (row types).
 - `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
   `FixtureLedgerSource`, `raw-ledger.ts`.
-- `src/xrpl/node-client.ts`, `src/query/` (rates, decimals, the daily-rate and account day-group reads), `src/aggregate/` (the stats, volume, and account and market jobs), `src/util/`.
-- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`, `schema/004_amm_fee_estimates.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
+- `src/xrpl/node-client.ts`, `src/query/` (rates, decimals, the daily-rate and account day-group reads), `src/aggregate/` (the stats, volume, AMM, NFT, tokens, and account and market jobs), `src/util/`.
+- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`, `schema/004_amm_fee_estimates.sql`, `schema/009_account_network_names.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
 - `test/` (e2e suites, the shared ClickHouse container helper, fixtures), `scripts/record-fixtures.ts`.
 
 Everything the apps use is re-exported from `packages/shared/src/index.ts`: **export what you add there.**
@@ -83,10 +88,12 @@ docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123 / 9000
 
 cp apps/api/.env.example    apps/api/.env  # the .env files are git-ignored; the .env.example files are committed
 cp apps/syncer/.env.example apps/syncer/.env
-#   defaults: GH_NETWORK=xrpl; the syncer example reads from Ripple's full-history server wss://s2.ripple.com (the API example keeps the
-#   default nodes wss://s2.ripple.com,wss://xrplcluster.com); GH_API_KEYS is empty (no authentication)
+#   defaults: GH_NETWORK=xrpl; GH_NODE_ENDPOINTS is commented out in both examples, so the nodes are the public ones of the network (for
+#   xrpl wss://s2.ripple.com, Ripple's full-history server, then wss://xrplcluster.com); GH_API_KEYS is empty (no authentication)
 
+export GH_CLICKHOUSE_URL=http://localhost:8123  # required, with no default; ch:migrate reads no .env file
 pnpm ch:migrate                            # creates the database of GH_NETWORK (xrpl) and applies the schema
+pnpm ch:migrate:shared                     # creates the shared database (account names, labels) and applies its own schema
 
 pnpm start:syncer                          # http://localhost:3002 (probe), starts at the validated head
 pnpm start:api                             # http://localhost:3001, Swagger at /internal/docs
@@ -103,6 +110,10 @@ curl -s localhost:3001/liveliness/healthz
 **A second network (Xahau).** Use a second pair of env files (or the compose stack), with `GH_NETWORK=xahau`: the database defaults to
 `xahau`, the node to `wss://xahau.network`, the native currency to `XAH`. Run `GH_NETWORK=xahau pnpm ch:migrate` once, and give the second
 API and syncer different ports (`GH_HTTP_API_PORT`, `GH_METRICZ_PORT`).
+
+**A testnet.** The same with `GH_NETWORK=xrpl-testnet` or `xahau-testnet`: the database defaults to `xrpl_testnet` / `xahau_testnet`, the node to
+the public testnet servers, and a node of another network is refused at boot. Leave `GH_NODE_ENDPOINTS` at its default (a mainnet value fails
+the boot). In the compose stack set `XRPL_NETWORK=xrpl-testnet` (or `XAHAU_NETWORK=xahau-testnet`) for the slot ([deployment](deployment.md#option-2-local-development-stack)).
 
 **Everything in containers.** `NPM_TOKEN=... docker compose --profile full up -d --build` brings up ClickHouse, the XRPL migrate job,
 syncer and api (add `--profile xahau` for Xahau); see [deployment](deployment.md#option-2-local-development-stack). The ports are
@@ -124,13 +135,16 @@ From the repo root; `pnpm -r <script>` fans out in dependency order.
 | `pnpm --filter @gatehub/data-api-shared test:e2e` | Shared e2e tests (migrations, writer, build-rows, rates, aggregation). **Needs Docker.** |
 | `pnpm format` | Prettier write over `{apps,packages}/**/src/**/*.ts`. (`pnpm lint` runs `eslint --fix`, but the repo has no ESLint configuration yet, so it does not work.) |
 | `pnpm ch:migrate` | applies the schema to the database of `GH_NETWORK` (`ts-node` on `migrate.ts`) |
+| `pnpm ch:migrate:shared` | applies `schema-shared/` to the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`, default `shared`), which the api reads the account names and labels from |
 | `pnpm --filter @gatehub/data-syncer ingest:range --from N --to M` | the range-ingest CLI from source: it runs `dist/`, so `pnpm build` first, and it needs the syncer's `GH_*` environment (`.env` or `GH_ENV=local`) ([backfill](backfill.md)) |
-| `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures. Two more modes record the inputs of the `validators` worker: `--unl --network xrpl\|xahau [--out <dir>]` the validator lists of the network's default publishers (needs no node), and `--network-state --network xrpl\|xahau --endpoint <wss> [--out <dir>] [--ledger <n>]` what the worker asks the node for (the Amendments, NegativeUNL and FeeSettings objects at the validated ledger, or at `--ledger`, which the node must still hold, `server_info` and `feature`) |
-| `pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl\|xahau [--clickhouse]` | compares the amendment metadata file with a node (and with the database) and exits 1 on a difference ([operations](operations.md#keep-the-amendment-metadata-current)) |
-| `pnpm start:api` / `pnpm start:syncer` | `nest start --watch` |
+| `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures (`--network` is one of `xrpl`, `xahau`, `xrpl-testnet`, `xahau-testnet`, and the node must be of that network: a mainnet rippled is refused as `xrpl-testnet`). Two more modes record the inputs of the `validators` worker: `--unl --network xrpl\|xahau\|xrpl-testnet\|xahau-testnet [--out <dir>]` the validator lists of the network's default publishers (needs no node; Xahau Testnet has no publisher), and `--network-state --network xrpl\|xahau\|xrpl-testnet\|xahau-testnet --endpoint <wss> [--out <dir>] [--ledger <n>]` what the worker asks the node for (the Amendments, NegativeUNL and FeeSettings objects at the validated ledger, or at `--ledger`, which the node must still hold, `server_info` and `feature`) |
+| `pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl\|xahau\|xrpl-testnet\|xahau-testnet [--clickhouse]` | compares the amendment metadata file of the network's family with a node (and with the database) and exits 1 on a difference ([operations](operations.md#keep-the-amendment-metadata-current)) |
+| `pnpm start:api` / `pnpm start:syncer` / `pnpm start:exporter` | `nest start --watch` |
 | `pnpm docker:up` / `pnpm docker:down` | start/stop the dev ClickHouse container |
 
 There is no root `test:e2e`: each package spins its own throwaway ClickHouse and runs `--runInBand`.
+
+The api's `test:e2e` sets `NODE_OPTIONS=--max-old-space-size=6144` (Linux and macOS). `--runInBand` holds about 40 to 80 MB per suite, and one full run crashed at Node's 4 GB default. The limit only caps growth, so a machine that needs less uses less; a runner with less than about 6 GB free would swap on a full run.
 
 ## 5. Conventions
 
@@ -200,13 +214,15 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `004_amm_fee_estimates.sql`;
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `017_mpt.sql`; 008 is reserved by another change of spec #4;
    never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
    statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.
 3. For a ledger-derived table: have `buildLedgerRows` produce the rows and add the table to `CHILD_TABLES` (`build-rows.ts`), to
    `LEDGER_KEYED_TABLES` (`ingest-state.ts`, so recovery deletes it; keep its partitioning identical to the DDL) and give it
    `non_replicated_deduplication_window`. Bump `PARSER_VERSION` when the parsers' output changes, and re-ingest with `--reprocess`.
+   A feature that readers gate on the parser version gets a constant of its own (`AMM_PARSER_VERSION`, `STATE_PARSER_VERSION`, `NFT_PARSER_VERSION`, `DOMAIN_PARSER_VERSION`, `OBJECT_PARSER_VERSION`, `TOKEN_PARSER_VERSION`, `MINT_PARSER_VERSION`, `MPT_PARSER_VERSION`) with
+   the first version that writes it, and its gate compares with that constant, never with `PARSER_VERSION`, which later features move.
 4. Read it from an API service with `${Table.X}`. Apply: `pnpm ch:migrate` locally; the migrate job in compose; the e2e suites apply
    `runMigrations()` themselves.
 
@@ -225,7 +241,7 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 There are no materialized views ([ADR-0008](adr/0008-no-aggregate-materialized-views.md)). Query-time aggregates are plain `GROUP BY`
 queries over a bounded, key-ordered range (guard them with a window). A precomputed aggregate is a table the **aggregator** writes: a
 `ReplacingMergeTree(version)`, recomputed idempotently (a complete set under one new version; readers keep the highest version), added as a
-job in `aggregator.service.ts` with its own budget (a job with state of its own, such as `amm_pools` and `amm_daily`, is a runner in a
+job in `aggregator.service.ts` with its own budget (a job with state of its own, such as `amm_pools`, `amm_daily`, `nft_state` and `nft_collections`, is a runner in a
 file of its own, `*.job-runner.ts`, behind the `AggregatorJobContext` of `job-context.ts`), and marked via `agg_dirty` when ingest
 rewrites its inputs.
 
@@ -275,6 +291,10 @@ env -i PATH="$PATH" NODE_ENV=development GH_ENV=container GH_API_KEYS=any GH_CLI
 curl -s http://127.0.0.1:23001/internal/docs-json | ruby -ryaml -rjson -e 'puts JSON.parse(STDIN.read).to_yaml' > /tmp/openapi.yaml
 kill %1                                                                           # then keep the header comment of docs/openapi.yaml on top of /tmp/openapi.yaml
 ```
+
+If `ruby` stops with `Encoding::InvalidByteSequenceError` its default external encoding is not UTF-8 (a description holds a non-ASCII character): write
+`ruby -E UTF-8:UTF-8 -ryaml ...`. The file lists the paths in the order the controllers register, so adding a controller can move other blocks of the file; compare two
+generated files by their parsed paths (`YAML.load_file`) and not by `git diff` alone.
 
 At runtime the API serves Swagger UI at `/internal/docs` and the JSON at `/internal/docs-json` (the shipped nginx does not expose them).
 

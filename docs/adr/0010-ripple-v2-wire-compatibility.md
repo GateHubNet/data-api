@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended three times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53).
+**Status:** Accepted. Amended eleven times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72); Amendment 5 (2026-10-24), by [ADR-0016](0016-nft-and-uritoken-data.md), the NFT and URIToken routes, the `coverage` field and `nft_volume` (the amendment at the end of this record, items 73 to 78); Amendment 6 (2026-10-24), by [ADR-0017](0017-display-names.md), the account names and toml routes (the amendment at the end of this record, items 79 to 83); Amendment 7 (2026-10-24), by [ADR-0018](0018-ledger-object-history.md), the routes of the ledger objects and delegations, the `delegate` column of the account transactions CSV and the fee of a delegated transaction (the amendment at the end of this record, items 84 to 93); Amendment 8 (2026-10-30), by [ADR-0019](0019-issued-tokens-from-state-history.md), the routes of the issued tokens (the amendment at the end of this record, items 94 to 102); Amendment 9 (2026-10-31), by the [supply design](../superpowers/specs/2026-10-24-supply-design.md) (no ADR: the job is a precomputed aggregate of [ADR-0008](0008-no-aggregate-materialized-views.md)'s kind), the supply routes (its amendment below, items 103 to 104); Amendment 10 (2026-10-31), by the [validator toml details design](../superpowers/specs/2026-10-24-validator-toml-details-design.md) (D8; like D7, it has no ADR of its own, and [ADR-0012](0012-validators-and-amendments-data.md) records the decision), `toml` on the validator routes, the `country` filter and the countries route (its amendment below, items 105 to 107); Amendment 11 (2026-10-31), by [ADR-0020](0020-mpt-data.md), the MPT routes and `kind=mpt`, MPT payments and balance changes on the routes of the original, `clawback` and the MPT asset syntax (the amendment at the end of this record, items 108 to 117). Items 7 and 10 were edited in place on 2026-10-29, each to point at Amendment 7 (the routes and the table it adds are not the ones those items dropped), and item 54 gained the column `delegate` on the same day. Items 85 and 101 were edited in place on 2026-10-31, each to point at Amendment 11: item 85 no longer says that the MPT routes serve D5's amount object (item 109), and item 101's message `invalid kind - use: issued` became `invalid kind - use: issued, mpt` (item 113). Item 44 gained one sentence on 2026-10-24, for the fixed validator list of Xahau Testnet ([ADR-0012](0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -48,12 +48,12 @@ below. Where a ruling made during implementation changed served behaviour it is 
    validators[/{pubkey}[/manifests|/reports]], validator_reports, rippled_versions}`; `/v2/accounts/{address}/{escrows, payment_channels}`; `/v2/reports[/{date}]`;
    `/v2/maintenance/{domain}`; `/v2/estimate`; and the API map at `/` and `/v2`, whose index also appeared as the `api-map` key of the original's 404 body (here the
    404 body is `{result, message}` only). The old GateHub `/v2/ledgers` time-range list is dropped as well (it collided with Ripple's "latest ledger": `/v2/ledgers`
-   without an identifier is the latest ledger). Dropping the escrows and payment-channels *routes* goes with dropping their tables (item 10).
+   without an identifier is the latest ledger). Dropping the escrows and payment-channels *routes* goes with dropping their tables (item 10). Amendment 7 (items 84 to 93) serves the escrows, checks and payment channels *by object ID* from a table of another kind; these two account lists stay 404.
 8. **`/v2/ledger/{hash}/validations[/{pubkey}]`** (singular) is registered as an alias of `/v2/ledgers/{hash}/validations[/{pubkey}]`. It appears only in the
    original's README, not in the route table of either branch's `server.js`; it is provided because the README documented it and it was asked for.
 9. **`minute` live period of the volume routes is not supported** (the original's develop branch had it); `hour, day` (payments) and `hour, day,
    3day, 7day, 30day` (trades) are. The historical mode (`start`/`end`/`interval=day|week|month`) of the develop branch is implemented.
-10. **Data dropped:** the offers, issuers, escrows and paychannels tables and parsers. Escrow and payment-channel *typing* stays in `balance_changes`.
+10. **Data dropped:** the offers, issuers, escrows and paychannels tables and parsers. Escrow and payment-channel *typing* stays in `balance_changes`. (Amendment 7 adds the history of escrows, checks, payment channels and delegations in `object_changes`, a ledger table of its own, and `escrows`, an aggregate for D7's total: neither is the original's table.)
     `accounts_created.genesis_*` stays empty until a history import loads ledger 32570.
 
 **Amendment 2 (2026-10-19), added by the account and market aggregates ([ADR-0013](0013-account-and-market-aggregates.md)); the wording is in [api-reference](../api-reference.md#account-analytics-get-v2accountsaddressanalytics):**
@@ -199,7 +199,7 @@ own crawler (`api/routes/network/getValidators.js`, `topology.js`); this API ser
     order).
 43. **Row.** The original's row was `{validation_public_key, domain, chain, current_index, agreement_1h, agreement_24h, partial, unl}`. Here the same keys in the same order,
     without `chain` (one network per deployment), then the new ones. The agreement objects keep `{missed, total, score, incomplete}` and add `partial`; `agreement_30d` is new.
-44. **`unl`** was "on Ripple's main or altnet list". Here it is "on the trusted UNL of the configured publishers" (`GH_UNL_PUBLISHERS`), and `unl_lists` names the lists.
+44. **`unl`** was "on Ripple's main or altnet list". Here it is "on the trusted UNL of the configured publishers" (`GH_UNL_PUBLISHERS`), and `unl_lists` names the lists. `unl_lists` may name `local`, the fixed list of `GH_UNL_VALIDATORS`.
 45. **`domain`** came from the original's own domain check. Here it is the domain of the validator's manifest, and `domain_verification` says whether the validator's
     `/.well-known/xrp-ledger.toml` (Xahau: `xahau.toml`) confirms it.
 46. **Agreement** was counted against the ledgers the original's chain logic saw. Here it is counted against the indexed validated chain, over full validations only,
@@ -212,3 +212,326 @@ own crawler (`api/routes/network/getValidators.js`, `topology.js`); this API ser
 Kept from the original: the messages `Validator not found` and `unable to retrieve validator(s)` and the CSV name `validators.csv`. New 400s exist for the new parameters
 (`invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid marker`, `invalid validator public key`). The endpoint-by-endpoint wording is in
 [api-reference](../api-reference.md#validators-and-amendments).
+
+## Amendment 4 (2026-10-24): account investigation data
+The account investigation data (spec #4: account transactions export, account names and labels, account state history, path
+payments, exports; the hard-to-reverse parts are [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and
+[ADR-0015](0015-historical-account-state-from-clickhouse.md)) adds routes, parameters and fields the original did not have. Each is an
+addition: what the original served is served as before. Names and labels are served inline on `GET /v2/accounts/{address}` only.
+
+54. **`format=csv` on `GET /v2/accounts/{address}/transactions`.** The original had no CSV for account transactions and ignored
+    `format`. Here `format=csv` answers one summary row per transaction from the account's side (`hash, ledger_index, executed_time,
+    tx_type, result, initiator, counterparty, amount, currency, issuer, fee, flags_changed, delegate`; the last column came with Amendment 7, item 90), in a file `<address> - transactions.csv`,
+    with every parameter and the paging of the JSON list. The raw `tx` and `meta` are not in it: flattened, they would give a column per
+    field of every type. The JSON answer is unchanged.
+55. **`account_name`.** The original's `account_data` was `{account, parent, initial_balance, inception, ledger_index, tx_hash}` (and the
+    genesis fields). Here the same keys in the same order, then `account_name`, the account name of the address, left out when it has
+    none. It is the same on every network.
+56. **Names are not activations.** A name is the operator's, not the ledger's: it is served from a copy the api loads every 60 s
+    (`GH_NAMES_AND_LABELS_RELOAD_MS`), so a new or removed name shows within that time, and an address with a name but no activation
+    on the network still answers 404 `Account not found`, as in the original.
+57. **`account_labels`.** After `account_name` and `account_network_name` (item 58), `account_data` carries the labels the operator
+    put on the address (`scam`, `spam`, `advisory`) as an object keyed by label, in that order:
+    `{ "scam": { "description": "…", "source": "…", "url": "…" } }`, with `source` and `url` left out when empty, and the whole field
+    left out when the address has no label. The original had no labels. They are the same on every network, load and reload with the
+    names (60 s), and a label on an address without an activation on the network does not make it found (item 56).
+58. **`account_network_name`.** After `account_name`, the account network name: the name the operator gave the account on this
+    network only ("USD Issuer" on the XRP Ledger), kept in the network's own database (`account_network_names`, migration 009) with
+    the rules of the account names and reloaded with them. It is served with or without an `account_name`, and left out when there is
+    none; the other network's api never shows it.
+59. **Account flags.** The original's `/v2/accounts/{address}` answered with the account's creation only. Here `flags=true` adds `flags` to
+    `account_data`, after its other keys: one `true`/`false` per account flag the network names (the XRP Ledger's from its definitions,
+    Xahau's from xahaud's source), named without the `lsf` prefix. With `date` (alias `close_time`), a numeric `ledger_index` (alias
+    `ledger`) or `ledger_hash` they are read from the account state history, with the precedence of `/balances`, and `ledger_index` and
+    `close_time` come before `account_data`; without one (or with `validated`, `closed`, `current`) from `account_info` on the live node,
+    with its `ledger_index`. Without `flags=true` the route reads and answers exactly as before, whatever ledger parameters it is sent.
+60. **Historical ledgers from ClickHouse.** A ledger named by a date, a number or a hash is a ledger this API holds. One it does not hold
+    (a number or hash it has not stored, a date before its first ledger), and one the state history does not cover (at or below the
+    newest ledger an older parser wrote), answers 400 `the date provided is too old`, the original's message for a ledger its node did not
+    have. An account with no state at that ledger, or one deleted at or before it, answers 404 `account not found`, as the node does.
+61. **`GET /v2/accounts/{address}/trustlines`.** The original had no trust line route: its `/balances` listed each line's balance
+    only, from the node. Here the account's trust lines at a ledger, from the trust line state history, each from the account's side:
+    `{ result, ledger_index, close_time, count, marker?, trustlines: [ { currency, counterparty, balance, limit, limit_peer, no_ripple,
+    no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out } ] }`, ordered and paged by
+    (`counterparty`, `currency`) with `limit` (200, max 1000) and `marker`, filtered by `currency` and `counterparty`, and
+    `format=csv` (`<address> - trustlines.csv`). Lines with a zero balance are listed, lines deleted at or before the ledger are not;
+    an issuer's lines are its holders. The ledger parameters are those of `/balances`, with its precedence.
+62. **The newest indexed ledger, never the node.** Where `/balances` reads the node's validated ledger when no ledger is named,
+    `/trustlines` reads the newest ledger this API has indexed, and `validated`, `closed` and `current` name that ledger too: its
+    markers then always belong to this API's data, and its pages never mix two sources. The answer always carries that ledger's
+    `ledger_index` and `close_time`. A newest ledger the state history does not cover answers 400 `the date provided is too old`, like a
+    named one (item 60).
+63. **`/balances` at a historical ledger, from the state history.** The original (and this API before ADR-0015) asked the node for
+    the balances at any ledger, which needs a full-history node. Here a ledger named by `ledger_hash`, `date` or a numeric
+    `ledger_index` is read from the account and trust line state history, never from the node: the native balance is the account's
+    state at the ledger, the trust lines those of `/trustlines` at the ledger. The answer keeps its shape, precedence, `currency`,
+    `counterparty`, `limit` (200, max 400, or `all`), CSV and messages, with three differences: the trust lines are **ordered by
+    (`counterparty`, `currency`)**, not in the node's order; the answer always carries the ledger's `close_time` (before, only a
+    `date` gave one); and it is not in the live cache, so it carries the global `Cache-Control`, not the live one. The rules of
+    item 60 apply: a ledger this API does not hold or the state history does not cover is 400 `the date provided is too old`, an
+    account with no state at the ledger or deleted at or before it 404 `account not found`. No ledger named, `validated`, `closed`
+    and `current` still read the node, as does every ledger of `/orders`.
+
+Kept from the original: the JSON answers of the routes it had, their parameters and their messages (`Account not found` and `unable to get accounts`). No new message: with `flags=true` the 400s of `/balances` (`invalid date format`, `invalid ledger hash`, `the date provided is too old`) and its 404 `account not found` apply, and `/balances` at a historical ledger keeps its own; `/trustlines` answers the 400s of `/balances` and of the paged lists (`invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, `invalid marker`, `the date provided is too old`), and 500 `unable to retrieve trustlines`. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddresstransactions), [api-reference](../api-reference.md#get-v2accountsaddress), [api-reference](../api-reference.md#get-v2accountsaddressbalances) and [api-reference](../api-reference.md#get-v2accountsaddresstrustlines).
+
+**Path payments** (items 65 to 67). The wording is in [api-reference](../api-reference.md#path-payments).
+
+65. **`GET /v2/path_payments`.** The original had no list of path payments (GLOSSARY.md: a successful payment whose delivery used
+    someone else's liquidity). Here the path payments of the network in a window: `start`, `end`, `descending`, `limit` (200, at most
+    1000), `marker` and a `Link` header, as every list, and `format=csv` with the file `path payments.csv`. The row is
+    `hash, ledger_index, executed_time, source, destination, delivered_amount, currency, issuer?, source_amount, source_currency,
+    source_issuer?, offers_crossed, amm_pools, rippled_through`, the issuers absent for the native currency. In the CSV, `amm_pools`
+    and `rippled_through` are one cell each with the accounts separated by a space, where the original's flattening would have made
+    one column per position (`amm_pools[0]`, ...) that changes from page to page.
+66. **Payments to oneself.** The original's payments left a payment to oneself out (a conversion, not a payment), and
+    `/v2/payments`, `/v2/accounts/{address}/payments` and the payment volumes still do. A path payment to oneself (an arbitrage loop,
+    or a conversion through an offer or a pool) is listed by `/v2/path_payments` and `/v2/accounts/{address}/path_payments`.
+67. **`GET /v2/accounts/{address}/path_payments`.** The original had no list of an account's path payments. Here the path payments
+    the account sent or received, with the parameters, the paging and the row of `/v2/path_payments` (item 65), and `format=csv` with
+    the file `<address> - path payments.csv`. A payment to oneself is listed once. An account a payment only rippled through, a pool
+    and the owner of an offer crossed do not list it: they are in the row, not its source or destination. As on the original's lists
+    under an account, the address is not checked: one that is none has an empty list.
+
+The messages of `/v2/path_payments` and `/v2/accounts/{address}/path_payments` are those of `/v2/payments` (`invalid start date
+format`, `invalid end date format`, `invalid marker`), with the 500 `unable to retrieve path payments`.
+
+**Exports** (items 68 to 72). The wording is in [api-reference](../api-reference.md#exports).
+
+68. **Exports.** The original had no exports: a client walked the pages itself. Here `POST /v2/exports` with `{path, format}` queues
+    an export of any list with a CSV form (`path` is the list's `/v2/…?…` path, a list over time names `start` and `end`) and answers
+    202 `{result, id, status: "queued"}`; `GET /v2/exports/{id}` answers `{result, id, status, format, path, created, finished?,
+    rows?, error?, url?}`. Both are routes of their own: no route of the original changes.
+69. **An export is the list.** The file is made by the exporter of the network, which walks the list's own CSV pages through the
+    api with its own API key, so the file is the CSV the route would give for the whole list in one page (one header, the columns
+    of every row, in the order they first appear). The format is `csv`, or `pdf` (item 72).
+70. **An export belongs to its API key.** Only the key that created a job sees it: any other key gets 404 `export not found`, as
+    for an id that does not exist. The job keeps the SHA-256 of the key, never the key. A done job's `url` is a Google Cloud
+    Storage link signed at each request and valid for 15 minutes; the job and its file are kept 7 days.
+71. **Export limits.** An API key has at most 3 exports queued or running (`GH_EXPORT_MAX_JOBS_PER_KEY`): one more answers 429
+    `{"result":"error","message":"too many exports in progress: at most 3 per API key"}`, the body of every error of these routes,
+    not the rate limit's `{"error":…}` (a different limit, with no time to wait for). An export holds at most 1,000,000 rows as CSV
+    and 10,000 as PDF (`GH_EXPORT_MAX_ROWS_CSV`, `_PDF`). Where the list counts its rows up front (the account transactions by
+    time) an export above the cap answers 400 at once; any other export fails when its list passes the cap, with the same message
+    as its `error`: `the list has more than <cap> rows, the most a CSV export holds: narrow the window` (for PDF, `... a PDF export
+    holds: narrow the window or use CSV`).
+72. **PDF exports.** The original had no PDF. Here `format: "pdf"` makes a document of the same walked list, rendered by the
+    exporter with `pdfkit` (not GateHub's `pdf-generator`): landscape A4; a header with the list's file name, for an account's list
+    the address with its account name, account network name and labels (read from `/v2/accounts/{address}` through the api, like
+    the rows), then the network, the list's path, its window (or the ledger it is at), the ledgers its rows cover, the row count
+    and when it was made; then a table of the columns chosen for the list (the first 8 of a list without a choice; the CSV keeps
+    every column) and `Page n of m` on every page. Opening and closing balances are not in it.
+
+The messages of the export routes are new: 400 `invalid path`, `path is not exportable`, `start and end are required`,
+`invalid format`, `the list has more than <cap> rows, ...`; 404 `export not found`; 429 `too many exports in progress: at most 3
+per API key`; 503 `exports are not available` (no bucket configured); 500 `unable to create the export` and `unable to retrieve
+the export`.
+
+## Amendment 5 (2026-10-24): NFTs and URITokens
+The NFT and URIToken data (program 2, sub-project D3: [ADR-0016](0016-nft-and-uritoken-data.md), the wording in
+[api-reference](../api-reference.md#nfts)) adds routes, a field and a volume metric the original did not have. Each is an addition: what the
+original served is served as before.
+
+73. **The NFT routes, as extras.** The original predates NFTs. Here `GET /v2/nfts/{nft_id}`, `GET /v2/nfts/{nft_id}/history`,
+    `GET /v2/nfts/{nft_id}/offers`, `GET /v2/accounts/{address}/nfts`, `GET /v2/accounts/{address}/nft_history`, `GET /v2/nft_collections`,
+    `GET /v2/nft_collections/{issuer}/{taxon}` (XRPL) and `GET /v2/nft_collections/{issuer}` (Xahau) with their sub-routes `/nfts`, `/holders`,
+    `/sales` and `/stats`, and `GET /v2/nft_sales`. They serve the NFTokens of the XRP Ledger and the URITokens of Xahau (`kind` is `nftoken` or
+    `uritoken`) with the contract of every list: `limit` (200, at most 1000), `marker` and a `Link` header, `format=csv`, absent keys left out.
+    A key that does not exist for a kind is left out (`taxon`, `serial` and `transfer_fee` of a URIToken). The other network's id, or the other
+    form of a collection's path, is 404 `nft not found` or `collection not found`.
+74. **`coverage`.** Every answer of these routes carries `"coverage": { "from_ledger_index": N, "complete": bool }`, the key right after `result`
+    (`from_ledger_index` is left out when no ledger is stored), and it is not in the CSV. It says whether the NFT history the answer is read
+    from is whole: it starts at the first ledger written by the NFT parser (version 5) and is complete when that is at or before the ledger the
+    feature starts at, the enable ledger of `NonFungibleTokensV1_1` (XRPL) or `URIToken` (Xahau, ledger 1). The detail, history and offers of an NFT
+    state their own: complete when its mint is indexed. The rule is the program's one coverage rule ([api-reference](../api-reference.md#coverage),
+    [ADR-0016](0016-nft-and-uritoken-data.md)); no existing route gained the field.
+75. **`GET /v2/network/nft_volume`.** The route of `exchange_volume` (live and historical modes, `interval`, `exchange_currency` and
+    `exchange_issuer`, `limit`, `marker`) for the sales of NFTs, in the native currency, a component per collection:
+    `{issuer, taxon?, count, amount, rate, converted_amount}`. The live periods are `day`, `7day` and `30day` only (400 `invalid period - use:
+    day, 7day, 30day`), so the live sets are fifteen in all. `amount` is the volume of the collection's sales that have a price in the native
+    currency at that day's rate and `count` those sales; **the `count` of the row is every sale of the window**, those with no rate included. The
+    amounts of this metric are exact decimals, and so are their sums (the other metrics add Float64 values). `coverage` follows `result`.
+    CSV: `nft_volume.csv`. Its daily sets carry a config version of their own, so a change of the markets config does not recompute them.
+76. **The CSV names.** `<nft_id> - nft history.csv`, `<address> - nfts.csv`, `<address> - nft history.csv`, `nft collections.csv`,
+    `<issuer>[ <taxon>] - nfts.csv`, `<issuer>[ <taxon>] - holders.csv`, `<issuer>[ <taxon>] - sales.csv`, `<issuer>[ <taxon>] - stats.csv`,
+    `nft sales.csv` and `nft_volume.csv`. The columns are the keys of the object in order, a nested object as `a.b`, an absent key an empty cell.
+    Each route with a CSV form can be exported ([Exports](../api-reference.md#exports)); those over time (`history`, `nft_history`, a
+    collection's `sales` and `stats`, `nft_sales`, `nft_volume`) name `start` and `end` in the export.
+77. **Messages and checks.** The messages are new: 400 `invalid nft id`, `invalid taxon`, `invalid event`, `invalid role`, `invalid type`,
+    `invalid sort`, `start is required` (the stats of a collection), `invalid window - use at most 366 days`; 404 `nft not found`, `collection
+    not found`; 500 `unable to retrieve nft`, `unable to retrieve nft history`, `unable to retrieve offers`, `unable to retrieve nfts`,
+    `unable to retrieve collections`, `unable to retrieve collection`, `unable to retrieve holders`, `unable to retrieve sales`, `unable to
+    retrieve stats` and, for the volume, `error getting data`. The checks run in the order the parameters are listed, a bad marker is a 400
+    before a 404, and **an empty `start=` or `end=` is 400** on the NFT routes (the volume keeps the contract of the other volumes: empty is none).
+    A failed coverage read fails the route with its own 500, no `complete: false` is invented.
+78. **Caching.** The NFT routes send the global `Cache-Control` (`private, max-age=60`); the list of all collections is kept 60 s in the api.
+
+Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#nfts) and
+[api-reference](../api-reference.md#get-v2networknft_volume).
+
+## Amendment 6 (2026-10-24): display names
+The display names (program 2, sub-project D4: [ADR-0017](0017-display-names.md), the wording in
+[api-reference](../api-reference.md#account-names-and-tomls)) add two routes the original did not have. Each is an addition: **no route of the original
+changes**, and the fields `account_name`, `account_network_name` and `account_labels` of `GET /v2/accounts/{address}` are as before.
+
+79. **`GET /v2/account_names`, as an extra.** The original predates names. Here `GET /v2/account_names?addresses=` answers `{result, count, account_names}`
+    with one entry per address asked, **in the order asked**: `{address, display_name?, domain?, account_name?, account_network_name?, labels?}`, a key
+    without a value left out and never `null`. `display_name` is `{text, kind}`, `kind` being `verified` (the toml of the account's domain lists the
+    address), `account` (the operator's name, else its name on this network) or `domain` (a domain nothing vouches for); `domain` is the account's domain
+    whatever its state. The parameter is 1 to 100 classic addresses separated by `,`, with no spaces and no trimming; a repeated address is answered at each
+    place and counts towards the 100; an X-address is refused; the first of a repeated `addresses` wins. Any address is answered: one that is no account on
+    the network keeps its name and labels and has no domain.
+80. **`GET /v2/toml/{domain}`, as an extra.** What the toml of a domain says, as the `tomls` worker last stored it: `{result, toml}` with `domain, toml_url,
+    status, reason?, status_code?, checked, fetched?, modified?, expires?, accounts?, currencies?, principals?, validators?`, only the entries that count on the
+    network and only the keys the reference lists (a principal's email and social handles are never read; `[[SERVERS]]` and `[ORGANIZATION]` neither). The
+    domain is lower-cased first. A failed check is a 200 with `status: "failed"`, not a 404. The api never fetches on a request.
+81. **The key of the labels is `labels`.** The batch's entry says `labels` where `GET /v2/accounts/{address}` says `account_labels`; the object is the
+    same (keyed `scam`, `spam`, `advisory`, each `description`, `source?`, `url?`).
+82. **Messages and checks.** The messages are new: 400 `addresses is required`, `too many addresses - at most 100`, `invalid ripple address`, `invalid domain`;
+    404 `toml not found`; 500 `unable to retrieve account names`, `unable to retrieve toml`. The checks run in this order: `addresses is required`, then
+    `too many addresses - at most 100`, then `invalid ripple address`; a failed read of the account domains fails the batch with its 500, and no answer is
+    made without them. Unknown parameters are ignored.
+83. **No `coverage`, no CSV, the default cache.** Neither answer carries `coverage` (a lookup that lists nothing: [Coverage](../api-reference.md#coverage));
+    neither has `limit`, `marker`, `Link` or a CSV form; both send the global `Cache-Control` (`private, max-age=60`) and errors `no-store`. An account
+    whose Domain was set before the state history starts and has not changed since has no domain until it does ([backfill](../backfill.md#account-domains-seed)).
+
+## Amendment 7 (2026-10-24): ledger objects and delegation
+The ledger objects (program 2, sub-project D5: [ADR-0018](0018-ledger-object-history.md), the wording in
+[api-reference](../api-reference.md#ledger-objects)) add nine routes the original did not have, change one column of an export and fix two bugs of the account
+books. **No route of the original is removed or changes the shape of its answer**: the JSON list of account transactions is as before, and its CSV gains a column.
+
+84. **Nine routes, as extras.** The original served no object of the ledger by its ID. Here `GET /v2/escrows/{escrow_id}`, `GET /v2/checks/{check_id}` and
+    `GET /v2/payment_channels/{channel_id}`, each with `/history`; `GET /v2/accounts/{address}/escrows/{sequence}` (an escrow by its owner and the sequence of
+    the transaction that created it, answered exactly as its ID is: the ID is worked out from the two, so no table is read first); `GET /v2/accounts/{address}/delegations`
+    (the permission delegations an account gave or holds); and `GET /v2/ledger_objects/{object_id}` (which kind of object an ID is, so that a pasted ID finds its page).
+    They are served on both networks.
+85. **Shape.** Every answer but the lookup of an ID starts `result, coverage, ledger_index, close_time`: the `coverage` of its feature ([Coverage](../api-reference.md#coverage);
+    an object's own is complete also when its creation is indexed), then the newest committed ledger and when it closed, which is the point the state and the `status` are
+    as of. The key orders (`escrow_id, account, sequence?, destination, amount, ...`) are ours and are pinned by tests and by the reference's "Keys of" lines; a key with
+    no value is left out, never `null`. IDs are 64 hex digits, accepted in any case and answered in upper case; times are `YYYY-MM-DDTHH:mm:ssZ`; the permission of a
+    delegation is `{permission, kind, transaction_type?}`. An **amount** is `{currency, issuer?, value}`: the native currency's code without an issuer and the value in
+    whole units, an issued token as on the ledger, and a multi-purpose token as `{currency: <48 hex digits of the issuance ID>, issuer, value: <raw integer units>,
+    mpt_issuance_id}` (**the data API's MPT amount object**, of these routes; the later MPT routes serve an amount as its integer string beside the issuance ID, item 109). The `status` is worked out at the close time of the
+    answer: an escrow is `pending`, `can_be_finished` or `can_be_cancelled` and, once deleted, `finished`, `cancelled` or `removed`; a check `open`, `expired`, `cashed`,
+    `cancelled` or `removed`; a payment channel `open`, `closing` (it has an `expiration`, or a `cancel_after` that has been reached, and any transaction on it closes it)
+    or, once deleted, `closed` or `removed`.
+86. **History and paging.** The detail of an object embeds its newest 50 events (newest first) and a `history_marker` when there are more, which continues at
+    `/{id}/history?descending=true&marker=...`. The history routes take `descending` (default false: oldest first), `limit` (200, at most 1000), `marker`, `format=csv`
+    (files `<id> - escrow history.csv`, `<id> - check history.csv`, `<id> - payment channel history.csv`; the same columns on every page, an amount's keys joined to its name
+    with a dot) and send `Link`. An unknown parameter is ignored. A page past the end of an object that has events is `count: 0`; an object with none is 404.
+87. **Delegations.** `direction` is `given` (default; the account is the delegating `account`) or `held` (it is the `authorize`); an empty `direction=` is `given`. Only the
+    entries that are in the ledger are listed, ordered by `updated` (newest first) and then `delegation_id`, with `limit` (200, at most 1000), `marker`, `Link` and
+    `format=csv` (files `<address> - delegations given.csv` and `<address> - delegations held.csv`; the permission names in one cell, separated by a space). An account with
+    more than 10,000 delegations in the direction is a 500 `unable to retrieve delegations` that is logged: the list is a guard, not a page. **On Xahau, which has no
+    permission delegation, the answer is an empty list with `complete: true`**, not a 404, and no table is read.
+88. **Messages and checks.** The messages are new: 400 `invalid escrow id`, `invalid check id`, `invalid channel id`, `invalid ledger object id`, `invalid ripple address`
+    and `invalid sequence number` (the messages of `GET /v2/accounts/{address}/transactions/{sequence}`; **the owner of an escrow by sequence is checked**, as it is part
+    of the ID), `invalid direction`, `invalid marker`; 404 `escrow not found`, `check not found`, `payment channel not found`, `ledger object not found`; 500 `unable to retrieve
+    escrow`, `escrow history`, `check`, `check history`, `payment channel`, `payment channel history`, `delegations`, `ledger object`. The checks run in the order the
+    reference lists them (a bad marker is a 400 before a 404). A failed read of the coverage fails the route with its own 500, and no `complete: false` is invented. With no
+    committed ledger the object routes answer their 404 and the delegations 500.
+89. **No node fallback, and what 404 means.** The API serves what the index holds and never asks a node for an object. An object the index has no row of answers 404, which is
+    also what an object created before the first ledger written by parser version 7 and untouched since gets; the `coverage` of the other routes says where the history starts
+    ([backfill](../backfill.md#ledger-objects-and-delegation-re-ingest)). Escrows, checks and channels stay `complete: false` until the history backfill; delegation is complete
+    after its re-ingest. The routes send the global `Cache-Control` (`private, max-age=60`) and errors `no-store`.
+90. **`delegate` in the account transactions CSV.** The summary row of `GET /v2/accounts/{address}/transactions?format=csv` (item 54) gains `delegate` as its **last**
+    column: the transaction's `Delegate`, empty when it has none, on the row of every account the transaction affected. `fee` is on the row of the account that paid it: the
+    delegate's when the transaction names one, else the sender's. The JSON list is unchanged (its `tx` already carries `Delegate`), and so are the PDF columns of an
+    export. A delegate always has the transaction in its own list, with `is_initiator` 0, also when the metadata names none of its accounts (a fee-free inner transaction of
+    a Batch); `account_tx_by_sequence` stays the sender's.
+91. **The fee of a delegated transaction is the delegate's (a fix).** Until parser version 7 the `transaction_cost` row of a delegated transaction was put on its
+    `Account`, but the delegate signs it and pays its fee (the original predates permission delegation). From parser version 7 on the row is the delegate's and the sender's native row is its whole change, so the
+    rule that, per currency, the changes of a transaction sum to zero but the fee burned holds for a delegated transaction. The same rule is applied to two columns that
+    added the fee back to the source whoever paid it, `payments.source_balance_changes` and `path_payments.source_amount`, and to `payments.destination_balance_changes`
+    when the delegate is the Payment's `Destination` (a sweep to itself): the delegate's native change there is what arrived, the fee added back, and none when that is
+    0 (a token payment to its delegate). Everything derived from `balance_changes` (`/accounts/{address}/balance_changes`, the `stats` and `reports`, the analytics,
+    the rollups) follows from a re-ingest of the ledgers (`range-ingest --reprocess` from
+    ledger 107,524,865, [backfill](../backfill.md#ledger-objects-and-delegation-re-ingest)); ledgers before it keep the old rows, and a delegated transaction before the
+    reprocess has no fee row on the delegate.
+92. **Issued-token payment channels are typed (a fix).** On Xahau (`PaychanAndEscrowForTokens`) a payment channel can hold an issued token, and the parser read every
+    channel amount as drops: `dropsToNative` of a token's amount object throws a `LedgerParseError`, which halts the live syncer and fails a range chunk at the first such
+    ledger. Channels are now typed in the currency they hold, as escrows are, and **a Xahau syncer halted on such a ledger resumes after the deploy**. One thing means
+    something else than for a native channel: on Xahau the creator's line moves at each claim, so a claim's creator row is typed `paychannel_fund` with the claimed delta
+    (the values match the ledger; the label does not say "funded").
+93. **Kept: item 7.** `/v2/accounts/{address}/escrows` and `/v2/accounts/{address}/payment_channels`, the lists of the original, still answer 404 (the explorer's Objects
+    tab reads an account's objects from the node). Items 7 and 10 stand, and say so, in place.
+
+Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#ledger-objects).
+
+## Amendment 8 (2026-10-30): issued tokens
+The issued tokens (program 2, sub-project D6: [ADR-0019](0019-issued-tokens-from-state-history.md), the wording in [api-reference](../api-reference.md#tokens)) add four routes the
+original did not have. **No route of the original is removed or changes the shape of its answer.**
+
+94. **Four routes, as extras.** The original served no list of tokens and no token by its currency and issuer (its `/v2/currencies` and `/v2/gateways` are still not served, item 7).
+    Here `GET /v2/tokens` (the issued tokens of the network ranked by holders), `GET /v2/tokens/{currency}.{issuer}` (one token), `GET /v2/tokens/{currency}.{issuer}/holders` (its holders by
+    balance) and `GET /v2/tokens/{currency}.{issuer}/transfers` (the payments that delivered it). They are served on both networks and on the testnets, and the objects and key orders are
+    ours: pinned by tests and by the reference's "Keys of" lines.
+95. **Shape.** Every answer starts `result, coverage` ([Coverage](../api-reference.md#coverage)): the list, the detail and the holders state the feature `issued_tokens` (the state tables,
+    parser version 3), the transfers the feature `token_transfers` (the payments, parser version 1). Both are D3's case of a feature without an amendment, which starts at the first ledger of
+    the network (32,570 on the XRP Ledger, 1 on Xahau; a testnet is never complete). The list, the detail and the holders go on with `ledger_index` and `close_time`, the ledger the aggregate is
+    through; the transfers, which are read from the ledgers at query time, have none. A key with no value is left out, never `null`; amounts are exact decimal text, a `share` has 6 decimals
+    (half up), a `price` 8 significant digits (a price below 0.000001 or from 100,000,000 up is exponent text, as `last` of `network/markets` already is) and a change is a percent with 2 decimals.
+96. **Definitions.** From the issuer's side of a trust line, the other account **holds** the token when the balance is below 0; the line **counts** when its holder holds the token, or the balance is 0
+    and the holder's own limit is above 0. **Holders** are the counting lines with a balance above 0; **trust lines** are the counting lines (zero balances included); **supply** is the exact sum of
+    the holders' balances, the issuer's obligations as `gateway_balances` gives them (not the circulating supply of the native currency). A frozen line counts, an AMM pool's reserve line counts
+    (the pool is a holder), and a currency of an LP token (`03` and 38 hex digits) is not a token: it is never listed and its detail and holders are 404, but its transfers are listed.
+97. **The list: order, `rank` and a moving marker.** Ordered by `holders` descending, then `issuer`, then `currency`; `rank` is the place among the tokens the filters select. The ranking is
+    rebuilt each minute, so the marker `(kind, holders, issuer, currency)` is a cursor into a ranking that moves, as the marker of `/v2/amm/pools`: a token can move between two pages, and the pages
+    concatenate to the unpaged list only while the ranking does not change. `kind` (`issued`; D9 adds `mpt`) is echoed and part of the marker, so a marker of one kind is `invalid marker` for another.
+    `min_holders` (0 to 1,000,000,000) and a search `q` (an issuer address, or text in the code, name or domain, a 40-hex currency, an issuer prefix) filter it; `total` counts what the filters select,
+    `total_below` what matches `q` with fewer holders, and `totals` describe the whole kind whatever the filters (`holders` is left out while the job has not counted them). `format=csv` (file
+    `tokens.csv`) has the columns of a row, and a page without a row is an empty file. Before the first generation exists the answer is `{result, coverage, kind, count: 0, tokens: []}`.
+98. **One token.** The path `{currency}.{issuer}` is split at its last `.`, `+` or `|`; the code is a 3-character code of the ledger's set (upper-cased), 40 hex digits or a text of 4 to 20 characters
+    (as its hex), and `usd` in lower case names `USD`. The answer has the token's counts, its `price` (the last trade against the native currency in the `day` set of the markets, else the `30day`
+    set, without a change), the `native_volume` and `trades` of the day, the issuer's `domain` and `toml_url`, whether the toml `listed` it (**two-way**: the issuer's own account domain has a
+    `[[CURRENCIES]]` entry for the token that counts on the network) and `toml` (the served fields of that entry), `issuer_settings` (the transfer fee as an exact percent and the account flags by the
+    names of the network; left out while the issuer has no row in the state tables), `markets` (the pairs of the `day` set turned so that the token is the base, at most 20) and `last_ledger`.
+    No CSV.
+99. **Holders.** The counting lines with a balance above 0 by balance descending, then holder, with `rank` over the whole list on every page (so a page costs the token's whole prefix), `share` (the balance
+    over the supply, 6 decimals, half up), `limit`, `frozen` and `authorized`. The order and the marker are made on the balance as a double (balances of the same double are tied and come by holder), so the marker is that double and the holder of the last row. CSV file `<code or currency> <issuer> - holders.csv`.
+100. **Transfers and `/v2/payments`.** The same payments from the same table in the same order, window and paging as [`/v2/payments/{currency}`](../api-reference.md#get-v2paymentscurrency), with its
+    messages (`start`, `end`, `descending`, `limit`, `marker`): the successful `Payment` transactions between two different accounts that delivered the token (**a payment to oneself is not a
+    transfer**, as item 66 has it, and is a path payment), in a smaller row with the delivered amount as `amount`. The list does not look the token up: there is **no 404** for a token nobody was
+    paid in, one the aggregate does not know or an LP currency. CSV file `<code or currency> <issuer> - transfers.csv`.
+101. **Messages and checks.** The messages are new: 400 `invalid kind - use: issued` (`invalid kind - use: issued, mpt` since Amendment 11, item 113), `invalid min_holders`, `invalid search`, `invalid marker`, `invalid currency`, `XRP cannot have an issuer` (`XAH` on
+    Xahau, where an issued `XRP` is a currency like any other), `invalid issuer address`, and for the transfers `invalid start date format` and `invalid end date format`; 404 `token not found`; 500
+    `unable to retrieve tokens`, `token`, `holders`, `transfers`. The checks run in the order the reference lists them and before any read; a failed read of the coverage fails the route with its own
+    500 and no `complete: false` is invented. The routes send the global `Cache-Control` (`private, max-age=60`) and errors `no-store`.
+102. **No node fallback, and what 404 means; item 7 kept.** The API serves what the index holds and never asks a node for a token or its holders: a token with no counting line, an LP currency, a token
+    whose lines have not changed since the coverage starts, and every token before the first generation exists answer 404, and the `coverage` says where the state starts (the explorer shows the
+    token from the node). No history of supply or holders is kept. Items 7 and 10 stand: `/v2/currencies` and `/v2/gateways` still answer 404.
+
+Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#tokens).
+
+## Amendment 9 (2026-10-31): supply
+The native supply (program 2, sub-project D7: the [design](../superpowers/specs/2026-10-24-supply-design.md), the wording in [api-reference](../api-reference.md#get-v2networksupply)) adds two routes the
+original did not have. **No route of the original is removed or changes the shape of its answer.**
+
+103. `GET /v2/network/supply`. The original had `/v2/network/xrp_distribution` (out of scope, 404) and no supply route. Here one snapshot an hour, every figure in exact text and each history-derived part with its coverage.
+104. `GET /v2/network/supply/minted`: Xahau's minting, by day and source; empty on XRPL.
+
+Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2networksupply).
+
+## Amendment 10 (2026-10-31): validator toml details
+What a validator's verified toml says (program 2, sub-project D8: the [design](../superpowers/specs/2026-10-24-validator-toml-details-design.md), the wording in [api-reference](../api-reference.md#get-v2networkvalidators)) adds fields, one filter and one route the original did not have. **No route of the original is removed or changes the shape of its answer.**
+
+105. `toml` on a validator row and on the answer for one validator: added fields, last on the row after `last_seen`. The original's keys of the row are unchanged, in their order. The original had no countries.
+106. `country` on `GET /v2/network/validators`: an ISO 3166-1 alpha-2 code or `unknown`, with its 400 `invalid country`. The original had no such filter.
+107. `GET /v2/network/validators/countries`: the validators of a scope per server country, with the message of the validator routes, `unable to retrieve validator(s)`.
+
+Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2networkvalidators).
+
+## Amendment 11 (2026-10-31): MPTokens
+The MPT data (program 2, sub-project D9: [ADR-0020](0020-mpt-data.md), the wording in [api-reference](../api-reference.md#mpt)) add routes the original did not have, and rows it never had to the routes it did. **No route of the original is removed, and no row of a history without MPT changes**, but for the `change_type` of a `Clawback` of an issued token (item 112). The original predates MPTokens (XLS-33).
+
+108. **Five routes and a kind, as extras.** `GET /v2/mpt/{issuanceId}` (one issuance, with its flags and metadata), `GET /v2/mpt?ids=` (a summary of 1 to 100 issuances, in the order asked, duplicates too), `GET /v2/mpt/{issuanceId}/holders` (its balances, the largest first), `GET /v2/mpt/{issuanceId}/transfers` (what the successful transactions moved, clawed back, locked or unlocked, oldest first), `GET /v2/accounts/{address}/mpt` (the holdings of an account at the newest committed ledger) and `kind=mpt` on `GET /v2/tokens`. The objects and key orders are ours: pinned by tests and by the reference's "Keys of" lines. A key with no value is left out, never `null`. An issuance ID is 48 hex digits, in either case on a route and in upper case in an answer.
+109. **Amounts: integer strings beside the ID (corrects item 85).** Item 85 said that the later MPT routes would serve every MPT amount in D5's amount object. They do not: `outstanding_amount`, `amount`, `fee` and the rest are the ledger's integer units as strings of digits, never scaled, beside `mpt_issuance_id`, as section 7 of the [spec](../superpowers/specs/2026-10-17-mpt-data-design.md) shows them and the explorer's client (E14) reads them. D5's object stays what the ledger objects' routes serve, unchanged. `asset_scale` says how to show them, and `?ids=` gives the scale and the ticker of an ID. Counts are numbers. Flags are named booleans, the bits of the ledger's `UInt32`.
+110. **MPT payments are payments.** `/v2/payments`, `/v2/payments/{currency}` and `/v2/accounts/{address}/payments` serve them, with the issuance ID as `currency`, the issuer the ID holds as `issuer`, the amounts in integer units and **`mpt_issuance_id` as the last key, after `transaction_cost`**; no other payment has that key, and the CSV has its column only when a row of the page has one. Until parser version 10 such a payment was dropped. Exchanges, AMM pools and path payments still skip MPT amounts: MPTokensV2 is not enabled.
+111. **MPT balance changes, with the issuer's mirror.** `/v2/accounts/{address}/balance_changes` serves two rows for each change of a holder's `MPTAmount`, as for a trust line: the holder's, with the issuer as `counterparty`, and the issuer's, with the holder as `counterparty` and the sign reversed, so that each currency of a transaction sums to zero. `mpt_issuance_id` is the last key, after `tx_hash`, with a CSV column as in item 110. `/analytics/*`, `stats` and `reports` then show an MPT line, in raw units and worth 0: an MPT has no rate.
+112. **`change_type: "clawback"` for every balance row of a `Clawback`**, of an MPT and of an issued token, from the re-ingest of its ledger on (parser version 10); the row of the fee keeps its type. The filter `change_type=clawback` is accepted and its message lists it, and `/analytics/balance_changes` orders it after `paychannel_payout`. The original had no such type: a `Clawback` is newer than it.
+113. **`kind=mpt` on `GET /v2/tokens`.** D6's route, parameters, envelope and order (`holders` descending, then `issuer`, then the ID), with a row, totals and a search of its own, over the issuances whose state is known and that are not destroyed. The message of item 101 becomes `invalid kind - use: issued, mpt`. A marker of one kind stays `invalid marker` for the other. With nothing to list the answer is the whole envelope with zeros at the newest committed ledger.
+114. **The asset syntax.** An MPT is written `<48hex>` or `<48hex>+<issuer>`: 48 hex digits in any case are always an issuance ID, and 3-character and 40-hex codes stay issued currencies. An issuer that is not the one the ID holds is the new 400 `issuer does not match mpt issuance`. A route that takes such an asset as a filter and holds no MPT (`asset` and `asset2` of `/v2/amm/pools`, `currency` of `/v2/nft_sales`) answers an MPT with an empty list, not with its old 400 `issuer is required`.
+115. **Shape and coverage.** Every answer that lists or describes an issuance has `coverage` right after `result` ([Coverage](../api-reference.md#coverage)), the feature `mpt` (parser version 10), which starts at the ledger `MPTokensV1` was enabled in (99,226,369 on the XRP Ledger); `?ids=` lists nothing and has none. It is never in a CSV. CSV files: `<issuanceId> - holders.csv`, `<issuanceId> - transfers.csv`, `<address> - mpt.csv` and `tokens.csv`, with the same columns on every page.
+116. **Messages and checks.** The messages are new: 400 `invalid mpt issuance id`, `ids is required`, `too many ids`, `invalid kind - use: payment, clawback, lock, unlock, escrow_create, escrow_finish, escrow_cancel`, with `invalid start date format`, `invalid end date format`, `invalid ripple address` and `invalid marker` as elsewhere; 404 `issuance not found`; 500 `unable to retrieve issuance`, `issuances`, `holders`, `transfers` and `mpt holdings`. A route that names an issuance checks the ID first, and every 400 comes before any read. A failed read of the coverage fails the route with its own 500, and no `complete: false` is invented. The routes send the global `Cache-Control` (`private, max-age=60`) and errors `no-store`.
+117. **No node fallback, what 404 means, and Xahau.** The API serves what the index holds and never asks a node. An issuance whose own node has not changed inside the coverage has no known state: `/v2/mpt/{issuanceId}` is a 404 and the list leaves it out, while its holders and transfers are served; a brand-new one is a 404 until the job's next run. A destroyed issuance is served, with `destroyed: true`. **Xahau and Xahau Testnet have no MPT**, and no route reads an MPT table there: `/v2/mpt/{issuanceId}`, its holders and its transfers are 404, `?ids=` the bare IDs, and `kind=mpt` and the holdings an empty list with `complete: true`.
+
+Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#mpt).

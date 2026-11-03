@@ -1,2 +1,3 @@
 # Migration checksums are sha256 of the file bytes, so line endings must not depend on the checkout platform.
 schema/*.sql text eol=lf
+schema-shared/*.sql text eol=lf

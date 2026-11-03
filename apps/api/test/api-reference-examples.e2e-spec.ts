@@ -14,21 +14,24 @@ import {
   TYPICAL,
 } from './support/analytics-world';
 import { MARKETS_ISSUER, MARKETS_NOW, seedLiveRate, seedMarketsWorld } from './support/markets-world';
+import { MPT_WORLD, seedMptWorld } from './support/mpt-world';
 
 /**
- * The JSON examples of the routes of sub-project D2 in `docs/api-reference.md` are what the API serves, key order included.
+ * The JSON examples of the routes of sub-projects D2 and D9 in `docs/api-reference.md` are what the API serves, key order included.
  *
- * Every example is preceded by a line `<!-- d2-example GET <path?query> -->` and followed by a fenced `json` block. This suite
- * seeds the two worlds the examples are made from, GETs each path, and expects `JSON.stringify` of the answer to equal that of
- * the block: the contract the explorer's fixtures are generated from cannot drift from the code. The examples pass an explicit
- * `end`, so that none of them depends on today (`network/markets` has no `end`: its set is the one written at `MARKETS_NOW`).
+ * Every example is preceded by a line `<!-- d2-example GET <path?query> -->` or `<!-- mpt-example GET <path?query> -->` and followed
+ * by a fenced `json` block. This suite seeds the worlds the examples are made from, GETs each path, and expects `JSON.stringify` of
+ * the answer to equal that of the block: the contract the explorer's fixtures are generated from cannot drift from the code. The D2
+ * examples pass an explicit `end`, so that none of them depends on today (`network/markets` has no `end`: its set is the one written
+ * at `MARKETS_NOW`); the MPT world's answers stand at its head, whatever today is.
  *
  * The worlds:
  *  - the analytics world (`support/analytics-world.ts`: read its header), with the payments and the trades below written for
  *    the typical account, at times that world has a ledger for;
  *  - the markets world (`support/markets-world.ts`: read its header), whose sets are those of 2020-07-02T10:42:17Z, and the
- *    trades a display currency's live rate is made of.
- * They are in two databases: the ledgers of the two worlds do not share one time axis, and the markets world's trades would
+ *    trades a display currency's live rate is made of;
+ *  - the MPT world (`support/mpt-world.ts`: read its header), the rows the MPT suites read, whose coverage is complete.
+ * They are in three databases: the ledgers of the worlds do not share one time axis, and the markets world's trades would
  * change the rates of the analytics world's last days.
  */
 
@@ -44,29 +47,30 @@ interface Example {
 }
 
 /**
- * The examples of a Markdown text: each `<!-- d2-example GET <path> -->` line and the fenced `json` block after it (blank
- * lines may come between). A marker that is not followed by such a block is an error, so an example cannot lose its answer.
+ * The examples of a Markdown text: each `<!-- <name> GET <path> -->` line and the fenced `json` block after it (blank lines may
+ * come between). A marker that is not followed by such a block is an error, so an example cannot lose its answer.
  */
-function examplesOf(markdown: string): Example[] {
+function examplesOf(markdown: string, name: string): Example[] {
   const lines = markdown.split('\n');
   const found: Example[] = [];
   for (let i = 0; i < lines.length; i++) {
-    const marker = /^<!-- d2-example GET (\S+) -->$/.exec(lines[i]);
+    const marker = new RegExp(`^<!-- ${name} GET (\\S+) -->$`).exec(lines[i]);
     if (!marker) continue;
     let at = i + 1;
     while (at < lines.length && lines[at].trim() === '') at++;
     if (lines[at]?.trim() !== '```json') {
-      throw new Error(`The d2-example marker at line ${i + 1} of the reference is not followed by a json block`);
+      throw new Error(`The ${name} marker at line ${i + 1} of the reference is not followed by a json block`);
     }
     const body: string[] = [];
     for (at++; at < lines.length && lines[at].trim() !== '```'; at++) body.push(lines[at]);
-    if (at >= lines.length) throw new Error(`The json block of the d2-example at line ${i + 1} is never closed`);
+    if (at >= lines.length) throw new Error(`The json block of the ${name} at line ${i + 1} is never closed`);
     found.push({ line: i + 1, path: marker[1], json: body.join('\n') });
   }
   return found;
 }
 
-const EXAMPLES = examplesOf(readFileSync(REFERENCE, 'utf8'));
+const EXAMPLES = examplesOf(readFileSync(REFERENCE, 'utf8'), 'd2-example');
+const MPT_EXAMPLES = examplesOf(readFileSync(REFERENCE, 'utf8'), 'mpt-example');
 
 /** What the reference has to show: a path that matches, and for some the keys that its answer must have. */
 const REQUIRED: { name: string; path: RegExp; json?: RegExp[] }[] = [
@@ -123,6 +127,20 @@ const TRADES_A: TradeSpec[] = [
   ['2020-01-15T10:00:00Z', 1, 'XRP', `ZAR+${I}`, '5', '100', A, B], // a native base
 ];
 
+// -- the MPT world: one example for each route of spec 7.1 to 7.6, from its IDs -------------------------------------------------
+
+const { ids, holders } = MPT_WORLD;
+
+/** The paths the reference has to show, in the order of its section. Each has its block, and every block is one of these. */
+const MPT_PATHS: readonly string[] = [
+  `/v2/mpt/${ids.htf}`,
+  `/v2/mpt?ids=${ids.htf},${ids.nowhere}`,
+  `/v2/mpt/${ids.htf}/holders?limit=1`,
+  `/v2/mpt/${ids.htf}/transfers?kind=payment&limit=2`,
+  '/v2/tokens?kind=mpt&limit=2',
+  `/v2/accounts/${holders[0]}/mpt?limit=1`,
+];
+
 describe('the examples of the D2 routes in docs/api-reference.md', () => {
   let analytics: Harness;
   let markets: Harness;
@@ -172,6 +190,38 @@ describe('the examples of the D2 routes in docs/api-reference.md', () => {
       'GET %s answers its example, key order included',
       async (_, e) => {
         const api = e.path.startsWith('/v2/network/') ? marketsApi : analyticsApi;
+        const res = await api.ok(e.path);
+        const example = JSON.parse(e.json);
+        // the readable difference first, then the exact one: the same values in the same key order
+        expect(res.body).toEqual(example);
+        expect(JSON.stringify(res.body)).toBe(JSON.stringify(example));
+      },
+    );
+  }
+});
+
+describe('the examples of the MPT routes in docs/api-reference.md', () => {
+  let mpt: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    mpt = await startHarness({ seed: 'none', env: NO_RATE_LIMIT });
+    api = await mpt.api();
+    await seedMptWorld(mpt);
+  });
+  afterAll(async () => {
+    await mpt?.close();
+  });
+
+  it('has one example of each route of the section, from the IDs of the world, each once', () => {
+    expect(MPT_EXAMPLES.map((e) => e.path)).toEqual(MPT_PATHS);
+  });
+
+  // (no example: the test above is what fails, and `it.each` refuses an empty table)
+  if (MPT_EXAMPLES.length > 0) {
+    it.each(MPT_EXAMPLES.map((e) => [e.path, e] as const))(
+      'GET %s answers its example, key order included',
+      async (_, e) => {
         const res = await api.ok(e.path);
         const example = JSON.parse(e.json);
         // the readable difference first, then the exact one: the same values in the same key order

@@ -1,4 +1,10 @@
-import { AmmPoolsRecomputeAborted, MarketsConfig, RatesService } from '@gatehub/data-api-shared';
+import {
+  AmmPoolsRecomputeAborted,
+  getNetworkProfile,
+  MarketsConfig,
+  RatesService,
+  SupplyAmmSight,
+} from '@gatehub/data-api-shared';
 import { FakeClickHouse, iso, NOW, NOW_SECONDS, QUIET, unix } from '../../test/aggregator-fakes';
 import {
   AGGREGATOR_AMM_POOLS_BUDGET_MS,
@@ -860,6 +866,94 @@ describe('AggregatorService amm_pools job', () => {
       await svc.tick();
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('read-only'));
+    });
+  });
+
+  describe('the sight it lends to the supply job (SupplyAmmSight)', () => {
+    /** The sights the start of the supply job was given, one for each tick (it has no snapshot, so it tries at every tick). */
+    let sights: Array<SupplyAmmSight | undefined>;
+    const supplyOptions = (): AggregatorOptions => ({
+      supply: { profile: getNetworkProfile('xrpl') },
+      supplyFunctions: {
+        newestSnapshot: async () => undefined,
+        // the start waits, so that the job does nothing but ask
+        startSupplyCycle: async (_ch, _profile, _startedAt, amm) => {
+          sights.push(amm);
+          return { waiting: 'escrows' };
+        },
+      },
+    });
+    const tickAt = async (svc: AggregatorService, minutes: number): Promise<void> => {
+      jest.setSystemTime(NOW_SECONDS * 1000 + minutes * 60_000);
+      await svc.tick();
+    };
+
+    beforeEach(() => {
+      sights = [];
+    });
+
+    it('is the cursor of the job, the ledger its read placed it at and then where its batches took it', async () => {
+      pages.set(500, { accounts: ['rA'], upTo: 700 });
+      pages.set(700, { accounts: ['rB'], upTo: 900 });
+      const svc = service(supplyOptions());
+      await svc.tick();
+      // job 3 ran before the supply job, which sees the cursor after the batches of its tick
+      expect(sights).toEqual([{ cursor: 900, setAside: [] }]);
+      await tickAt(svc, 1);
+      expect(sights).toEqual([
+        { cursor: 900, setAside: [] },
+        { cursor: 900, setAside: [] },
+      ]);
+    });
+
+    it('has no cursor until the job has read it, and a read that fails leaves it so', async () => {
+      watermark.mockRejectedValueOnce(new Error('connect ECONNREFUSED'));
+      const svc = service(supplyOptions());
+      await svc.tick();
+      expect(sights).toEqual([{ cursor: undefined, setAside: [] }]);
+      await tickAt(svc, 1);
+      expect(sights[1]).toEqual({ cursor: 500, setAside: [] });
+    });
+
+    it('lists the pools that are set aside, and drops one from the list when its retry works', async () => {
+      pages.set(500, { accounts: ['rB', 'rC'], upTo: 700 });
+      failing.add('rC');
+      const svc = service(supplyOptions());
+      await svc.tick();
+      expect(sights).toEqual([{ cursor: 700, setAside: ['rC'] }]);
+
+      // the pool stays on the list while its wait lasts, and for as long as its retry fails
+      await tickAt(svc, 1);
+      await tickAt(svc, 5);
+      expect(sights.slice(1)).toEqual([
+        { cursor: 700, setAside: ['rC'] },
+        { cursor: 700, setAside: ['rC'] },
+      ]);
+      failing.clear();
+      await tickAt(svc, 15);
+      expect(sights[3]).toEqual({ cursor: 700, setAside: [] });
+    });
+
+    it('is a copy: a list that the supply job empties is not the pools the job has set aside', async () => {
+      pages.set(500, { accounts: ['rB', 'rC'], upTo: 700 });
+      failing.add('rC');
+      const svc = service({
+        ...supplyOptions(),
+        supplyFunctions: {
+          newestSnapshot: async () => undefined,
+          startSupplyCycle: async (_ch, _profile, _startedAt, amm) => {
+            sights.push({ cursor: amm?.cursor, setAside: [...(amm?.setAside ?? [])] });
+            (amm?.setAside as string[]).length = 0;
+            return { waiting: 'escrows' };
+          },
+        },
+      });
+      await svc.tick();
+      await tickAt(svc, 1);
+      expect(sights).toEqual([
+        { cursor: 700, setAside: ['rC'] },
+        { cursor: 700, setAside: ['rC'] },
+      ]);
     });
   });
 });

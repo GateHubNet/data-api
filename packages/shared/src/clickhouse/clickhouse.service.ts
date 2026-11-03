@@ -1,5 +1,5 @@
 import { ClickHouseClient, ClickHouseSettings, createClient } from '@clickhouse/client';
-import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnApplicationShutdown } from '@nestjs/common';
 import { CLICKHOUSE_CONFIG, ClickHouseConfig } from './clickhouse.config';
 import { Table } from './tables';
 
@@ -32,7 +32,7 @@ export interface CommandOptions {
  * - `command()` runs DDL / DML (used by the migration runner and the ingest bookkeeping).
  */
 @Injectable()
-export class ClickHouseService implements OnModuleDestroy {
+export class ClickHouseService implements OnApplicationShutdown {
   private readonly logger = new Logger(ClickHouseService.name);
   private readonly client: ClickHouseClient;
 
@@ -128,7 +128,17 @@ export class ClickHouseService implements OnModuleDestroy {
     return this.client;
   }
 
-  async onModuleDestroy(): Promise<void> {
+  /** Closes the client. A script or a test that made a service of its own ends it with this; an application's service closes itself. */
+  async close(): Promise<void> {
     await this.client.close();
+  }
+
+  /**
+   * Closes the client when the application shuts down: Nest runs this after the `onModuleDestroy` hooks of every module, and
+   * not in one of them, because a worker stops in its own (and writes what it holds), and Nest orders the destroy hooks of
+   * modules at the same distance by when they were scanned, which puts the ClickHouse module's before the workers'.
+   */
+  async onApplicationShutdown(): Promise<void> {
+    await this.close();
   }
 }

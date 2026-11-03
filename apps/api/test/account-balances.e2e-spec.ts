@@ -1,18 +1,22 @@
-import { Table } from '@gatehub/data-api-shared';
+import { STATE_PARSER_VERSION, Table, TrustLineStatesRow } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, rippledError, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
-import { Ledger, ledgerClock, liveNode, NodeRequest, trustLine } from './support/live-node';
+import { liveNode, NodeRequest, trustLine } from './support/live-node';
 
 /**
  * `GET /v2/accounts/:address/balances` on a real ClickHouse, with the live node replaced by a scripted stub
  * (`xrplStub`): the stub gets the exact request objects the app sends, so each test pins the commands and parameters
  * (`account_info`, then `account_lines` with `peer`, `limit` 400 and the `marker` of each page).
  *
+ * The node is asked for the current ledger only: no ledger named, or `validated`, `closed`, `current`. A ledger named by a
+ * hash, a date or a number is read from the account and trust line state history (ADR-0015); those tests run on the
+ * recorded ledgers of `xrpl-account-state` and check that the stub hears nothing.
+ *
  * Parity with `test.account.balances.js`: its one `it` ('get account balances') ran against a rippled that was not
  * there and expects the 500 `unable to retrieve balances`; it is ported unchanged, on a harness without a stub. The
  * original has nothing else (no test mocked rippled), so the rest is written from `accountBalances.js` and
  * `lib/rippled.js`, with the rulings of the task:
- *  - the default ledger is `validated` (the original asked for the open one), `ledger_hash` is forwarded (the original
+ *  - the default ledger is `validated` (the original asked for the open one), `ledger_hash` is honoured (the original
  *    read it and ignored it), a `date` resolves to the last stored ledger closed at or before it;
  *  - `limit=all` pages every trust line (the original sent no limit); numeric limits are 200 by default and at most 400;
  *  - the native currency comes from the network profile (`XRP`, `XAH` on Xahau), converted from drops.
@@ -29,6 +33,44 @@ const HASH = 'BC79855472F0724120FD1196BE6C25E4EB74C4BEEAF5499F5BEECF65139ADF20';
 const VALIDATED = 70_000_000;
 
 const path = (account: string = ACCOUNT): string => `/v2/accounts/${account}/balances`;
+
+/**
+ * Accounts of the recorded ledgers of `xrpl/account-state` (see the fixtures README). The native balances the tests expect
+ * are the `Balance` of the account's AccountRoot in the metadata of those ledgers (its last change at or before the
+ * ledger), read off the fixture files.
+ */
+/** The holder of an LBR line of `LBR_ISSUER`: TrustSets in 26922216, 26926380 and 26926383. */
+const LBR_HOLDER = 'rKQxxMQxm6jHV82bq4BCwyfcxcGG9GPWiU';
+const LBR_ISSUER = 'rsbgrRPMTykHoStSYst8jbqkscAnHCPWY8';
+const HASH_26926380 = '98BB69974A0476D080063951217515492C259ACF2DE26F69A00778B0F68CBED8';
+/** The TUJ issuer: created in 93663329; holders and an AMM pool create lines to it in 93663330 and 93663334. */
+const TUJ_ISSUER = 'rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV';
+/** The TUJ pool, created in 93663330; the issuer holds its LP token from 93663334. */
+const TUJ_POOL = 'rGuYK1v7kyrKEa86wPN2M9CHpT9LiWFr5m';
+const TUJ_LP = '03F5BC4D66B44AEAD668A84F094E08C8C13F5EE2';
+/** The TUJ issuer's trust lines at 93663334 as balances, ordered by (counterparty, currency): not the node's order. */
+const TUJ_BALANCES = [
+  { currency: TUJ_LP, counterparty: TUJ_POOL, value: '141421356.2373095' },
+  { currency: 'TUJ', counterparty: TUJ_POOL, value: '-87637118.62037774' },
+  { currency: 'TUJ', counterparty: 'rKeNzBwMPm1hbxmFfAu3iy85iXqsrfbdW5', value: '-767234.46269743' },
+  { currency: 'TUJ', counterparty: 'rXPMxDRxMM6JLk8AMVh569iap3TtnjaF3', value: '-800000000' },
+  { currency: 'TUJ', counterparty: 'raJHgTNASWNsg4BvMEQ4tcLtTgGGfE19Wf', value: '-4886027.6593725' },
+  { currency: 'TUJ', counterparty: 'rd7zuWvrgTMfcy4ezRTRYVHgpai1St5Q4', value: '-2032147.83066483' },
+  { currency: 'TUJ', counterparty: 'rfiTZj7HvwBajwkMJ7CVzbWFA9dsXe7ow3', value: '-1176453.86673002' },
+  { currency: 'TUJ', counterparty: 'rhRXL16HqqbLMV266jct2Enyjspr7m39CJ', value: '-4355078.04727168' },
+  { currency: 'TUJ', counterparty: 'rhbj4x2i7hiwoWb7vQZ16XmnAKPcLtepDX', value: '-921224.3812527' },
+];
+const USDV_ISSUER = 'rfffsukWALJB1PXYk7H8xkR6UJUDT8nMJE';
+const USDV = '5553445600000000000000000000000000000000';
+/** Creates a USDV line with a zero balance in 104566877 and deletes it in 104566926. */
+const USDV_DELETER = 'rsMeJ5p6qzVARADTYhvZbHqwkfyN18U2XH';
+/** Changes in 107670694, then deletes its account (AccountDelete) in 107671593. */
+const DELETED = 'r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC';
+/** The newest recorded ledger. */
+const NEWEST = 107872958;
+
+const TOO_OLD = { result: 'error', message: 'the date provided is too old' };
+const ACCOUNT_NOT_FOUND = { result: 'error', message: 'account not found' };
 
 const USD = trustLine('USD', GATEWAY, '12.5');
 const EUR = trustLine('EUR', OTHER_GATEWAY, '-3');
@@ -92,20 +134,10 @@ describe('GET /v2/accounts/:address/balances', () => {
     let h: Harness;
     let api: ApiClient;
     const node = liveNode();
-    let clock: ReturnType<typeof ledgerClock>;
-
-    const iso = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 19);
-    const shown = (seconds: number): string => `${iso(seconds)}Z`;
 
     beforeAll(async () => {
       h = await startHarness({ seed: 'ripple-mock', xrplStub: node.stub, env: { GH_LIVE_CACHE_TTL_MS: '0' } });
       api = await h.api();
-      clock = ledgerClock(
-        await h.ch.query<Ledger>(
-          `SELECT ledger_index, toUnixTimestamp(close_time) AS close_time FROM ${Table.Ledgers} ORDER BY ledger_index`,
-        ),
-        3,
-      );
     });
     afterAll(async () => {
       await h?.close();
@@ -178,44 +210,30 @@ describe('GET /v2/accounts/:address/balances', () => {
       });
     });
 
-    describe('the ledger', () => {
-      it('ledger_index is forwarded to account_info, and the lines are read from the ledger it answered with', async () => {
-        const res = await api.get(`${path()}?ledger_index=${VALIDATED + 5}`);
-        expect(res.body.ledger_index).toBe(VALIDATED + 5);
-        expect(node.requests()).toEqual([
-          { command: 'account_info', account: ACCOUNT, ledger_index: VALIDATED + 5 },
-          { command: 'account_lines', account: ACCOUNT, ledger_index: VALIDATED + 5, limit: 400 },
-        ]);
-        expect('close_time' in res.body).toBe(false);
-      });
-
-      it('ledger is the alias of ledger_index, which wins when both are given and not empty', async () => {
-        await api.get(`${path()}?ledger=11`);
-        expect(node.requests('account_info')[0].ledger_index).toBe(11);
-        node.serve(standardNode);
-        await api.get(`${path()}?ledger_index=5&ledger=6`);
-        expect(node.requests('account_info')[0].ledger_index).toBe(5);
-        node.serve(standardNode);
-        await api.get(`${path()}?ledger_index=&ledger=6`);
-        expect(node.requests('account_info')[0].ledger_index).toBe(6);
-      });
-
-      it('ledger_index 0 is sent as it is (the node has no such ledger)', async () => {
-        await api.get(`${path()}?ledger_index=0`);
-        expect(node.requests('account_info')[0].ledger_index).toBe(0);
-      });
-
+    describe('the ledger (the current one: the node)', () => {
       it('the node shortcuts validated, closed and current are accepted; current answers with its open ledger', async () => {
         for (const word of ['validated', 'closed']) {
           node.serve(standardNode);
           const res = await api.get(`${path()}?ledger_index=${word}`);
           expect(node.requests('account_info')[0].ledger_index).toBe(word);
           expect(res.body.ledger_index).toBe(VALIDATED);
+          expect('close_time' in res.body).toBe(false);
         }
         node.serve(standardNode);
         const current = await api.get(`${path()}?ledger_index=current`);
         expect(current.body.ledger_index).toBe(VALIDATED + 9);
         expect(node.requests('account_lines')[0].ledger_index).toBe(VALIDATED + 9);
+      });
+
+      it('ledger is the alias of ledger_index, which wins when both are given and not empty', async () => {
+        await api.get(`${path()}?ledger=closed`);
+        expect(node.requests('account_info')[0].ledger_index).toBe('closed');
+        node.serve(standardNode);
+        await api.get(`${path()}?ledger_index=current&ledger=closed`);
+        expect(node.requests('account_info')[0].ledger_index).toBe('current');
+        node.serve(standardNode);
+        await api.get(`${path()}?ledger_index=&ledger=closed`);
+        expect(node.requests('account_info')[0].ledger_index).toBe('closed');
       });
 
       it('a ledger_index that is not a ledger number is ignored, as the original did (it sent NaN, the open ledger)', async () => {
@@ -231,29 +249,12 @@ describe('GET /v2/accounts/:address/balances', () => {
         }
       });
 
-      it('ledger_hash is forwarded, to the trust lines too: a hash names one ledger already', async () => {
-        const res = await api.get(`${path()}?ledger_hash=${HASH}`);
-        expect(res.status).toBe(200);
-        expect(node.requests()).toEqual([
-          { command: 'account_info', account: ACCOUNT, ledger_hash: HASH },
-          { command: 'account_lines', account: ACCOUNT, ledger_hash: HASH, limit: 400 },
-        ]);
-        expect(res.body.ledger_index).toBe(VALIDATED);
-      });
-
-      it('ledger_hash is sent in upper case, and wins over ledger_index and date', async () => {
-        await api.get(`${path()}?ledger_hash=${HASH.toLowerCase()}&ledger_index=5&date=2015-01-14T17:29:10Z`);
-        expect(node.requests('account_info')).toEqual([
-          { command: 'account_info', account: ACCOUNT, ledger_hash: HASH },
-        ]);
-      });
-
-      it('an empty ledger_hash is none', async () => {
-        await api.get(`${path()}?ledger_hash=&ledger_index=7`);
+      it('an empty ledger_hash or date is none', async () => {
+        await api.get(`${path()}?ledger_hash=&date=&ledger_index=closed`);
         expect(node.requests('account_info')[0]).toEqual({
           command: 'account_info',
           account: ACCOUNT,
-          ledger_index: 7,
+          ledger_index: 'closed',
         });
       });
 
@@ -266,66 +267,6 @@ describe('GET /v2/accounts/:address/balances', () => {
         expect(node.requests()).toEqual([]);
       });
 
-      it('date resolves to ledger at or before', async () => {
-        const { from, to } = clock;
-        const between = from.close_time + 1; // `from` and `to` are neighbours at least 3 seconds apart
-        const expected = clock.atOrBefore(between);
-        const res = await api.get(`${path()}?date=${iso(between)}`);
-        expect(res.status).toBe(200);
-        expect(node.requests('account_info')).toEqual([
-          { command: 'account_info', account: ACCOUNT, ledger_index: expected.ledger_index },
-        ]);
-        expect(res.body.ledger_index).toBe(expected.ledger_index);
-        // the close time is the one of the ledger, not the date asked for
-        expect(res.body.close_time).toBe(shown(expected.close_time));
-        expect(expected.close_time).toBe(from.close_time);
-        expect(Object.keys(res.body)).toEqual(['result', 'ledger_index', 'close_time', 'limit', 'balances']);
-
-        // the very second a ledger closed is "at or before"
-        node.serve(standardNode);
-        const exact = await api.get(`${path()}?date=${iso(to.close_time)}`);
-        expect(exact.body.ledger_index).toBe(clock.atOrBefore(to.close_time).ledger_index);
-        expect(exact.body.close_time).toBe(shown(to.close_time));
-        expect(exact.body.ledger_index).toBeGreaterThan(res.body.ledger_index);
-      });
-
-      it('date takes the formats of Ripple, close_time is its alias and wins when both are given', async () => {
-        const { from, to } = clock;
-        const viaUnix = await api.get(`${path()}?date=${to.close_time}`);
-        expect(viaUnix.body.ledger_index).toBe(clock.atOrBefore(to.close_time).ledger_index);
-
-        node.serve(standardNode);
-        const alias = await api.get(`${path()}?close_time=${iso(from.close_time)}Z`);
-        expect(alias.body.ledger_index).toBe(clock.atOrBefore(from.close_time).ledger_index);
-
-        node.serve(standardNode);
-        const both = await api.get(`${path()}?close_time=${iso(from.close_time)}&date=${iso(to.close_time)}`);
-        expect(both.body.ledger_index).toBe(clock.atOrBefore(from.close_time).ledger_index);
-
-        node.serve(standardNode);
-        const empty = await api.get(`${path()}?close_time=&date=${iso(to.close_time)}`);
-        expect(empty.body.ledger_index).toBe(clock.atOrBefore(to.close_time).ledger_index);
-      });
-
-      it('a date after the last ledger resolves to the last ledger stored', async () => {
-        const res = await api.get(`${path()}?date=2099-01-01`);
-        expect(res.body.ledger_index).toBe(clock.last.ledger_index);
-        expect(res.body.close_time).toBe(shown(clock.last.close_time));
-      });
-
-      it('a date before the first ledger answers 400 the date provided is too old, without asking the node', async () => {
-        const res = await api.get(`${path()}?date=2012-01-01`);
-        expect(res.status).toBe(400);
-        expect(res.body).toEqual({ result: 'error', message: 'the date provided is too old' });
-        expect(node.requests()).toEqual([]);
-        // the second before the first ledger closed is too old as well, the second it closed is not
-        const justBefore = await api.get(`${path()}?date=${clock.first.close_time - 1}`);
-        expect(justBefore.status).toBe(400);
-        const exactly = await api.get(`${path()}?date=${clock.first.close_time}`);
-        expect(exactly.status).toBe(200);
-        expect(exactly.body.ledger_index).toBe(clock.atOrBefore(clock.first.close_time).ledger_index);
-      });
-
       it('a date that is none answers 400 invalid date format', async () => {
         for (const bad of ['yesterday', '2015-13-01', '2015-02-30', '20150114']) {
           const res = await api.get(`${path()}?date=${bad}`);
@@ -335,14 +276,22 @@ describe('GET /v2/accounts/:address/balances', () => {
         expect(node.requests()).toEqual([]);
       });
 
-      it('date is checked even when a hash makes it unused, and a hash answers without close_time', async () => {
-        const bad = await api.get(`${path()}?ledger_hash=${HASH}&date=nope`);
-        expect(bad.status).toBe(400);
-        expect(bad.body.message).toBe('invalid date format');
-
-        const res = await api.get(`${path()}?ledger_hash=${HASH}&date=${iso(clock.from.close_time)}`);
-        expect(res.status).toBe(200);
-        expect('close_time' in res.body).toBe(false);
+      it('a hash, a date or a ledger number is a historical ledger: never asked of the node', async () => {
+        // none of these is a ledger this harness holds, so each is too old; the node hears of none
+        for (const query of [
+          `ledger_hash=${'AB'.repeat(32)}`,
+          'date=2012-01-01',
+          `ledger_index=${VALIDATED + 5}`,
+          'ledger=0',
+        ]) {
+          const res = await api.get(`${path()}?${query}`);
+          expect({ query, status: res.status, body: res.body }).toEqual({
+            query,
+            status: 400,
+            body: { result: 'error', message: 'the date provided is too old' },
+          });
+        }
+        expect(node.requests()).toEqual([]);
       });
     });
 
@@ -474,11 +423,11 @@ describe('GET /v2/accounts/:address/balances', () => {
         expect(node.requests('account_lines')).toEqual([lines, { ...lines, marker: 'm1' }, { ...lines, marker: 'm2' }]);
       });
 
-      it('limit=all with a ledger_hash pages every trust line on that hash (M3)', async () => {
+      it('limit=all on current pages every trust line on the open ledger it answered with', async () => {
         node.serve(pagedNode);
-        const res = await api.get(`${path()}?ledger_hash=${HASH}&limit=all`);
+        const res = await api.get(`${path()}?ledger_index=current&limit=all`);
         expect(res.status).toBe(200);
-        const lines = { command: 'account_lines', account: ACCOUNT, ledger_hash: HASH, limit: 400 };
+        const lines = { command: 'account_lines', account: ACCOUNT, ledger_index: VALIDATED + 9, limit: 400 };
         expect(node.requests('account_lines')).toEqual([lines, { ...lines, marker: 'm1' }, { ...lines, marker: 'm2' }]);
       });
 
@@ -597,11 +546,11 @@ describe('GET /v2/accounts/:address/balances', () => {
         expect(res.body.message).toBe('account not found');
       });
 
-      it('lgrNotFound → 400 the date provided is too old, whatever named the ledger', async () => {
+      it('lgrNotFound → 400 the date provided is too old, whatever word named the ledger', async () => {
         node.serve(() => {
           throw rippledError('lgrNotFound', 'ledgerNotFound');
         });
-        for (const query of ['', '?ledger_index=5', `?ledger_hash=${HASH}`, `?date=${iso(clock.from.close_time)}`]) {
+        for (const query of ['', '?ledger_index=validated', '?ledger_index=closed', '?ledger_index=current']) {
           const res = await api.get(`${path()}${query}`);
           expect(res.status).toBe(400);
           expect(res.body).toEqual({ result: 'error', message: 'the date provided is too old' });
@@ -661,6 +610,432 @@ describe('GET /v2/accounts/:address/balances', () => {
     });
   });
 
+  describe('historical ledgers, from the account state history (xrpl-account-state)', () => {
+    let h: Harness;
+    let api: ApiClient;
+    const node = liveNode();
+
+    beforeAll(async () => {
+      h = await startHarness({ seed: 'xrpl-account-state', xrplStub: node.stub, env: { GH_LIVE_CACHE_TTL_MS: '0' } });
+      api = await h.api();
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+    beforeEach(() => node.serve(standardNode));
+
+    const balancesAt = async (account: string, query: string): Promise<Body> => {
+      const res = await api.get(`${path(account)}?${query}`);
+      expect({ account, query, status: res.status }).toEqual({ account, query, status: 200 });
+      return res.body as Body;
+    };
+
+    describe('never ask the node', () => {
+      // every test of this block ends with no node request recorded
+      afterEach(() => expect(node.requests()).toEqual([]));
+
+      it('a ledger number: the native balance and the trust lines of that ledger, with its close time', async () => {
+        const res = await api.get(`${path(LBR_HOLDER)}?ledger_index=26922216`);
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({
+          result: 'success',
+          ledger_index: 26922216,
+          close_time: '2017-01-12T14:30:01Z',
+          limit: 200,
+          balances: [
+            { currency: 'XRP', value: '827.150187' },
+            { currency: 'LBR', counterparty: LBR_ISSUER, value: '5.017529627551844' },
+          ],
+        });
+        expect(Object.keys(res.body)).toEqual(['result', 'ledger_index', 'close_time', 'limit', 'balances']);
+        expect(Object.keys(res.body.balances[0])).toEqual(['currency', 'value']);
+        expect(Object.keys(res.body.balances[1])).toEqual(['currency', 'counterparty', 'value']);
+      });
+
+      it('a later ledger: the state of the last change at or before it', async () => {
+        expect((await balancesAt(LBR_HOLDER, 'ledger_index=26926380')).balances[0]).toEqual({
+          currency: 'XRP',
+          value: '827.141456',
+        });
+        expect((await balancesAt(LBR_HOLDER, 'ledger_index=26926383')).balances[0].value).toBe('827.141444');
+        // the TUJ issuer's balance after its three transactions of 93663334, the last one at the end of the ledger
+        expect((await balancesAt(TUJ_ISSUER, 'ledger_index=93663330')).balances[0].value).toBe('3.999978');
+        expect((await balancesAt(TUJ_ISSUER, 'ledger_index=93663334')).balances[0].value).toBe('3.999943');
+        // no change of the account since: the newest recorded ledger still has its last balance
+        const newest = await balancesAt(LBR_HOLDER, `ledger_index=${NEWEST}`);
+        expect(newest.balances).toEqual([
+          { currency: 'XRP', value: '827.141444' },
+          { currency: 'LBR', counterparty: LBR_ISSUER, value: '5.017529627551844' },
+        ]);
+      });
+
+      it('ledger is the alias of ledger_index, which wins when both are given and not empty', async () => {
+        expect((await balancesAt(LBR_HOLDER, 'ledger=26926380')).ledger_index).toBe(26926380);
+        expect((await balancesAt(LBR_HOLDER, 'ledger_index=26922216&ledger=26926380')).ledger_index).toBe(26922216);
+        expect((await balancesAt(LBR_HOLDER, 'ledger_index=&ledger=26926380')).ledger_index).toBe(26926380);
+      });
+
+      it('ledger_hash names its stored ledger, in any case, and answers with its close time', async () => {
+        const body = await balancesAt(LBR_HOLDER, `ledger_hash=${HASH_26926380.toLowerCase()}`);
+        expect(body).toEqual({
+          result: 'success',
+          ledger_index: 26926380,
+          close_time: '2017-01-12T18:49:31Z',
+          limit: 200,
+          balances: [
+            { currency: 'XRP', value: '827.141456' },
+            { currency: 'LBR', counterparty: LBR_ISSUER, value: '5.017529627551844' },
+          ],
+        });
+      });
+
+      it('the precedence: a hash wins over a date, a date over a ledger number', async () => {
+        const all = await balancesAt(
+          LBR_HOLDER,
+          `ledger_hash=${HASH_26926380}&date=2017-01-12T15:00:00Z&ledger_index=26926383`,
+        );
+        expect(all.ledger_index).toBe(26926380);
+        expect((await balancesAt(LBR_HOLDER, 'date=2017-01-12T15:00:00Z&ledger_index=26926383')).ledger_index).toBe(
+          26922216,
+        );
+      });
+
+      it('an empty ledger_hash or date is none', async () => {
+        expect((await balancesAt(LBR_HOLDER, 'ledger_hash=&date=&ledger_index=26922216')).ledger_index).toBe(26922216);
+      });
+
+      it('a date reads the last ledger closed at or before it, and answers with that close time, not the date', async () => {
+        const body = await balancesAt(LBR_HOLDER, 'date=2017-01-12T15:00:00Z');
+        expect([body.ledger_index, body.close_time, body.balances[0].value]).toEqual([
+          26922216,
+          '2017-01-12T14:30:01Z',
+          '827.150187',
+        ]);
+        // the very second a ledger closed is "at or before"
+        const exact = await balancesAt(LBR_HOLDER, 'date=2017-01-12T18:49:31Z');
+        expect([exact.ledger_index, exact.close_time]).toEqual([26926380, '2017-01-12T18:49:31Z']);
+      });
+
+      it('date takes the formats of Ripple, close_time is its alias and wins when both are given', async () => {
+        const unix = Date.parse('2017-01-12T15:00:00Z') / 1000;
+        expect((await balancesAt(LBR_HOLDER, `date=${unix}`)).ledger_index).toBe(26922216);
+        expect((await balancesAt(LBR_HOLDER, 'close_time=2017-01-12T15:00:00')).ledger_index).toBe(26922216);
+        const both = await balancesAt(LBR_HOLDER, 'close_time=2017-01-12T15:00:00Z&date=2017-01-12T19:00:00Z');
+        expect(both.ledger_index).toBe(26922216);
+        expect((await balancesAt(LBR_HOLDER, 'close_time=&date=2017-01-12T18:49:35Z')).ledger_index).toBe(26926380);
+      });
+
+      it('a date after the last ledger reads the newest stored ledger', async () => {
+        const body = await balancesAt(LBR_HOLDER, 'date=2099-01-01');
+        expect([body.ledger_index, body.close_time]).toEqual([NEWEST, '2026-10-24T14:17:20Z']);
+      });
+
+      it('the trust lines come ordered by (counterparty, currency), after the native balance', async () => {
+        expect((await balancesAt(TUJ_ISSUER, 'ledger_index=93663334')).balances).toEqual([
+          { currency: 'XRP', value: '3.999943' },
+          ...TUJ_BALANCES,
+        ]);
+      });
+
+      it('a trust line with a zero balance is a balance; a line deleted at or before the ledger is not', async () => {
+        expect((await balancesAt(USDV_DELETER, 'ledger_index=104566877')).balances).toEqual([
+          { currency: 'XRP', value: '12.359551' },
+          { currency: USDV, counterparty: USDV_ISSUER, value: '0' },
+        ]);
+        expect((await balancesAt(USDV_DELETER, 'ledger_index=104566926')).balances).toEqual([
+          { currency: 'XRP', value: '12.359515' },
+        ]);
+      });
+
+      describe('the filters', () => {
+        it('currency keeps the trust lines of that currency, and drops the native balance', async () => {
+          expect((await balancesAt(TUJ_ISSUER, 'ledger_index=93663334&currency=TUJ')).balances).toEqual(
+            TUJ_BALANCES.filter((b) => b.currency === 'TUJ'),
+          );
+        });
+
+        it('currency is compared as it is written: lower case matches nothing', async () => {
+          expect((await balancesAt(TUJ_ISSUER, 'ledger_index=93663334&currency=tuj')).balances).toEqual([]);
+        });
+
+        it('currency of the native currency answers the native balance only', async () => {
+          expect(await balancesAt(TUJ_ISSUER, 'ledger_index=93663334&currency=XRP')).toEqual({
+            result: 'success',
+            ledger_index: 93663334,
+            close_time: '2025-01-24T00:37:02Z',
+            limit: 200,
+            balances: [{ currency: 'XRP', value: '3.999943' }],
+          });
+        });
+
+        it('counterparty keeps the trust lines with that account, issuer is its alias, and the native balance stays', async () => {
+          const expected = [{ currency: 'XRP', value: '3.999943' }, ...TUJ_BALANCES.slice(0, 2)];
+          expect((await balancesAt(TUJ_ISSUER, `ledger_index=93663334&counterparty=${TUJ_POOL}`)).balances).toEqual(
+            expected,
+          );
+          expect((await balancesAt(TUJ_ISSUER, `ledger_index=93663334&issuer=${TUJ_POOL}`)).balances).toEqual(expected);
+          const both = await balancesAt(
+            TUJ_ISSUER,
+            `ledger_index=93663334&counterparty=${TUJ_POOL}&issuer=${LBR_ISSUER}`,
+          );
+          expect(both.balances).toEqual(expected);
+        });
+
+        it('currency and counterparty together', async () => {
+          const body = await balancesAt(TUJ_ISSUER, `ledger_index=93663334&currency=TUJ&counterparty=${TUJ_POOL}`);
+          expect(body.balances).toEqual([TUJ_BALANCES[1]]);
+        });
+
+        it('an empty currency or counterparty is no filter', async () => {
+          const body = await balancesAt(TUJ_ISSUER, 'ledger_index=93663334&currency=&counterparty=&issuer=');
+          expect(body.balances).toHaveLength(1 + TUJ_BALANCES.length);
+        });
+      });
+
+      describe('limit', () => {
+        it('counts the native balance: limit=3 is the native balance and the first two trust lines', async () => {
+          const body = await balancesAt(TUJ_ISSUER, 'ledger_index=93663334&limit=3');
+          expect(body.limit).toBe(3);
+          expect(body.balances).toEqual([{ currency: 'XRP', value: '3.999943' }, ...TUJ_BALANCES.slice(0, 2)]);
+        });
+
+        it('limit=1 is the native balance alone', async () => {
+          expect((await balancesAt(TUJ_ISSUER, 'ledger_index=93663334&limit=1')).balances).toEqual([
+            { currency: 'XRP', value: '3.999943' },
+          ]);
+        });
+
+        it('with a currency, the limit is filled with lines of that currency', async () => {
+          const body = await balancesAt(TUJ_ISSUER, 'ledger_index=93663334&currency=TUJ&limit=2');
+          expect(body.balances).toEqual(TUJ_BALANCES.filter((b) => b.currency === 'TUJ').slice(0, 2));
+        });
+
+        it('limit=all is every trust line, and says no limit', async () => {
+          const body = await balancesAt(TUJ_ISSUER, 'ledger_index=93663334&limit=all');
+          expect(body.balances).toEqual([{ currency: 'XRP', value: '3.999943' }, ...TUJ_BALANCES]);
+          expect(Object.keys(body)).toEqual(['result', 'ledger_index', 'close_time', 'balances']);
+        });
+
+        it('a limit that is not a number answers 400 invalid limit', async () => {
+          const res = await api.get(`${path(TUJ_ISSUER)}?ledger_index=93663334&limit=abc`);
+          expect([res.status, res.body]).toEqual([400, { result: 'error', message: 'invalid limit' }]);
+        });
+      });
+
+      describe('format=csv', () => {
+        it('the balances as a CSV file named after the account', async () => {
+          const res = await api.get(`${path(TUJ_ISSUER)}?ledger_index=93663330&format=csv`);
+          expect(res.status).toBe(200);
+          expect(res.headers['content-type']).toMatch(/^text\/csv/);
+          expect(res.headers['content-disposition']).toBe(csvDisposition(`${TUJ_ISSUER} - balances`));
+          expect(res.text.split('\n')).toEqual([
+            '"currency","value","counterparty"',
+            '"XRP","3.999978",""',
+            `"TUJ","-200000000","${TUJ_POOL}"`,
+            '"TUJ","-800000000","rXPMxDRxMM6JLk8AMVh569iap3TtnjaF3"',
+          ]);
+        });
+      });
+
+      describe('errors', () => {
+        const error = async (account: string, query: string) => {
+          const res = await api.get(`${path(account)}?${query}`);
+          return { query, status: res.status, body: res.body };
+        };
+
+        it('a ledger this API does not hold, or a date before the first one, is 400 the date provided is too old', async () => {
+          for (const query of [
+            'ledger_index=26922215',
+            'ledger_index=0',
+            `ledger_hash=${'AB'.repeat(32)}`,
+            'date=2015-01-01T00:00:00Z',
+          ]) {
+            expect(await error(LBR_HOLDER, query)).toEqual({ query, status: 400, body: TOO_OLD });
+          }
+        });
+
+        it('an account with no state at the ledger is 404 account not found, as the node answers', async () => {
+          // r3Cger… changes first in 107670694 (it existed before, but the recorded history has no state of it)
+          const query = 'ledger_index=26922216';
+          expect(await error(DELETED, query)).toEqual({ query, status: 404, body: ACCOUNT_NOT_FOUND });
+        });
+
+        it('a deleted account is 404 account not found from the ledger that deleted it on', async () => {
+          expect((await balancesAt(DELETED, 'ledger_index=107670694')).balances[0]).toEqual({
+            currency: 'XRP',
+            value: '1.32826',
+          });
+          for (const query of ['ledger_index=107671593', `ledger_index=${NEWEST}`]) {
+            expect(await error(DELETED, query)).toEqual({ query, status: 404, body: ACCOUNT_NOT_FOUND });
+          }
+        });
+
+        it('the checks before the ledger come first: address, date, hash, limit', async () => {
+          expect(await error('rNotAnAddress', 'date=nope&ledger_index=0')).toEqual({
+            query: 'date=nope&ledger_index=0',
+            status: 400,
+            body: { result: 'error', message: 'invalid ripple address' },
+          });
+          expect((await error(LBR_HOLDER, `ledger_hash=${HASH}&date=nope`)).body.message).toBe('invalid date format');
+          expect((await error(LBR_HOLDER, 'ledger_hash=ABC&limit=x')).body.message).toBe('invalid ledger hash');
+          expect((await error(LBR_HOLDER, 'ledger_index=0&limit=x')).body.message).toBe('invalid limit');
+        });
+      });
+
+      it('a historical answer is not a live one: the Cache-Control of the routes that read ClickHouse', async () => {
+        const res = await api.get(`${path(LBR_HOLDER)}?ledger_index=26922216`);
+        const trustlines = await api.get(`/v2/accounts/${LBR_HOLDER}/trustlines?ledger_index=26922216`);
+        expect(res.headers['cache-control']).toBe(trustlines.headers['cache-control']);
+        expect(res.headers['cache-control']).not.toBe('no-store');
+      });
+    });
+
+    describe('the current ledger still asks the node', () => {
+      it('no ledger named: the validated ledger of the node, without close_time and with the live Cache-Control', async () => {
+        const res = await api.get(path(LBR_HOLDER));
+        expect(res.body).toEqual({
+          result: 'success',
+          ledger_index: VALIDATED,
+          limit: 200,
+          balances: [{ currency: 'XRP', value: '100' }, ...LINES.map(asBalance)],
+        });
+        expect(node.requests()).toEqual([
+          { command: 'account_info', account: LBR_HOLDER, ledger_index: 'validated' },
+          { command: 'account_lines', account: LBR_HOLDER, ledger_index: VALIDATED, limit: 400 },
+        ]);
+        expect(res.headers['cache-control']).toBe('no-store');
+      });
+
+      it('validated, closed and current are the node words: the node is asked for them', async () => {
+        for (const word of ['validated', 'closed', 'current']) {
+          node.serve(standardNode);
+          const res = await api.get(`${path(LBR_HOLDER)}?ledger_index=${word}`);
+          expect({ word, status: res.status }).toEqual({ word, status: 200 });
+          expect(node.requests('account_info')).toEqual([
+            { command: 'account_info', account: LBR_HOLDER, ledger_index: word },
+          ]);
+        }
+      });
+    });
+  });
+
+  describe('historical ledgers: the limit (trust lines written by hand at the newest ledger)', () => {
+    let h: Harness;
+    let api: ApiClient;
+    const node = liveNode();
+
+    beforeAll(async () => {
+      h = await startHarness({ seed: 'xrpl-account-state', xrplStub: node.stub });
+      api = await h.api();
+      // 500 USD lines of LBR_HOLDER at the newest ledger, one per counterparty, after its LBR line
+      const rows: TrustLineStatesRow[] = Array.from({ length: 500 }, (_, i) => ({
+        account: LBR_HOLDER,
+        counterparty: `s${String(i).padStart(5, '0')}`,
+        currency: 'USD',
+        ledger_index: NEWEST,
+        tx_index: 0,
+        node_index: i,
+        tx_hash: 'A'.repeat(64),
+        close_time: 1_792_851_440,
+        balance: String(i),
+        limit: '1000',
+        limit_peer: '0',
+        no_ripple: 0,
+        no_ripple_peer: 0,
+        authorized: 0,
+        peer_authorized: 0,
+        freeze: 0,
+        peer_freeze: 0,
+        quality_in: 0,
+        quality_out: 0,
+        flags: 0,
+        deleted: 0,
+      }));
+      await h.ch.insert(Table.TrustLineStates, rows);
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+    beforeEach(() => node.serve(standardNode));
+    afterEach(() => expect(node.requests()).toEqual([]));
+
+    it('is 200 by default and 400 at most, counting the native balance', async () => {
+      for (const [query, limit] of [
+        ['', 200],
+        ['&limit=1000', 400],
+        ['&limit=400', 400],
+        ['&limit=0', 200],
+        ['&limit=7.9', 7],
+      ] as const) {
+        const res = await api.get(`${path(LBR_HOLDER)}?ledger_index=${NEWEST}${query}`);
+        expect({ query, status: res.status, limit: res.body.limit, count: res.body.balances.length }).toEqual({
+          query,
+          status: 200,
+          limit,
+          count: limit,
+        });
+      }
+    });
+
+    it('limit=all is every trust line: the native balance, the LBR line, then the 500 written by hand', async () => {
+      const res = await api.get(`${path(LBR_HOLDER)}?ledger_index=${NEWEST}&limit=all`);
+      expect(res.status).toBe(200);
+      const balances = res.body.balances as Record<string, unknown>[];
+      expect(balances).toHaveLength(502);
+      expect(balances.slice(0, 3)).toEqual([
+        { currency: 'XRP', value: '827.141444' },
+        { currency: 'LBR', counterparty: LBR_ISSUER, value: '5.017529627551844' },
+        { currency: 'USD', counterparty: 's00000', value: '0' },
+      ]);
+      expect(balances[501]).toEqual({ currency: 'USD', counterparty: 's00499', value: '499' });
+      expect('limit' in res.body).toBe(false);
+    });
+  });
+
+  describe('historical ledgers: the coverage of the state tables (a ledger an older parser wrote)', () => {
+    /** Written by parser version 2 between the LBR ledgers and the TUJ ones: the coverage starts above it. */
+    const OLDER = 30_000_000;
+    let h: Harness;
+    let api: ApiClient;
+    const node = liveNode();
+
+    beforeAll(async () => {
+      h = await startHarness({ seed: 'xrpl-account-state', xrplStub: node.stub });
+      api = await h.api();
+      // a `ledgers` row of a parser that did not record state yet: a copy of the first one, with its own index and hash
+      await h.ch.command(
+        `INSERT INTO ${Table.Ledgers}
+         SELECT tpl.* REPLACE (toUInt32({ledger:UInt32}) AS ledger_index, toDateTime({time:UInt32}, 'UTC') AS close_time,
+                               {hash:String} AS ledger_hash, toUInt16({version:UInt16}) AS parser_version)
+           FROM (SELECT * FROM ${Table.Ledgers} ORDER BY ledger_index LIMIT 1) AS tpl`,
+        {
+          ledger: OLDER,
+          time: 1_500_000_000,
+          hash: OLDER.toString(16).toUpperCase().padStart(64, '0'),
+          version: STATE_PARSER_VERSION - 1,
+        },
+      );
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+    beforeEach(() => node.serve(standardNode));
+    afterEach(() => expect(node.requests()).toEqual([]));
+
+    it('a ledger at or below the newest one an older parser wrote is too old, even one the newer parser wrote', async () => {
+      for (const query of ['ledger_index=26922216', `ledger_index=${OLDER}`, 'date=2017-06-01T00:00:00Z']) {
+        const res = await api.get(`${path(LBR_HOLDER)}?${query}`);
+        expect({ query, status: res.status, body: res.body }).toEqual({ query, status: 400, body: TOO_OLD });
+      }
+    });
+
+    it('a ledger above it is covered', async () => {
+      const res = await api.get(`${path(TUJ_ISSUER)}?ledger_index=93663334`);
+      expect(res.status).toBe(200);
+      expect(res.body.balances).toEqual([{ currency: 'XRP', value: '3.999943' }, ...TUJ_BALANCES]);
+    });
+  });
+
   describe('Xahau', () => {
     let h: Harness;
     let api: ApiClient;
@@ -705,18 +1080,10 @@ describe('GET /v2/accounts/:address/balances', () => {
     let h: Harness;
     let api: ApiClient;
     const node = liveNode();
-    let clock: ReturnType<typeof ledgerClock>;
-    const iso = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 19);
 
     beforeAll(async () => {
-      h = await startHarness({ seed: 'ripple-mock', xrplStub: node.stub });
+      h = await startHarness({ xrplStub: node.stub });
       api = await h.api();
-      clock = ledgerClock(
-        await h.ch.query<Ledger>(
-          `SELECT ledger_index, toUnixTimestamp(close_time) AS close_time FROM ${Table.Ledgers} ORDER BY ledger_index`,
-        ),
-        5,
-      );
     });
     afterAll(async () => {
       await h?.close();
@@ -768,9 +1135,8 @@ describe('GET /v2/accounts/:address/balances', () => {
         '?limit=all',
         '?currency=USD',
         `?counterparty=${GATEWAY}`,
-        '?ledger_index=123',
-        `?ledger_hash=${HASH}`,
         '?ledger_index=closed',
+        '?ledger_index=current',
       ]) {
         const before = asked();
         await api.get(`${path(a)}${query}`);
@@ -802,21 +1168,6 @@ describe('GET /v2/accounts/:address/balances', () => {
       const res = await api.get(path(a));
       expect(res.status).toBe(200);
       expect(node.requests('account_info')).toHaveLength(1);
-    });
-
-    it('dates that resolve to one ledger share an entry; close_time is the date route only, never taken from the entry', async () => {
-      const a = freshAccount();
-      const { from, to } = clock;
-      const one = await api.get(`${path(a)}?date=${iso(from.close_time + 1)}`);
-      const two = await api.get(`${path(a)}?date=${iso(to.close_time - 1)}`);
-      expect(one.body.ledger_index).toBe(clock.atOrBefore(from.close_time).ledger_index);
-      expect(two.body).toEqual(one.body);
-      expect(node.requests('account_info')).toHaveLength(1);
-
-      const plain = await api.get(`${path(a)}?ledger_index=${one.body.ledger_index}`);
-      expect(node.requests('account_info')).toHaveLength(1);
-      expect('close_time' in plain.body).toBe(false);
-      expect('close_time' in one.body).toBe(true);
     });
   });
 

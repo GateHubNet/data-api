@@ -1,4 +1,7 @@
 import { NotFoundModule } from './common/not-found.controller';
+import { LedgerObjectsModule } from './ledger-objects/ledger-objects.module';
+import { MptModule } from './mpt/mpt.module';
+import { TokensModule } from './tokens/tokens.module';
 import { ValidatorsModule } from './validators/validators.module';
 
 describe('AppModule', () => {
@@ -16,5 +19,26 @@ describe('AppModule', () => {
     const imports = Reflect.getMetadata('imports', AppModule) as unknown[];
     expect(imports.filter((m) => m === ValidatorsModule)).toHaveLength(1);
     expect(imports.indexOf(ValidatorsModule)).toBeLessThan(imports.indexOf(NotFoundModule));
+  });
+
+  it('serves the ledger object routes: the module is an endpoint module, before the catch-all', async () => {
+    const { AppModule } = await import('./app.module');
+    const imports = Reflect.getMetadata('imports', AppModule) as unknown[];
+    expect(imports.filter((m) => m === LedgerObjectsModule)).toHaveLength(1);
+    expect(imports.indexOf(LedgerObjectsModule)).toBeLessThan(imports.indexOf(NotFoundModule));
+  });
+
+  it('serves the tokens routes: the module is an endpoint module, before the catch-all', async () => {
+    const { AppModule } = await import('./app.module');
+    const imports = Reflect.getMetadata('imports', AppModule) as unknown[];
+    expect(imports.filter((m) => m === TokensModule)).toHaveLength(1);
+    expect(imports.indexOf(TokensModule)).toBeLessThan(imports.indexOf(NotFoundModule));
+  });
+
+  it('serves the MPT routes: the module is an endpoint module, before the catch-all', async () => {
+    const { AppModule } = await import('./app.module');
+    const imports = Reflect.getMetadata('imports', AppModule) as unknown[];
+    expect(imports.filter((m) => m === MptModule)).toHaveLength(1);
+    expect(imports.indexOf(MptModule)).toBeLessThan(imports.indexOf(NotFoundModule));
   });
 });

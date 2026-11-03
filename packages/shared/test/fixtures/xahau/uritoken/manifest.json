@@ -1,0 +1,162 @@
+{
+  "network": "xahau",
+  "endpoint": "wss://xahau.network",
+  "recorded_at": "2026-10-26T15:30:01.278Z",
+  "validated_head": 26811706,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B": {
+      "ledger": 26774724,
+      "type": "URITokenMint",
+      "result": "tesSUCCESS"
+    },
+    "9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E": {
+      "ledger": 26768773,
+      "type": "URITokenBurn",
+      "result": "tesSUCCESS"
+    },
+    "CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169": {
+      "ledger": 26765431,
+      "type": "URITokenCreateSellOffer",
+      "result": "tesSUCCESS"
+    },
+    "01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C": {
+      "ledger": 26763778,
+      "type": "URITokenBuy",
+      "result": "tesSUCCESS"
+    },
+    "B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01": {
+      "ledger": 26771798,
+      "type": "Remit",
+      "result": "tesSUCCESS"
+    },
+    "3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426": {
+      "ledger": 26689211,
+      "type": "Remit",
+      "result": "tesSUCCESS"
+    },
+    "4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B": {
+      "ledger": 26763629,
+      "type": "URITokenMint",
+      "result": "tesSUCCESS"
+    },
+    "A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B": {
+      "ledger": 26763618,
+      "type": "URITokenBurn",
+      "result": "tesSUCCESS"
+    },
+    "1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D": {
+      "ledger": 26533927,
+      "type": "URITokenCancelSellOffer",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "uritoken_mint": {
+      "ledger": 26774724,
+      "hash": "8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B",
+      "type": "URITokenMint",
+      "note": "URITokenMint with Flags 1 (burnable) by rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E, an Evernode lease token (URI \"evrlease\u2026\" in base64), no Amount, no Destination: one CreatedNode URIToken whose Issuer and Owner are the sender, Flags 1, no Digest. The ledger holds nothing else."
+    },
+    "uritoken_sell_offer_create": {
+      "ledger": 26765431,
+      "hash": "CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169",
+      "type": "URITokenCreateSellOffer",
+      "note": "URITokenCreateSellOffer by owner r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS: Amount 2200000000 drops (2200 XAH), no Destination, on a token issued by rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb. The URIToken is a ModifiedNode whose PreviousFields is empty: an Amount that was added is not listed there."
+    },
+    "uritoken_sell_offer_cancel": {
+      "ledger": 26533927,
+      "hash": "1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D",
+      "type": "URITokenCancelSellOffer",
+      "note": "URITokenCancelSellOffer by the owner r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS of a token issued by rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb: the one ModifiedNode URIToken loses its Amount (PreviousFields.Amount 1800000000 drops) and keeps its Owner."
+    },
+    "uritoken_buy_above_ask": {
+      "ledger": 26763778,
+      "hash": "01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C",
+      "type": "URITokenBuy",
+      "note": "URITokenBuy by rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg paying Amount 4200000000 drops, exactly the ask (PreviousFields.Amount): no buy above an ask was found. The seller r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS gains 4200000000, the buyer loses that plus the fee 26810; Owner changes and Amount is cleared."
+    },
+    "uritoken_burn_with_offer": {
+      "ledger": 26768773,
+      "hash": "9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E",
+      "type": "URITokenBurn",
+      "note": "URITokenBurn by r4gUH2cjAfXGFTBUXBnspYWpj4nprzgQgH (its own Evernode lease token, Flags 1) while a sell offer stands: the DeletedNode URIToken still has Amount 0.0001 EVR (issuer rEvernodee8dJLaFsujS6q1EiXvZYmHXr8) in FinalFields."
+    },
+    "remit_transfer": {
+      "ledger": 26771798,
+      "hash": "B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01",
+      "type": "Remit",
+      "note": "Remit by r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS to rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp with one URITokenID (issuer rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb) and Amounts of 1000000 drops: the URIToken's Owner changes to the destination, and its sell offer (Amount 3350000000) is cleared with it."
+    },
+    "remit_mint": {
+      "ledger": 26689211,
+      "hash": "3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426",
+      "type": "Remit",
+      "note": "Remit by rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb with MintURIToken (Digest and URI \"odinseyes:raven:v2:004e010a\") for Destination r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS, no URITokenIDs: one CreatedNode URIToken with Issuer the sender, Owner the destination, a Digest and no Flags."
+    },
+    "uritoken_remint": {
+      "ledger": 26763629,
+      "hash": "4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B",
+      "type": "URITokenMint",
+      "note": "URITokenMint by r4k1jdyThSDbPwbNrpiuqNCoRJ61y9N4Wj of an Evernode lease URI: the CreatedNode URIToken has the index E5ECD96D609E8E7C29C967D3D2FA542AE58FC9A05B9C4EAE7BFF608A7D0306A2, which the same account's URITokenBurn A6F805E9\u2026 (ledger 26763618, 11 ledgers earlier) deleted. One id, two lives.",
+      "burn": {
+        "ledger": 26763618,
+        "hash": "A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B"
+      }
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 26533927,
+      "bytes": 28347,
+      "gzipBytes": 9795
+    },
+    {
+      "ledger": 26689211,
+      "bytes": 44685,
+      "gzipBytes": 8715
+    },
+    {
+      "ledger": 26763618,
+      "bytes": 30518,
+      "gzipBytes": 8373
+    },
+    {
+      "ledger": 26763629,
+      "bytes": 35324,
+      "gzipBytes": 9638
+    },
+    {
+      "ledger": 26763778,
+      "bytes": 66721,
+      "gzipBytes": 15808
+    },
+    {
+      "ledger": 26765431,
+      "bytes": 135734,
+      "gzipBytes": 26403
+    },
+    {
+      "ledger": 26768773,
+      "bytes": 9204,
+      "gzipBytes": 2904
+    },
+    {
+      "ledger": 26771798,
+      "bytes": 26113,
+      "gzipBytes": 9826
+    },
+    {
+      "ledger": 26774724,
+      "bytes": 3035,
+      "gzipBytes": 1363
+    }
+  ]
+}

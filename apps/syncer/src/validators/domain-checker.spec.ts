@@ -1,4 +1,5 @@
 import {
+  DomainTomlsRow,
   getNetworkProfile,
   KEY_MAP_WITH,
   MANIFEST_MAP_SQL,
@@ -14,6 +15,7 @@ import { makeManifest, TestKey, testKey } from '../../../../packages/shared/src/
 import {
   DomainChecker,
   DomainReason,
+  isDomainDue,
   isTransientReason,
   MANIFEST_LOOKUP_INTERVAL_MS,
   nextDomainRow,
@@ -32,6 +34,8 @@ const KEY = 'nHUBvDGzZWNgxzsEQzMy3JR7sDDz5wPiuDnj4hZdZpDeM2yeu6gy';
 const TOML_URL = 'https://a.example/.well-known/xrp-ledger.toml';
 const ACCOUNT_1 = encodeAccountID(Buffer.alloc(20, 1));
 const ACCOUNT_2 = encodeAccountID(Buffer.alloc(20, 2));
+/** The toml columns of a row the checker writes when the file gives none of the facts, or it read no file. */
+const NO_FACTS = { owner_country: '', server_country: '', toml_network: '', toml_unl: '', toml_version: 1 };
 
 describe('isTransientReason', () => {
   it.each<[DomainReason, number | undefined, boolean]>([
@@ -82,6 +86,7 @@ describe('nextDomainRow', () => {
     verified_at: NOW - 6 * HOUR,
     next_check_at: NOW - 1,
     accounts: [ACCOUNT_1],
+    ...NO_FACTS,
     ...o,
   });
 
@@ -97,6 +102,7 @@ describe('nextDomainRow', () => {
       verified_at: NOW,
       next_check_at: NOW + 6 * HOUR,
       accounts: [ACCOUNT_1, ACCOUNT_2],
+      ...NO_FACTS,
     });
   });
 
@@ -136,6 +142,7 @@ describe('nextDomainRow', () => {
         verified_at: null,
         next_check_at: NOW + 6 * HOUR,
         accounts: [],
+        ...NO_FACTS,
       });
     },
   );
@@ -147,6 +154,7 @@ describe('nextDomainRow', () => {
       status_code: 404,
       next_check_at: NOW + 6 * HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
   });
 
@@ -176,6 +184,7 @@ describe('nextDomainRow', () => {
         verified_at: NOW - 23 * HOUR,
         next_check_at: NOW + HOUR,
         accounts: [ACCOUNT_1, ACCOUNT_2],
+        ...NO_FACTS,
       });
     }
   });
@@ -199,6 +208,7 @@ describe('nextDomainRow', () => {
       verified_at: NOW - 25 * HOUR,
       next_check_at: NOW + HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
   });
 
@@ -210,6 +220,7 @@ describe('nextDomainRow', () => {
       status_code: 502,
       next_check_at: NOW + HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
   });
 
@@ -220,6 +231,7 @@ describe('nextDomainRow', () => {
       verified_at: null,
       next_check_at: NOW + HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
     const failed = previous({ status: 'unverified', reason: 'timeout', verified_at: NOW - HOUR, accounts: [] });
     expect(nextDomainRow(failed, check({ reason: 'timeout' }), NOW, RECHECK_MS)).toMatchObject({
@@ -227,6 +239,7 @@ describe('nextDomainRow', () => {
       reason: 'timeout',
       verified_at: NOW - HOUR,
       accounts: [],
+      ...NO_FACTS,
     });
   });
 
@@ -239,6 +252,65 @@ describe('nextDomainRow', () => {
     ]) {
       expect(nextDomainRow(prev, failure, NOW, RECHECK_MS)).toMatchObject({ status: 'unverified', accounts: [] });
     }
+  });
+
+  describe('the toml facts', () => {
+    const ENTRY = {
+      ownerCountry: 'NO',
+      serverCountry: 'DE',
+      network: 'main',
+      unl: 'https://vl.ripple.com',
+      invalid: [],
+    };
+    const FACTS = {
+      owner_country: 'NO',
+      server_country: 'DE',
+      toml_network: 'main',
+      toml_unl: 'https://vl.ripple.com',
+    };
+
+    it('writes the facts and toml_version 1 on verified', () => {
+      expect(nextDomainRow(undefined, check({ entry: ENTRY }), NOW, RECHECK_MS)).toMatchObject({
+        status: 'verified',
+        ...FACTS,
+        toml_version: 1,
+      });
+    });
+
+    it('writes empty facts and toml_version 1 on verified without an entry', () => {
+      expect(nextDomainRow(previous(FACTS), check(), NOW, RECHECK_MS)).toMatchObject(NO_FACTS);
+    });
+
+    it('writes empty facts and toml_version 1 on a definite failure', () => {
+      const row = nextDomainRow(
+        previous({ ...FACTS, toml_version: 0 }),
+        check({ reason: 'not_listed' }),
+        NOW,
+        RECHECK_MS,
+      );
+      expect(row).toMatchObject({ status: 'unverified', ...NO_FACTS });
+    });
+
+    it("keeps prev's facts and toml_version through a transient failure within 24 h", () => {
+      const prev = previous({ ...FACTS, toml_version: 0, verified_at: NOW - 2 * HOUR });
+      expect(nextDomainRow(prev, check({ reason: 'timeout' }), NOW, RECHECK_MS)).toMatchObject({
+        status: 'verified',
+        ...FACTS,
+        toml_version: 0,
+      });
+    });
+
+    it('clears them after the grace', () => {
+      const prev = previous({ ...FACTS, toml_version: 0, verified_at: NOW - 25 * HOUR });
+      expect(nextDomainRow(prev, check({ reason: 'timeout' }), NOW, RECHECK_MS)).toMatchObject({
+        status: 'unverified',
+        ...NO_FACTS,
+      });
+    });
+
+    it.each<[DomainReason]>([['manifest_unverified'], ['domain_invalid']])('writes empty facts for %s', (reason) => {
+      expect(nextDomainRow(previous(FACTS), check({ reason }), NOW, RECHECK_MS)).toMatchObject(NO_FACTS);
+    });
   });
 
   it('records the URL it fetched, or would have, and does not change the row it was given', () => {
@@ -306,10 +378,18 @@ class FakeClickHouse {
   seen: { key: string; lastSeen: number }[] = [];
   manifests: ValidatorManifestsRow[] = [];
   domains: ValidatorDomainsRow[] = [];
+  /** The rows of `domain_tomls` a read gives, in the shape `STORED_TOMLS_SQL` has. */
+  storedTomls: Record<string, unknown>[] = [];
   readonly inserts: { table: string; rows: unknown[] }[] = [];
   failInserts?: Error;
+  failTomlInserts?: Error;
+  failTomlReads?: Error;
 
   readonly query = jest.fn(async (sql: string, params: Record<string, unknown> = {}) => {
+    if (sql.includes(Table.DomainTomls)) {
+      if (this.failTomlReads) throw this.failTomlReads;
+      return this.storedTomls.filter((row) => (params.domains as string[]).includes(row.domain as string));
+    }
     if (sql.includes(Table.UnlLists)) {
       const wanted = params.publishers as string[];
       const newest = new Map<string, UnlListsRow>();
@@ -384,6 +464,11 @@ class FakeClickHouse {
         verified_ms: d.verified_at === null ? null : String(Math.round(d.verified_at * 1000)),
         next_check: d.next_check_at,
         accounts: d.accounts,
+        stored_owner_country: d.owner_country ?? '',
+        stored_server_country: d.server_country ?? '',
+        stored_toml_network: d.toml_network ?? '',
+        stored_toml_unl: d.toml_unl ?? '',
+        stored_toml_version: d.toml_version ?? 1,
       }));
     }
     throw new Error(`unexpected query: ${sql}`);
@@ -391,6 +476,7 @@ class FakeClickHouse {
 
   readonly insert = jest.fn(async (table: string, rows: unknown[]) => {
     if (this.failInserts) throw this.failInserts;
+    if (table === Table.DomainTomls && this.failTomlInserts) throw this.failTomlInserts;
     this.inserts.push({ table, rows });
     if (table === Table.ValidatorManifests) this.manifests.push(...(rows as ValidatorManifestsRow[]));
     if (table === Table.ValidatorDomains) this.domains.push(...(rows as ValidatorDomainsRow[]));
@@ -430,7 +516,15 @@ async function until(what: string, probe: () => boolean): Promise<void> {
   throw new Error(`Timed out waiting for ${what}`);
 }
 
-function setup(o: { profile?: NetworkProfile; publishers?: string; recheckMs?: number; timeoutMs?: number } = {}) {
+function setup(
+  o: {
+    profile?: NetworkProfile;
+    publishers?: string;
+    validators?: string;
+    recheckMs?: number;
+    timeoutMs?: number;
+  } = {},
+) {
   const ch = new FakeClickHouse();
   const clock = { ms: NOW_MS };
   const fetcher = {
@@ -439,12 +533,18 @@ function setup(o: { profile?: NetworkProfile; publishers?: string; recheckMs?: n
     }),
   };
   const node = { request: jest.fn(async (_request?: unknown, _options?: unknown): Promise<unknown> => ({})) };
-  const metrics = { validatorsDomainChecksTotal: { inc: jest.fn() } };
+  const metrics = {
+    validatorsDomainChecksTotal: { inc: jest.fn() },
+    validatorsTomlFieldsTotal: { inc: jest.fn() },
+    validatorsTomlStoreWritesTotal: { inc: jest.fn() },
+  };
   const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
   const cfg = {
     unlPublishers: o.publishers ?? PUBLISHERS,
+    unlValidators: o.validators ?? '',
     domainRecheckMs: o.recheckMs ?? RECHECK_MS,
     domainFetchTimeoutMs: o.timeoutMs ?? 10_000,
+    tomlRecheckMs: 86_400_000,
   };
   const checker = new DomainChecker(
     cfg as never,
@@ -471,6 +571,46 @@ function setup(o: { profile?: NetworkProfile; publishers?: string; recheckMs?: n
 }
 
 const url = (domain: string, path = '/.well-known/xrp-ledger.toml') => `https://${domain}${path}`;
+
+describe('isDomainDue', () => {
+  const row = (o: Partial<ValidatorDomainsRow> = {}): ValidatorDomainsRow => ({
+    validation_public_key: KEY,
+    domain: 'a.example',
+    status: 'verified',
+    reason: '',
+    status_code: 0,
+    toml_url: TOML_URL,
+    checked_at: NOW - 60,
+    verified_at: NOW - 60,
+    next_check_at: NOW + 3 * HOUR,
+    accounts: [],
+    ...NO_FACTS,
+    ...o,
+  });
+
+  it('is due: no row; next check passed; verified below the version and checked more than an hour ago', () => {
+    expect(isDomainDue(undefined, NOW)).toBe(true);
+    expect(isDomainDue(row({ next_check_at: NOW }), NOW)).toBe(true);
+    expect(isDomainDue(row({ status: 'unverified', next_check_at: NOW - 1 }), NOW)).toBe(true);
+    expect(isDomainDue(row({ toml_version: 0, checked_at: NOW - HOUR }), NOW)).toBe(true);
+    expect(isDomainDue(row({ toml_version: 0, checked_at: NOW - 2 * HOUR }), NOW)).toBe(true);
+  });
+
+  it('is not due: verified below the version checked 10 minutes ago; unverified below the version; verified at the version before its next check', () => {
+    expect(isDomainDue(row({ toml_version: 0, checked_at: NOW - 600 }), NOW)).toBe(false);
+    expect(isDomainDue(row({ status: 'unverified', toml_version: 0, checked_at: NOW - 2 * HOUR }), NOW)).toBe(false);
+    expect(isDomainDue(row({ checked_at: NOW - 2 * HOUR }), NOW)).toBe(false);
+  });
+
+  it('a verified pair below the version that failed transiently 10 minutes ago is not due', () => {
+    const before = row({ toml_version: 0, checked_at: NOW - 2 * HOUR, verified_at: NOW - 2 * HOUR });
+    const check = { key: KEY, domain: 'a.example', tomlUrl: TOML_URL, reason: 'timeout' as const };
+    const grace = nextDomainRow(before, check, NOW - 600, RECHECK_MS);
+    expect(grace).toMatchObject({ status: 'verified', toml_version: 0, checked_at: NOW - 600 });
+    expect(isDomainDue(grace, NOW)).toBe(false);
+    expect(isDomainDue(grace, NOW - 600 + HOUR)).toBe(true);
+  });
+});
 
 describe('DomainChecker', () => {
   describe('which validators are checked', () => {
@@ -501,6 +641,52 @@ describe('DomainChecker', () => {
           [b.master.base58, 'verified'],
         ]),
       );
+    });
+
+    it('checks the validators of the fixed list as on a list in use', async () => {
+      const [a, b, c] = [validator(1), validator(2), validator(3)];
+      const t = setup({ validators: `${b.master.base58},${c.master.base58}` });
+      // `a` is on the list of a publisher, `b` and `c` on the fixed list; none of them was ever seen by this deployment
+      t.ch.lists.push(listRow({ sequence: 5, validators: [a.master.base58] }));
+      t.ch.manifests.push(
+        manifestRow(a, { domain: 'a.example' }),
+        manifestRow(b, { domain: 'b.example' }),
+        manifestRow(c, { domain: 'c.example' }),
+      );
+      t.serve({ [url('a.example')]: toml(a.master.base58), [url('b.example')]: toml(b.master.base58) });
+
+      expect(await t.checker.pass()).toBe(3);
+      expect(t.ch.seen).toEqual([]);
+      expect(t.fetched().sort()).toEqual([url('a.example'), url('b.example'), url('c.example')]);
+      expect(t.ch.written.map((r) => [r.validation_public_key, r.status])).toEqual(
+        expect.arrayContaining([
+          [a.master.base58, 'verified'],
+          [b.master.base58, 'verified'],
+          [c.master.base58, 'unverified'],
+        ]),
+      );
+    });
+
+    it('checks the validators of the fixed list when there is no publisher at all', async () => {
+      const [a, other] = [validator(1), validator(2)];
+      const t = setup({ publishers: '', validators: a.master.base58 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }), manifestRow(other, { domain: 'other.example' }));
+      t.serve({ [url('a.example')]: toml(a.master.base58) });
+
+      expect(await t.checker.pass()).toBe(1);
+      expect(t.fetched()).toEqual([url('a.example')]);
+    });
+
+    it('checks a validator once when the fixed list, a publisher and the validators seen all name it', async () => {
+      const a = validator(1);
+      const t = setup({ validators: a.master.base58 });
+      t.ch.lists.push(listRow({ sequence: 5, validators: [a.master.base58] }));
+      t.ch.seen.push({ key: a.master.base58, lastSeen: NOW - 60 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
+      t.serve({ [url('a.example')]: toml(a.master.base58) });
+
+      expect(await t.checker.pass()).toBe(1);
+      expect(t.fetched()).toEqual([url('a.example')]);
     });
 
     it('takes the validators of the list in use, not of a superseded one', async () => {
@@ -1195,6 +1381,54 @@ describe('DomainChecker', () => {
         verified_at: NOW,
         next_check_at: NOW + 6 * HOUR,
         accounts: [ACCOUNT_2],
+        ...NO_FACTS,
+      });
+    });
+
+    it("writes the facts of the validator's entry with its verdict", async () => {
+      const { row } = await checkWith(
+        `# Hand-written test data\n[[VALIDATORS]]\npublic_key = "KEY"\nserver_country = "de"\nnetwork = 21337\n`,
+      );
+      expect(row).toMatchObject({
+        status: 'verified',
+        server_country: 'DE',
+        owner_country: '',
+        toml_network: '21337',
+        toml_version: 1,
+      });
+    });
+
+    it('reads the stored facts, so that a blip keeps them with the version they were read at', async () => {
+      const t = setup();
+      const a = validator(1);
+      t.ch.seen.push({ key: a.master.base58, lastSeen: NOW - 60 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
+      t.ch.domains.push({
+        validation_public_key: a.master.base58,
+        domain: 'a.example',
+        status: 'verified',
+        reason: '',
+        status_code: 0,
+        toml_url: url('a.example'),
+        checked_at: NOW - 2 * HOUR,
+        verified_at: NOW - 2 * HOUR,
+        next_check_at: NOW - 1,
+        accounts: [],
+        owner_country: 'NO',
+        server_country: 'DE',
+        toml_network: 'main',
+        toml_unl: 'https://vl.ripple.com',
+        toml_version: 0,
+      });
+      t.serve({ [url('a.example')]: new SafeFetchError('timeout', 'x') });
+      await t.checker.pass();
+      expect(t.ch.written[0]).toMatchObject({
+        status: 'verified',
+        owner_country: 'NO',
+        server_country: 'DE',
+        toml_network: 'main',
+        toml_unl: 'https://vl.ripple.com',
+        toml_version: 0,
       });
     });
 
@@ -1389,6 +1623,7 @@ describe('DomainChecker', () => {
           // the later in the list, the more recently due, so that the order of the list is not the order wanted
           next_check_at: NOW - 100 - (99 - i) * 10,
           accounts: [],
+          ...NO_FACTS,
         });
       }
       for (const [i, v] of fresh.entries()) {
@@ -1520,6 +1755,316 @@ describe('DomainChecker', () => {
       again.serve({});
       expect(await again.checker.pass()).toBe(0);
       expect(again.fetcher.get).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('the toml details', () => {
+    const TOML_RECHECK_S = 86_400;
+    /** The rows of `domain_tomls` the checker wrote. */
+    const tomlRows = (t: ReturnType<typeof setup>) => t.ch.rowsOf<DomainTomlsRow>(Table.DomainTomls);
+    const storeOutcomes = (t: ReturnType<typeof setup>) =>
+      t.metrics.validatorsTomlStoreWritesTotal.inc.mock.calls.map((c) => (c[0] as { outcome: string }).outcome);
+    function naming(domain: string, ...ns: number[]) {
+      const t = setup();
+      const vals = ns.map((n) => validator(n));
+      for (const v of vals) {
+        t.ch.seen.push({ key: v.master.base58, lastSeen: NOW - 60 });
+        t.ch.manifests.push(manifestRow(v, { domain }));
+      }
+      return { t, vals };
+    }
+
+    it('checks the pairs below the version with the never-checked ones, before the others', async () => {
+      const { t, vals } = naming('a.example', 1);
+      const [a] = vals;
+      const [b, c] = [validator(2), validator(3)];
+      t.ch.domains.push({
+        validation_public_key: a.master.base58,
+        domain: 'a.example',
+        status: 'unverified',
+        reason: 'not_listed',
+        status_code: 0,
+        toml_url: url('a.example'),
+        checked_at: NOW - 7 * HOUR,
+        verified_at: null,
+        next_check_at: NOW - 6 * HOUR,
+        accounts: [],
+        ...NO_FACTS,
+      });
+      for (const [v, domain] of [
+        [b, 'b.example'],
+        [c, 'c.example'],
+      ] as const) {
+        t.ch.seen.push({ key: v.master.base58, lastSeen: NOW - 60 });
+        t.ch.manifests.push(manifestRow(v, { domain }));
+      }
+      t.ch.domains.push({
+        validation_public_key: b.master.base58,
+        domain: 'b.example',
+        status: 'verified',
+        reason: '',
+        status_code: 0,
+        toml_url: url('b.example'),
+        checked_at: NOW - 2 * HOUR,
+        verified_at: NOW - 2 * HOUR,
+        next_check_at: NOW + 4 * HOUR,
+        accounts: [],
+        ...NO_FACTS,
+        toml_version: 0,
+      });
+      t.serve({});
+      expect(await t.checker.pass()).toBe(3);
+      // a's next check is the oldest, yet it comes last; b and c go by key
+      const byKey = [
+        [b.master.base58, url('b.example')],
+        [c.master.base58, url('c.example')],
+      ]
+        .sort(([x], [y]) => (x < y ? -1 : 1))
+        .map(([, u]) => u);
+      expect(t.fetched()).toEqual([...byKey, url('a.example')]);
+    });
+
+    describe('the store write-through', () => {
+      it('writes the file it read once per domain, after the verdicts of its validators', async () => {
+        const { t, vals } = naming('a.example', 1, 2);
+        t.serve({ [url('a.example')]: `${toml(vals[0].master.base58)}[[PRINCIPALS]]\nname = "Mara Lindqvist"\n` });
+        expect(await t.checker.pass()).toBe(2);
+        expect(t.ch.inserts.map((i) => i.table)).toEqual([Table.ValidatorDomains, Table.DomainTomls]);
+        expect(tomlRows(t)).toEqual([
+          expect.objectContaining({
+            domain: 'a.example',
+            toml_url: url('a.example'),
+            status: 'ok',
+            checked_at: NOW,
+            fetched_at: NOW,
+            next_check_at: NOW + TOML_RECHECK_S,
+            principals: ['Mara Lindqvist'],
+          }),
+        ]);
+        expect(storeOutcomes(t)).toEqual(['ok']);
+      });
+
+      it('writes the file whatever the verdict', async () => {
+        const { t } = naming('a.example', 1);
+        t.serve({ [url('a.example')]: toml('nHBt9fsb4849WmZiCds4r5TXyBeQjqnH5kzPtqgMAQMgi39YZRPa') });
+        await t.checker.pass();
+        expect(t.ch.written[0]).toMatchObject({ status: 'unverified', reason: 'not_listed' });
+        expect(tomlRows(t)).toEqual([expect.objectContaining({ status: 'ok' })]);
+      });
+
+      it('stores the domain in lower case, with the URL of that name', async () => {
+        const { t, vals } = naming('A.Example', 1);
+        t.serve({ [url('A.Example')]: toml(vals[0].master.base58) });
+        await t.checker.pass();
+        expect(tomlRows(t)[0]).toMatchObject({ domain: 'a.example', toml_url: url('a.example') });
+      });
+
+      it('stamps the row with the time the file arrived, not the start of the pass', async () => {
+        const { t, vals } = naming('a.example', 1);
+        t.fetcher.get.mockImplementation(async () => {
+          t.clock.ms += 5_000;
+          return served(toml(vals[0].master.base58));
+        });
+        await t.checker.pass();
+        expect(tomlRows(t)[0]).toMatchObject({ fetched_at: NOW + 5, checked_at: NOW + 5 });
+      });
+
+      it('writes nextTomlRow over the stored row for a fetch failure and for a file that is not TOML', async () => {
+        const stored = {
+          domain: 'a.example',
+          toml_url: url('a.example'),
+          status: 'ok',
+          reason: '',
+          status_code: 0,
+          checked_ms: String((NOW - 3_600) * 1000),
+          fetched_ms: String((NOW - 3_600) * 1000),
+          next_check: NOW + 3_600,
+          failures: 0,
+          modified_s: null,
+          expires_s: null,
+          accounts: [],
+          currencies: [],
+          validators: [],
+          principals: ['Mara Lindqvist'],
+        };
+        const blip = naming('a.example', 1);
+        blip.t.ch.storedTomls.push(stored);
+        blip.t.serve({ [url('a.example')]: new SafeFetchError('timeout', 'x') });
+        await blip.t.checker.pass();
+        // a transient failure carries the content of the row it read
+        expect(tomlRows(blip.t)).toEqual([
+          expect.objectContaining({
+            status: 'failed',
+            reason: 'timeout',
+            failures: 1,
+            fetched_at: NOW - 3_600,
+            principals: ['Mara Lindqvist'],
+            next_check_at: NOW + HOUR,
+          }),
+        ]);
+
+        const gone = naming('a.example', 1);
+        gone.t.ch.storedTomls.push(stored);
+        gone.t.serve({});
+        await gone.t.checker.pass();
+        expect(tomlRows(gone.t)).toEqual([
+          expect.objectContaining({
+            status: 'failed',
+            reason: 'http_status',
+            status_code: 404,
+            fetched_at: null,
+            principals: [],
+          }),
+        ]);
+
+        const bad = naming('a.example', 1);
+        bad.t.serve({ [url('a.example')]: 'this is not TOML' });
+        await bad.t.checker.pass();
+        expect(tomlRows(bad.t)).toEqual([
+          expect.objectContaining({ status: 'failed', reason: 'toml_invalid', fetched_at: null }),
+        ]);
+        expect(storeOutcomes(bad.t)).toEqual(['ok']);
+      });
+
+      it('writes nothing for domain_invalid and manifest_unverified', async () => {
+        const invalid = naming('not a domain', 1);
+        await invalid.t.checker.pass();
+        expect(invalid.t.ch.written[0]).toMatchObject({ reason: 'domain_invalid' });
+
+        const other = validator(2);
+        const unverified = naming('a.example', 1);
+        unverified.t.ch.manifests[0] = manifestRow(validator(1), {
+          domain: 'a.example',
+          hex: makeManifest({ master: other.master, signing: other.signing, sequence: 1, domain: 'a.example' }),
+        });
+        await unverified.t.checker.pass();
+        expect(unverified.t.ch.written[0]).toMatchObject({ reason: 'manifest_unverified' });
+
+        for (const { t } of [invalid, unverified]) {
+          expect(tomlRows(t)).toEqual([]);
+          expect(storeOutcomes(t)).toEqual([]);
+          expect(t.fetcher.get).not.toHaveBeenCalled();
+        }
+      });
+
+      it('counts a failed store write and finishes the pass', async () => {
+        const { t, vals } = naming('a.example', 1);
+        t.ch.failTomlInserts = new TypeError('the secret text of the failure');
+        t.serve({ [url('a.example')]: toml(vals[0].master.base58) });
+        expect(await t.checker.pass()).toBe(1);
+        expect(storeOutcomes(t)).toEqual(['error']);
+        expect(t.logger.warn).toHaveBeenCalledTimes(1);
+        const line = t.logger.warn.mock.calls[0][0] as string;
+        expect(line).toContain('"a.example"');
+        expect(line).toContain('TypeError');
+        expect(line).not.toContain('secret');
+      });
+
+      it('counts a failed read of the stored row as a failed store write', async () => {
+        const { t } = naming('a.example', 1);
+        t.ch.failTomlReads = new Error('the secret text of the failure');
+        t.serve({});
+        expect(await t.checker.pass()).toBe(1);
+        expect(storeOutcomes(t)).toEqual(['error']);
+        expect(t.logger.warn).toHaveBeenCalledTimes(1);
+        expect(t.logger.warn.mock.calls[0][0]).not.toContain('secret');
+      });
+
+      it('writes nothing once the checker is stopped', async () => {
+        const { t, vals } = naming('a.example', 1);
+        const file = deferred<{ url: string; body: Buffer }>();
+        t.fetcher.get.mockImplementation(() => file.promise);
+        const pass = t.checker.pass();
+        await until('the fetch', () => t.fetcher.get.mock.calls.length === 1);
+        const stopping = t.checker.stop();
+        file.resolve(served(toml(vals[0].master.base58)));
+        await Promise.all([pass, stopping]);
+        expect(t.ch.inserts).toEqual([]);
+      });
+    });
+
+    it('counts each field of a verified check as read, absent or invalid', async () => {
+      const { t, vals } = naming('a.example', 1);
+      t.serve({
+        [url('a.example')]:
+          `[[VALIDATORS]]\npublic_key = "${vals[0].master.base58}"\nserver_country = "de"\nowner_country = "Germany"\n`,
+      });
+      await t.checker.pass();
+      expect(t.metrics.validatorsTomlFieldsTotal.inc.mock.calls.map((c) => c[0])).toEqual([
+        { field: 'owner_country', outcome: 'invalid' },
+        { field: 'server_country', outcome: 'read' },
+        { field: 'network', outcome: 'absent' },
+        { field: 'unl', outcome: 'absent' },
+      ]);
+    });
+
+    it('counts no field of a check that did not verify', async () => {
+      const { t } = naming('a.example', 1);
+      t.serve({});
+      await t.checker.pass();
+      expect(t.metrics.validatorsTomlFieldsTotal.inc).not.toHaveBeenCalled();
+    });
+
+    it('logs the ignored values of a pair verified before D8 when it is first read, though no fact changed', async () => {
+      const { t, vals } = naming('a.example', 1);
+      const key = vals[0].master.base58;
+      t.ch.domains.push({
+        validation_public_key: key,
+        domain: 'a.example',
+        status: 'verified',
+        reason: '',
+        status_code: 0,
+        toml_url: url('a.example'),
+        checked_at: NOW - 2 * HOUR,
+        verified_at: NOW - 2 * HOUR,
+        next_check_at: NOW + 4 * HOUR,
+        accounts: [],
+        ...NO_FACTS,
+        toml_version: 0,
+      });
+      t.serve({ [url('a.example')]: `[[VALIDATORS]]\npublic_key = "${key}"\nserver_country = "Germany"\n` });
+      await t.checker.pass();
+      expect(t.logger.log.mock.calls.map((c) => c[0])).toEqual([
+        `Validator ${key}: domain "a.example" is verified; ignored server_country "Germany"`,
+      ]);
+
+      // and once: at the version, nothing changed, nothing is logged
+      t.clock.ms += RECHECK_MS;
+      await t.checker.pass();
+      expect(t.logger.log).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs a change of server country and the ignored values, never a principal', async () => {
+      const { t, vals } = naming('northpeak.example', 1, 2);
+      const [one, two] = vals.map((v) => v.master.base58);
+      const file = (country: string) =>
+        [
+          `[[VALIDATORS]]\npublic_key = "${one}"\nserver_country = "${country}"\n`,
+          `[[VALIDATORS]]\npublic_key = "${two}"\nserver_country = "Germany"\nunl = "http://vl.example"\n`,
+          `[[PRINCIPALS]]\nname = "Mara Lindqvist"\n`,
+        ].join('');
+      t.serve({ [url('northpeak.example')]: file('de') });
+      await t.checker.pass();
+      const lines = () => t.logger.log.mock.calls.map((c) => c[0] as string);
+      expect([...lines()].sort()).toEqual(
+        [
+          `Validator ${one}: domain "northpeak.example" is verified, server country DE`,
+          `Validator ${two}: domain "northpeak.example" is verified; ignored server_country "Germany", unl "http://vl.exampl..."`,
+        ].sort(),
+      );
+      expect(lines().join('\n')).not.toContain('Mara');
+
+      // nothing changed: nothing logged
+      t.clock.ms += RECHECK_MS;
+      await t.checker.pass();
+      expect(lines()).toHaveLength(2);
+
+      // only a fact changed
+      t.serve({ [url('northpeak.example')]: file('fi') });
+      t.clock.ms += RECHECK_MS;
+      await t.checker.pass();
+      expect(lines()).toHaveLength(3);
+      expect(lines()[2]).toBe(`Validator ${one}: domain "northpeak.example" is verified, server country FI`);
     });
   });
 

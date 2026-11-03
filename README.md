@@ -1,31 +1,49 @@
 # GateHub Data API
 
 A drop-in replacement for the **Ripple Data API v2** (`data.ripple.com`, the `rippled-historical-database` project) for the **XRP Ledger**
-and for **Xahau**. It indexes a network's validated ledgers into ClickHouse (the *syncer*) and serves the Ripple v2 endpoints over REST
+and for **Xahau**, and for the testnet of each. It indexes a network's validated ledgers into ClickHouse (the *syncer*) and serves the Ripple v2 endpoints over REST
 (the *api*): ledgers, transactions, payments, exchanges and candles, rates, accounts (history, balances, orders, reports, stats), active
 accounts, network fees, volumes and markets, validations, validators and amendments, and stats. Paths, parameters, defaults, error messages and the shape and key order of the
 answers match what `data.ripple.com` served, so a client of the original works by changing its host and sending an API key. The deliberate
 differences are listed in [ADR-0010](docs/adr/0010-ripple-v2-wire-compatibility.md). On top of the Ripple API it serves **AMM data** on the
 XRP Ledger (pools and their history, swaps, liquidity events, votes and bids, LP positions, AMM volume): swaps against pools are exchanges
-([ADR-0011](docs/adr/0011-amm-data-and-swaps-as-exchanges.md)).
+([ADR-0011](docs/adr/0011-amm-data-and-swaps-as-exchanges.md)); and **NFT data** on both networks (XRPL NFTokens and Xahau URITokens: events, owners,
+open offers, an account's NFTs, collections with supply and holders, sales with prices, NFT sales volume), each answer stating how much of the history
+it holds in `coverage` ([ADR-0016](docs/adr/0016-nft-and-uritoken-data.md)); and **display names**: the name to show for up to 100 addresses in one call
+(a verified name from the toml of the account's domain, else the name the operator gave the address, else its unverified domain), with the labels, and what a domain's
+toml says ([ADR-0017](docs/adr/0017-display-names.md)); and **ledger objects** on both networks: an escrow, a check, a payment channel by its object ID with the
+history of the transactions that changed it, the permission delegations of an account (XRP Ledger), and which kind of object an ID is, each stating its `coverage`
+([ADR-0018](docs/adr/0018-ledger-object-history.md)); and the **native supply**: an hourly snapshot of the total, burned, escrowed and circulating figures, the AMM pools (XRP Ledger), the reserves, and Xahau's minting by source and day,
+each part read from history stating its `coverage` ([api reference](docs/api-reference.md#get-v2networksupply)); and **MPT data** on the XRP Ledger (XLS-33): an issuance with its flags and decoded metadata, its holders and transfers, the issuances ranked by holders, an account's holdings, and MPT payments and balance changes on the routes of the original,
+each answer stating its `coverage` ([ADR-0020](docs/adr/0020-mpt-data.md)).
 
-One deployment serves one network; the same images run both. The API answers the same `/v2/...` paths on `xrpl.data.<domain>` (native
-currency `XRP`) and `xahau.data.<domain>` (`XAH`).
+One deployment serves one network; the same images run all four. The API answers the same `/v2/...` paths on a host per network:
 
-This is a **pnpm workspace** with two services and a shared library:
+| Network | `GH_NETWORK` | Host | Native currency |
+| --- | --- | --- | --- |
+| XRP Ledger | `xrpl` | `xrpl.data.gatehub.net` (production) | `XRP` |
+| Xahau | `xahau` | `xahau.data.gatehub.net` (production) | `XAH` |
+| XRPL Testnet | `xrpl-testnet` | `xrpl.data.sandbox.gatehub.net` (sandbox) | `XRP` |
+| Xahau Testnet | `xahau-testnet` | `xahau.data.sandbox.gatehub.net` (sandbox) | `XAH` |
+
+The hosts are `xrpl.data.<domain>` and `xahau.data.<domain>` of the deployment. The sandbox is the production compose file on a host of
+its own, with `deploy/.env.sandbox` ([Environments](docs/deployment.md#environments)).
+
+This is a **pnpm workspace** with two services, an exporter and a shared library:
 
 ```
 data-api-new/
 ├── apps/
 │   ├── api/        @gatehub/data-api-service — REST API (reads ClickHouse; live node for balances/orders)
-│   └── syncer/     @gatehub/data-syncer      — five workers (ingest, validations, fee_stats, aggregator, validators); range-ingest CLI
+│   ├── syncer/     @gatehub/data-syncer      — six workers (ingest, validations, fee_stats, aggregator, validators, tomls); range-ingest CLI
+│   └── exporter/   @gatehub/data-exporter    — makes the export files (POST /v2/exports) by walking the api's lists; GCS
 ├── packages/
 │   └── shared/     @gatehub/data-api-shared  — parsers, ledger writer, ClickHouse client + schema, node client, network profiles
-├── deploy/         nginx template, ClickHouse/Keeper config, .env.prod.example
+├── deploy/         nginx template, ClickHouse/Keeper config, .env.prod.example, .env.sandbox.example
 ├── docs/           architecture, API reference, data model, operations, ADRs, OpenAPI
 ├── load/           k6 load test + synthetic seeder
 ├── docker-compose.yaml        local development stack (one ClickHouse, per-network profiles)
-└── docker-compose.prod.yaml   production-shaped stack (Keeper, ClickHouse, per-network migrate/syncer/api, nginx)
+└── docker-compose.prod.yaml   production-shaped stack (Keeper, ClickHouse, per-network migrate/syncer/api, nginx); the sandbox too
 ```
 
 ## Quickstart (local)
@@ -42,15 +60,16 @@ docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123
 cp apps/syncer/.env.example apps/syncer/.env
 cp apps/api/.env.example    apps/api/.env  # GH_NETWORK=xrpl by default; GH_API_KEYS empty = no authentication (development only)
 
-pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline, 002_validators_amendments, 003_account_market_aggregates, 004_amm_fee_estimates)
+export GH_CLICKHOUSE_URL=http://localhost:8123  # required, with no default; ch:migrate reads no .env file
+pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline ... 017_mpt)
 
 pnpm start:syncer                          # ingests the XRP Ledger from the validated head  (probe on :3002)
 pnpm start:api                             # serves /v2/* on :3001, Swagger at /internal/docs
 curl -s localhost:3001/v2/ledgers
 ```
 
-**Per network.** Everything is per network: `GH_NETWORK=xrpl|xahau` picks the node URLs, the native currency, the markets config and the
-default database. For Xahau run a second pair with `GH_NETWORK=xahau` (and its own ports): `GH_NETWORK=xahau pnpm ch:migrate`, then
+**Per network.** Everything is per network: `GH_NETWORK=xrpl|xahau|xrpl-testnet|xahau-testnet` picks the node URLs, the native currency, the markets
+config and the default database (`xrpl`, `xahau`, `xrpl_testnet`, `xahau_testnet`). For Xahau run a second pair with `GH_NETWORK=xahau` (and its own ports): `GH_NETWORK=xahau pnpm ch:migrate`, then
 start its syncer and api the same way. Or run both networks in containers:
 
 ```bash
@@ -70,7 +89,8 @@ pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000   
 ```
 
 On the XRP Ledger the AMM data (pools, swaps as exchanges, liquidity) needs the history re-ingested from the AMM enablement ledger,
-86795265, with `--reprocess`: see [AMM data re-ingest](docs/backfill.md#amm-data-re-ingest).
+86795265, with `--reprocess`: see [AMM data re-ingest](docs/backfill.md#amm-data-re-ingest). The NFT data needs it from the enablement of the
+NFT amendment (XRPL 75443457) and, on Xahau, from ledger 1: see [NFT re-ingest](docs/backfill.md#nft-re-ingest).
 
 ## Build and test
 
@@ -78,7 +98,7 @@ On the XRP Ledger the AMM data (pools, swaps as exchanges, liquidity) needs the 
 pnpm build                                  # shared, then both apps
 pnpm test                                   # unit tests of every package
 pnpm --filter @gatehub/data-api-shared test:e2e    # e2e suites: need Docker (testcontainers starts a real ClickHouse)
-pnpm --filter @gatehub/data-api-service test:e2e   # per-endpoint contract tests, both networks
+pnpm --filter @gatehub/data-api-service test:e2e   # per-endpoint contract tests, on each network
 pnpm --filter @gatehub/data-syncer test:e2e        # recovery, workers, range ingest
 ```
 
@@ -111,10 +131,15 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Rates | `/v2/exchange_rates/{base}/{counter}`, `/v2/normalize` |
 | Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]` (`interval`), `.../stats/{transactions\|value}` (`interval`), `.../analytics/{balances\|balance_changes\|counterparties\|exchanges}` (extra), `.../amm_liquidity`, `.../amm_positions` (AMM, extras) |
 | Markets | `/v2/active_accounts/{base}/{counter}` |
-| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/markets` (extra), `/v2/network/amm_volume` (AMM, extra) |
+| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/markets` (extra), `/v2/network/amm_volume` (AMM, extra), `/v2/network/nft_volume` (NFTs, extra), `/v2/network/supply` (extra), `/v2/network/supply/minted` (Xahau's minting, extra) |
 | AMM (extras) | `/v2/amm/pools`, `/v2/amm/pools/{pool}`, `/v2/amm/pools/{base}/{counter}`, `/v2/amm/pools/{pool}/{history,swaps,liquidity,governance}` |
+| NFTs (extras, both networks) | `/v2/nfts/{nft_id}`, `/v2/nfts/{nft_id}/{history,offers}`, `/v2/accounts/{address}/{nfts,nft_history}`, `/v2/nft_collections`, `/v2/nft_collections/{issuer}/{taxon}` (XRPL) or `/{issuer}` (Xahau) with `/{nfts,holders,sales,stats}`, `/v2/nft_sales`; each answer has `coverage` |
+| Names (extras) | `/v2/account_names?addresses=` (the display names, domains and labels of up to 100 addresses), `/v2/toml/{domain}` (what a domain's toml says, as the syncer last read it) |
+| Ledger objects (extras, both networks) | `/v2/escrows/{id}`, `/v2/checks/{id}`, `/v2/payment_channels/{id}`, each with `/history` (an object's state and the transactions that changed it, with `status` and `coverage`), `/v2/accounts/{address}/escrows/{sequence}` (an escrow by owner and sequence), `/v2/accounts/{address}/delegations` (`direction=given\|held`; empty on Xahau), `/v2/ledger_objects/{id}` (which kind of object an ID is) |
+| Tokens (extras, both networks) | `/v2/tokens` (the issued tokens ranked by holders; `kind`, `min_holders`, `q`), `/v2/tokens/{currency}.{issuer}` (one token: supply, price, the issuer's settings, its toml entry, its markets), `.../holders` and `.../transfers`; each answer has `coverage` |
+| MPT (extras, XRPL; empty or 404 on Xahau) | `/v2/mpt/{issuanceId}` with `/holders` and `/transfers`, `/v2/mpt?ids=` (a summary of up to 100 issuances), `/v2/tokens?kind=mpt` (the issuances ranked by holders), `/v2/accounts/{address}/mpt` (an account's holdings); amounts are integer strings beside the issuance ID, and each answer but `?ids=` has `coverage` |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
-| Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/{key}/validations` |
+| Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/countries`, `/v2/network/validators/{key}/validations` |
 | Amendments | `/v2/network/amendments[/{name}]` |
 | Stats | `/v2/stats[/{family}[/{metric}]]` |
 | Operational | `/liveliness/healthz` (api 3001, syncer 3002), `/metricz` (3000), `/internal/docs` |
@@ -139,11 +164,22 @@ Moving an existing host from the previous single-network stack: add `--remove-or
 and a still-running old syncer holds the writer lease), update `deploy/.env.prod` to the new format and recreate old local ClickHouse volumes with
 `docker compose down -v` ([docs/deployment.md](docs/deployment.md#cutover-on-an-existing-host)).
 
+**The sandbox** (XRPL Testnet and Xahau Testnet) is the same compose file on a host of its own, with its own ClickHouse server, and the env file
+`deploy/.env.sandbox` (copy `deploy/.env.sandbox.example`, which sets `XRPL_NETWORK=xrpl-testnet` and `XAHAU_NETWORK=xahau-testnet`). It indexes from the
+validated head of its first boot; [docs/deployment.md](docs/deployment.md#environments) has the certificates and the rest.
+
+```bash
+cp deploy/.env.sandbox.example deploy/.env.sandbox          # fill in the secrets and the sandbox explorer's key in GH_API_KEYS and GH_RATE_LIMIT_KEYS
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox up -d --build
+```
+
 Migrations are owned by the migrate jobs (the apps wait for them): each `schema/*.sql` is a checksummed, tracked migration applied at most once per
 network database. Set `TRUSTED_PROXIES` to your front proxy and bind nginx to an interface only it can reach ([docs/security.md](docs/security.md#4-transport-and-the-client-address)).
 
 The `validators` worker needs outbound HTTPS to public hosts, and its migration (`002`) has a deploy order and a constraint with the AMM branch:
 read [Rolling out the validators and amendments data](docs/deployment.md#rolling-out-the-validators-and-amendments-data) before deploying it to a persistent environment.
+The `tomls` worker needs it to **every domain an account names** (tens of thousands of hosts), or `GH_DOMAIN_VERIFICATION=false`, and its migration (`012`) must be applied
+before the syncer of its release: [Display names rollout](docs/operations.md#the-display-names).
 
 ## Load and capacity testing
 

@@ -1,4 +1,11 @@
-import { ClickHouseService, getNetworkProfile, RatesService, ShutdownSignals, Table } from '@gatehub/data-api-shared';
+import {
+  ClickHouseService,
+  getNetworkProfile,
+  NFT_VOLUME_CONFIG_VERSION,
+  RatesService,
+  ShutdownSignals,
+  Table,
+} from '@gatehub/data-api-shared';
 import { Global, Module } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -12,7 +19,7 @@ import { AggregatorService } from './aggregator.service';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 
-/** The metrics of the aggregator and of the account and market jobs, over fakes. */
+/** The metrics of the aggregator, of the account and market jobs, of the NFT jobs, of the escrows job, of the tokens job, of the supply job and of the mpt_state job, over fakes. */
 const fakeMetrics = () => ({
   aggregatorRunsTotal: { inc: jest.fn() },
   aggregatorErrorsTotal: { inc: jest.fn() },
@@ -23,6 +30,18 @@ const fakeMetrics = () => ({
   ratesDailyMissingDays: { set: jest.fn() },
   accountRollupsHeavyAccounts: { set: jest.fn() },
   accountRollupsPendingAccounts: { set: jest.fn() },
+  nftStateLagLedgers: { set: jest.fn() },
+  nftDirtyLedgers: { set: jest.fn() },
+  nftCollectionsPending: { set: jest.fn() },
+  escrowsLagLedgers: { set: jest.fn() },
+  escrowsOpen: { set: jest.fn() },
+  tokensLive: { set: jest.fn() },
+  tokensLagLedgers: { set: jest.fn() },
+  tokensBuilding: { set: jest.fn() },
+  tokensRepairLedgers: { set: jest.fn() },
+  supplySnapshotAgeSeconds: { set: jest.fn() },
+  supplyCycleSeconds: { set: jest.fn() },
+  mptStateLagLedgers: { set: jest.fn() },
 });
 
 describe('AggregatorModule', () => {
@@ -90,6 +109,33 @@ describe('AggregatorModule', () => {
     }
     // and so is the AMM pools job, which has nothing to rebuild over an empty database
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+    // and the NFT state job, which has nothing to rebuild over an empty database, and sets its gauges
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_state' });
+    expect(metrics.nftStateLagLedgers.set).toHaveBeenCalledWith(0);
+    expect(metrics.nftDirtyLedgers.set).toHaveBeenCalledWith(0);
+    // and the escrows job, which has nothing to rebuild over an empty database, writes the sentinel of its first step (the
+    // watermark at 0, nothing escrowed) and sets its gauges
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'escrows' });
+    expect(metrics.escrowsLagLedgers.set).toHaveBeenCalledWith(0);
+    expect(metrics.escrowsOpen.set).toHaveBeenCalledWith(0);
+    // and the tokens job, which has no ledger to build a generation from over an empty database, and sets its four gauges
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'tokens' });
+    for (const gauge of [
+      metrics.tokensLive,
+      metrics.tokensLagLedgers,
+      metrics.tokensBuilding,
+      metrics.tokensRepairLedgers,
+    ]) {
+      expect(gauge.set).toHaveBeenCalledWith(0);
+    }
+    // and the supply job, which finds no snapshot and no escrows sentinel in an empty database: its start waits, and it knows no
+    // snapshot, so it sets neither of its gauges
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'supply' });
+    expect(metrics.supplySnapshotAgeSeconds.set).not.toHaveBeenCalled();
+    expect(metrics.supplyCycleSeconds.set).not.toHaveBeenCalled();
+    // and the NFT collections job, which finds no collection behind in an empty database and sets its gauge
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_collections' });
+    expect(metrics.nftCollectionsPending.set).toHaveBeenCalledWith(0);
     // and the AMM daily job, which runs at the first tick: today and yesterday, each a sentinel without any pool
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_daily' });
     // and so are the account and market jobs, which have nothing to do on a database without a ledger
@@ -98,10 +144,16 @@ describe('AggregatorModule', () => {
     }
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     const written = insert.mock.calls.map(([table]) => table);
-    // the three metrics: 5 + 2 + 5 live sets, and today and yesterday of each
-    expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(12);
-    expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(6);
+    // the four metrics: 5 + 2 + 5 + 3 live sets, and today and yesterday of each
+    expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(15);
+    expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(8);
     expect(written).not.toContain(Table.AmmPools);
+    // no ledger, so no generation is started
+    expect(written).not.toContain(Table.TokenGenerations);
+    const sentinels = insert.mock.calls.filter(([table]) => table === Table.Escrows);
+    expect(sentinels.map(([, rows]) => rows)).toEqual([
+      [expect.objectContaining({ escrow_id: '', amount_drops: '0', open_count: 0, through_ledger: 0 })],
+    ]);
     const days = insert.mock.calls.filter(([table]) => table === Table.AmmDaily);
     expect(
       days.map(([, rows]) => (rows as Array<{ day: string; amm_account: string }>).map((r) => [r.day, r.amm_account])),
@@ -112,7 +164,7 @@ describe('AggregatorModule', () => {
     expect(query.mock.calls.length).toBe(queries);
   });
 
-  it('reads the markets config from GH_MARKETS_CONFIG, and its version is the version of the sets', async () => {
+  it('reads the markets config from GH_MARKETS_CONFIG, and its version is the version of the sets (the NFT volume has its own)', async () => {
     jest.useFakeTimers({ now: new Date('2026-10-16T12:34:56Z') });
     const dir = mkdtempSync(join(tmpdir(), 'markets-'));
     try {
@@ -129,10 +181,14 @@ describe('AggregatorModule', () => {
       await app.init();
       await jest.advanceTimersByTimeAsync(0);
       const sets = insert.mock.calls.filter(([table]) => table === Table.VolumeLive);
-      expect(sets).toHaveLength(12);
+      expect(sets).toHaveLength(15);
       for (const [, rows] of sets) {
-        expect((rows as Array<{ config_version: number }>).every((row) => row.config_version === 42)).toBe(true);
+        const set = rows as Array<{ metric: string; config_version: number }>;
+        // the markets config does not move the NFT volume: its sets carry the version of the metric
+        const expected = set[0].metric === 'nft_volume' ? NFT_VOLUME_CONFIG_VERSION : 42;
+        expect(set.every((row) => row.metric === set[0].metric && row.config_version === expected)).toBe(true);
       }
+      expect(sets.filter(([, rows]) => (rows as Array<{ metric: string }>)[0].metric === 'nft_volume')).toHaveLength(3);
       await app.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -142,20 +198,85 @@ describe('AggregatorModule', () => {
   it('gives the volume jobs and the account and market jobs one RatesService, and the minimum of the config', () => {
     const ch = {} as ClickHouseService;
     const profile = getNetworkProfile('xrpl');
-    const options = aggregatorOptions(
-      ch,
-      profile,
-      { accountRollupMinRows: 1234 } as SyncerConfig,
-      { log: jest.fn() } as never,
-    );
+    const log = jest.fn();
+    const options = aggregatorOptions(ch, profile, { accountRollupMinRows: 1234 } as SyncerConfig, { log } as never);
     expect(options.volumes?.rates).toBeInstanceOf(RatesService);
     expect(options.aggregates?.rates).toBe(options.volumes?.rates);
     expect(options.aggregates?.rates.nativeCurrency).toBe('XRP');
     expect(options.aggregates?.accountRollupMinRows).toBe(1234);
+    // and the NFT job the same rates, with the daily rates over them
+    expect(options.nfts?.rates).toBe(options.volumes?.rates);
+    expect(options.nfts?.dailyRates.nativeCurrency).toBe('XRP');
+    // and the escrows job the same rates, with the native currency of the network
+    expect(options.escrows?.rates).toBe(options.volumes?.rates);
+    expect(options.escrows?.nativeCurrency).toBe('XRP');
+    expect(log).toHaveBeenCalledWith(
+      'Escrows job on: the current state of every escrow and the escrowed total, from object_changes',
+    );
+    expect(
+      aggregatorOptions(
+        ch,
+        getNetworkProfile('xahau'),
+        { accountRollupMinRows: 1 } as SyncerConfig,
+        {
+          log: jest.fn(),
+        } as never,
+      ).escrows?.nativeCurrency,
+    ).toBe('XAH');
     expect(
       aggregatorOptions(ch, profile, { accountRollupMinRows: 0 } as SyncerConfig, { log: jest.fn() } as never)
         .aggregates?.accountRollupMinRows,
     ).toBe(0);
+  });
+
+  it('turns the tokens job on with the profile and the rates', () => {
+    const ch = {} as ClickHouseService;
+    const profile = getNetworkProfile('xrpl');
+    const log = jest.fn();
+    const options = aggregatorOptions(ch, profile, { accountRollupMinRows: 1234 } as SyncerConfig, { log } as never);
+    // the profile of the network (the tomls its tokens are matched with) and the one RatesService the other jobs share
+    expect(options.tokens?.profile).toBe(profile);
+    expect(options.tokens?.rates).toBe(options.volumes?.rates);
+    // the knobs are the tests': the job's own defaults hold
+    expect(options.tokens?.configVersion).toBeUndefined();
+    expect(options.tokens?.retiredKeepMs).toBeUndefined();
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^Tokens job on: /));
+    const xahau = getNetworkProfile('xahau');
+    expect(
+      aggregatorOptions(ch, xahau, { accountRollupMinRows: 1 } as SyncerConfig, { log: jest.fn() } as never).tokens
+        ?.profile,
+    ).toBe(xahau);
+  });
+
+  it('turns the supply job on with the profile of the network', () => {
+    const ch = {} as ClickHouseService;
+    const log = jest.fn();
+    for (const network of ['xrpl', 'xahau'] as const) {
+      const profile = getNetworkProfile(network);
+      const options = aggregatorOptions(ch, profile, { accountRollupMinRows: 1 } as SyncerConfig, { log } as never);
+      // the profile says whether the network has an AMM (the sight of the amm_pools runner is the service's to lend) and mints
+      expect(options.supply?.profile).toBe(profile);
+      expect(options.supply?.ammSight).toBeUndefined();
+    }
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^Supply job on: /));
+  });
+
+  it('turns the mpt_state job on with the one RatesService, on every network', () => {
+    const ch = { query: jest.fn() } as unknown as ClickHouseService;
+    for (const network of ['xrpl', 'xrpl-testnet', 'xahau', 'xahau-testnet'] as const) {
+      const log = jest.fn();
+      const options = aggregatorOptions(
+        ch,
+        getNetworkProfile(network),
+        { accountRollupMinRows: 1 } as SyncerConfig,
+        {
+          log,
+        } as never,
+      );
+      expect(options.mptState?.rates).toBeInstanceOf(RatesService);
+      expect(options.mptState?.rates).toBe(options.ammPools?.rates);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/^MPT state job on: /));
+    }
   });
 
   it('refuses to boot on a markets config that is not valid, and says what is wrong with it', async () => {

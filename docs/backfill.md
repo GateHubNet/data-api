@@ -69,7 +69,7 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   divide 1,000,000: 500, 250, 100, ...) if memory is tight.
 - Budget disk for `transactions` (`tx_json` and `meta_json` are ZSTD-compressed text and by far the largest columns): roughly
   1-1.5 TB compressed for full XRPL history.
-- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools`) and, in ClickHouse,
+- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools, J skipped NFT events, L unclassified object changes`) and, in ClickHouse,
   `SELECT count(), max(ledger_index) FROM xrpl.ledgers`. The aggregator follows by itself (see below).
 
 ### Resuming, gap repair, reprocessing
@@ -106,13 +106,44 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   reprocess from the AMM enablement ledger (86795265) on is needed for complete pool data: see
   [AMM data re-ingest](#amm-data-re-ingest). Pools or reserve lines the parser could not turn into rows
   are counted in `syncer_amm_unclassified_total` (and the range-ingest log names the total of its run).
+  Parser version 4 adds the path payments (`path_payments`, and their index by account `account_path_payments`): ledgers written by
+  an older version have none, see
+  [Path payments re-ingest](#path-payments-re-ingest).
+  Parser version 5 adds the NFT and URIToken events (`nft_events`, `account_nft_events`, `collection_nft_events`,
+  `nft_sales`, `nft_touches`): ledgers written by an older version have none, see [NFT re-ingest](#nft-re-ingest). NFT events the parser
+  dropped for an amount that is an MPT amount are counted in `syncer_nft_skipped_total`, and the range-ingest log names the total of its run
+  (a warning when it is not 0, and the last line always says `J skipped NFT events` and, after it, `L unclassified object changes`).
+  Parser version 6 adds the Domain of every account root that has or had one (`account_domains`, a row for each change
+  of such an account): ledgers written by an older version have none. **No reprocess is needed for them**: a one-off SQL seed gives every
+  account its current Domain from the state history ([Account domains seed](#account-domains-seed)), and an account whose Domain was set
+  before that history is learnt at its next change. A `--reprocess` of a range writes the rows of its ledgers, as for every table.
+  Parser version 7 adds the history of escrows, checks, payment channels and delegations (`object_changes` and its index by
+  account `account_object_changes`), gives a delegate its `account_transactions` row, books the fee of a delegated transaction to its delegate and
+  types the balance changes of issued-token payment channels: ledgers written by an older version have none of these, and `--reprocess` writes them (see
+  [Ledger objects and delegation re-ingest](#ledger-objects-and-delegation-re-ingest)).
+  Changes of these objects that no event of the table expects are counted in `syncer_objects_unclassified_total`, and the range-ingest log names the
+  total of its run (a warning when it is not 0, and `L unclassified object changes` in the last line).
+  Parser version 8 adds the index of the trust lines and issuers whose token state a transaction changed (`state_touches`, a row for each
+  created, modified or deleted trust line and for each account root whose flags, transfer rate or domain changed, or that sent an `AccountSet`;
+  `TOKEN_PARSER_VERSION`): ledgers written by an older version have none. **The aggregate of the issued tokens needs no re-ingest of them**: its account
+  pass reads `trust_line_states` as it is, and the job needs the touches only above the ledger its generation was built at. The job never applies a window that
+  holds a ledger of an older version: it builds a new generation instead. A `--reprocess` of a range writes the touches of its ledgers, as for every table.
+  Parser version 9 adds the Xahau mint rows (`genesis_mints`, `imports` and `reward_claims`; `MINT_PARSER_VERSION`): the entries of a `GenesisMint`, the
+  drops each `Import` brought and the `ClaimReward`s that a reward mint answers. Xahau ledgers written by an older version have none of them, and a `--reprocess` of a range
+  writes them; XRPL has none of the three transaction types, so its ledgers hold no mint row of any version. Readers of the three tables gate on `MINT_PARSER_VERSION`, never on
+  `PARSER_VERSION`. An `Import` whose minted drops come out below 0 (the network cannot produce one) is stored as 0 and counted in
+  `syncer_parser_anomalies_total{kind="import_minted_negative"}`; the range-ingest log names the count of its run in a warning when it is not 0 (its last line does not carry it).
+  Parser version 10 (the current one) adds the MPT data (`mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers`; `MPT_PARSER_VERSION`): it writes MPT
+  payments to `payments`, `payments_by_currency` and `account_payments`, which older versions dropped, and an `MPToken`'s rows to `balance_changes`, and it types the rows of a `Clawback` as `clawback`. Ledgers written by an older
+  version have none of these, and a `--reprocess` of a range writes them; Xahau has no MPT, so its ledgers hold no MPT row of any version. Readers gate on `MPT_PARSER_VERSION`, never on `PARSER_VERSION`. An MPT amount that is not a `UInt64`
+  (the network cannot produce one) is stored as 0, and a node whose ID cannot be made is skipped, each counted in `syncer_parser_anomalies_total{kind="mpt_unreadable"}`; the range-ingest log names the count of its run in a warning when it is not 0 (its last line does not carry it).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
 
 ### AMM data re-ingest
 
-`PARSER_VERSION` is 2 since the AMM parser ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)). A ledger written by version 1 has no
+`PARSER_VERSION` became 2 with the AMM parser ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)). A ledger written by version 1 has no
 AMM rows, and what the live syncer writes from the deploy on is version 2 only: **a database that ingested the XRP Ledger before this
 release is missing every swap, liquidity event and pool state before it**, and `ledgers.exchanges_count` and `/v2/stats` lack the swaps.
 A pool appears in the API when its first transaction is ingested, so until the history is re-ingested the pool list has the pools that were
@@ -155,7 +186,7 @@ How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enable
 4. Check:
 
    ```sql
-   -- every ledger from the enablement on is written by parser version 2
+   -- every ledger from the enablement on is written by parser version 2 or later
    SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY parser_version;
    -- how many pools and days the aggregator has built so far
    SELECT uniqExact(amm_account) FROM xrpl.amm_pools;
@@ -164,6 +195,374 @@ How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enable
 
    `syncer_amm_unclassified_total` counts the pools the parser could not place, and the range-ingest log ends with a warning that names
    the total of the run. A pool whose creation is older than the first ledger you ingested has no `created_ledger` / `created_by`.
+
+### Account state history re-ingest
+
+`PARSER_VERSION` became 3 with the account and trust line state history
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)): every ledger written by version 3 has its `account_states` and
+`trust_line_states` rows, and a ledger written by an older version has none. The API answers a historical read of the state tables
+(`/v2/accounts/{address}?flags=true` with a ledger named, `/v2/accounts/{address}/trustlines`) only above the **newest ledger an older
+parser wrote** (`STATE_PARSER_VERSION`, `StateLedgerService`); a ledger at or below it answers 400 `the date provided is too old`. Gaps in the
+ledger numbers do not matter, only the versions of the stored ledgers do.
+
+So after the deploy, the coverage starts at the first ledger the live syncer writes, and **a single ledger of an older version left
+anywhere above an older range moves the start up to it**. To extend the coverage downwards, re-ingest from the start you want up to the
+live checkpoint with `--reprocess`, as for the AMM data above (the same command, another `--from`; a range that is not committed yet
+needs no `--reprocess`). The state of an account that has not changed since the coverage start is not known: the history spec fills
+the tables back to ledger 32570 with the state of that ledger. Check the coverage start:
+
+```sql
+-- the state tables cover the ledgers above this one (NULL: every stored ledger)
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 3;
+```
+
+The API keeps that answer for a minute (`STATE_COVERAGE_CACHE_MS`).
+### Path payments re-ingest
+
+`PARSER_VERSION` became 4 with the path payments parser (`PATH_PARSER_VERSION`, spec #4). A ledger written by an older version has no
+`path_payments` or `account_path_payments` rows, so `/v2/path_payments` and `/v2/accounts/{address}/path_payments` list the path
+payments of the ledgers ingested since the deploy only. Nothing else
+changes for those ledgers: the payments, exchanges and AMM rows a reprocess rewrites come out the same.
+
+1. Apply migrations `007_path_payments.sql` and `008_account_path_payments.sql` **before** the syncer of this release starts: the
+   syncer writes `path_payments` and `account_path_payments` with every ledger, and a write to a missing table fails the batch, so the live runner would retry it for ever
+   ([operations](operations.md#apply-a-schema-migration)). Then deploy the syncer and the api.
+2. To fill the history, reprocess the range you want listed, the same way as the [AMM data re-ingest](#amm-data-re-ingest):
+   `range-ingest --from <A> --to <B> --reprocess`. It rewrites every table of each ledger. Path payments exist from the first ledgers
+   on (rippling through market makers is as old as the ledger), so there is no natural start; filling all of history is the history
+   spec's job (out of scope of spec #4).
+3. Check which parser wrote a range:
+
+   ```sql
+   SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index BETWEEN <A> AND <B> GROUP BY parser_version;
+   ```
+
+### NFT re-ingest
+
+`PARSER_VERSION` became 5 with the NFT parser (`NFT_PARSER_VERSION`, [ADR-0016](adr/0016-nft-and-uritoken-data.md)). A ledger written by an
+older version has no rows in the five NFT tables, and what the live syncer writes from the deploy on is version 5 or later: **a database that
+ingested a network before this release lists the NFTs of the ledgers since the deploy and nothing earlier**, and every NFT answer says so in its
+`coverage` (`from_ledger_index`, and `complete: false` until the history is re-ingested). Both networks have the data: XRPL NFTokens and
+Xahau URITokens.
+
+**Where to start.** No NFT exists before the ledger that enabled the amendment (`packages/shared/config/amendments/<family>.json`):
+
+| | XRPL | Xahau |
+| --- | --- | --- |
+| Amendment | `NonFungibleTokensV1_1` | `URIToken` |
+| Enable ledger | **75,443,457** (2022-10-31) | **1**, the genesis: `complete_ledgers` of `xahau.network` starts at 1 and ledger 1 has `URIToken` in its `Amendments` |
+| Re-ingest | `--from 75443457` | `--from 1` |
+
+Complete coverage needs **every** ledger from the enable ledger to the checkpoint written by version 5 or later, so on Xahau it needs ledger 1 itself. Ledger
+1 is the genesis: its close time is 0 (the file gives the date of ledger 2, the first closed ledger), so the daily volume back-fill that
+follows starts at 1970-01-01 and walks about 19,000 days with no ledger in them, for each of the four volume metrics, newest first (the real
+days come first and an empty day is cheap, but `volume_backfill` stays busy with them for a long time). Nothing is wrong with it.
+
+**Procedure.**
+1. Apply migration `011_nft_data.sql` **before** the syncer of this release starts: the syncer writes the five NFT tables with every ledger, and
+   a write to a missing table fails the batch, so the live runner would retry it for ever
+   ([operations](operations.md#apply-a-schema-migration)). Then deploy the syncer, then the api.
+2. Re-ingest the committed history from the enable ledger up to the live checkpoint with `--reprocess`:
+
+   ```bash
+   # the checkpoint: SELECT max(ledger_index) FROM xrpl.ledgers
+   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
+     node dist/cli/range-ingest.js --from 75443457 --to <checkpoint> --reprocess --concurrency 16
+   # Xahau: --from 1, on syncer-xahau, with --concurrency 1 on the public node
+   ```
+
+   That is 32 million ledgers on XRPL and the whole history on Xahau. **Do it once, as part of the program's one reprocess after its last
+   parser version**: a reprocess rewrites every table of each ledger, and one pass serves every parser version, which is far cheaper than one
+   per feature. Read [Which node?](#2-which-node) and use a node of your own. After a failure do
+   not rerun the same command (see [Resuming](#resuming-gap-repair-reprocessing)). Ledgers that are not committed yet (a new database filled
+   below the live start) need no `--reprocess`.
+3. **The aggregates follow by themselves, in three queues.** Every written chunk marks its hours in `agg_dirty`, and its slice's hook appends
+   the ledger range to `nft_dirty` (the hook rebuilds no NFT). The `nft_state` job works through the oldest range of `nft_dirty` in steps of
+   10,000 ledgers within its 3 s a tick: **watch `syncer_nft_dirty_ledgers` fall to 0** (`SELECT * FROM xrpl.nft_dirty` shows the ranges), and
+   `syncer_nft_state_lag_ledgers` stay near 0. A restart of the syncer while this runs adds the stretch from the oldest NFT not rebuilt yet to the
+   head to `nft_dirty` once more ([operations](operations.md#the-nft-data)): avoid restarts until it is 0. The collections it rebuilt are queued for `nft_collections`: **its first fill is
+   first in, first out, one 3 s run every five minutes**: plan on about 150 collections every five minutes for XRPL's large ones (batches of 50 that
+   take a second; small collections go thousands to a run, as on Xahau), and `syncer_nft_collections_pending` falls. A collection that changes
+   meanwhile waits behind the fill, so after a rollout collection pages update slowly until it has drained (days on XRPL). The daily
+   `nft_volume` sets are filled by `volume_backfill` (the stats and the other volumes' sets are recomputed with the slices as always).
+4. Check the coverage:
+
+   ```sql
+   -- the NFT data cover the ledgers above this one (NULL: every stored ledger); `complete` once this is below the enable ledger
+   SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 5;
+   -- which parser wrote a range
+   SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 75443457 GROUP BY parser_version;
+   -- the ranges the aggregator has still to rebuild the NFTs of (syncer_nft_dirty_ledgers is their size)
+   SELECT from_ledger, to_ledger FROM xrpl.nft_dirty ORDER BY from_ledger;
+   ```
+
+   (Xahau: `xahau.ledgers`, `WHERE ledger_index >= 1`; on the sandbox the databases are `xrpl_testnet.` and `xahau_testnet.`.) The API keeps the
+   coverage for a minute (`FEATURE_COVERAGE_CACHE_MS`). It also needs the enable ledger of the amendment, which the API reports only for an amendment that the node's
+   ledger state lists as enabled: the `validators` worker polls that state into `network_state` (the ledger itself is the indexed `EnableAmendment` transaction,
+   which the re-ingest brings in, or, on a mainnet, the amendment metadata file). A deployment without that worker reads its amendments as `voting` and never says
+   `complete`.
+5. **The testnets** (XRPL Testnet, Xahau Testnet) get no backfill: their index starts at the validated head of their deployment's first boot, and
+   their NFT answers stay `complete: false`.
+
+### Account domains seed
+
+`PARSER_VERSION` became 6 with the Domain of accounts (`DOMAIN_PARSER_VERSION`, [ADR-0017](adr/0017-display-names.md)): from the deploy on, the
+live syncer writes an `account_domains` row for every change of an account that has a Domain. The ledgers written before it have none, and
+without more **no account would have an account domain, and so no verified name, until it next changed**. The state history already holds each
+account's Domain (`account_states.fields`), so the operator **seeds** the table from it, once per network, instead of reprocessing the history: the
+seed copies the newest state row of every account that has a Domain, in 16 buckets of accounts (`cityHash64(account) % 16`) so that the `GROUP BY account`
+of one statement stays within memory. **No reprocess is needed for D4**, and `domain_tomls` needs no backfill: the `tomls` worker's first sweep fills it.
+
+**When.** After migration `012_display_names.sql` is applied and the syncer of this release is running ([the rollout](operations.md#the-display-names)): from
+then on every new ledger is written by parser version 6 or later, so `X` stops moving, and no change falls between the seed and the live rows. Before it, the old
+parser would go on writing ledgers that have no `account_domains` rows.
+
+**`X`** is the last ledger an older parser wrote: the seed reads the state history up to it, and the ledgers above it are the parser's own.
+
+```sql
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 6;
+```
+
+(NULL, `\N` in the client: every stored ledger was written by parser version 6 or later, and there is nothing to seed.)
+
+**The statement**, run once for each `bucket` from 0 to 15, with `X` and `bucket` as query parameters:
+
+```sql
+INSERT INTO account_domains (account, ledger_index, tx_index, node_index, version, domain_hex, deleted)
+SELECT account, top.1, top.2, top.3,
+       bitOr(bitShiftLeft(toUInt64(top.1), 32), bitOr(bitShiftLeft(toUInt64(top.2), 16), toUInt64(top.3))), hex, 0
+  FROM (SELECT account,
+               argMax((ledger_index, tx_index, node_index), (ledger_index, tx_index, node_index)) AS top,
+               argMax(JSONExtractString(fields, 'Domain'), (ledger_index, tx_index, node_index)) AS hex,
+               argMax(deleted, (ledger_index, tx_index, node_index)) AS gone
+          FROM account_states
+         WHERE ledger_index <= {X:UInt32} AND cityHash64(account) % 16 = {bucket:UInt8}
+         GROUP BY account)
+ WHERE hex != '' AND gone = 0
+```
+
+**Running it.** For example, with the statement saved as `account-domains-seed.sql`, from the repo root, `dc` as in [operations](operations.md) (the container's
+own environment authenticates, the password stays off the host command line):
+
+```bash
+ch() { dc exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" "$@"' sh "$@"; }
+X=$(ch -q "SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 6")
+if [ "$X" = '\N' ] || [ -z "$X" ]; then echo 'nothing to seed: every ledger was written by parser version 6 or later'; else
+  for bucket in $(seq 0 15); do ch --database xrpl --param_X="$X" --param_bucket="$bucket" < account-domains-seed.sql || break; done
+fi
+```
+
+The guard matters: with `X` NULL (`\N`) every statement would fail on its `UInt32` parameter, sixteen times. On Xahau use `xahau.ledgers` and
+`--database xahau`; on the sandbox `xrpl_testnet` and `xahau_testnet`.
+
+**What it costs.** Each bucket reads the whole of `account_states` up to `X` (the bucket is a condition on a hash of the account, not a range of the key),
+the `fields` column included, so the seed reads that table **16 times**; only the `GROUP BY` of one bucket's accounts is held in memory. **Time one bucket on
+the sandbox first** (and watch its memory in `system.query_log`) to know how long the sixteen take on a mainnet.
+
+**Checking it.** The accounts that have a domain now (a deleted account and an empty Domain are not one), which is what the discovery of the `tomls` worker finds:
+
+```sql
+SELECT count() FROM (SELECT account, argMax(domain_hex, version) AS hex, argMax(deleted, version) AS gone FROM xrpl.account_domains GROUP BY account)
+ WHERE hex != '' AND gone = 0;
+```
+
+Then watch `syncer_tomls_domains` and `syncer_tomls_due` ([observability](observability.md#4-metrics-syncer)): the worker discovers the seeded domains within five
+minutes, and its first sweep reads their tomls at about 300 domains a minute.
+
+How the seed behaves:
+
+- **The seed's row sits on the account's newest state row at or below `X`**: its `ledger_index`, `tx_index` and `node_index`, and the `version` the parser
+  gives that row. So a later `--reprocess` of that ledger deletes it and the parser writes the same row back.
+- **It is safe to run twice**, or again for one bucket after a failure: the same rows are inserted again, and the row with the largest `version` of an
+  account is its current Domain either way (readers take `argMax(domain_hex, version)`, never `FINAL`). An account without a Domain and a deleted account get no row.
+- **Run it again after a rollback.** A syncer of an older release writes no `account_domains`: when this release is deployed again after one ran, the
+  ledgers it wrote have no rows, and `X` has moved to the last of them. The seed with the new `X` fills them (the newest row of an account wins).
+- **It agrees with the parser.** The shared e2e writes recorded ledgers, sets the parser's rows aside, seeds from `account_states` and compares the newest
+  row of every account: the same Domain on the same (ledger, tx, node), and no row for an account without a Domain.
+- **Coverage.** The seed is as good as `account_states`: the state tables start at the first ledger parser version 3 wrote
+  ([Account state history re-ingest](#account-state-history-re-ingest)), and an account whose Domain was set before that and whose root has not changed since has no
+  row. It has **no domain, and so no verified name, until its next change** (a payment received is enough), or until the history is filled from ledger 32570
+  and ingested again with parser version 6 or later. The names answer carries no `coverage` for this ([api-reference](api-reference.md#account-names-and-tomls)).
+
+### Ledger objects and delegation re-ingest
+
+`PARSER_VERSION` became 7 with the ledger objects (`OBJECT_PARSER_VERSION`, [ADR-0018](adr/0018-ledger-object-history.md)). From the deploy on, the live syncer writes
+the history of every escrow, check, payment channel and delegation (`object_changes` and its index by account `account_object_changes`), lists a delegate in its
+own `account_transactions`, books the fee of a delegated transaction to its delegate, and types the balance changes of issued-token payment channels. The ledgers written
+before it have none of that, so **the objects they created are not in the index, and the fee rows of the delegated transactions in them are the sender's**. Both
+networks have escrows, checks and payment channels; only the XRP Ledger has delegation.
+
+**Where to start.** Each feature has the ledger from which no object can be missing, and its `coverage` is `complete` when the index is whole from there
+([Coverage](api-reference.md#coverage)):
+
+| Feature | XRPL | Xahau |
+| --- | --- | --- |
+| Delegations (`PermissionDelegationV1_1`) | **107,524,865** (2026-10-08) | none: the network cannot have it, `complete: true` with no table read |
+| Escrows (`Escrow`) and payment channels (`PayChan`) | 28,685,313 | **1**, the first ledger of the network (no amendment: `Escrow` and `PayChan` are retired there) |
+| Checks (`Checks`) | 56,219,905 | **1**, as above |
+
+**Delegation is the re-ingest this release asks for.** It is short because the amendment is recent: `--from 107524865` is about 415,000 ledgers on 2026-10-28, and about
+20,800 more a day. **Escrows, checks and channels are not part of it**: their coverage stays `complete: false` until every ledger from 28,685,313 (checks:
+56,219,905; Xahau: 1) is written by parser version 7 or later, which is **the program's one reprocess after its last parser version**, or the history load from ledger
+32,570 ([Account state history re-ingest](#account-state-history-re-ingest)), and no part of D5 does it. Until then **an object created before the first ledger the new
+parser wrote and untouched since is not in the index**: its route answers 404 and the explorer shows it from the node; one created before it and changed after it has a
+history that starts in the middle, with no `created`, and says `complete: false`.
+
+**Procedure.**
+1. Apply migration `013_ledger_objects.sql` **before** the syncer of this release starts: the syncer writes the two ledger tables with every ledger, and a write to a
+   missing table fails the batch, so the live runner would retry it for ever ([operations](operations.md#apply-a-schema-migration)). Then deploy the syncer, then the api.
+   A Xahau syncer that is **halted on a ledger with an issued-token payment channel** (the old parser threw on it: `Cannot parse ledger <n>`, `state=halted`) goes on from
+   its checkpoint when this release is deployed (a restart), because the ledger parses now: no other step is needed for it.
+2. On the XRP Ledger, re-ingest the committed history from the amendment's enable ledger up to the ledger the syncer started writing parser version 7 at (the deploy
+   ledger) with `--reprocess`:
+
+   ```bash
+   # the deploy ledger, the first one the new syncer wrote: SELECT min(ledger_index) FROM xrpl.ledgers WHERE parser_version >= 7
+   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
+     node dist/cli/range-ingest.js --from 107524865 --to <deploy ledger> --reprocess --concurrency 16
+   ```
+
+   `--to` is inclusive, and rewriting the deploy ledger writes the rows its version-7 parser wrote already. It is hours on Ripple's full-history node
+   ([Which node?](#2-which-node)). After a failure do **not** rerun the same command (see [Resuming](#resuming-gap-repair-reprocessing)). If the program's full reprocess is
+   about to run, it covers this range, and running both writes these ledgers twice, which does no harm.
+   It writes the `Delegate` rows, the delegates' `account_transactions` rows, the fee rows of the delegated transactions on their delegates and the object rows of
+   escrows, checks and channels for these ledgers. Xahau has no delegation: nothing is re-ingested there for it.
+3. **The aggregates follow by themselves, all of them.** Every written chunk marks its hours in `agg_dirty`, so the reprocess queues its whole range: the days since
+   the amendment (2026-10-08), about 20 of them on 2026-10-28. `stats_dirty` drains it a slice (at most a day) at a time, and **every aggregate's dirty work runs for
+   those days**, although only the rows of the delegated transactions changed: `stats_hourly` and the daily volume sets of each day, the AMM pools with a state row in
+   the slice and the `amm_daily` sets of its days, the rates of its days and of the 14 days after them (marked stale, then computed again), its hours of
+   `pair_hourly`, the day rollups of the heavy accounts, the ledgers marked in `nft_dirty` (the dirty sweep of `nft_state` then rebuilds every NFT touched in those
+   days), **the `escrows` hook**, which recomputes the escrows of the slice's ledgers as of the job's watermark and reads the total again if one changed
+   ([syncer](syncer.md#the-escrows-job)), and, last, **the `tokens` hook**, which marks the slice for the repair of the generations of the issued tokens (the next run of the `tokens` job applies the
+   touches of those ledgers again; [syncer](syncer.md#76-the-agg_dirty-hooks)). Until a slice is drained its hours show the old numbers. Watch the queue drain (only `range-ingest` adds to it):
+
+   ```sql
+   SELECT count() FROM xrpl.agg_dirty;
+   ```
+
+   The `escrows` job itself builds its table from the rows there are, in steps of 1,000,000 ledgers, until **`syncer_escrows_lag_ledgers` is a few ledgers**
+   ([operations](operations.md#ledger-objects-and-delegation)).
+4. Check the coverage:
+
+   ```sql
+   -- the object data cover the ledgers above this one (NULL: every stored ledger); delegations are `complete` once this is below 107,524,865
+   SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 7;
+   -- which parser wrote a range
+   SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 107524865 GROUP BY parser_version;
+   -- the rows the new parser has written so far, by type
+   SELECT object_type, count() FROM xrpl.object_changes GROUP BY object_type;
+   -- the sentinel of the escrows job: the open native escrows, their drops and the ledger it is as of
+   SELECT open_count, amount_drops, through_ledger FROM xrpl.escrows WHERE escrow_id = '' ORDER BY version DESC LIMIT 1;
+   ```
+
+   (Xahau: `xahau.ledgers`, from ledger 1; on the sandbox the databases are `xrpl_testnet.` and `xahau_testnet.`.) The API keeps the coverage for a minute
+   (`FEATURE_COVERAGE_CACHE_MS`). It also needs the enable ledger of the amendment, which it reports only for an amendment that the node's ledger state lists as
+   enabled (`PermissionDelegationV1_1`: the `validators` worker polls that state into `network_state`); a deployment without that worker never says `complete`.
+5. **The testnets** (XRPL Testnet, Xahau Testnet) get no backfill: their index starts at the validated head of their deployment's first boot, and their object answers stay
+   `complete: false` (the delegations of Xahau Testnet are `complete: true`, as on Xahau).
+
+How it behaves:
+
+- **What a reprocess changes in the books.** A delegated transaction in the range gets its `transaction_cost` row on the delegate (and none on the sender), the source
+  columns of `payments` and `path_payments` stop adding the fee back to a sender who did not pay it, `payments.destination_balance_changes` adds it back to a delegate
+  that is the Payment's `Destination` (a sweep to itself: what arrived, with no native change for a token payment to it), and the delegate lists the transaction. The
+  balance changes, stats, reports and analytics of the accounts concerned are different from before for those ledgers, and the rollups follow through `agg_dirty` ([operations](operations.md#what-a-re-ingest-does-to-them)).
+- **Changes the table does not expect** (an object of a tracked type changed by a transaction no event of its type covers) are written as event `update` and counted
+  in `syncer_objects_unclassified_total`; the range-ingest log warns with the total of its run and its last line ends with `L unclassified object changes`.
+- **The reprocess of a range that is already version 7** deletes and writes its rows again, in both tables, like every child table; the `escrows` hook then recomputes
+  the escrows of the range, so an escrow whose rows a reprocess made vanish is removed from the aggregate.
+
+### Issued tokens re-ingest
+
+`PARSER_VERSION` became 8 with the touch index of the issued tokens (`TOKEN_PARSER_VERSION`, [ADR-0019](adr/0019-issued-tokens-from-state-history.md)). From the deploy on, the live syncer writes `state_touches`: a row for
+each trust line a transaction created, deleted or changed and for each issuer whose flags, transfer rate or domain changed (or that sent an `AccountSet`), in the order of the ledgers. The ledgers written before it
+have none. Both networks have the data: the XRP Ledger's trust lines and Xahau's.
+
+**The aggregate of the issued tokens needs no re-ingest.** The `tokens` job builds its first generation from `trust_line_states` as it is (the account pass), and needs the touches only above the ledger the
+generation was built at. What decides how much of the history the tokens show is the **state tables**, not this parser: the `coverage` of `/v2/tokens`, `/v2/tokens/{currency}.{issuer}` and `/holders` is the feature `issued_tokens`,
+which starts at the first ledger of the network (32,570 on the XRP Ledger, 1 on Xahau) and is `complete` when every ledger from there is written by parser version 3 or later, the
+[account state history](#account-state-history-re-ingest) back to its first ledger. The transfers (`token_transfers`) are payments, which every stored ledger has.
+
+| | XRPL | Xahau |
+| --- | --- | --- |
+| Coverage of the tokens starts at | **32,570**, the first ledger | **1**, the genesis |
+| Fill the state tables with | `--from 32570` | `--from 1` (`--concurrency 1` on the public node) |
+
+**What a re-ingest does to the tokens.**
+- **Filling the state tables further back** moves the state coverage start, and the job builds a **new generation** by itself (its `coverage_from` is no longer the start): the pass over the wider
+  `trust_line_states`, an hour to a few hours, with the live generation serving until it is promoted ([operations](operations.md#issued-tokens)). **Do not fill the history while the first generation is
+  building**: the job compares the coverage start with the one a generation was built on at every housekeeping (about every ten minutes; the promotion does not check it, so a build that finishes in between is promoted and
+  replaced at the next one), and retires a building generation whose start has moved (the oldest stored ledger when no ledger of a parser older than 3 is stored, else one above the newest of them) and starts another
+  from the first account. A fill that keeps writing ledgers below the oldest stored one (a single ascending `--from/--to` run moves the start once, at its first chunk; a fill from the top down moves it with every chunk)
+  therefore restarts a first build every ten minutes until it ends; finish the fill first, or expect the restarts (the log says `tokens: generation N was stale while it built; it is retired`). Only the building
+  generation restarts: the live one keeps serving.
+- **A `--reprocess` of a range** writes the touches of its ledgers, as for every table, and marks its hours in `agg_dirty`. Each slice's **`tokens` hook**, the last but one of the hooks, lowers the `repair_from` of the live and the
+  building generation to the slice's first ledger, and the job applies the touches of `[repair_from, through_ledger]` again, 500 ledgers a window, reading the state at `through_ledger` (a line changed in the range
+  and again later keeps its later state). A window that meets a ledger written by an **older parser** (one without touches) ends the repair and marks a **rebuild**: a new generation is built from the state
+  tables beside the live one and swapped in, which is how the **program's one reprocess**, over the whole history after its last parser version (about **108 million ledgers, 216,000 windows of 500**), reaches the tokens.
+  The rebuild is an hour to a few hours, once at a time; expect more than one while a reprocess runs from the oldest ledger up, because the repair keeps reaching ledgers not yet reprocessed ([operations](operations.md#issued-tokens)).
+- **The testnets** get no backfill, and their tokens stay `complete: false`.
+
+**Prerequisites for the listing.** A token is `listed`, and has a `domain`, only when the issuer's account domain is known and its toml was read: seed `account_domains` from the state history first
+([Account domains seed](#account-domains-seed)) and let the `tomls` worker make its first sweep ([operations](operations.md#the-display-names)), or the tokens are built with no domain and no listing, and the job's
+toml sweep corrects them as the domains are read.
+
+Check the coverage and the build:
+
+```sql
+-- the state tables cover the ledgers above this one (NULL: every stored ledger)
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 3;
+-- the touches exist from this ledger on (the ledgers below it were written before parser version 8)
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 8;
+-- the generations of the issued tokens (building, live, retired) and how far each is
+SELECT generation, argMax(state, version) AS state, argMax(through_ledger, version) AS through_ledger, argMax(repair_from, version) AS repair_from
+FROM xrpl.token_generations GROUP BY generation ORDER BY generation;
+```
+
+### Supply
+
+The hourly supply snapshot ([operations](operations.md#supply-snapshots)) is read from what the ledgers already hold, and only one of its parts needs a re-ingest.
+
+- **Xahau: the minted part.** The mint tables (`genesis_mints`, `imports`, `reward_claims`) come with parser version 9, so ledgers written earlier have none. Until they are re-ingested, `minted` and the rows of
+  `/v2/network/supply/minted` start at the deploy ledger, with `complete: false`. The repair is `range-ingest --from <firstLedger> --to <deploy ledger> --reprocess` on Xahau, about 27 million ledgers. **Share one run:** it is
+  the same command as the [ledger object](#ledger-objects-and-delegation-re-ingest) and [issued token](#issued-tokens-re-ingest) re-ingests, so run it once, after the program's last parser version. A reprocess also reaches the
+  issued tokens through their hook, and a window that meets a ledger of an older parser rebuilds them, more than once during a run from the oldest ledger up (above).
+- **The XRP Ledger needs no re-ingest for the supply.** `total` and `burned` come from the ledger header. `escrowed`, `amm` and `reserves` follow the coverage of the ledger objects, the AMM data and the state tables. `reserves`
+  turns `complete` only with the history load from ledger 32,570, which provides the state of the first ledger.
+- **The figures follow with the next cycle that starts after the fill** ([operations](operations.md#supply-snapshots)). `coverage` changes at once.
+- **A reward near the start of the coverage can read as `genesis_mint`.** A mint is a reward when its claim is stored, so a `GenesisMint` just above the coverage start whose `ClaimReward` is just below it counts as `genesis_mint` in every snapshot until the re-ingest. The part says `complete: false` meanwhile.
+
+Check the coverage:
+
+```sql
+-- the mints are indexed above this ledger (NULL: every stored ledger)
+SELECT maxOrNull(ledger_index) FROM xahau.ledgers WHERE parser_version < 9;
+```
+
+### MPT data re-ingest
+
+Parser version 10 writes the five MPT ledger tables, MPT payments to the payment tables and an `MPToken`'s rows to `balance_changes`, so ledgers written earlier have none of them, and what happened on an MPT before the deploy is not in the index.
+
+- **What MPT needs: ledger 99,226,369 upward.** `MPTokensV1` was enabled there on the XRP Ledger (2025-10-01T13:13:10Z, `Amendment` `14853FF2D09D198B576A531C50883C59D71474BA9072C1F5C0ED1DD57882B922`, read from the recorded `EnableAmendment` in `packages/shared/test/fixtures/xrpl/mpt/FINDINGS.md`), and no MPT row can be older. That is about 8.5 million ledgers on 2026-10-24.
+- **The program's one reprocess covers it; there is no separate run.** That reprocess is the whole history, about 108 million ledgers, after the program's last parser version ([issued tokens](#issued-tokens-re-ingest)), so it writes these ledgers with the rest. Run the range below on its own only if the program's reprocess is skipped; it rewrites every table of each ledger, so it costs what the first ingest did ([Which node?](#2-which-node)):
+
+  ```bash
+  ... node dist/cli/range-ingest.js --from 99226369 --to <checkpoint> --reprocess
+  ```
+
+  From a public node such as `wss://s2.ripple.com` that is `--concurrency 1`, and 8.5 million ledgers are for your own node ([rate limits](#public-nodes-and-rate-limits)).
+- **`agg_dirty` reaches the job.** The chunks mark their hours, and `stats_dirty`'s hook of `mpt_state` rebuilds the issuances the slice names, with their holders, so nothing has to be started by hand. [Operations](operations.md#the-mpt-state-job) says what a failing hook looks like.
+- **Until then** an issuance whose own node has not changed since the deploy has no known state (`state_known = 0`): `/v2/mpt/{issuanceId}` is a 404 and the list leaves it out, while its holders and transfers are served, and `complete` is false.
+- **Xahau and Xahau Testnet need none:** they have no MPT, and they answer `complete: true`. **XRPL Testnet** is not backfilled: its index starts at its first boot, and it stays `complete: false` unless it indexed its own `EnableAmendment` (ledger 11,119,873 on the testnet of today).
+
+Check it:
+
+```sql
+-- every ledger from the enablement up should be of parser version 10 or later
+SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 99226369 GROUP BY parser_version;
+-- the issuances with no known state: 0 once the reprocess has been through the job
+SELECT countIf(state_known = 0) FROM (SELECT * FROM xrpl.mpt_issuances ORDER BY mpt_issuance_id, version DESC LIMIT 1 BY mpt_issuance_id);
+```
 
 ### Public nodes and rate limits
 

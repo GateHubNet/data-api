@@ -4,6 +4,7 @@ import {
   poolsClosedIn,
   RatesService,
   recomputeAmmPools,
+  SupplyAmmSight,
 } from '@gatehub/data-api-shared';
 import { AggregatorJobContext, AggregatorTick, describe } from './job-context';
 
@@ -115,6 +116,16 @@ export class AmmPoolsJobRunner {
     private readonly amm: AggregatorAmmPools,
     private readonly fns: AmmPoolsFunctions,
   ) {}
+
+  /**
+   * What the `supply` job is lent of this runner (spec 2026-10-24-supply-design.md, 4.1 and 4.2): the cursor, `undefined` until the
+   * first run of the job has read it, and the pools set aside, which the cursor has gone past and which are stale in the tables
+   * until their retry works. Read-only: a copy, not the runner's own state. The service hands the getter to the supply runner,
+   * which reads it when it attempts a start (after this job in the tick).
+   */
+  sight(): SupplyAmmSight {
+    return { cursor: this.watermark, setAside: [...this.retry.keys()] };
+  }
 
   /**
    * Rebuilds the pools whose state rows changed since the cursor, a batch at a time, until nothing is left, the budget of the job

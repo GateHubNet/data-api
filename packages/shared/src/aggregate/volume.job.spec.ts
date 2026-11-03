@@ -8,8 +8,11 @@ import {
   componentFeesEst,
   computeDailyVolumeSet,
   computeLiveVolumeSet,
+  configVersionOf,
   LIVE_PERIOD_SECONDS,
   livePeriodsOf,
+  NFT_LIVE_PERIODS,
+  NFT_VOLUME_CONFIG_VERSION,
   PAYMENT_LIVE_PERIODS,
   TRADE_LIVE_PERIODS,
   VOLUME_DAY_SETTLE_MS,
@@ -38,9 +41,32 @@ describe('the periods and the metrics', () => {
   });
 
   it('the AMM volume is the third metric, after the trade and the payment volume, and has the live periods of the trade volume', () => {
-    expect(VOLUME_METRICS).toEqual(['trade_volume', 'payment_volume', 'amm_volume']);
+    expect(VOLUME_METRICS.slice(0, 3)).toEqual(['trade_volume', 'payment_volume', 'amm_volume']);
     expect(livePeriodsOf('amm_volume')).toBe(TRADE_LIVE_PERIODS);
     expect(livePeriodsOf('amm_volume')).toEqual(['hour', 'day', '3day', '7day', '30day']);
+  });
+
+  it('nft_volume is the fourth metric', () => {
+    expect(VOLUME_METRICS).toEqual(['trade_volume', 'payment_volume', 'amm_volume', 'nft_volume']);
+  });
+
+  it('nft_volume has the live periods day, 7day and 30day', () => {
+    expect(NFT_LIVE_PERIODS).toEqual(['day', '7day', '30day']);
+    expect(livePeriodsOf('nft_volume')).toBe(NFT_LIVE_PERIODS);
+  });
+
+  it('configVersionOf is 1 for nft_volume whatever the markets version', () => {
+    expect(NFT_VOLUME_CONFIG_VERSION).toBe(1);
+    for (const version of [0, 1, 7, 4_294_967_295]) {
+      expect(configVersionOf('nft_volume', config({ version }))).toBe(1);
+    }
+  });
+
+  it('configVersionOf is the markets version for every other metric', () => {
+    for (const metric of ['trade_volume', 'payment_volume', 'amm_volume'] as const) {
+      expect(configVersionOf(metric, config({ version: 7 }))).toBe(7);
+      expect(configVersionOf(metric, config({ version: 42 }))).toBe(42);
+    }
   });
 
   it('each period is as long as its name says, in seconds', () => {
@@ -265,6 +291,11 @@ describe('the set functions refuse before they read', () => {
     await expect(
       computeLiveVolumeSet(never, rates, config(), 'payment_volume', '3day', new Date('2026-01-01T00:00:00Z')),
     ).rejects.toThrow(RangeError);
+    for (const period of ['hour', '3day'] as const) {
+      await expect(
+        computeLiveVolumeSet(never, rates, config(), 'nft_volume', period, new Date('2026-01-01T00:00:00Z')),
+      ).rejects.toThrow(RangeError);
+    }
     await expect(computeLiveVolumeSet(never, rates, config(), 'trade_volume', 'day', new Date(NaN))).rejects.toThrow(
       RangeError,
     );

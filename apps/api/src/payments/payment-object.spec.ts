@@ -72,6 +72,18 @@ describe('toPaymentObject', () => {
     expect(Object.keys(bare)).toHaveLength(13);
   });
 
+  it('ends an MPT payment with mpt_issuance_id, after transaction_cost; an issued or a native payment has none', () => {
+    const id = '0598F6E09E30A809E63A1F02DE789586D2F4FDA9EF5200E3';
+    const mpt = toPaymentObject({ ...STORED, currency: id, issuer: 'rERShrtUSEXkrwtTpugPV4v8E787vpx1kb' });
+    expect(Object.keys(mpt).slice(-2)).toEqual(['transaction_cost', 'mpt_issuance_id']);
+    expect(mpt.mpt_issuance_id).toBe(id);
+    expect(mpt.currency).toBe(id);
+    expect(toPaymentObject(STORED)).not.toHaveProperty('mpt_issuance_id');
+    // 40 hex digits are an issued currency
+    expect(toPaymentObject({ ...STORED, currency: 'A'.repeat(40) })).not.toHaveProperty('mpt_issuance_id');
+    expect(toPaymentObject({ ...STORED, currency: 'XRP', issuer: '' })).not.toHaveProperty('mpt_issuance_id');
+  });
+
   it('writes a fee without exponent notation and a zero fee as 0', () => {
     expect(toPaymentObject({ ...STORED, fee: '10' }).transaction_cost).toBe('0.00001');
     expect(toPaymentObject({ ...STORED, fee: '1' }).transaction_cost).toBe('0.000001');

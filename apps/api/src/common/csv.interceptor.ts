@@ -1,4 +1,11 @@
-import { CallHandler, ExecutionContext, NestInterceptor, UseInterceptors } from '@nestjs/common';
+import {
+  applyDecorators,
+  CallHandler,
+  ExecutionContext,
+  NestInterceptor,
+  SetMetadata,
+  UseInterceptors,
+} from '@nestjs/common';
 import { Request, Response } from 'express';
 import { convert } from 'nice-json2csv';
 import { map, Observable } from 'rxjs';
@@ -33,6 +40,32 @@ export function flattenJSON(data: unknown): Json {
 
   recurse(data, '');
   return result;
+}
+
+/** An object as a CSV row: every column of its list, `null` where the object has none. */
+export type CsvRow = Record<string, string | number | boolean | null>;
+
+/**
+ * The CSV row of an object: every column of `columns`, in its order, `null` (an empty cell) where the object has none. A CSV takes its
+ * columns from the keys of its rows, so a key that is left out would move them from one page to the next; a nested object's keys are
+ * joined with a dot, as `flattenJSON` writes them (`flags.locked`).
+ */
+export function toCsvRow(object: object, columns: readonly string[]): CsvRow {
+  const values = flattenJSON(object) as Record<string, string | number | boolean | undefined>;
+  return Object.fromEntries(columns.map((column) => [column, values[column] ?? null]));
+}
+
+/** What makes a spreadsheet run a cell as a formula (OWASP, CSV Injection). */
+const FORMULA_START = /^[=+\-@\t\r]/;
+
+/**
+ * Text an outsider wrote, as a cell of a CSV of our own: a `'` before what a spreadsheet would run as a formula, and `'` for each `"`,
+ * which `convert` writes as `\"`, where an RFC 4180 reader ends the cell and moves the columns after it. The CSVs of the original's
+ * routes keep the original's cells.
+ */
+export function csvSafeText(text: string): string {
+  const cell = text.replace(/"/g, "'");
+  return FORMULA_START.test(cell) ? `'${cell}` : cell;
 }
 
 /** Whether the request asks for the CSV form: `format=csv`, in any case (the original lowercased the format). */
@@ -98,9 +131,18 @@ export class CsvInterceptor implements NestInterceptor {
 }
 
 /**
+ * Metadata key that `@Csv` sets (to `true`) on its route: a route with a CSV form is a list that can be exported
+ * (`POST /v2/exports`, ticket #15), with nothing else to declare.
+ */
+export const CSV_ROUTE = 'ripple:csv-route';
+
+/**
  * Lets a route answer `format=csv`: the array at `body[rowsKey]` becomes the CSV, downloaded as `<filename>.csv`.
- * Put it on the route next to `@RippleRoute`.
+ * Put it on the route next to `@RippleRoute`. It also makes the list exportable (`CSV_ROUTE`).
  */
 export function Csv(filename: CsvFilename, rowsKey: string): MethodDecorator {
-  return UseInterceptors(new CsvInterceptor(filename, rowsKey)) as MethodDecorator;
+  return applyDecorators(
+    SetMetadata(CSV_ROUTE, true),
+    UseInterceptors(new CsvInterceptor(filename, rowsKey)),
+  ) as MethodDecorator;
 }

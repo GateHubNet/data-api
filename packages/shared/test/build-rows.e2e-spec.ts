@@ -21,6 +21,27 @@ const TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
 
 type Row = Record<string, unknown>;
 
+/**
+ * `account_domains` is ordered by account (spec 1.1, decision 7), so the rows of one account collapse: within one insert
+ * (`optimize_on_insert`) and across inserts at the merges, whenever they run. Its row count is neither the number of rows
+ * written nor stable, so the comparisons by count and by row leave it out and compare the newest row of each account
+ * instead (`newestPerAccount`).
+ */
+const MERGED_TABLES: ReadonlySet<Table> = new Set([Table.AccountDomains]);
+/** The tables whose stored rows are the rows written. */
+const EXACT_TABLES: Table[] = TABLES.map(([table]) => table).filter((table) => !MERGED_TABLES.has(table));
+
+/** The row with the largest `version` (decimal text: compared as a BigInt) of each account. */
+function newestPerAccount(rows: Row[]): Row[] {
+  const newest = new Map<string, Row>();
+  for (const row of rows) {
+    const known = newest.get(row.account as string);
+    if (!known || BigInt(row.version as string) > BigInt(known.version as string))
+      newest.set(row.account as string, row);
+  }
+  return [...newest.values()];
+}
+
 /** Reads give back what was written when UInt64 is quoted (exact) and DateTime is a unix timestamp. */
 const READ_SETTINGS = {
   output_format_json_quote_64bit_integers: 1,
@@ -55,11 +76,21 @@ interface Scenario {
   /** Test name. */
   name: string;
   database: string;
-  network: 'xrpl' | 'xahau';
+  network: 'xrpl' | 'xahau' | 'xrpl-testnet';
   dir: string;
   ledgers: number;
   /** The number of payments the Ripple Data API finds in these ledgers, when it is known. */
   payments?: number;
+  /** The ledgers are the recorded NFT or URIToken cases: every NFT table gets rows. */
+  nft?: boolean;
+  /** The ledgers are the recorded escrow, check, channel and delegation cases: both object tables get rows. */
+  objects?: boolean;
+  /** The ledgers are the recorded AccountSet and Clawback cases of the token aggregate: `state_touches` gets rows of both kinds. */
+  touches?: boolean;
+  /** The ledgers are the recorded Xahau mint cases (Imports with their parent ledgers, and two hand-made ledgers): the three mint tables get rows. */
+  mint?: boolean;
+  /** The ledgers are the recorded MPT cases: the five MPT tables get rows. */
+  mpt?: boolean;
 }
 
 const SCENARIOS: Scenario[] = [
@@ -70,6 +101,92 @@ const SCENARIOS: Scenario[] = [
   { name: 'recorded xahau', database: 'rows_xahau', network: 'xahau', dir: 'xahau/recorded', ledgers: 6 },
   // A flag ledger: 22 UNLReport pseudo-transactions with Account "" (ruling R95).
   { name: 'xahau flag ledger', database: 'rows_xahau_flag', network: 'xahau', dir: 'xahau/flag', ledgers: 1 },
+  // Whole ledgers around the recorded NFT cases: mints, offers, sales, burns and a modify; and around the URIToken cases.
+  { name: 'recorded NFTs', database: 'rows_nft', network: 'xrpl', dir: 'xrpl/nft', ledgers: 11, nft: true },
+  {
+    name: 'recorded URITokens',
+    database: 'rows_uritoken',
+    network: 'xahau',
+    dir: 'xahau/uritoken',
+    ledgers: 9,
+    nft: true,
+  },
+  // Whole ledgers around the recorded escrow, check, payment channel and delegation cases of both networks.
+  {
+    name: 'recorded objects xrpl',
+    database: 'rows_objects_xrpl',
+    network: 'xrpl',
+    dir: 'xrpl/objects',
+    ledgers: 22,
+    objects: true,
+  },
+  {
+    name: 'recorded objects xahau',
+    database: 'rows_objects_xahau',
+    network: 'xahau',
+    dir: 'xahau/objects',
+    ledgers: 12,
+    objects: true,
+  },
+  // Whole ledgers around the recorded AccountSet (TransferRate, asfAllowTrustLineClawback) and Clawback cases: the touches of both kinds.
+  {
+    name: 'recorded state touches xrpl',
+    database: 'rows_state_touches',
+    network: 'xrpl',
+    dir: 'xrpl/state-touches',
+    ledgers: 3,
+    touches: true,
+  },
+  // The recorded Xahau Imports (an account created, an account that existed) with their parent ledgers, and the two hand-made ledgers: the mint rows.
+  {
+    name: 'recorded mint cases xahau',
+    database: 'rows_mint',
+    network: 'xahau',
+    dir: 'xahau/mint',
+    ledgers: 6,
+    mint: true,
+  },
+  // Whole ledgers around the recorded MPT cases, the three enable ledgers among them, and the escrow cases mainnet does not have.
+  { name: 'recorded MPT cases xrpl', database: 'rows_mpt', network: 'xrpl', dir: 'xrpl/mpt', ledgers: 27, mpt: true },
+  {
+    name: 'recorded MPT cases xrpl testnet',
+    database: 'rows_mpt_testnet',
+    network: 'xrpl-testnet',
+    dir: 'xrpl-testnet/mpt',
+    ledgers: 5,
+    mpt: true,
+  },
+];
+
+/** The five NFT tables, with the property of `LedgerRows` that holds their rows. */
+const NFT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
+  [Table.NftEvents, 'nftEvents'],
+  [Table.AccountNftEvents, 'accountNftEvents'],
+  [Table.CollectionNftEvents, 'collectionNftEvents'],
+  [Table.NftSales, 'nftSales'],
+  [Table.NftTouches, 'nftTouches'],
+];
+
+/** The three Xahau mint tables, with the property of `LedgerRows` that holds their rows. */
+const MINT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
+  [Table.GenesisMints, 'genesisMints'],
+  [Table.Imports, 'imports'],
+  [Table.RewardClaims, 'rewardClaims'],
+];
+
+/** The five MPT tables, with the property of `LedgerRows` that holds their rows. */
+const MPT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
+  [Table.MptIssuanceStates, 'mptIssuanceStates'],
+  [Table.MptHolderStates, 'mptHolderStates'],
+  [Table.MptTouches, 'mptTouches'],
+  [Table.MptTransfers, 'mptTransfers'],
+  [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+];
+
+/** The two object tables, with the property of `LedgerRows` that holds their rows. */
+const OBJECT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
+  [Table.ObjectChanges, 'objectChanges'],
+  [Table.AccountObjectChanges, 'accountObjectChanges'],
 ];
 
 describe('buildLedgerRows into ClickHouse (e2e)', () => {
@@ -85,6 +202,8 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
 
   describe.each(SCENARIOS)('$name', (scenario) => {
     let svc: ClickHouseService;
+    /** What `buildLedgerRows` made of the ledgers. */
+    let built: LedgerRows[];
     /** What was inserted, per table. */
     const inserted = new Map<Table, Row[]>();
 
@@ -99,8 +218,10 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
       for (const [table] of TABLES) inserted.set(table, []);
 
       // One insert per table per ledger, the way the ledger writer will: the ledger row is the commit marker, last.
+      built = [];
       for (const raw of ledgers) {
         const rows = buildLedgerRows(raw, ctx);
+        built.push(rows);
         const dedupToken = (table: Table) => `e2e:${table}:${raw.header.ledger_index}`;
         for (const [table, key] of [...TABLES].reverse()) {
           const value = rows[key] as unknown as Row | Row[];
@@ -112,37 +233,127 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
     });
 
     afterAll(async () => {
-      await svc?.onModuleDestroy();
+      await svc?.close();
     });
 
     const count = async (table: Table): Promise<number> =>
       Number((await svc.queryOne<{ n: string }>(`SELECT count() AS n FROM ${table}`, {}, READ_SETTINGS))?.n);
 
     it('inserts every row into a migrated schema: count() equals the rows written, in every table', async () => {
-      for (const [table] of TABLES) {
+      for (const table of EXACT_TABLES) {
         expect([table, await count(table)]).toEqual([table, inserted.get(table)!.length]);
       }
       expect(await count(Table.Ledgers)).toBe(scenario.ledgers);
     });
 
-    /** A DateTime comes back as a quoted unix timestamp; the rows hold it as a number. */
+    /** A DateTime comes back as a quoted unix timestamp, a Nullable one too (NULL stays null); the rows hold a number. */
     const dateTimeColumns = async (table: Table): Promise<string[]> =>
       (
         await svc.query<{ name: string }>(
-          "SELECT name FROM system.columns WHERE database = {db:String} AND table = {table:String} AND type LIKE 'DateTime%'",
+          "SELECT name FROM system.columns WHERE database = {db:String} AND table = {table:String} AND (type LIKE 'DateTime%' OR type LIKE 'Nullable(DateTime%')",
           { db: scenario.database, table },
         )
       ).map((c) => c.name);
 
-    it.each(TABLES.map(([table]) => table))('%s: every row reads back exactly as written', async (table) => {
+    it.each(EXACT_TABLES)('%s: every row reads back exactly as written', async (table) => {
       // `ingested_at` is the server default, not part of the rows.
       const columns = table === Table.Ledgers ? '* EXCEPT ingested_at' : '*';
       const stored = await svc.query<Row>(`SELECT ${columns} FROM ${table}`, {}, READ_SETTINGS);
       const times = await dateTimeColumns(table);
-      for (const row of stored) for (const column of times) if (column in row) row[column] = Number(row[column]);
+      for (const row of stored) {
+        for (const column of times) if (column in row && row[column] !== null) row[column] = Number(row[column]);
+      }
 
       expect(firstDifference(stored, inserted.get(table)!)).toBeUndefined();
     });
+
+    it('account_domains: the newest row of each account is stored, whatever the merges kept of its older ones', async () => {
+      const written = inserted.get(Table.AccountDomains)!;
+      // Every fixture set has account roots with a Domain.
+      expect(written.length).toBeGreaterThan(0);
+
+      const stored = await svc.query<Row>(`SELECT * FROM ${Table.AccountDomains}`, {}, READ_SETTINGS);
+      // Never fewer rows than accounts, never more rows than written; which of the older rows of an account remain is up to
+      // the merges.
+      const newest = newestPerAccount(written);
+      expect(stored.length).toBeGreaterThanOrEqual(newest.length);
+      expect(stored.length).toBeLessThanOrEqual(written.length);
+      expect(firstDifference(newestPerAccount(stored), newest)).toBeUndefined();
+    });
+
+    if (scenario.nft) {
+      it('the NFT fixtures land in all five tables', async () => {
+        for (const [table, key] of NFT_TABLES) {
+          const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
+          expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
+        }
+      });
+    }
+
+    if (scenario.mint) {
+      it('the mint fixtures land in all three tables, and the drops of an Import read back exactly', async () => {
+        for (const [table, key] of MINT_TABLES) {
+          const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
+          expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
+        }
+        const minted = await svc.query<{ minted: string }>(
+          `SELECT minted FROM ${Table.Imports} ORDER BY ledger_index`,
+          {},
+          READ_SETTINGS,
+        );
+        expect(minted.map((r) => r.minted)).toEqual(['11', '2000000']);
+      });
+    }
+
+    if (scenario.mpt) {
+      it('the MPT fixtures land in all five tables, the enum and the amounts read back exactly', async () => {
+        for (const [table, key] of MPT_TABLES) {
+          const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
+          expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
+        }
+        const written = built.flatMap((rows) => rows.mptTransfers);
+        const stored = await svc.query<{ kind: string; amount: string; fee: string }>(
+          `SELECT kind, amount, fee FROM ${Table.MptTransfers} ORDER BY ledger_index, tx_index`,
+          {},
+          READ_SETTINGS,
+        );
+        expect(stored).toEqual(written.map(({ kind, amount, fee }) => ({ kind, amount, fee })));
+      });
+    }
+
+    if (scenario.objects) {
+      it('the object fixtures land in both tables, and every change has an owner row in the index', async () => {
+        for (const [table, key] of OBJECT_TABLES) {
+          const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
+          expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
+        }
+        const owners = await svc.queryOne<{ n: string }>(
+          `SELECT count() AS n FROM ${Table.AccountObjectChanges} WHERE role = 'owner'`,
+          {},
+          READ_SETTINGS,
+        );
+        expect(Number(owners?.n)).toBe(await count(Table.ObjectChanges));
+      });
+    }
+
+    if (scenario.touches) {
+      it('the touch fixtures land in state_touches, with line and account rows (kind reads back as its label)', async () => {
+        const written = inserted.get(Table.StateTouches)!;
+        const stored = await svc.query<{ kind: string; n: string }>(
+          `SELECT kind, count() AS n FROM ${Table.StateTouches} GROUP BY kind`,
+          {},
+          READ_SETTINGS,
+        );
+        const byKind = (kind: string) => written.filter((r) => r.kind === kind).length;
+        expect(byKind('line')).toBeGreaterThan(0);
+        expect(byKind('account')).toBeGreaterThan(0);
+        // (GROUP BY gives no order, and an Enum8 sorts by value, not by label: the groups are compared as a map.)
+        expect(Object.fromEntries(stored.map((r) => [r.kind, Number(r.n)]))).toEqual({
+          line: byKind('line'),
+          account: byKind('account'),
+        });
+      });
+    }
 
     if (scenario.payments !== undefined) {
       it('stores the known number of payments, both in the table and in the ledger summaries', async () => {
@@ -215,7 +426,7 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
     });
 
     afterAll(async () => {
-      await svc?.onModuleDestroy();
+      await svc?.close();
     });
 
     it('commits the ledger, with the UNLReport sender as the zero account and its tx_json as the node sent it', async () => {

@@ -1,3 +1,4 @@
+import { NETWORK_NAMES, networkChoiceText } from '@gatehub/data-api-shared/dist/network';
 import { ApiConfig, apiKeysOf, corsOriginOf, endpointList, rateLimitKeysOf } from './api.config';
 
 interface Loaded {
@@ -59,6 +60,10 @@ describe('ApiConfig (GH_* environment)', () => {
       // key-gated answers: private, so a shared cache does not serve one client's answer to another (R109)
       cacheControl: 'private, max-age=60',
       amendmentsConfig: '',
+      namesAndLabelsReloadMs: 60000,
+      exportMaxJobsPerKey: 3,
+      exportMaxRowsCsv: 1_000_000,
+      exportMaxRowsPdf: 10_000,
     });
   });
 
@@ -78,6 +83,10 @@ describe('ApiConfig (GH_* environment)', () => {
       GH_TRUST_PROXY_HOPS: '0',
       GH_CACHE_CONTROL: 'public, max-age=5',
       GH_AMENDMENTS_CONFIG: ' /etc/gatehub/amendments.json ',
+      GH_NAMES_AND_LABELS_RELOAD_MS: '250',
+      GH_EXPORT_MAX_JOBS_PER_KEY: '5',
+      GH_EXPORT_MAX_ROWS_CSV: '500',
+      GH_EXPORT_MAX_ROWS_PDF: '50',
     });
     expect(exits).toEqual([]);
     expect(cfg).toMatchObject({
@@ -95,6 +104,10 @@ describe('ApiConfig (GH_* environment)', () => {
       trustProxyHops: 0,
       cacheControl: 'public, max-age=5',
       amendmentsConfig: '/etc/gatehub/amendments.json',
+      namesAndLabelsReloadMs: 250,
+      exportMaxJobsPerKey: 5,
+      exportMaxRowsCsv: 500,
+      exportMaxRowsPdf: 50,
     });
   });
 
@@ -135,10 +148,26 @@ describe('ApiConfig (GH_* environment)', () => {
     );
   });
 
-  it('reports an unknown network once, instead of failing on its endpoint default', async () => {
+  it("defaults GH_NODE_ENDPOINTS to the testnet's public servers", async () => {
+    const xrplTestnet = await loadConfig({ GH_NETWORK: 'xrpl-testnet' });
+    expect(xrplTestnet.exits).toEqual([]);
+    expect(xrplTestnet.cfg.nodeEndpoints).toBe('wss://s.altnet.rippletest.net:51233,wss://testnet.xrpl-labs.com');
+    const xahauTestnet = await loadConfig({ GH_NETWORK: 'xahau-testnet' });
+    expect(xahauTestnet.exits).toEqual([]);
+    expect(xahauTestnet.cfg.nodeEndpoints).toBe('wss://xahau-test.net');
+  });
+
+  it.each(NETWORK_NAMES)('takes GH_NETWORK=%s', async (name) => {
+    const { cfg, exits } = await loadConfig({ GH_NETWORK: name });
+    expect(exits).toEqual([]);
+    expect(cfg.network).toBe(name);
+  });
+
+  it('refuses another network, listing the four, once, instead of failing on its endpoint default', async () => {
     const { exits, errors } = await loadConfig({ GH_NETWORK: 'bitcoin' });
     expect(exits).toEqual([1]);
-    expect(errors).toContain('GH_NETWORK must be xrpl or xahau');
+    expect(errors).toContain(networkChoiceText('GH_NETWORK'));
+    expect(errors).toContain('GH_NETWORK must be one of xrpl, xahau, xrpl-testnet, xahau-testnet');
     expect(errors).not.toContain('GH_NODE_ENDPOINTS');
   });
 
@@ -149,7 +178,7 @@ describe('ApiConfig (GH_* environment)', () => {
   });
 
   it.each([
-    ['GH_NETWORK', 'bitcoin', 'GH_NETWORK must be xrpl or xahau'],
+    ['GH_NETWORK', 'bitcoin', networkChoiceText('GH_NETWORK')],
     [
       'GH_NODE_ENDPOINTS',
       'https://example.com',
@@ -177,6 +206,7 @@ describe('ApiConfig (GH_* environment)', () => {
     ['GH_RATE_LIMIT', '0', 'GH_RATE_LIMIT must be a positive integer'],
     ['GH_RATE_LIMIT', '1e3', 'GH_RATE_LIMIT must be a positive integer'],
     ['GH_RATE_LIMIT_WINDOW', '-5', 'GH_RATE_LIMIT_WINDOW must be a positive integer'],
+    ['GH_NAMES_AND_LABELS_RELOAD_MS', '0', 'GH_NAMES_AND_LABELS_RELOAD_MS must be a positive integer'],
     ['GH_LIVE_CACHE_TTL_MS', '-1', 'GH_LIVE_CACHE_TTL_MS must be a non-negative integer'],
     ['GH_TX_CACHE_SIZE', '-1', 'GH_TX_CACHE_SIZE must be a non-negative integer'],
     ['GH_TX_CACHE_SIZE', 'lots', 'GH_TX_CACHE_SIZE must be a non-negative integer'],

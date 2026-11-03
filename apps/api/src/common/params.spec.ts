@@ -9,6 +9,7 @@ import {
   endExclusive,
   first,
   Granularity,
+  ledgerDates,
   limitParam,
   parseDate,
   ParsedDate,
@@ -378,6 +379,23 @@ describe('dateParam', () => {
     it('still answers 400 for an invalid param', () => {
       expect(thrown(() => dateParam({ start: 'x' }, 'start', ERR, '2013-01-01'))).toEqual([400, ERR]);
     });
+  });
+});
+
+describe('ledgerDates', () => {
+  it('is the start as it is and the end as the end of the period it names, each left out when missing', () => {
+    expect(ledgerDates({})).toEqual({});
+    const both = ledgerDates({ start: '2015-01-14T10:00:00Z', end: '2015-01-31' });
+    expect(Object.keys(both)).toEqual(['start', 'endExclusive']);
+    expect(iso(both.start as Date)).toBe('2015-01-14T10:00:00.000Z');
+    expect(iso(both.endExclusive as Date)).toBe('2015-02-01T00:00:00.000Z');
+    expect(Object.keys(ledgerDates({ end: '2015' }))).toEqual(['endExclusive']);
+  });
+
+  it('checks the start before the end: 400 invalid start date format, then invalid end date format', () => {
+    expect(thrown(() => ledgerDates({ start: 'x', end: 'y' }))).toEqual([400, 'invalid start date format']);
+    expect(thrown(() => ledgerDates({ start: '2015', end: 'y' }))).toEqual([400, 'invalid end date format']);
+    expect(thrown(() => ledgerDates({ start: '' }))).toEqual([400, 'invalid start date format']);
   });
 });
 

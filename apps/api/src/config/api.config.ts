@@ -1,5 +1,5 @@
 // Only the network profile, not the package root: the config is loaded (and its tests reload it) before anything else.
-import { getNetworkProfile } from '@gatehub/data-api-shared/dist/network';
+import { getNetworkProfile, NETWORK_NAMES, networkChoiceText } from '@gatehub/data-api-shared/dist/network';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
 import { Transform } from 'class-transformer';
@@ -60,10 +60,10 @@ function NodeEndpoints(): PropertyDecorator {
 }
 
 export class ApiConfig {
-  /** `GH_NETWORK`: `xrpl` or `xahau`. */
+  /** `GH_NETWORK`: `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`. */
   @ConfigValue()
   @Text()
-  @IsIn(['xrpl', 'xahau'], { message: 'GH_NETWORK must be xrpl or xahau' })
+  @IsIn(NETWORK_NAMES, { message: networkChoiceText('GH_NETWORK') })
   network: string = 'xrpl';
 
   /**
@@ -149,15 +149,61 @@ export class ApiConfig {
 
   /**
    * `GH_AMENDMENTS_CONFIG`: path of the amendment metadata file (the same file as the syncer's, so that both name an amendment
-   * alike). Empty, the default, is the file shipped as `config/amendments/<network>.json`.
+   * alike). Empty, the default, is the file shipped as `config/amendments/<family>.json` (a testnet reads its family's).
    */
   @ConfigValue()
   @MaybeEmptyText()
   amendmentsConfig: string = '';
+
+  /**
+   * `GH_NAMES_AND_LABELS_RELOAD_MS`: how often the account names (and the other sets of names and labels the operator
+   * writes, ADR-0014) are loaded again, in milliseconds. A row the operator inserts shows within this time. The tomls are not
+   * loaded (ADR-0017): a call of the display names reads the tomls of its accounts' domains by key, and keeps each answer 60 s.
+   */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  namesAndLabelsReloadMs: number = 60000;
+
+  /**
+   * `GH_EXPORT_BUCKET`: the Google Cloud Storage bucket of the export files (spec #4, ticket #15), the same bucket as the
+   * exporter's; the files of a network are under `<network>/`. The api signs the download links with the application
+   * default credentials (`GOOGLE_APPLICATION_CREDENTIALS`). Empty, the default, turns exports off:
+   * `/v2/exports` answers 503 `exports are not available`.
+   */
+  @ConfigValue()
+  @MaybeEmptyText()
+  exportBucket: string = '';
+
+  /**
+   * `GH_EXPORT_MAX_JOBS_PER_KEY`: the most exports one API key may have queued or running at once (ticket #16); one more
+   * answers 429. The exporter makes one export at a time, so this bounds how far one key can queue ahead of the others.
+   */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  exportMaxJobsPerKey: number = 3;
+
+  /**
+   * `GH_EXPORT_MAX_ROWS_CSV`: the most rows a CSV export holds (ticket #16). An export whose list counts its rows up front
+   * and has more answers 400; the exporter, with the same setting, fails one whose list turns out longer.
+   */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  exportMaxRowsCsv: number = 1_000_000;
+
+  /** `GH_EXPORT_MAX_ROWS_PDF`: the most rows a PDF export holds (ticket #16), as `GH_EXPORT_MAX_ROWS_CSV`. */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  exportMaxRowsPdf: number = 10_000;
 }
 
 /** The network profile of the app (`getNetworkProfile(cfg.network)`), provided by the CommonModule. */
 export const NETWORK_PROFILE = Symbol('NETWORK_PROFILE');
+
+/**
+ * The name of the shared database (ADR-0014: `GH_CLICKHOUSE_SHARED_DATABASE`, default `shared`), provided by the
+ * CommonModule. It is on the server of the app's own database, and is read with the table names qualified by it.
+ */
+export const SHARED_DATABASE = Symbol('SHARED_DATABASE');
 
 /** The entries of a comma separated endpoint list, trimmed, without empty items. */
 export function endpointList(csv: string): string[] {
