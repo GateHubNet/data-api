@@ -3,8 +3,8 @@
  *
  * Each `*.sql` file in `packages/shared/schema/` (or in `GH_SCHEMA_DIR`) is one migration unit of a network database. The
  * shared database (ADR-0014) has a set of its own in `packages/shared/schema-shared/` (`runSharedMigrations`). The runner:
- *   1. creates the target database (through a client bound to `default`, which always exists) and a
- *      `schema_migrations` bookkeeping table,
+ *   1. creates the target database (through a client bound to `default`, which always exists; a Replicated database
+ *      on every replica when `GH_CLICKHOUSE_CLUSTER` is set) and a `schema_migrations` bookkeeping table,
  *   2. reads which files have already been applied and verifies their sha256 checksum — an applied file that changed
  *      is a hard error, never silently re-run or skipped,
  *   3. applies only the new files (in lexical order), statement by statement,
@@ -62,6 +62,19 @@ function splitStatements(sql: string): string[] {
     .filter((s) => s.length > 0);
 }
 
+/**
+ * On a single server, a plain database. On a cluster (`GH_CLICKHOUSE_CLUSTER`), a Replicated database created on every
+ * replica: Keeper replays each later CREATE/ALTER on all of them and the MergeTree tables inside become replicated, so
+ * the migrations run once and the data is not split across replicas. Both names are validated before they get here.
+ */
+export function createDatabaseStatement(database: string, cluster?: string): string {
+  if (!cluster) return 'CREATE DATABASE IF NOT EXISTS {database:Identifier}';
+  return (
+    `CREATE DATABASE IF NOT EXISTS ${database} ON CLUSTER '${cluster}' ` +
+    `ENGINE = Replicated('/clickhouse/databases/${database}', '{shard}', '{replica}')`
+  );
+}
+
 function checksum(content: string): string {
   return createHash('sha256').update(content).digest('hex');
 }
@@ -76,7 +89,7 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
   // The target database may not exist yet, so create it through a connection bound to `default`.
   const bootstrap = new ClickHouseService({ ...config, database: 'default' });
   try {
-    await bootstrap.command('CREATE DATABASE IF NOT EXISTS {database:Identifier}', { database });
+    await bootstrap.command(createDatabaseStatement(database, config.cluster), { database });
   } finally {
     await bootstrap.close();
   }

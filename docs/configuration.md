@@ -53,6 +53,7 @@ network, and the shared database that the apis of every network read ([ADR-0014]
 | `GH_CLICKHOUSE_PASSWORD` | empty | A secret. |
 | `GH_CLICKHOUSE_DATABASE` | the database of the network's profile: `xrpl`, `xahau`, `xrpl_testnet`, `xahau_testnet` | Plain lowercase identifier (`^[a-z_][a-z0-9_]*$`): it is written into DDL. |
 | `GH_CLICKHOUSE_SHARED_DATABASE` | `shared` (also when empty) | The shared database (account names and labels), on the same server: read by the api, created and migrated by `migrate.js shared` (the `migrate-shared` job). Give every api and the job the same name. A plain lowercase identifier, as above: it is written into the SQL. |
+| `GH_CLICKHOUSE_CLUSTER` | empty | The server's cluster (its `remote_servers` name) when ClickHouse runs as several replicas. Set, the migration creates each database `ON CLUSTER` with the `Replicated` engine (Keeper path `/clickhouse/databases/<database>`, macros `{shard}` and `{replica}`), so every later CREATE/ALTER reaches all replicas and the MergeTree tables become replicated. Its user needs `GRANT CLUSTER ON *.*`. Empty: a plain database, for one server. Letters, digits, `_`, `-` and `.` only: it is written into the SQL. |
 | `GH_CLICKHOUSE_REQUEST_TIMEOUT` | `30000` | Client request timeout, ms. |
 | `GH_CLICKHOUSE_MAX_CONNECTIONS` | `10` | Connections in the client pool. |
 | `GH_CLICKHOUSE_MAX_EXECUTION_TIME` | `30` | `max_execution_time` of every SELECT, seconds; 0 = unlimited. Kills runaway queries. |
