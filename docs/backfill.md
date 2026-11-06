@@ -582,7 +582,8 @@ lists nothing from before the deploy ([api-reference](api-reference.md#get-v2acc
   ```
 
   `<first>` is 32570 on the XRP Ledger and 1 on Xahau. From a public node that is `--concurrency 1` ([rate limits](#public-nodes-and-rate-limits)).
-- **Until then** `coverage` says `complete: false`, and the ledgers below `from_ledger_index` have no rows: a tagged list leaves out what was sent there.
+- **Until then** `coverage` says `complete: false`. `from_ledger_index` is one above the newest ledger of an older parser, so every ledger from it up is indexed. Below it,
+  only the ledgers the reprocess has already rewritten are (an oldest-first run fills them from the bottom), and a tagged list leaves out what was sent in the others.
 - **The testnets are never complete:** their index starts at their first boot and they are not backfilled.
 
 Check it:
