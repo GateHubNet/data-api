@@ -1,6 +1,6 @@
 # Transactions by destination tag: design
 
-Status: draft for the owner's review, 2026-11-06. It builds on `feat/explorer-data-2` ([#21](https://github.com/GateHubNet/data-api/pull/21)): migration 017 and parser version 10 must be there first.
+Status: approved by the owner, 2026-11-06. It builds on `feat/explorer-data-2` ([#21](https://github.com/GateHubNet/data-api/pull/21)): migration 017 and parser version 10 must be there first.
 
 ## 1. Goal
 
@@ -86,6 +86,8 @@ A tagged page reads at most its own rows plus 2 granules per part of the new tab
 ## 9. Testing
 
 - **Parser:** recorded ledgers of each type that has the fields, where recordings exist. Synthetic cases for tag 0, no tag, no `Destination`, a tag that is not an integer or is above 2^32 − 1, a failed transaction, a Batch inner transaction and Xahau's `Remit`.
+> **Dated note (2026-11-06, the plan).** Recordings exist for a failed payment, a Batch inner payment, tag 0 and Xahau's `Remit`, so the plan uses them in place of synthetic cases. No recording has a tag on any other type, so those are synthetic edits of recorded untagged creates.
+
 - **Ingest e2e:** the rows are written and replaced by a reprocess.
 - **API e2e:**
     - the filter, with paging in both directions, `start` and `end`, `type`, `result`, `binary`, the summary form and the CSV
