@@ -7,6 +7,7 @@ import { mptOfferHash, withMptOffers } from '../../test/synthetic-mpt-offers';
 import { EXPIRED_ACCEPT_BASE, withTecExpiredAccept } from '../../test/synthetic-tec-expired-accept';
 import { foldNftEvents } from '../aggregate/nft-state';
 import {
+  DESTINATION_TAG_PARSER_VERSION,
   DOMAIN_PARSER_VERSION,
   MINT_PARSER_VERSION,
   MPT_PARSER_VERSION,
@@ -183,6 +184,18 @@ const MPT_TESTNET_SET: FixtureSet = {
   minTrustlinesChecked: 0,
 };
 
+/**
+ * The recorded ledgers of the state history (`test/fixtures/xrpl/account-state`): whole mainnet ledgers, among them failed
+ * payments with a tag and a Batch. No `SETS` entry either; the destination tag tests below use it.
+ */
+const ACCOUNT_STATE_SET: FixtureSet = {
+  name: 'recorded account state cases (xrpl)',
+  ctx: XRPL,
+  dir: join(FIXTURES, 'xrpl', 'account-state'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
 interface Built {
   raw: RawLedger;
   rows: LedgerRows;
@@ -257,6 +270,7 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.MptTouches, 'mptTouches'],
   [Table.MptTransfers, 'mptTransfers'],
   [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+  [Table.AccountTxByDestinationTag, 'accountTxByDestinationTag'],
 ];
 
 /** The five MPT ledger tables, with the property of `LedgerRows` that holds their rows. */
@@ -1467,13 +1481,15 @@ describe('AMM rows (parser version 2)', () => {
       [Table.MptTouches, 'mptTouches'],
       [Table.MptTransfers, 'mptTransfers'],
       [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+      [Table.AccountTxByDestinationTag, 'accountTxByDestinationTag'],
     ];
 
     // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter. The Domain rows are in
     // the recorded Xahau and XRPL ledgers: the Xahau flag ledger and 26540188 hold account roots with a Domain. The object
     // rows are in the recorded escrow, check, channel and delegation ledgers. The mint rows are in the recorded Xahau ledgers
     // 26540187 (a ClaimReward) and 26540188 (a GenesisMint); the Import rows only in the mint cases. The MPT rows are in the
-    // recorded MPT ledgers of both networks.
+    // recorded MPT ledgers of both networks. The destination tag rows are in most of them, the Remit of the URIToken
+    // ledgers among them.
     const recorded = (): Built[] => [
       ...builtOf(AMM_SET),
       ...builtOf(NFT_SET),
@@ -1521,10 +1537,10 @@ describe('AMM rows (parser version 2)', () => {
       }
     });
 
-    it('stores parser_version 10 (the MPT data, after Xahau minting of 9)', () => {
-      expect(PARSER_VERSION).toBe(10);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(10);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(10);
+    it('stores parser_version 11 (the destination tag index, after the MPT data of 10)', () => {
+      expect(PARSER_VERSION).toBe(11);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(11);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(11);
     });
   });
 
@@ -1933,17 +1949,17 @@ describe('NFT rows (parser version 5)', () => {
   });
 
   describe('parser_version', () => {
-    it('stamps the parser version of the build on the ledger row: 10, with the NFT parser still at 5, the domain parser at 6, the object parser at 7, the token parser at 8 and the mint parser at 9', () => {
-      expect([PARSER_VERSION, MPT_PARSER_VERSION]).toEqual([10, 10]);
+    it('stamps the parser version of the build on the ledger row: 11, with the NFT parser still at 5, the domain parser at 6, the object parser at 7, the token parser at 8, the mint parser at 9 and the MPT parser at 10', () => {
+      expect([PARSER_VERSION, DESTINATION_TAG_PARSER_VERSION, MPT_PARSER_VERSION]).toEqual([11, 11, 10]);
       expect(MINT_PARSER_VERSION).toBe(9);
       expect(NFT_PARSER_VERSION).toBe(5);
       expect(DOMAIN_PARSER_VERSION).toBe(6);
       expect(OBJECT_PARSER_VERSION).toBe(7);
       expect(TOKEN_PARSER_VERSION).toBe(8);
       for (const set of [NFT_SET, URITOKEN_SET, RIPPLE_MOCK]) {
-        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(10);
+        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(11);
       }
-      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(10);
+      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(11);
     });
   });
 
@@ -2425,9 +2441,9 @@ describe('ledger objects (parser version 7)', () => {
     },
   );
 
-  it('stamps parser_version 10 on the object ledgers: OBJECT_PARSER_VERSION, the first version with object rows, stays 7', () => {
+  it('stamps parser_version 11 on the object ledgers: OBJECT_PARSER_VERSION, the first version with object rows, stays 7', () => {
     expect(OBJECT_PARSER_VERSION).toBe(7);
-    expect(PARSER_VERSION).toBe(10);
+    expect(PARSER_VERSION).toBe(11);
     for (const set of [OBJECTS_XRPL, OBJECTS_XAHAU]) {
       for (const { rows } of builtOf(set)) {
         expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
@@ -2942,9 +2958,12 @@ describe('MPT rows (parser version 10)', () => {
   const ofTx = <T extends { tx_index: number }>(rows: readonly T[], txIndex: number): T[] =>
     rows.filter((r) => r.tx_index === txIndex);
 
-  it('is parser version 10 for both the build and the first version that has the rows, which readers gate on', () => {
-    expect([PARSER_VERSION, MPT_PARSER_VERSION]).toEqual([10, 10]);
-    for (const { rows } of everyBuilt()) expect(rows.ledger.parser_version).toBe(MPT_PARSER_VERSION);
+  it('stamps the MPT ledgers at or above MPT_PARSER_VERSION, the first version that has the rows, which readers gate on and which stays 10', () => {
+    expect([PARSER_VERSION, MPT_PARSER_VERSION]).toEqual([11, 10]);
+    for (const { rows } of everyBuilt()) {
+      expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
+      expect(rows.ledger.parser_version).toBeGreaterThanOrEqual(MPT_PARSER_VERSION);
+    }
   });
 
   // [issuance states, holder states, transfers] of each case's transaction, from FINDINGS and the cases' nodes.
@@ -3206,8 +3225,139 @@ describe('MPT rows (parser version 10)', () => {
   );
 });
 
+describe('account_tx_by_destination_tag (parser version 11)', () => {
+  const tagRowsOf = (set: FixtureSet) => builtOf(set).flatMap(({ rows }) => rows.accountTxByDestinationTag);
+
+  it('writes the 25 tagged payments of the ripple-mock ledgers, under 8 destinations and tags', () => {
+    const rows = tagRowsOf(RIPPLE_MOCK);
+    expect(rows).toHaveLength(25);
+    expect(rows.every((r) => r.tx_type === 'Payment')).toBe(true);
+
+    const groups = new Map<string, number>();
+    for (const r of rows) {
+      const group = `${r.account} ${r.destination_tag}`;
+      groups.set(group, (groups.get(group) ?? 0) + 1);
+    }
+    expect(Object.fromEntries(groups)).toEqual({
+      'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj 191150': 1,
+      'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj 223051': 8,
+      'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj 225881': 9,
+      'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj 219151': 3,
+      'rfKeuNcxyuKRK8QH5VmcxKfsVgPdSxwGpj 3087927': 1,
+      'rfKeuNcxyuKRK8QH5VmcxKfsVgPdSxwGpj 3087932': 1,
+      'rhxULAn1xW9T4V2u67FX9pQjSz4Tay2zjZ 761732776': 1,
+      'rGmFH7pyrKs7E84MkGmgKc1gnsx6ZbWDwB 18547409': 1,
+    });
+
+    const { rows: ledger } = ledgerNamed(RIPPLE_MOCK, 11_119_610);
+    expect(ledger.accountTxByDestinationTag.filter((r) => r.tx_index === 2)).toEqual([
+      {
+        account: 'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj',
+        destination_tag: 191_150,
+        ledger_index: 11_119_610,
+        tx_index: 2,
+        tx_type: 'Payment',
+        result: 'tesSUCCESS',
+        close_time: ledger.ledger.close_time,
+      },
+    ]);
+  });
+
+  it('writes the failed and the Batch inner transactions of the recorded account-state ledgers', () => {
+    const failed = ledgerNamed(ACCOUNT_STATE_SET, 93_663_334).rows.accountTxByDestinationTag;
+    expect(failed.filter((r) => r.tx_index >= 113 && r.tx_index <= 116)).toEqual(
+      [113, 114, 115, 116].map((tx_index) =>
+        expect.objectContaining({
+          account: 'rBUZp2fS6WCjURm5WVJGzevmXafJ23pk19',
+          destination_tag: 104,
+          ledger_index: 93_663_334,
+          tx_index,
+          result: 'tecPATH_DRY',
+        }),
+      ),
+    );
+
+    const batch = ledgerNamed(ACCOUNT_STATE_SET, 107_872_956);
+    expect(batch.raw.transactions.find((t) => t.meta.TransactionIndex === 240)?.tx.Flags).toBe(0x40030000);
+    expect(batch.rows.accountTxByDestinationTag.filter((r) => r.tx_index === 240)).toEqual([
+      expect.objectContaining({
+        account: 'r9ruWAaX3E4EDrMWgs7A7QbcvooMnHkaUd',
+        destination_tag: 0,
+        ledger_index: 107_872_956,
+        tx_index: 240,
+      }),
+    ]);
+  });
+
+  it('writes the Remit of Xahau', () => {
+    const { rows } = ledgerNamed(URITOKEN_SET, 26_689_211);
+    expect(rows.accountTxByDestinationTag.filter((r) => r.tx_index === 0)).toEqual([
+      expect.objectContaining({
+        account: 'r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS',
+        destination_tag: 0,
+        ledger_index: 26_689_211,
+        tx_index: 0,
+        tx_type: 'Remit',
+      }),
+    ]);
+  });
+
+  it('builds the rest of a ledger and writes no row for a tag that is not one (synthetic: sampleLedger with DestinationTag 4294967296 and "5" on two of its transactions)', () => {
+    // synthetic: sampleLedger, the DestinationTag of transaction 0 (42) set to 4294967296 and that of transaction 4 (0) to "5"
+    const raw = sampleLedger();
+    const bad: Record<number, unknown> = { 0: 4_294_967_296, 4: '5' };
+    const edited: RawLedger = deepFreeze({
+      ...raw,
+      transactions: raw.transactions.map((t, i) => (i in bad ? { ...t, tx: { ...t.tx, DestinationTag: bad[i] } } : t)),
+    });
+
+    const original = buildLedgerRows(raw, XRPL);
+    // the control: unedited, the two transactions have a row each
+    expect(original.accountTxByDestinationTag.map((r) => [r.tx_index, r.account, r.destination_tag])).toEqual([
+      [0, RECEIVER, 42],
+      [4, NEWBIE, 0],
+    ]);
+
+    let rows: LedgerRows | undefined;
+    expect(() => (rows = buildLedgerRows(edited, XRPL))).not.toThrow();
+    expect(rows!.accountTxByDestinationTag).toEqual([]);
+    expect(rows!.ledger).toEqual(original.ledger);
+    expect(rows!.transactions.map((r) => r.hash)).toEqual(original.transactions.map((r) => r.hash));
+    expect(rows!.accountTransactions).toEqual(original.accountTransactions);
+    expect(rows!.accountTxBySequence).toEqual(original.accountTxBySequence);
+    expect(rows!.balanceChanges).toEqual(original.balanceChanges);
+    expect(rows!.exchanges).toEqual(original.exchanges);
+    expect(rows!.accountsCreated).toEqual(original.accountsCreated);
+    expect(rows!.payments).toHaveLength(original.payments.length);
+  });
+
+  it('writes at most one row per transaction: (account, destination_tag, ledger_index, tx_index) is unique', () => {
+    const EVERY_SET = [
+      ...SETS,
+      NFT_SET,
+      URITOKEN_SET,
+      OBJECTS_XRPL,
+      OBJECTS_XAHAU,
+      STATE_TOUCHES_XRPL,
+      MINT_XAHAU,
+      MPT_TESTNET_SET,
+      ACCOUNT_STATE_SET,
+    ];
+    let total = 0;
+    for (const set of EVERY_SET) {
+      const rows = tagRowsOf(set);
+      const transactions = rows.map((r) => `${r.ledger_index} ${r.tx_index}`);
+      const keys = rows.map((r) => `${r.account} ${r.destination_tag} ${r.ledger_index} ${r.tx_index}`);
+      expect([set.name, new Set(transactions).size]).toEqual([set.name, rows.length]);
+      expect([set.name, new Set(keys).size]).toEqual([set.name, rows.length]);
+      total += rows.length;
+    }
+    expect(total).toBeGreaterThan(25);
+  });
+});
+
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones, the account domains, the object changes and their index by account, the state touches, the 3 Xahau mint tables, the 5 MPT ledger tables', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones, the account domains, the object changes and their index by account, the state touches, the 3 Xahau mint tables, the 5 MPT ledger tables and the destination tag index', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -3250,6 +3400,7 @@ describe('CHILD_TABLES', () => {
         Table.MptTouches,
         Table.MptTransfers,
         Table.MptIssuanceTransfers,
+        Table.AccountTxByDestinationTag,
       ].sort(),
     );
   });

@@ -16,6 +16,7 @@ import {
   AccountStatesRow,
   AccountTradesDailyRow,
   AccountTransactionsRow,
+  AccountTxByDestinationTagRow,
   AccountTxBySequenceRow,
   AccountTxDailyRow,
   AggDirtyRow,
@@ -130,6 +131,7 @@ export interface TableRows {
   [Table.MptTouches]: MptTouchesRow;
   [Table.MptTransfers]: MptTransfersRow;
   [Table.MptIssuanceTransfers]: MptIssuanceTransfersRow;
+  [Table.AccountTxByDestinationTag]: AccountTxByDestinationTagRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -723,6 +725,16 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     destination: ALICE,
     amount: '9007199254740993',
     fee: '0',
+  },
+  // Tag 0 is a tag like any other, not "no tag".
+  [Table.AccountTxByDestinationTag]: {
+    account: BOB,
+    destination_tag: 0,
+    ledger_index: LEDGER,
+    tx_index: 2,
+    tx_type: 'Payment',
+    result: 'tecPATH_DRY',
+    close_time: CLOSE,
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,

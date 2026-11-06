@@ -401,6 +401,9 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       expect(await count(svc, Table.Ledgers)).toBe(54);
       expect(await count(svc, Table.Payments)).toBe(182);
+      // The 25 tagged payments: not a seeded table, so the generic tests reach it through CHILD_TABLES and LEDGER_KEYED_TABLES.
+      expect(BUILT.flatMap((rows) => rows.accountTxByDestinationTag)).toHaveLength(25);
+      expect(await count(svc, Table.AccountTxByDestinationTag)).toBe(25);
       await expectStored(svc, BUILT);
       expect(await committedCheckpoint(svc)).toBe(index(53));
       expect(await storedLedgerHash(svc, index(7))).toBe(LEDGERS[7].header.ledger_hash);
@@ -488,13 +491,15 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       // The child tables that have rows (the 12 of the Ripple data, the 2 state tables, the path payments and their index
       // by account, account_domains, which the last ledger has two rows for, the 2 object tables, which the ledgers of
-      // a recorded EscrowCreate and of two channel claims have rows for, and state_touches, which the ledgers of 11119620 and
-      // 11618225 have rows for: these ledgers have no AMM, NFT, Xahau mint or MPT activity, so the 5 AMM tables, the 5 NFT
-      // tables, the 3 mint tables and the 5 MPT tables get no insert) start together, before any of them has finished.
+      // a recorded EscrowCreate and of two channel claims have rows for, state_touches, which the ledgers of 11119620 and
+      // 11618225 have rows for, and the destination tag index, which the 25 tagged payments have rows for: these ledgers have
+      // no AMM, NFT, Xahau mint or MPT activity, so the 5 AMM tables, the 5 NFT tables, the 3 mint tables and the 5 MPT
+      // tables get no insert) start together, before any of them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
       );
-      expect(childTables.size).toBe(20);
+      expect(childTables.size).toBe(21);
+      expect(childTables).toContain(Table.AccountTxByDestinationTag);
       expect(childTables).toContain(Table.StateTouches);
       expect(childTables).toContain(Table.ObjectChanges);
       expect(childTables).toContain(Table.AccountObjectChanges);
@@ -771,6 +776,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // Ledger 20,005,122 has transactions but no payment, so payments has no partition 20.
       expect(partitionsOf(Table.Payments)).toEqual([11, 29]);
       expect(partitionsOf(Table.TxByHash)).toEqual([1, 2]);
+      // The tagged payments above the 40th ledger are in ledgers 11616399 to 11618225 and in 29709909.
+      expect(partitionsOf(Table.AccountTxByDestinationTag)).toEqual([1, 2]);
       // The AMM, NFT, account domain and object tables are P7 like tx_by_hash, but the touches of a pool, the NFT sales and
       // the NFT touches, which are P6 like transactions.
       for (const table of SEEDED_LEDGER_TABLES) {

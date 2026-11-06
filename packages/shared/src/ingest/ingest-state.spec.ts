@@ -123,6 +123,12 @@ describe('LEDGER_KEYED_TABLES', () => {
     expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.MptHolders);
   });
 
+  it('lists account_tx_by_destination_tag by ten million, as account_tx_by_sequence', () => {
+    for (const table of [Table.AccountTxBySequence, Table.AccountTxByDestinationTag]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P7 }]);
+    }
+  });
+
   it('lists every table once and keeps the commit marker first', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(new Set(tables).size).toBe(tables.length);
