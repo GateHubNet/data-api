@@ -53,12 +53,16 @@ function sequenceParam(q: QueryParams, name: string): number | undefined {
 /**
  * `destination_tag` (ours, no Ripple original): digits from 0 to `MAX_DESTINATION_TAG`, leading zeros included (`007` is tag 7);
  * missing is no tag. Anything else, the empty value too, is 400 `invalid destination_tag`: unlike `/payments`, where text that
- * is not a tag matches nothing because that rule copies Ripple's, this parameter says what is wrong.
+ * is not a tag matches nothing because that rule copies Ripple's, this parameter says what is wrong. That includes a value
+ * the query string makes an object (`destination_tag[a]=5`), which `first` reads as missing: a tag that is present is never
+ * the list without the tag.
  */
 function destinationTagParam(q: QueryParams): number | undefined {
+  if (q.destination_tag === undefined) return undefined;
   const raw = first(q, 'destination_tag');
-  if (raw === undefined) return undefined;
-  if (!DIGITS.test(raw) || Number(raw) > MAX_DESTINATION_TAG) throw badRequest('invalid destination_tag');
+  if (raw === undefined || !DIGITS.test(raw) || Number(raw) > MAX_DESTINATION_TAG) {
+    throw badRequest('invalid destination_tag');
+  }
   return Number(raw);
 }
 

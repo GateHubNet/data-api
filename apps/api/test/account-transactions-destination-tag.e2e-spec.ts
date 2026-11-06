@@ -276,6 +276,12 @@ describe('account transactions by destination tag', () => {
       tagged('+1'),
       `${listPath(ACCOUNT)}?destination_tag`,
       `${listPath(ACCOUNT)}?destination_tag=x&destination_tag=1`,
+      // brackets make the parameter an object (`{ a: '5' }`, `[{ a: '5' }]`): present, so never the list without the tag, in
+      // JSON or in CSV
+      ...['destination_tag[a]=5', 'destination_tag[0][a]=5'].flatMap((param) => [
+        `${listPath(ACCOUNT)}?${param}`,
+        `${listPath(ACCOUNT)}?${param}&format=csv`,
+      ]),
     ];
     const query = jest.spyOn(h.ch, 'query');
     for (const path of paths) {
