@@ -27,7 +27,7 @@ import {
   clickHouseConfigFromEnv,
   sharedDatabaseFromEnv,
 } from './clickhouse.config';
-import { ClickHouseService } from './clickhouse.service';
+import { ClickHouseService, type CommandOptions } from './clickhouse.service';
 
 /** `src/clickhouse` and `dist/clickhouse` are both two levels below the package root, which ships `schema/`. */
 const DEFAULT_SCHEMA_DIR = join(__dirname, '..', '..', 'schema');
@@ -107,7 +107,7 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
   const service = new ClickHouseService({ ...config, database });
   // On a cluster a table left unreplicated would keep its rows on one replica (for `schema_migrations`, the history the
   // next run reads), so the server refuses one that slips past `replicatedEngines`.
-  const replicatedOnly = { settings: { database_replicated_allow_only_replicated_engine: 1 } };
+  const replicatedOnly: CommandOptions = { settings: { database_replicated_allow_only_replicated_engine: 1 } };
   const ddl = config.cluster
     ? (statement: string) => service.command(replicatedEngines(statement), {}, replicatedOnly)
     : (statement: string) => service.command(statement);
