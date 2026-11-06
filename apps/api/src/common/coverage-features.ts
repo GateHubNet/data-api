@@ -1,5 +1,6 @@
 import {
   AMM_PARSER_VERSION,
+  DESTINATION_TAG_PARSER_VERSION,
   MINT_PARSER_VERSION,
   MPT_PARSER_VERSION,
   NetworkProfile,
@@ -27,8 +28,8 @@ export interface CoverageFeature {
 
 /**
  * The features of program 2 whose coverage an answer states, by name. D3 registers `nfts`, D5 `escrows`, `payment_channels`,
- * `checks` and `delegations`, D6 `issued_tokens` and `token_transfers`, D7 `fees`, `amm`, `account_states` and `mints`, D9 `mpt`; each
- * uses `FeatureCoverageService` and defines no rule of its own.
+ * `checks` and `delegations`, D6 `issued_tokens` and `token_transfers`, D7 `fees`, `amm`, `account_states` and `mints`, D9 `mpt`, and
+ * the transactions by destination tag `destination_tags`; each uses `FeatureCoverageService` and defines no rule of its own.
  */
 export const COVERAGE_FEATURES = {
   // NFTs are an amendment on both families, by the family and not the network, so a testnet takes its mainnet's
@@ -88,6 +89,10 @@ export const COVERAGE_FEATURES = {
     parserVersion: MPT_PARSER_VERSION,
     startOf: (p) => (p.hasMpt ? { kind: 'amendment', amendment: 'MPTokensV1' } : { kind: 'unavailable' }),
   },
+  // The transactions sent to an account under a destination tag (spec §6 of the destination-tag design). The two fields need no
+  // amendment, so the list starts at the first ledger of the network on both families (none on a testnet, whose coverage is
+  // therefore never complete).
+  destination_tags: { parserVersion: DESTINATION_TAG_PARSER_VERSION, startOf: () => ({ kind: 'first_ledger' }) },
 } satisfies Record<string, CoverageFeature>;
 
 export type CoverageFeatureName = keyof typeof COVERAGE_FEATURES;

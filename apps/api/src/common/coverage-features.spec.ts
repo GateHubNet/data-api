@@ -1,5 +1,6 @@
 import {
   AMM_PARSER_VERSION,
+  DESTINATION_TAG_PARSER_VERSION,
   getNetworkProfile,
   MINT_PARSER_VERSION,
   MPT_PARSER_VERSION,
@@ -150,5 +151,19 @@ describe('the coverage feature of D9', () => {
       { kind: 'unavailable' },
     ]);
     expect(NETWORK_NAMES.map((name) => getNetworkProfile(name).hasMpt)).toEqual([true, false, true, false]);
+  });
+});
+
+describe('the coverage feature of the destination tags', () => {
+  it('destination_tags: parser version 11, from the first ledger on every network', () => {
+    expect(COVERAGE_FEATURES.destination_tags.parserVersion).toBe(DESTINATION_TAG_PARSER_VERSION);
+    expect(DESTINATION_TAG_PARSER_VERSION).toBe(11);
+    // any stored ledger can hold a tagged transaction: the start is NetworkProfile.firstLedger, which the testnets do not have
+    expect(startsOf('destination_tags')).toEqual([
+      { kind: 'first_ledger' },
+      { kind: 'first_ledger' },
+      { kind: 'first_ledger' },
+      { kind: 'first_ledger' },
+    ]);
   });
 });
