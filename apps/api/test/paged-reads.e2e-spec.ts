@@ -1,7 +1,8 @@
 import { MPT_PARSER_VERSION, mptIssuanceId, Table } from '@gatehub/data-api-shared';
 import { SAMPLE_ROWS } from '../../../packages/shared/test/sample-rows';
+import type { AccountTransactionsController } from '../src/accounts/account-transactions.controller';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
-import { accountAt, primaryKeys, served } from './support/amm';
+import { accountAt, primaryKeys, served, Served } from './support/amm';
 import { fixtureTransactions } from './support/fixtures';
 import { mptHolderRow, mptHolderStateRow, mptIssuanceRow, mptTransferRow } from './support/mpt-world';
 import { insertNftEvents, nftEventRow } from './support/nfts';
@@ -2852,5 +2853,246 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
       expect(byAccount.keys[0]).toBe('holder');
       expect(byAccount.condition).toContain('holder in');
     });
+  });
+});
+
+describe('the transactions of a destination tag read the rows of the tag, not the other tags of the account (read_rows over a bulk of four parts)', () => {
+  // The rows of a tag are a range of the primary key of `account_tx_by_destination_tag` (the account, the tag, then its ledgers):
+  // `readDistinctPage` reads that range in the order of the key and stops after the page. The account has 100 rows of the tag in
+  // each of four parts, and in the same part, in the same ledgers, 100,000 rows of the tag before it and 100,000 of the tag after
+  // it: a read that did not narrow by the tag would read the account's 800,421 rows. The three tags share their parts, so the
+  // statistics of a part (its lowest and highest tag) skip none of them, and only the key can.
+  const ACCOUNT = 'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj';
+  /** A tag of the account in the mock ledgers: its oldest row is the template of the bulk, and its transaction that of the pages. */
+  const SEED_TAG = 225881;
+  const SEED_KEY = { ledger: 11616401, tx: 0 };
+  const TAG = 4_000_000_000;
+  const TAG_PER_PART = 100;
+  const OTHERS_PER_PART = 100_000;
+  const GRANULE = 8192;
+  const PARTS = BULK_BASES.length;
+  /** Spec §7: a tagged page reads at most its own rows (the tag's 400) plus 2 granules per part. */
+  const READ_BOUND = PARTS * TAG_PER_PART + 2 * GRANULE * PARTS;
+  /** The rows of the account: the bulk, and its 21 rows of the mock ledgers. */
+  const ACCOUNT_ROWS = PARTS * (TAG_PER_PART + 2 * OTHERS_PER_PART) + 21;
+  /** The ledger of the `n`-th row of the tag in a part: one every 250 ledgers, at `tx_index` 4 (the other tags use 0 to 3 and 5 to 8). */
+  const tagLedger = (base: number): string => `toUInt32(${base} + n.number * 250)`;
+  /**
+   * One part a base, its rows by `n.number`: the tag's 100 first (`tagLedger`, `tx_index` 4), then the 100,000 of the tag before it
+   * and the 100,000 of the tag after it, each counted from 0 as `bulkLedger` and `BULK_TX_INDEX` count (`tx_index` 0 to 3, and 5 to 8).
+   */
+  const bulkRow = (base: number): string => {
+    const k = 'toInt64(n.number)';
+    const m = `(${k} - ${TAG_PER_PART}) % ${OTHERS_PER_PART}`;
+    const isTag = `${k} < ${TAG_PER_PART}`;
+    const isBefore = `${k} < ${TAG_PER_PART + OTHERS_PER_PART}`;
+    return [
+      `multiIf(${isTag}, {tag:UInt32}, ${isBefore}, {before:UInt32}, {after:UInt32}) AS destination_tag`,
+      `toUInt32(${base} + if(${isTag}, ${k} * 250, intDiv(${m}, 4))) AS ledger_index`,
+      `toUInt32(multiIf(${isTag}, 4, ${isBefore}, ${m} % 4, 5 + ${m} % 4)) AS tx_index`,
+    ].join(', ');
+  };
+  /** The 51st row of the tag in the second part: a marker there makes the page start inside the bulk. */
+  const INSIDE = [BULK_BASES[1] + 12_500, 4];
+  const pathOf = (descending: boolean, marker?: (string | number)[]): string =>
+    `/v2/accounts/${ACCOUNT}/transactions?destination_tag=${TAG}&limit=100&descending=${descending}` +
+    (marker === undefined ? '' : `&marker=${markerOf(marker)}`);
+
+  let h: Harness;
+  let api: ApiClient;
+  let controller: () => AccountTransactionsController;
+
+  /**
+   * Empties the server's query condition cache, which keeps the granules a filter matched nothing in: a read of the same
+   * conditions after it skips them, and would pass a bound that a read of its own could not (a page and the same page
+   * descending have the same conditions). Every read below is charged its own cost.
+   */
+  const forgetConditions = (): Promise<void> => h.ch.command('SYSTEM DROP QUERY CONDITION CACHE');
+  /** `served`, on the table of the tag, after `forgetConditions`. */
+  const servedCold = async (path: string): Promise<Served> => {
+    await forgetConditions();
+    return served(h, api, Table.AccountTxByDestinationTag, path, 'transactions');
+  };
+
+  beforeAll(async () => {
+    let controllerClass: typeof AccountTransactionsController | undefined;
+    h = await startHarness({
+      seed: 'ripple-mock',
+      env: NO_RATE_LIMIT,
+      controllers: async () => {
+        // the class of the app's own module registry, for `h.app.get`
+        ({ AccountTransactionsController: controllerClass } =
+          await import('../src/accounts/account-transactions.controller'));
+        return [];
+      },
+    });
+    api = await h.api();
+    controller = () => h.app.get(controllerClass as typeof AccountTransactionsController);
+
+    const template = `SELECT * FROM ${Table.AccountTxByDestinationTag}
+                       WHERE account = {account:String} AND destination_tag = {seed_tag:UInt32}
+                       ORDER BY ledger_index, tx_index LIMIT 1`;
+    await insertBulk(
+      h,
+      Table.AccountTxByDestinationTag,
+      template,
+      { account: ACCOUNT, seed_tag: SEED_TAG, tag: TAG, before: TAG - 1, after: TAG + 1 },
+      bulkRow,
+      TAG_PER_PART + 2 * OTHERS_PER_PART,
+    );
+    // the transactions of the tag's 400 keys, copies of the mock transaction of the template, so that a page is whole
+    await insertBulk(
+      h,
+      Table.Transactions,
+      `SELECT * FROM ${Table.Transactions} WHERE ledger_index = {ledger:UInt32} AND tx_index = {tx:UInt32} LIMIT 1`,
+      SEED_KEY,
+      (base) => `${tagLedger(base)} AS ledger_index, toUInt32(4) AS tx_index`,
+      TAG_PER_PART,
+    );
+  }, 600_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the seed is as assumed: 400 rows of the tag in four parts, 800,421 rows of the account', async () => {
+    const byTag = await h.ch.query<{ destination_tag: number; n: string; parts: string }>(
+      `SELECT destination_tag, count() AS n, uniqExact(_part) AS parts FROM ${Table.AccountTxByDestinationTag}
+        WHERE account = {account:String} AND destination_tag >= {before:UInt32}
+        GROUP BY destination_tag ORDER BY destination_tag`,
+      { account: ACCOUNT, before: TAG - 1 },
+    );
+    expect(byTag.map((row) => [Number(row.destination_tag), Number(row.n), Number(row.parts)])).toEqual([
+      [TAG - 1, PARTS * OTHERS_PER_PART, PARTS],
+      [TAG, PARTS * TAG_PER_PART, PARTS],
+      [TAG + 1, PARTS * OTHERS_PER_PART, PARTS],
+    ]);
+    // one part a base, the three tags together
+    const [bulk] = await h.ch.query<{ parts: string }>(
+      `SELECT uniqExact(_part) AS parts FROM ${Table.AccountTxByDestinationTag} WHERE destination_tag >= {before:UInt32}`,
+      { before: TAG - 1 },
+    );
+    expect(Number(bulk.parts)).toBe(PARTS);
+    const [all] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM ${Table.AccountTxByDestinationTag} WHERE account = {account:String}`,
+      { account: ACCOUNT },
+    );
+    expect(Number(all.n)).toBe(ACCOUNT_ROWS);
+    expect(ACCOUNT_ROWS).toBe(800_421);
+    // no two rows of the bulk share a key, even without the tag in it
+    const [keys] = await h.ch.query<{ n: string }>(
+      `SELECT uniqExact(ledger_index, tx_index) AS n FROM ${Table.AccountTxByDestinationTag} WHERE account = {account:String}`,
+      { account: ACCOUNT },
+    );
+    expect(Number(keys.n)).toBe(ACCOUNT_ROWS);
+    const [copies] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM ${Table.Transactions}
+        WHERE ledger_index >= {from:UInt32} AND ledger_index < {to:UInt32} AND tx_index = 4`,
+      { from: BULK_BASES[0], to: BULK_BASES[PARTS - 1] + 1_000_000 },
+    );
+    expect(Number(copies.n)).toBe(PARTS * TAG_PER_PART);
+    // the bound is far below the rows of the account
+    expect(READ_BOUND).toBeLessThan(ACCOUNT_ROWS / 10);
+  });
+
+  describe.each([false, true])('descending=%s', (descending) => {
+    it.each([
+      ['the first page', undefined],
+      ['a page that starts inside the bulk', INSIDE],
+    ] as const)(
+      'a page of 100 (%s) reads at most the rows of the tag and two granules a part, and is whole',
+      async (_name, marker) => {
+        const path = pathOf(descending, marker as (string | number)[] | undefined);
+        const { reads, body } = await servedCold(path);
+        expect(reads.length).toBeGreaterThanOrEqual(1);
+        for (const read of reads) {
+          expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+        }
+        expect([path, (body.transactions as unknown[]).length, body.marker === undefined]).toEqual([path, 100, false]);
+      },
+    );
+
+    it('the page read is read in the order of the key, stops after its rows, and narrows the key to the account and the tag', async () => {
+      const path = pathOf(descending, INSIDE);
+      const { statements } = await servedCold(path);
+      const page = statements.filter(([sql]) => isPageRead(sql));
+      expect(page).toHaveLength(1);
+      const [sql, params] = page[0];
+      await expectBoundedInOrderRead(h, sql, params, descending, path);
+      expect(sql).not.toMatch(/\bFINAL\b/i);
+      // the primary key narrows the read to the account, the tag and its ledgers: a few granules out of those of the table
+      const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerRead(sql), params));
+      expect(primary.keys).toEqual(['account', 'destination_tag', 'ledger_index']);
+      expect(primary.granules[0]).toBeLessThanOrEqual(2 * PARTS);
+      expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+    });
+  });
+
+  it('the up-front count of an export reads the rows of the tag', async () => {
+    let rows: number | undefined;
+    await forgetConditions();
+    const reads = await readsOf(h, Table.AccountTxByDestinationTag, async () => {
+      rows = await controller().exportRows(ACCOUNT, { destination_tag: String(TAG) });
+    });
+    expect(rows).toBe(PARTS * TAG_PER_PART);
+    expect(reads.length).toBeGreaterThanOrEqual(1);
+    for (const read of reads) expect(read.read_rows).toBeLessThanOrEqual(READ_BOUND);
+  });
+
+  it('with the tag out of the key the same page reads the rows of the account: the bound is the key at work (control)', async () => {
+    const path = pathOf(false);
+    const table = `${h.database}.${Table.AccountTxByDestinationTag}`;
+    const mutant = `${table}_mutant`;
+    // the same columns, partition and settings, without the tag in the key
+    await h.ch.command(
+      `CREATE TABLE ${mutant} AS ${table}
+       ENGINE = ReplacingMergeTree
+       PARTITION BY intDiv(ledger_index, 10000000)
+       ORDER BY (account, ledger_index, tx_index)
+       SETTINGS non_replicated_deduplication_window = 1000`,
+    );
+    await h.ch.command(`SYSTEM STOP MERGES ${mutant}`);
+    // part by part, as the table has them: one for each base of the bulk, and one for the rows of the mock ledgers
+    const ranges: [number, number][] = BULK_BASES.map((base) => [base, base + 1_000_000]);
+    for (const [from, to] of ranges) {
+      await h.ch.command(
+        `INSERT INTO ${mutant} SELECT * FROM ${table} WHERE ledger_index >= {from:UInt32} AND ledger_index < {to:UInt32}`,
+        { from, to },
+        { settings: { insert_deduplicate: 0 } },
+      );
+    }
+    await h.ch.command(
+      `INSERT INTO ${mutant} SELECT * FROM ${table} WHERE ledger_index < {from:UInt32} OR ledger_index >= {to:UInt32}`,
+      { from: ranges[0][0], to: ranges[PARTS - 1][1] },
+      { settings: { insert_deduplicate: 0 } },
+    );
+    const count = async (name: string, where: string): Promise<[number, number]> => {
+      const [row] = await h.ch.query<{ n: string; parts: string }>(
+        `SELECT count() AS n, uniqExact(_part) AS parts FROM ${name} WHERE ${where}`,
+        { from: ranges[0][0], to: ranges[PARTS - 1][1] },
+      );
+      return [Number(row.n), Number(row.parts)];
+    };
+    expect((await count(mutant, '1'))[0]).toBe((await count(table, '1'))[0]);
+    expect(await count(mutant, 'ledger_index >= {from:UInt32} AND ledger_index < {to:UInt32}')).toEqual([
+      PARTS * (TAG_PER_PART + 2 * OTHERS_PER_PART),
+      PARTS,
+    ]);
+
+    const real = await servedCold(path);
+    await h.ch.command(`EXCHANGE TABLES ${table} AND ${mutant}`);
+    try {
+      const { reads, body } = await servedCold(path);
+      // the same page, at the cost of the whole first part (200,100 rows) before the 101st row of the tag
+      expect(body).toEqual(real.body);
+      const most = Math.max(...reads.map((read) => read.read_rows));
+      expect(most).toBeGreaterThan(READ_BOUND);
+      expect(most).toBeGreaterThanOrEqual(2 * OTHERS_PER_PART);
+    } finally {
+      await h.ch.command(`EXCHANGE TABLES ${table} AND ${mutant}`);
+    }
+    // swapped back, the same page is within the bound again
+    const { reads } = await servedCold(path);
+    for (const read of reads) expect([path, read.read_rows <= READ_BOUND]).toEqual([path, true]);
   });
 });
