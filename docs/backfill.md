@@ -133,10 +133,13 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   writes them; XRPL has none of the three transaction types, so its ledgers hold no mint row of any version. Readers of the three tables gate on `MINT_PARSER_VERSION`, never on
   `PARSER_VERSION`. An `Import` whose minted drops come out below 0 (the network cannot produce one) is stored as 0 and counted in
   `syncer_parser_anomalies_total{kind="import_minted_negative"}`; the range-ingest log names the count of its run in a warning when it is not 0 (its last line does not carry it).
-  Parser version 10 (the current one) adds the MPT data (`mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers`; `MPT_PARSER_VERSION`): it writes MPT
+  Parser version 10 adds the MPT data (`mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers`; `MPT_PARSER_VERSION`): it writes MPT
   payments to `payments`, `payments_by_currency` and `account_payments`, which older versions dropped, and an `MPToken`'s rows to `balance_changes`, and it types the rows of a `Clawback` as `clawback`. Ledgers written by an older
   version have none of these, and a `--reprocess` of a range writes them; Xahau has no MPT, so its ledgers hold no MPT row of any version. Readers gate on `MPT_PARSER_VERSION`, never on `PARSER_VERSION`. An MPT amount that is not a `UInt64`
   (the network cannot produce one) is stored as 0, and a node whose ID cannot be made is skipped, each counted in `syncer_parser_anomalies_total{kind="mpt_unreadable"}`; the range-ingest log names the count of its run in a warning when it is not 0 (its last line does not carry it).
+  Parser version 11 (the current one) adds the index of the transactions sent to an account under a destination tag (`account_tx_by_destination_tag`, a row for each transaction
+  whose own `Destination` is a string and whose own `DestinationTag` an integer from 0 to 4,294,967,295, of any type and result; `DESTINATION_TAG_PARSER_VERSION`): ledgers written by an
+  older version have none, and a `--reprocess` of a range writes them, see [Destination tag re-ingest](#destination-tag-re-ingest). A malformed tag gives no row and no count.
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
@@ -562,6 +565,33 @@ Check it:
 SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 99226369 GROUP BY parser_version;
 -- the issuances with no known state: 0 once the reprocess has been through the job
 SELECT countIf(state_known = 0) FROM (SELECT * FROM xrpl.mpt_issuances ORDER BY mpt_issuance_id, version DESC LIMIT 1 BY mpt_issuance_id);
+```
+
+### Destination tag re-ingest
+
+Parser version 11 writes `account_tx_by_destination_tag`, so ledgers written earlier have no rows in it, and `GET /v2/accounts/{address}/transactions?destination_tag=T`
+lists nothing from before the deploy ([api-reference](api-reference.md#get-v2accountsaddresstransactions), [ADR-0021](adr/0021-transactions-by-destination-tag.md)).
+
+- **What it needs: every ledger from the network's first.** A destination tag is as old as the network, so the feature `destination_tags` starts at ledger **32,570** on the XRP
+  Ledger and ledger **1** on Xahau.
+- **The program's whole-history reprocess covers it if it runs after parser version 11**, so there is no separate run then. Run a range on its own only if that reprocess is
+  skipped or ran before parser version 11; it rewrites every table of each ledger, so it costs what the first ingest did ([Which node?](#2-which-node)):
+
+  ```bash
+  ... node dist/cli/range-ingest.js --from <first> --to <checkpoint> --reprocess
+  ```
+
+  `<first>` is 32570 on the XRP Ledger and 1 on Xahau. From a public node that is `--concurrency 1` ([rate limits](#public-nodes-and-rate-limits)).
+- **Until then** `coverage` says `complete: false`, and the ledgers below `from_ledger_index` have no rows: a tagged list leaves out what was sent there.
+- **The testnets are never complete:** their index starts at their first boot and they are not backfilled.
+
+Check it:
+
+```sql
+-- every ledger should be of parser version 11 or later
+SELECT parser_version, count() FROM xrpl.ledgers GROUP BY parser_version ORDER BY parser_version;
+-- the rows of the table
+SELECT count() FROM xrpl.account_tx_by_destination_tag;
 ```
 
 ### Public nodes and rate limits
