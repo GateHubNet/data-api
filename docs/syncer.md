@@ -55,6 +55,7 @@ Then, in order:
    and the `supply` job reads them, while it writes `network_supply` on both networks). The check of 015 runs after the one of 014.
    With the `validators` worker enabled, the five columns of `016_validator_toml_details.sql` on `validator_domains` are checked after those (`system.columns`: `lacks the schema of 016_validator_toml_details.sql`).
    With the `ingest` or the `aggregator` worker enabled, the tables of `017_mpt.sql` are checked after that (the ingest the five ledger tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers`, `mpt_issuance_transfers`; the aggregator `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches` and the two aggregates `mpt_issuances`, `mpt_holders`), on every network, since the schema is one (on XRPL and XRPL Testnet an insert into a missing MPT table fails the batch, and the `mpt_state` job and its hook would fail at every run: `lacks the schema of 017_mpt.sql`).
+   With the `ingest` worker enabled, the table of `018_destination_tags.sql` (`account_tx_by_destination_tag`) is checked after that, on every network, since the schema is one (the ingest inserts into it as soon as a ledger has a tagged transaction, and an insert into a missing table fails the batch: `lacks the schema of 018_destination_tags.sql`). The aggregator neither reads nor writes it, so it is not checked for the aggregator.
 2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
    (`server_info.network_id` must be one of the profile's `acceptedNodeNetworkIds`: `xrpl` 0 or nothing, `xahau` 21337, `xrpl-testnet` 1, `xahau-testnet` 21338, and no other). A node of another network refuses the boot.
 3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,
@@ -86,7 +87,7 @@ The single writer of the ledger tables. It follows the validated chain, one ledg
 
 ### Writing a ledger: `buildLedgerRows` and `LedgerWriter`
 
-For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 40
+For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 41
 **ledger-derived tables** (`ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`,
 `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
 `balance_changes`, `accounts_created`, and the AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`,
@@ -98,9 +99,11 @@ parser version 6 and ordered by account), the history of the tracked ledger obje
 lines and issuers whose token state a transaction changed `state_touches` (migration 014, filled from parser version 8: a ledger written by an older parser
 has no rows in it, and the tokens job never applies a window that holds one), the three Xahau mint tables `genesis_mints`, `imports` and
 `reward_claims` (migration 015, filled from parser version 9: a Xahau ledger written by an older parser has no rows in them, and XRPL has none of the three
-transaction types, so they stay empty there), and the five MPT tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and
-`mpt_issuance_transfers` (migration 017, filled from parser version 10: a ledger written by an older parser has no rows in them, and Xahau has no MPT, so they stay empty there);
-see [data-model](data-model.md)). The parsers never mutate their input and take the
+transaction types, so they stay empty there), the five MPT tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and
+`mpt_issuance_transfers` (migration 017, filled from parser version 10: a ledger written by an older parser has no rows in them, and Xahau has no MPT, so they stay empty there),
+and the index of the transactions sent to an account under a destination tag `account_tx_by_destination_tag` (migration 018, filled from parser version 11, the current one:
+a row for every transaction whose own `Destination` is a string and whose own `DestinationTag` an integer from 0 to 4,294,967,295, of any type and whatever its result,
+and a ledger written by an older parser has no rows in it); see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`
 copies), and a pool the parser touches gets a state row, plus a liquidity or governance row for the `AMM*` transactions. A pool or a
@@ -1389,6 +1392,7 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | Boot refuses: `lacks the schema of 014_issued_tokens.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs `state_touches`) or the `aggregator` worker (it needs all four tables of the file) | Apply it (`migrate-<network>`) and start the syncer again. |
 | Boot refuses: `lacks the schema of 015_supply.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the three mint tables `genesis_mints`, `imports` and `reward_claims`) or the `aggregator` worker (those and `network_supply`), on either network: the schema is one, on Xahau an insert into a missing mint table fails the batch and the `supply` job reads them, while it writes `network_supply` on both | Apply it (`migrate-<network>`) and start the syncer again. |
 | Boot refuses: `lacks the schema of 017_mpt.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the five MPT ledger tables) or the `aggregator` worker (it needs `mpt_touches`, the two state tables and the two aggregates) | Apply it (`migrate-<network>`) and start the syncer again. |
+| Boot refuses: `lacks the schema of 018_destination_tags.sql` | The migration was not applied before a syncer with the `ingest` worker (it writes `account_tx_by_destination_tag`, on every network) | Apply it (`migrate-<network>`) and start the syncer again. |
 | Boot refuses: `lacks the schema of 016_validator_toml_details.sql` | The migration was not applied before a syncer with the `validators` worker: the domain checker reads and writes the five columns on `validator_domains` | Apply the migrations (`pnpm ch:migrate`, or `GH_RUN_MIGRATIONS_ON_BOOT=true`) and start the syncer again |
 | `Aggregator job escrows failed: ...` and `syncer_escrows_lag_ledgers` grows with the head | A step of the `escrows` job failed (ClickHouse refusing a read or an insert, mostly) | The window `(watermark, head]` is done again at the next tick; the sentinel keeps its old total and watermark, which agree. The gauge follows the head. See [the escrows job](#the-escrows-job). |
 | `Aggregator job escrows failed for escrow <id>, set aside: <reason>` | The rows of one escrow cannot be mapped to an `escrows` row, for the reason given | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |

@@ -1379,6 +1379,71 @@ describe('rangeIngest (e2e)', () => {
     });
   });
 
+  describe('destination tag rows (parser version 11)', () => {
+    const OPTIONS = { from: FIXTURE_FROM, to: FIXTURE_TO, indexes: FIXTURE_INDEXES, ...FAST };
+    /** The rows of `account_tx_by_destination_tag` that writing the ripple-mock ledgers gives, from what `buildLedgerRows` makes. */
+    const EXPECTED = FIXTURES.reduce((sum, raw) => sum + buildLedgerRows(raw, ctx).accountTxByDestinationTag.length, 0);
+
+    /** `count()` and `uniqExact` of the sort key of the table: equal when no key is there twice. */
+    async function tagRows(svc: ClickHouseService): Promise<{ n: number; u: number }> {
+      const row = await svc.queryOne<{ n: string | number; u: string | number }>(
+        `SELECT count() AS n, uniqExact(account, destination_tag, ledger_index, tx_index) AS u
+           FROM ${Table.AccountTxByDestinationTag}`,
+      );
+      return { n: Number(row?.n), u: Number(row?.u) };
+    }
+
+    it('writes the 25 tag rows of the ripple-mock ledgers', async () => {
+      const svc = await freshService();
+      const result = await rangeIngest(new TestSource(FIXTURES), svc, ctx, OPTIONS);
+
+      expect(result).toEqual({ chunksDone: 10, ledgers: 54 });
+      expect(EXPECTED).toBe(25);
+      expect(await tagRows(svc)).toEqual({ n: EXPECTED, u: EXPECTED });
+    });
+
+    it('--reprocess replaces the tag rows of its range: the same 25, each once, and a row the parser does not write is gone', async () => {
+      const svc = await freshService();
+      await rangeIngest(new TestSource(FIXTURES), svc, ctx, OPTIONS);
+      // In an insert of its own: transaction 0 of ledger 11616401 is tagged 225881, so the parser never writes this row.
+      const ledger = FIXTURES.find((raw) => raw.header.ledger_index === 11_616_401)!;
+      await svc.insert(Table.AccountTxByDestinationTag, [
+        {
+          account: 'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj',
+          destination_tag: 1,
+          ledger_index: 11_616_401,
+          tx_index: 0,
+          tx_type: 'Payment',
+          result: 'tesSUCCESS',
+          close_time: ledger.header.close_time,
+        },
+      ]);
+      expect(await tagRows(svc)).toEqual({ n: 26, u: 26 });
+
+      await rangeIngest(new TestSource(FIXTURES), svc, ctx, { ...OPTIONS, reprocess: true });
+
+      expect(await count(svc, Table.AccountTxByDestinationTag, 'destination_tag = 1')).toBe(0);
+      expect(await tagRows(svc)).toEqual({ n: 25, u: 25 });
+    });
+
+    it('--reprocess gives ledgers written without tag rows (parser version 10) their rows', async () => {
+      const svc = await freshService();
+      await rangeIngest(new TestSource(FIXTURES), svc, ctx, OPTIONS);
+      // What parser version 10 wrote: no rows in the table.
+      await svc.command(
+        `DELETE FROM ${Table.AccountTxByDestinationTag} WHERE 1`,
+        {},
+        { settings: { lightweight_deletes_sync: '2' } },
+      );
+      expect(await count(svc, Table.AccountTxByDestinationTag)).toBe(0);
+
+      const result = await rangeIngest(new TestSource(FIXTURES), svc, ctx, { ...OPTIONS, reprocess: true });
+
+      expect(result).toEqual({ chunksDone: 10, ledgers: 54 });
+      expect(await tagRows(svc)).toEqual({ n: 25, u: 25 });
+    });
+  });
+
   describe('Xahau mint ledgers (parser version 9)', () => {
     const xahau = parseContextFor(getNetworkProfile('xahau'));
     const MINT_TABLES = [Table.GenesisMints, Table.Imports, Table.RewardClaims];

@@ -315,6 +315,36 @@ describe('AppModule on a real ClickHouse', () => {
     );
   });
 
+  it('fails the boot, naming 018_destination_tags.sql and its table, when the ingest worker runs on a database of 001, 014, 015 and 017', async () => {
+    const database = 'syncer_app_e2e_without_018';
+    const before = ['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql', '017_mpt.sql'];
+    await withMigrations(before, (schemaDir) =>
+      bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
+    );
+    await closeApp();
+    const tables = await tablesOf(database);
+    expect(tables).toContain('mpt_touches');
+    expect(tables).not.toContain('account_tx_by_destination_tag');
+
+    // the checks of 014, 015 and 017 pass on this database, so the refusal is 018's alone: on every network, as the schema is one
+    const refused = await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'ingest' }).catch(
+      (err: Error) => err,
+    );
+    expect(refused).toBeInstanceOf(Error);
+    expect((refused as Error).message).toMatch(
+      /lacks the schema of 018_destination_tags\.sql \(table account_tx_by_destination_tag\), which the ingest worker writes/,
+    );
+    expect((refused as Error).message).not.toContain('017_mpt.sql');
+    // the aggregator neither reads nor writes the table, so it boots on the same database
+    await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' });
+    await closeApp();
+    // and the migrations with 018 added give the table
+    await withMigrations([...before, '018_destination_tags.sql'], (schemaDir) =>
+      bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
+    );
+    expect(await tablesOf(database)).toContain('account_tx_by_destination_tag');
+  });
+
   it('fails the boot, naming 016_validator_toml_details.sql and its columns, when the validators worker runs on a database of 001 and 002', async () => {
     const database = 'syncer_app_e2e_without_016';
     await withMigrations(['001_baseline.sql', '002_validators_amendments.sql'], (schemaDir) =>
