@@ -3,8 +3,8 @@
  *
  * Each `*.sql` file in `packages/shared/schema/` (or in `GH_SCHEMA_DIR`) is one migration unit of a network database. The
  * shared database (ADR-0014) has a set of its own in `packages/shared/schema-shared/` (`runSharedMigrations`). The runner:
- *   1. creates the target database (through a client bound to `default`, which always exists) and a
- *      `schema_migrations` bookkeeping table,
+ *   1. creates the target database (through a client bound to `default`, which always exists; a Replicated database
+ *      on every replica when `GH_CLICKHOUSE_CLUSTER` is set) and a `schema_migrations` bookkeeping table,
  *   2. reads which files have already been applied and verifies their sha256 checksum — an applied file that changed
  *      is a hard error, never silently re-run or skipped,
  *   3. applies only the new files (in lexical order), statement by statement,
@@ -27,7 +27,7 @@ import {
   clickHouseConfigFromEnv,
   sharedDatabaseFromEnv,
 } from './clickhouse.config';
-import { ClickHouseService } from './clickhouse.service';
+import { ClickHouseService, type CommandOptions } from './clickhouse.service';
 
 /** `src/clickhouse` and `dist/clickhouse` are both two levels below the package root, which ships `schema/`. */
 const DEFAULT_SCHEMA_DIR = join(__dirname, '..', '..', 'schema');
@@ -62,6 +62,29 @@ function splitStatements(sql: string): string[] {
     .filter((s) => s.length > 0);
 }
 
+/**
+ * On a single server, a plain database. On a cluster (`GH_CLICKHOUSE_CLUSTER`), a Replicated database created on every
+ * replica: Keeper replays each later CREATE/ALTER on all of them, so the migrations run once. It replicates only the
+ * metadata: the data of a table is replicated by its engine (`replicatedEngines`). Both names are validated before
+ * they get here.
+ */
+export function createDatabaseStatement(database: string, cluster?: string): string {
+  if (!cluster) return 'CREATE DATABASE IF NOT EXISTS {database:Identifier}';
+  return (
+    `CREATE DATABASE IF NOT EXISTS ${database} ON CLUSTER '${cluster}' ` +
+    `ENGINE = Replicated('/clickhouse/databases/${database}', '{shard}', '{replica}')`
+  );
+}
+
+/**
+ * On a cluster, a `*MergeTree` engine becomes its `Replicated*MergeTree` twin, so the data reaches every replica, not
+ * only the one that was written to. No Keeper path or replica name: the Replicated database gives each table its
+ * default ones. The files keep the single-server engines, and their checksums, for both paths.
+ */
+export function replicatedEngines(statement: string): string {
+  return statement.replace(/\bENGINE(\s*)=(\s*)(?!Replicated)(\w*MergeTree)\b/g, 'ENGINE$1=$2Replicated$3');
+}
+
 function checksum(content: string): string {
   return createHash('sha256').update(content).digest('hex');
 }
@@ -76,14 +99,20 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
   // The target database may not exist yet, so create it through a connection bound to `default`.
   const bootstrap = new ClickHouseService({ ...config, database: 'default' });
   try {
-    await bootstrap.command('CREATE DATABASE IF NOT EXISTS {database:Identifier}', { database });
+    await bootstrap.command(createDatabaseStatement(database, config.cluster), { database });
   } finally {
     await bootstrap.close();
   }
 
   const service = new ClickHouseService({ ...config, database });
+  // On a cluster a table left unreplicated would keep its rows on one replica (for `schema_migrations`, the history the
+  // next run reads), so the server refuses one that slips past `replicatedEngines`.
+  const replicatedOnly: CommandOptions = { settings: { database_replicated_allow_only_replicated_engine: 1 } };
+  const ddl = config.cluster
+    ? (statement: string) => service.command(replicatedEngines(statement), {}, replicatedOnly)
+    : (statement: string) => service.command(statement);
   try {
-    await service.command(
+    await ddl(
       `CREATE TABLE IF NOT EXISTS ${MIGRATIONS_TABLE} ` +
         `(filename String, checksum String, applied_at DateTime DEFAULT now()) ENGINE = MergeTree ORDER BY filename`,
     );
@@ -122,7 +151,7 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
       }
       for (const statement of splitStatements(file.content)) {
         log(`[migrate] ${file.filename}: ${statement.slice(0, 80).replace(/\s+/g, ' ')}…`);
-        await service.command(statement);
+        await ddl(statement);
       }
       await service.insert(MIGRATIONS_TABLE, [{ filename: file.filename, checksum: file.checksum }]);
       applied.push(file.filename);

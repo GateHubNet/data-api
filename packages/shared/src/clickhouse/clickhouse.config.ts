@@ -19,6 +19,11 @@ export interface ClickHouseConfig {
   maxExecutionTime: number;
   /** Per-query memory cap in bytes (0 = use server default). Defends against OOM. */
   maxQueryMemoryBytes: number;
+  /**
+   * `GH_CLICKHOUSE_CLUSTER`: the server's cluster (`remote_servers`) when it runs as several replicas. Set, the migration
+   * creates the database `ON CLUSTER` with the Replicated engine, so the schema and the data reach every replica.
+   */
+  cluster?: string;
 }
 
 /** Database names are interpolated into DDL, so only plain lowercase identifiers are accepted. */
@@ -29,6 +34,18 @@ export function assertValidDatabaseName(database: string, variable = 'GH_CLICKHO
     throw new Error(`Invalid ClickHouse database name "${database}" (${variable} must match ${DATABASE_NAME})`);
   }
   return database;
+}
+
+/** Cluster names are written into DDL as a quoted literal: letters, digits, `_`, `-` and `.` only. */
+const CLUSTER_NAME = /^[A-Za-z0-9_.-]+$/;
+
+function clusterFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const cluster = env.GH_CLICKHOUSE_CLUSTER?.trim();
+  if (!cluster) return undefined;
+  if (!CLUSTER_NAME.test(cluster)) {
+    throw new Error(`Invalid ClickHouse cluster name "${cluster}" (GH_CLICKHOUSE_CLUSTER must match ${CLUSTER_NAME})`);
+  }
+  return cluster;
 }
 
 /** The name of the shared database when `GH_CLICKHOUSE_SHARED_DATABASE` is not set. */
@@ -74,6 +91,7 @@ export function clickHouseConfigFromEnv(
     maxOpenConnections: Number(env.GH_CLICKHOUSE_MAX_CONNECTIONS ?? 10),
     maxExecutionTime: Number(env.GH_CLICKHOUSE_MAX_EXECUTION_TIME ?? 30),
     maxQueryMemoryBytes: Number(env.GH_CLICKHOUSE_MAX_QUERY_MEMORY ?? 0),
+    cluster: clusterFromEnv(env),
   };
 }
 

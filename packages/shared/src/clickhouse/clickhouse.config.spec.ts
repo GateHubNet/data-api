@@ -35,6 +35,18 @@ describe('clickHouseConfigFromEnv', () => {
     expect(clickHouseConfigFromEnv({ ...URL, GH_CLICKHOUSE_DATABASE: name }).database).toBe(name);
   });
 
+  it.each([[{}], [{ GH_CLICKHOUSE_CLUSTER: '' }], [{ GH_CLICKHOUSE_CLUSTER: '  ' }]])('has no cluster for %j', (env) => {
+    expect(clickHouseConfigFromEnv({ ...URL, ...env }).cluster).toBeUndefined();
+  });
+
+  it.each(['default', 'clickhouse', 'xrpl_cluster', 'prod-1.eu'])('accepts the cluster name %j', (name) => {
+    expect(clickHouseConfigFromEnv({ ...URL, GH_CLICKHOUSE_CLUSTER: name }).cluster).toBe(name);
+  });
+
+  it.each(["a'b", 'a b', 'a;DROP', '{cluster}'])('rejects the cluster name %j', (name) => {
+    expect(() => clickHouseConfigFromEnv({ ...URL, GH_CLICKHOUSE_CLUSTER: name })).toThrow(/GH_CLICKHOUSE_CLUSTER/);
+  });
+
   it('reads the connection settings and keeps their defaults', () => {
     expect(clickHouseConfigFromEnv(URL)).toEqual({
       url: 'http://ch:8123',
