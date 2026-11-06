@@ -14,6 +14,7 @@ export * from './parsers/accounts-created.parser';
 export * from './parsers/affected-accounts.parser';
 export * from './parsers/amm.parser';
 export * from './parsers/balance-changes.parser';
+export * from './parsers/destination-tag.parser';
 export * from './parsers/exchanges.parser';
 export * from './parsers/from-client.parser';
 export * from './parsers/import.parser';
