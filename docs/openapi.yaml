@@ -1205,9 +1205,12 @@ paths:
         touching one of its offers or trust lines) in the ledgers that closed between
         `start` and `end`, oldest first. With `min_sequence` or `max_sequence` the
         list is instead the transactions the account sent, by their sequence number,
-        and `start` and `end` are ignored. `type` and `result` are the names of the
-        network (`Payment`, `tesSUCCESS`). `format=csv` serves the same list as a
-        CSV of summary rows from the account's side.
+        and `start` and `end` are ignored. With `destination_tag` the list is instead
+        the transactions sent to the account with that destination tag, of any type
+        and result, with `coverage` after `result`; it cannot be combined with `min_sequence`
+        or `max_sequence`. `type` and `result` are the names of the network (`Payment`,
+        `tesSUCCESS`). `format=csv` serves the same list as a CSV of summary rows
+        from the account's side.
       parameters:
       - name: address
         required: true
@@ -1253,6 +1256,13 @@ paths:
         in: query
         description: Only this transaction type.
         schema: {}
+      - name: destination_tag
+        required: false
+        in: query
+        description: 'Only the transactions sent to the account with this destination
+          tag: digits, 0 to 4294967295.'
+        schema:
+          type: number
       - name: max_sequence
         required: false
         in: query
