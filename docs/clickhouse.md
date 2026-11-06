@@ -154,7 +154,7 @@ It also needs `ALTER DELETE` on `mpt_holders` and `mpt_issuances`: the `mpt_stat
 
 ## High availability and replication
 
-The shipped schema uses plain `ReplacingMergeTree` (single-node correct). Two production paths:
+The shipped schema uses plain `ReplacingMergeTree` (single-node correct; Option B replicates it at migration time). Two production paths:
 
 ### Option A: ClickHouse Cloud / managed
 Replication, backups, scaling and upgrades are handled for you. Point `GH_CLICKHOUSE_URL` at the managed endpoint. Make sure the
@@ -165,11 +165,11 @@ service supports partition-scoped lightweight `DELETE` with `lightweight_deletes
 The production compose already runs **ClickHouse Keeper** and wires the server to it (`deploy/clickhouse/config.d/cluster.xml`
 defines `<zookeeper>`, `<macros>` and a one-shard cluster). To make it highly available:
 
-1. Switch the engines to `ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}'[, version])` in a **new
-   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the 40 ledger-derived tables
-   **and** on `validator_validations` and `validator_seen` (migration 002: the collector's retried inserts carry a deduplication token, and
-   those two tables have a window of 100; the nine tables of migration 003 have none, a set of theirs is idempotent by its `version`).
-   `{shard}` and `{replica}` come from the `<macros>`.
+1. Set `GH_CLICKHOUSE_CLUSTER` to the cluster's `remote_servers` name ([configuration](configuration.md)) **before the first migration**. The
+   migration then creates each database as `Replicated` on every replica and applies every `*MergeTree` engine as its
+   `Replicated*MergeTree` twin, with the Keeper path and replica name of the database (`{shard}` and `{replica}` come from the
+   `<macros>`). The schema files are unchanged. Inserts are deduplicated by `replicated_deduplication_window` (default 10000 blocks, one
+   hour) instead of `non_replicated_deduplication_window`. A database already created without it stays plain: recreate it.
 2. Run two or more replicas and an odd number (3) of Keeper nodes (the compose ships 1 for local use).
 3. Run the syncer recovery tests (`apps/syncer/test`) against your topology before relying on it: the recovery depends on synchronous
    `DELETE`s, on insert deduplication and on the single-writer lease behaving the same on every replica.

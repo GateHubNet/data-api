@@ -64,8 +64,9 @@ function splitStatements(sql: string): string[] {
 
 /**
  * On a single server, a plain database. On a cluster (`GH_CLICKHOUSE_CLUSTER`), a Replicated database created on every
- * replica: Keeper replays each later CREATE/ALTER on all of them and the MergeTree tables inside become replicated, so
- * the migrations run once and the data is not split across replicas. Both names are validated before they get here.
+ * replica: Keeper replays each later CREATE/ALTER on all of them, so the migrations run once. It replicates only the
+ * metadata: the data of a table is replicated by its engine (`replicatedEngines`). Both names are validated before
+ * they get here.
  */
 export function createDatabaseStatement(database: string, cluster?: string): string {
   if (!cluster) return 'CREATE DATABASE IF NOT EXISTS {database:Identifier}';
@@ -73,6 +74,15 @@ export function createDatabaseStatement(database: string, cluster?: string): str
     `CREATE DATABASE IF NOT EXISTS ${database} ON CLUSTER '${cluster}' ` +
     `ENGINE = Replicated('/clickhouse/databases/${database}', '{shard}', '{replica}')`
   );
+}
+
+/**
+ * On a cluster, a `*MergeTree` engine becomes its `Replicated*MergeTree` twin, so the data reaches every replica, not
+ * only the one that was written to. No Keeper path or replica name: the Replicated database gives each table its
+ * default ones. The files keep the single-server engines, and their checksums, for both paths.
+ */
+export function replicatedEngines(statement: string): string {
+  return statement.replace(/\bENGINE(\s*)=(\s*)(?!Replicated)(\w*MergeTree)\b/g, 'ENGINE$1=$2Replicated$3');
 }
 
 function checksum(content: string): string {
@@ -95,8 +105,14 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
   }
 
   const service = new ClickHouseService({ ...config, database });
+  // On a cluster a table left unreplicated would keep its rows on one replica (for `schema_migrations`, the history the
+  // next run reads), so the server refuses one that slips past `replicatedEngines`.
+  const replicatedOnly = { settings: { database_replicated_allow_only_replicated_engine: 1 } };
+  const ddl = config.cluster
+    ? (statement: string) => service.command(replicatedEngines(statement), {}, replicatedOnly)
+    : (statement: string) => service.command(statement);
   try {
-    await service.command(
+    await ddl(
       `CREATE TABLE IF NOT EXISTS ${MIGRATIONS_TABLE} ` +
         `(filename String, checksum String, applied_at DateTime DEFAULT now()) ENGINE = MergeTree ORDER BY filename`,
     );
@@ -135,7 +151,7 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
       }
       for (const statement of splitStatements(file.content)) {
         log(`[migrate] ${file.filename}: ${statement.slice(0, 80).replace(/\s+/g, ' ')}…`);
-        await service.command(statement);
+        await ddl(statement);
       }
       await service.insert(MIGRATIONS_TABLE, [{ filename: file.filename, checksum: file.checksum }]);
       applied.push(file.filename);
