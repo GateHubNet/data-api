@@ -7,6 +7,7 @@ import {
   Table,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable } from '@nestjs/common';
+import { Coverage, FeatureCoverageService } from '../common/feature-coverage.service';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import { TxObject, TxService } from '../common/tx-object';
@@ -40,6 +41,16 @@ const SEQUENCE_ORDER: KeysetKey[] = [
 const SEQUENCE_KEYS: KeysetKey[] = SEQUENCE_ORDER.slice(1);
 
 /**
+ * The ORDER BY of `account_tx_by_destination_tag`, with the account and the tag for the same reason. What follows them is the
+ * key of the time list, so a marker of this list is the time list's (`TIME_KEYS`).
+ */
+const DESTINATION_TAG_ORDER: KeysetKey[] = [
+  { column: 'account', type: 'String' },
+  { column: 'destination_tag', type: 'UInt32' },
+  ...TIME_KEYS,
+];
+
+/**
  * How a page serves its transactions: as the Ripple API's objects with `tx` and `meta` as JSON or as hex (`binary=true`),
  * or as summary rows from the account's side (`format=csv`).
  */
@@ -71,6 +82,15 @@ export interface TimeQuery extends ListQuery {
 export type TimeWindow = Pick<TimeQuery, 'account' | 'type' | 'result' | 'start' | 'endExclusive'>;
 
 /**
+ * The list by destination tag: the transactions whose own `Destination` is the account and whose own `DestinationTag` is the tag,
+ * of any type and result, in the window of the list by time and with its filters.
+ */
+export interface DestinationTagQuery extends TimeQuery {
+  /** From 0 to `MAX_DESTINATION_TAG`; 0 is a tag like any other. */
+  destinationTag: number;
+}
+
+/**
  * The list by sequence: the transactions the account sent with a `Sequence` between the two bounds, both ends included.
  * With both bounds given, their order does not matter: the original's HBase scan swapped them (ruling R57), so
  * `min_sequence=9&max_sequence=5` is the range 5 to 9.
@@ -91,6 +111,11 @@ export interface TransactionsPage {
   marker?: string;
 }
 
+/** A page of the list by destination tag, with the coverage of the feature `destination_tags`. */
+export interface DestinationTagPage extends TransactionsPage {
+  coverage: Coverage;
+}
+
 interface TimeKey {
   ledger_index: number;
   tx_index: number;
@@ -103,13 +128,16 @@ interface SequenceKey extends TimeKey {
 /**
  * The transactions of an account (`getAccountTransactions` and `getAccountTransaction` of the original).
  *
- * Two lists, as in the original, each paged through the narrow table whose ORDER BY starts with the filter:
+ * Two lists, as in the original, and a third of ours, each paged through the narrow table whose ORDER BY starts with the filter:
  *  - by time (the default): `account_transactions`, one row per account a transaction affects (sender, recipient,
  *    offer owners, issuers, ...). The dates become a range of ledgers once, `type` and `result` are columns of the
  *    table, a marker is `(ledger_index, tx_index)`;
  *  - by sequence (`min_sequence` or `max_sequence`): `account_tx_by_sequence`, the transactions the account sent,
  *    ordered by their `Sequence`, a marker is `(sequence, ledger_index, tx_index)`. No dates here. `type` and
- *    `result` are looked up in the sender's own row of `account_transactions`.
+ *    `result` are looked up in the sender's own row of `account_transactions`;
+ *  - by destination tag (`destination_tag`): `account_tx_by_destination_tag`, the transactions sent to the account with the
+ *    tag, one row each. The window, `type` and `result` are those of the list by time, columns of this table too, and so is
+ *    the marker. The page states the coverage of the feature `destination_tags`.
  *
  * The keys of a page are then read in full from `transactions` by `TxService`.
  */
@@ -121,6 +149,7 @@ export class AccountTransactionsService {
     private readonly ch: ClickHouseService,
     private readonly ranges: LedgerRangeResolver,
     private readonly txs: TxService,
+    private readonly features: FeatureCoverageService,
     @Inject(NETWORK_PROFILE) profile: NetworkProfile,
   ) {
     this.ctx = parseContextFor(profile);
@@ -169,7 +198,10 @@ export class AccountTransactionsService {
     return Number(row?.n ?? 0);
   }
 
-  /** The conditions on `account_transactions` of the list by time, without a page; `undefined` when no ledger is in it. */
+  /**
+   * The conditions on `account_transactions` of the list by time, without a page; `undefined` when no ledger is in it. They are
+   * columns of `account_tx_by_destination_tag` too, so the list by destination tag takes them as they are.
+   */
   private async timeWindow(
     q: TimeWindow,
   ): Promise<{ conditions: string[]; params: Record<string, string | number> } | undefined> {
@@ -190,6 +222,55 @@ export class AccountTransactionsService {
         max: range.max,
       },
     };
+  }
+
+  /**
+   * One page of the transactions sent to the account under a destination tag, in a time window, with the coverage of the
+   * feature, which is read beside the page.
+   */
+  async listByDestinationTag(q: DestinationTagQuery): Promise<DestinationTagPage> {
+    // before any query, as for the list by time: the marker is that list's
+    const after = decodeMarker(q.marker, TIME_KEYS);
+
+    const [window, coverage] = await Promise.all([this.timeWindow(q), this.features.coverage('destination_tags')]);
+    if (!window) return { coverage, transactions: [] };
+
+    const cursor = keysetClause(TIME_KEYS, q.descending, after);
+    // in the order of the table's whole key, each row once, with one more than the page, as the list by time reads its table
+    const found = await readDistinctPage<TimeKey>(this.ch, {
+      columns: 'ledger_index, tx_index',
+      table: Table.AccountTxByDestinationTag,
+      where: [
+        ...window.conditions,
+        'destination_tag = {destination_tag:UInt32}',
+        ...(cursor.clause !== '' ? [cursor.clause] : []),
+      ],
+      orderBy: columnsOf(DESTINATION_TAG_ORDER),
+      unique: columnsOf(TIME_KEYS),
+      descending: q.descending,
+      params: { ...window.params, destination_tag: q.destinationTag, ...cursor.params },
+      limit: q.limit + 1,
+    });
+
+    const page = paginate(found, q.limit, (key) => [key.ledger_index, key.tx_index]);
+    return { coverage, ...(await this.page(page.rows, page.marker, q)) };
+  }
+
+  /**
+   * How many transactions the list by destination tag holds, all its pages together, each once: what an export of it would
+   * hold, counted as `countByTime` counts the list by time.
+   */
+  async countByDestinationTag(q: TimeWindow & { destinationTag: number }): Promise<number> {
+    const window = await this.timeWindow(q);
+    if (!window) return 0;
+    const row = await this.ch.queryOne<{ n: number | string }>(
+      `SELECT count() AS n FROM (
+         SELECT DISTINCT ledger_index, tx_index FROM ${Table.AccountTxByDestinationTag}
+          WHERE ${[...window.conditions, 'destination_tag = {destination_tag:UInt32}'].join(' AND ')}
+       )`,
+      { ...window.params, destination_tag: q.destinationTag },
+    );
+    return Number(row?.n ?? 0);
   }
 
   /** One page of the transactions the account sent, by their `Sequence`. */

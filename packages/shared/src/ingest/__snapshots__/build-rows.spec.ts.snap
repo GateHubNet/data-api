@@ -1862,6 +1862,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
       "tx_type": "Payment",
     },
   ],
+  "accountTxByDestinationTag": [],
   "accountTxBySequence": [
     {
       "account": "r9E2h5xmwoT5UNSBnv4EgwU4c6SNZwdUhd",
@@ -3109,7 +3110,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     "ledger_index": 26570752,
     "parent_close_time": 1792166061,
     "parent_hash": "9F2936DE8B5EE15ECD33A9B49E609CCFB2241DD7AAF00DF1E67CF34ADD065A56",
-    "parser_version": 10,
+    "parser_version": 11,
     "payments_count": 15,
     "result_counts": {
       "tesSUCCESS": 37,
@@ -4932,6 +4933,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
       "tx_type": "Payment",
     },
   ],
+  "accountTxByDestinationTag": [],
   "accountTxBySequence": [
     {
       "account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
@@ -5445,7 +5447,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     "ledger_index": 26540188,
     "parent_close_time": 1792057530,
     "parent_hash": "C1BB45D8DD5C0E7791932423D7768C60442220D6C5785787FF716DE0D974D2C4",
-    "parser_version": 10,
+    "parser_version": 11,
     "payments_count": 2,
     "result_counts": {
       "tesSUCCESS": 4,
@@ -6105,6 +6107,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
       "tx_type": "OfferCancel",
     },
   ],
+  "accountTxByDestinationTag": [],
   "accountTxBySequence": [
     {
       "account": "rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg",
@@ -6504,7 +6507,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     "ledger_index": 11118827,
     "parent_close_time": 0,
     "parent_hash": "D18572CED3F13BA2AD7B951CB65A943181F1C0DB8FFB4B61F0C4797FBE65E1AC",
-    "parser_version": 10,
+    "parser_version": 11,
     "payments_count": 0,
     "result_counts": {
       "tesSUCCESS": 13,
@@ -7649,6 +7652,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_type": "OfferCancel",
     },
   ],
+  "accountTxByDestinationTag": [],
   "accountTxBySequence": [
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
@@ -8470,7 +8474,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     "ledger_index": 11119620,
     "parent_close_time": 0,
     "parent_hash": "53E8F8A9778B140571E12355244C8DFB832A8B2D5D450B594BD961E204957022",
-    "parser_version": 10,
+    "parser_version": 11,
     "payments_count": 3,
     "result_counts": {
       "tesSUCCESS": 11,
@@ -9541,6 +9545,35 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
       "tx_type": "Payment",
     },
   ],
+  "accountTxByDestinationTag": [
+    {
+      "account": "rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj",
+      "close_time": 1423513800,
+      "destination_tag": 219151,
+      "ledger_index": 11618225,
+      "result": "tesSUCCESS",
+      "tx_index": 1,
+      "tx_type": "Payment",
+    },
+    {
+      "account": "rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj",
+      "close_time": 1423513800,
+      "destination_tag": 219151,
+      "ledger_index": 11618225,
+      "result": "tesSUCCESS",
+      "tx_index": 2,
+      "tx_type": "Payment",
+    },
+    {
+      "account": "rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj",
+      "close_time": 1423513800,
+      "destination_tag": 219151,
+      "ledger_index": 11618225,
+      "result": "tesSUCCESS",
+      "tx_index": 3,
+      "tx_type": "Payment",
+    },
+  ],
   "accountTxBySequence": [
     {
       "account": "rBSZe33F5oxHTbxSF1nZJooVDpcrrqNFp3",
@@ -10036,7 +10069,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
     "ledger_index": 11618225,
     "parent_close_time": 1423513790,
     "parent_hash": "EA9C0029FB0171BC7F26B91E952B792FDA634D30E030BA1CDF4E10309554ADB3",
-    "parser_version": 10,
+    "parser_version": 11,
     "payments_count": 4,
     "result_counts": {
       "tesSUCCESS": 5,

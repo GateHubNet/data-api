@@ -178,6 +178,12 @@ const SHAPES: Record<Table, Shape> = {
     partition: P7,
     order: 'mpt_issuance_id, ledger_index, tx_index',
   },
+  // the destination tag index (migration 018): a destination's transactions under one tag, as account_tx_by_sequence
+  [Table.AccountTxByDestinationTag]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, destination_tag, ledger_index, tx_index',
+  },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -463,6 +469,8 @@ const MIGRATION_017_TABLES: Table[] = [
   Table.MptHolders,
 ];
 
+const MIGRATION_018 = '018_destination_tags.sql';
+
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
   Table.Ledgers,
@@ -505,6 +513,7 @@ const DEDUP_TABLES: Table[] = [
   Table.MptTouches,
   Table.MptTransfers,
   Table.MptIssuanceTransfers,
+  Table.AccountTxByDestinationTag,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -2566,6 +2575,127 @@ describe('migrations (e2e)', () => {
             (r) => r.kind,
           ),
         ).toEqual(kinds);
+      } finally {
+        await svc.close();
+      }
+    });
+  });
+
+  describe('018_destination_tags.sql', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-018-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('is one CREATE TABLE IF NOT EXISTS and nothing else', () => {
+      const statements = statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_018), 'utf8'));
+      expect(statements).toHaveLength(1);
+      expect(statements.map((s) => /^CREATE TABLE IF NOT EXISTS (\w+)\s/.exec(s)?.[1])).toEqual([
+        Table.AccountTxByDestinationTag,
+      ]);
+    });
+
+    it('applies 018 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_018_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_018);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_018);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.AccountTxByDestinationTag);
+
+      copyReal([MIGRATION_018]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_018], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.AccountTxByDestinationTag);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('applies 018 twice: the statement can simply be run again, and a row stays', async () => {
+      const config = { ...ch.config, database: 'ctl_018_twice' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        const sample = SAMPLE_ROWS[Table.AccountTxByDestinationTag];
+        await svc.insert(Table.AccountTxByDestinationTag, [sample]);
+        for (const statement of statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_018), 'utf8'))) {
+          await svc.command(statement);
+        }
+        expect(await svc.query(`SELECT account, destination_tag FROM ${Table.AccountTxByDestinationTag}`)).toEqual([
+          { account: sample.account, destination_tag: sample.destination_tag },
+        ]);
+      } finally {
+        await svc.close();
+      }
+    });
+
+    it('gives account_tx_by_destination_tag the columns of the spec, in order', async () => {
+      const config = { ...ch.config, database: 'ctl_018_columns' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const columns = await admin.query<{ name: string; type: string }>(
+        `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} ORDER BY position`,
+        { db: config.database, table: Table.AccountTxByDestinationTag },
+      );
+      expect(columns.map((c) => [c.name, c.type])).toEqual([
+        ['account', 'String'],
+        ['destination_tag', 'UInt32'],
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['tx_type', 'LowCardinality(String)'],
+        ['result', 'LowCardinality(String)'],
+        ['close_time', "DateTime('UTC')"],
+      ]);
+    });
+
+    it('holds the tags 0 and 4294967295', async () => {
+      const config = { ...ch.config, database: 'ctl_018_values' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        const sample = SAMPLE_ROWS[Table.AccountTxByDestinationTag];
+        await svc.insert(Table.AccountTxByDestinationTag, [
+          { ...sample, destination_tag: 0, tx_index: 1 },
+          { ...sample, destination_tag: 4_294_967_295, tx_index: 2 },
+        ]);
+        expect(
+          await svc.query(
+            `SELECT tx_index, destination_tag AS tag FROM ${Table.AccountTxByDestinationTag} ORDER BY tx_index`,
+          ),
+        ).toEqual([
+          { tx_index: 1, tag: 0 },
+          { tx_index: 2, tag: 4_294_967_295 },
+        ]);
       } finally {
         await svc.close();
       }

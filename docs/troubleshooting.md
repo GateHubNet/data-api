@@ -237,6 +237,10 @@ The `validators` worker is enabled and `validator_domains` does not have the fiv
 The `ingest` worker is enabled and the database does not have the five MPT ledger tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers`. The schema is one on every network, so a syncer on Xahau is refused too, though its ingest never inserts into them; on XRPL and XRPL Testnet an insert into a missing table fails the batch, so the live runner would retry the same ledgers without end. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer again
 ([deployment](deployment.md#schema-migrations)).
 
+### Syncer refuses to boot: `lacks the schema of 018_destination_tags.sql`
+The `ingest` worker is enabled and the database does not have `account_tx_by_destination_tag`. The ingest inserts into it as soon as a ledger has a tagged transaction, on every network, and an insert into a missing table fails the batch, so the live runner would retry the same ledgers without end. No other worker reads or writes it, so a syncer without the `ingest` worker (the aggregator alone, say) boots on the same database. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer again
+([deployment](deployment.md#schema-migrations)). Until the table exists the api answers 500 `unable to retrieve transactions` to a list with `destination_tag`, and every other request as before.
+
 ### An escrow, check, payment channel or delegation answers 404, has no `created`, or says `"complete": false`
 `coverage` says how much of the history the index holds ([api-reference](api-reference.md#coverage)): the object data start at the first ledger written by parser version 7 or
 later, and `complete` is true only when that is at or before the ledger the feature starts at (XRPL: 28,685,313 for escrows and payment channels, 56,219,905 for checks, 107,524,865

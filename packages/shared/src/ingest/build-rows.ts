@@ -9,6 +9,7 @@ import {
   AccountsCreatedRow,
   AccountStatesRow,
   AccountTransactionsRow,
+  AccountTxByDestinationTagRow,
   AccountTxBySequenceRow,
   AmmGovernanceRow,
   AmmLiquidityRow,
@@ -49,6 +50,7 @@ import { AccountsCreatedParser } from '../parsers/accounts-created.parser';
 import { AffectedAccountsParser } from '../parsers/affected-accounts.parser';
 import { AmmParser } from '../parsers/amm.parser';
 import { BalanceChangesParser } from '../parsers/balance-changes.parser';
+import { DestinationTagParser } from '../parsers/destination-tag.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
 import { ImportParser } from '../parsers/import.parser';
@@ -144,6 +146,11 @@ export interface LedgerRows {
   mptTransfers: MptTransfersRow[];
   /** The same rows as `mptTransfers`, for the copy ordered by issuance (migration 017). */
   mptIssuanceTransfers: MptIssuanceTransfersRow[];
+  /**
+   * Every transaction whose own `Destination` and `DestinationTag` are set, under its destination (migration 018, parser
+   * version 11: `DESTINATION_TAG_PARSER_VERSION`), whatever its type and result.
+   */
+  accountTxByDestinationTag: AccountTxByDestinationTagRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -195,7 +202,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
  * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
  * and their index by account, the 5 NFT tables, the account domains, the object changes and their index by account, the
- * state touches, the 3 Xahau mint tables, and the 5 MPT ledger tables.
+ * state touches, the 3 Xahau mint tables, the 5 MPT ledger tables and the destination tag index.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -236,6 +243,7 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.MptTouches, 'mptTouches'],
   [Table.MptTransfers, 'mptTransfers'],
   [Table.MptIssuanceTransfers, 'mptIssuanceTransfers'],
+  [Table.AccountTxByDestinationTag, 'accountTxByDestinationTag'],
 ];
 
 const paymentParser = new PaymentParser();
@@ -250,6 +258,7 @@ const stateTouchesParser = new StateTouchesParser();
 const rewardsParser = new RewardsParser();
 const importParser = new ImportParser();
 const mptParser = new MptParser();
+const destinationTagParser = new DestinationTagParser();
 const ammParser = new AmmParser();
 const nftParser = new NftParser();
 const objectChangesParser = new ObjectChangesParser();
@@ -379,6 +388,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     mptTouches: [],
     mptTransfers: [],
     mptIssuanceTransfers: [],
+    accountTxByDestinationTag: [],
     diagnostics: {
       ammUnclassified: 0,
       nftSkipped: 0,
@@ -447,6 +457,20 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
       ledger_index: header.ledger_index,
       tx_index: txIndex,
     });
+    // Whatever the type and the result: a tec transaction and a Batch inner one have a row as any other.
+    const tagged = destinationTagParser.parse(t);
+    if (tagged) {
+      const { destination, destination_tag } = tagged;
+      rows.accountTxByDestinationTag.push({
+        account: destination,
+        destination_tag,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_type: txType,
+        result,
+        close_time: closeTime,
+      });
+    }
 
     const payment = paymentParser.parse(t, ctx);
     if (payment) {

@@ -207,7 +207,7 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 ### Coverage
 
 A feature whose data are read from ledger history says how much of that history the index holds. The routes of such a feature (the
-[NFTs](#nfts), the [ledger objects](#ledger-objects), the [tokens](#tokens), the [MPT issuances](#mpt) and the [supply](#get-v2networksupply); later features of the same program register with the same service and add no rule of their own) put
+[NFTs](#nfts), the [ledger objects](#ledger-objects), the [tokens](#tokens), the [MPT issuances](#mpt), the [supply](#get-v2networksupply) and the [account transactions with `destination_tag`](#get-v2accountsaddresstransactions); later features of the same program register with the same service and add no rule of their own) put
 
 ```json
 "coverage": { "from_ledger_index": 107874617, "complete": false }
@@ -232,7 +232,8 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
     Ledger and **1** on Xahau, its genesis, so complete coverage on Xahau needs ledger 1 indexed (`range-ingest --from 1`). The escrows, payment
     channels and checks of Xahau are such features: it has had them since its genesis, and its coverage starts at ledger 1. The issued tokens are such a feature on every
     network: the list, the detail and the holders (made of the state tables, `issued_tokens`) and the transfers (the payments, `token_transfers`) each start at the first ledger,
-    so on a testnet they are never complete.
+    so on a testnet they are never complete. The destination tags (`destination_tags`, the account transactions with `destination_tag`) are such a feature on every
+    network too: they start at the first ledger, so on a testnet they are never complete.
   - **The testnets** have no first ledger (their index starts at the validated head of their deployment's first boot and is dropped when the
     network is reset) and ignore the enable ledgers of the metadata file, which are mainnet's: a feature as old as the network is always
     `complete: false` there, and a feature of an amendment only when the index holds the amendment's `EnableAmendment`. They are not
@@ -250,7 +251,7 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
   carry none.
 
 Coverage turns `complete` once no ledger at or above the start ledger was written by an older parser, which is what re-ingesting the history
-does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of (and the reserves of the supply, feature `account_states`) come with version 3 and the payments their transfers are read from (and Xahau's burned supply, from the fee totals, feature `fees`) with version 1; the AMM data of the supply (feature `amm`) come with version 2 and the mint tables of Xahau's minted supply (feature `mints`) with version 9; the MPT data with version 10 (feature `mpt`).
+does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of (and the reserves of the supply, feature `account_states`) come with version 3 and the payments their transfers are read from (and Xahau's burned supply, from the fee totals, feature `fees`) with version 1; the AMM data of the supply (feature `amm`) come with version 2 and the mint tables of Xahau's minted supply (feature `mints`) with version 9; the MPT data with version 10 (feature `mpt`); the destination tag rows with version 11 (feature `destination_tags`).
 
 ### Compatibility
 
@@ -320,6 +321,10 @@ From the MPT data ([ADR-0020](adr/0020-mpt-data.md), [ADR-0010](adr/0010-ripple-
 [`/transfers`](#get-v2mptissuanceidtransfers), [`GET /v2/mpt?ids=`](#get-v2mptids) and [`GET /v2/accounts/{address}/mpt`](#get-v2accountsaddressmpt), `kind=mpt` on [`GET /v2/tokens`](#get-v2tokenskindmpt), and the `coverage` field that their answers carry (all but the lookup `?ids=`). Routes of the original gain what they used to drop, and a history without MPT changes only by the type `clawback`:
 an MPT payment is a payment, with `mpt_issuance_id` as the last key of its row in [`/v2/payments`](#payments) and of its [balance change](#get-v2accountsaddressbalance_changes), and a CSV column only when a row of the page has one; a balance change of an MPT is two rows, the holder's and the issuer's mirror, as on a trust line;
 `change_type` gains `clawback`, for every balance row of a `Clawback`, of an issued token too; and an asset can be written `<48hex>` or `<48hex>+<issuer>`, with the 400 `issuer does not match mpt issuance`.
+
+From the destination tags ([ADR-0021](adr/0021-transactions-by-destination-tag.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-12-2026-11-06-transactions-by-destination-tag) Amendment 12, items 118 to 121): the parameter
+`destination_tag` on [`GET /v2/accounts/{address}/transactions`](#get-v2accountsaddresstransactions), the transactions sent to the account with that tag, with the `coverage` field
+after `result` and the 400s `invalid destination_tag` and `destination_tag cannot be combined with min_sequence or max_sequence`. Without the parameter the route is the original's.
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -959,6 +964,7 @@ transaction objects of `/v2/transactions` without `ledger_hash`: `{hash, ledger_
 | `start` | the first ledger (epoch) | |
 | `end` | the newest ledger | |
 | `min_sequence`, `max_sequence` | none | Switch to the **sequence mode**: the transactions the account **sent**, by their `Sequence`, both bounds inclusive. `start` and `end` are ignored. A reversed range (`min` greater than `max`) is swapped and serves the rows between. A non-numeric value is 400 `invalid min_sequence` / `invalid max_sequence`. |
+| `destination_tag` | none | Switch to the **destination tag mode**: the transactions sent **to** the account with this destination tag (below). Digits from 0 to 4294967295; leading zeros are digits (`007` is tag 7), and `0` is a tag. Any other form is 400 `invalid destination_tag`, among them a sign, a decimal point, an exponent, a space, a value above 4294967295, the empty value (`destination_tag=` or a bare `destination_tag`) and a value the query string makes an object (`destination_tag[a]=5`). A missing parameter means no tag. With `min_sequence` or `max_sequence` it is 400 `destination_tag cannot be combined with min_sequence or max_sequence`. |
 | `type`, `result` | all | As on `/v2/transactions` (validated against the network). In sequence mode they filter on the sender's row. |
 | `binary` | false | `tx` and `meta` as hex. |
 | `descending` | false | |
@@ -966,9 +972,27 @@ transaction objects of `/v2/transactions` without `ledger_hash`: `{hash, ledger_
 | `marker` | | |
 | `format` | json | `csv`: one **summary row** per transaction instead of the transaction object, file `<address> - transactions.csv`. Every other parameter applies as in JSON, and the pages follow the same `marker` and `Link` header. `binary` does not change the CSV. |
 
+**The destination tag mode** lists every transaction whose own `Destination` is the account and whose own `DestinationTag` is the tag,
+of any type (`Payment`, `EscrowCreate`, `CheckCreate`, `PaymentChannelCreate`, `AccountDelete`, Xahau's `Remit`, ...) and any result,
+`tec` codes included, Batch inner transactions too. It does not list a transaction that finishes a tagged object: `EscrowFinish`,
+`CheckCash` and `PaymentChannelClaim` carry no tag of their own, so the create is listed and the object's own route
+([Ledger objects](#ledger-objects)) shows how it ended. Nor does it list what the account sent with a tag: the account must be the
+destination. The rows are those of the list without the tag, and `start`, `end`, `type`, `result`, `binary`, `descending`, `limit` and
+`format=csv` work as there; the answer has `coverage` right after `result` ([Coverage](#coverage), the feature `destination_tags`), which
+the CSV does not have. A marker is the time list's, `(ledger_index, tx_index)`: one of the list without the tag continues the tagged list strictly after its
+key, and the other way round, and a marker of the sequence mode is `invalid marker` here (as a tagged one is there). An export of the
+tagged list is counted up front by the tag's rows.
+
+Keys of the answer with `destination_tag`, in order: `result, coverage, count, marker?, transactions`.
+
+`GET /v2/accounts/rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj/transactions?destination_tag=225881&limit=2` →
+`{ "result": "success", "coverage": { "from_ledger_index": 1021029, "complete": false }, "count": 2, "marker": "…", "transactions": [ {hash, ledger_index, date, tx, meta}, … ] }`.
+
 Errors: 400 `invalid start date format`, `invalid end date format`, `invalid min_sequence`, `invalid max_sequence`, `invalid
-transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. Errors stay JSON with
-`format=csv`.
+destination_tag`, `destination_tag cannot be combined with min_sequence or max_sequence`, `invalid transaction type`, `invalid
+transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. Errors stay JSON with `format=csv`. With `destination_tag`
+the checks come in this order: `min_sequence`, `max_sequence`, the value of `destination_tag`, the tag with a sequence, then `start`,
+`end`, `type`, `result` and `marker`, every 400 before any read.
 
 **The CSV summary row** says what the transaction was from the account's side, readable without opening `tx` and `meta`. The
 columns, the same on every page and in this order:
@@ -1007,7 +1031,10 @@ supported). A transaction that used a ticket has Sequence 0: the latest of them 
 **Differences from data.ripple.com** (both routes): `max_sequence` is inclusive (the HBase scan dropped its row); `type` and
 `result` are validated against the network definitions; a `min_sequence` above what a sequence can be gives an empty list and
 a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404. The original had no CSV for
-account transactions; `format=csv` with the summary row is a GateHub extra.
+account transactions; `format=csv` with the summary row is a GateHub extra. So is `destination_tag`, the original had no such parameter
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-12-2026-11-06-transactions-by-destination-tag) items 118 to 121): its
+400 says what is wrong, where `/v2/accounts/{address}/payments` copies Ripple's rule that text that is not a tag matches nothing.
+Without it the route is the original's.
 
 ### `GET /v2/accounts/{address}/payments`
 

@@ -1,3 +1,4 @@
+import { MAX_DESTINATION_TAG } from '@gatehub/data-api-shared';
 import { Get, Param, Query, Req, Res } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // `import type`: the decorated parameters below would otherwise make Nest's metadata `require('express')`, which is
@@ -7,6 +8,7 @@ import { BinaryCodecService } from '../common/binary-codec.service';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { badRequest, notFound } from '../common/errors';
 import { ExportCount } from '../common/export-count';
+import { Coverage } from '../common/feature-coverage.service';
 import { setLinkHeader } from '../common/pagination';
 import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
@@ -20,6 +22,12 @@ const LIST_FAILURE = 'unable to retrieve transactions';
 /** The message of the lookup by sequence (`accountTxSeq.js`). */
 const LOOKUP_FAILURE = 'unable to retrieve transaction';
 
+/**
+ * The keys of the answer with `destination_tag`, in order: `coverage` is the key after `result`, as on the MPT and supply
+ * routes. Without the tag the answer is the original's, `result, count, marker?, transactions`.
+ */
+export const DESTINATION_TAG_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'transactions'] as const;
+
 /** The name of the CSV file: `<address> - transactions`. `@Csv` adds the `.csv`. */
 function transactionsFilename(req: Request): string {
   return `${req.params.address} - transactions`;
@@ -27,6 +35,9 @@ function transactionsFilename(req: Request): string {
 
 /** `^\d+$` of the original, which tests every sequence with it. */
 const DIGITS = /^\d+$/;
+
+/** The 400 of `destination_tag` with a sequence: those page through `account_tx_by_sequence`, the tag through its own table. */
+const TAG_WITH_SEQUENCE = 'destination_tag cannot be combined with min_sequence or max_sequence';
 
 /**
  * `min_sequence` or `max_sequence`: the digits of the original's `intMatch`, as large as they come (a number above
@@ -36,6 +47,22 @@ function sequenceParam(q: QueryParams, name: string): number | undefined {
   const raw = first(q, name);
   if (raw === undefined || raw === '') return undefined;
   if (!DIGITS.test(raw)) throw badRequest(`invalid ${name}`);
+  return Number(raw);
+}
+
+/**
+ * `destination_tag` (ours, no Ripple original): digits from 0 to `MAX_DESTINATION_TAG`, leading zeros included (`007` is tag 7);
+ * missing is no tag. Anything else, the empty value too, is 400 `invalid destination_tag`: unlike `/payments`, where text that
+ * is not a tag matches nothing because that rule copies Ripple's, this parameter says what is wrong. That includes a value
+ * the query string makes an object (`destination_tag[a]=5`), which `first` reads as missing: a tag that is present is never
+ * the list without the tag.
+ */
+function destinationTagParam(q: QueryParams): number | undefined {
+  if (q.destination_tag === undefined) return undefined;
+  const raw = first(q, 'destination_tag');
+  if (raw === undefined || !DIGITS.test(raw) || Number(raw) > MAX_DESTINATION_TAG) {
+    throw badRequest('invalid destination_tag');
+  }
   return Number(raw);
 }
 
@@ -84,7 +111,9 @@ export class AccountTransactionsController {
       'Every transaction that affects the account (sent, received, or touching one of its offers or trust lines) in ' +
       'the ledgers that closed between `start` and `end`, oldest first. With `min_sequence` or `max_sequence` the ' +
       'list is instead the transactions the account sent, by their sequence number, and `start` and `end` are ' +
-      'ignored. `type` and `result` are the names of the network (`Payment`, `tesSUCCESS`). `format=csv` serves ' +
+      'ignored. With `destination_tag` the list is instead the transactions sent to the account with that destination ' +
+      'tag, of any type and result, with `coverage` after `result`; it cannot be combined with `min_sequence` or ' +
+      '`max_sequence`. `type` and `result` are the names of the network (`Payment`, `tesSUCCESS`). `format=csv` serves ' +
       "the same list as a CSV of summary rows from the account's side.",
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })
@@ -92,6 +121,12 @@ export class AccountTransactionsController {
   @ApiQuery({ name: 'end', required: false, description: 'End time. Default: the newest ledger.' })
   @ApiQuery({ name: 'min_sequence', required: false, type: Number, description: 'Lowest sequence number, included.' })
   @ApiQuery({ name: 'max_sequence', required: false, type: Number, description: 'Highest sequence number, included.' })
+  @ApiQuery({
+    name: 'destination_tag',
+    required: false,
+    type: Number,
+    description: 'Only the transactions sent to the account with this destination tag: digits, 0 to 4294967295.',
+  })
   @ApiQuery({ name: 'type', required: false, description: 'Only this transaction type.' })
   @ApiQuery({ name: 'result', required: false, description: 'Only this transaction result code.' })
   @ApiQuery({ name: 'binary', required: false, type: Boolean, description: 'Serve `tx` and `meta` as hex.' })
@@ -108,7 +143,13 @@ export class AccountTransactionsController {
     @Query() query: QueryParams,
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
-  ): Promise<{ result: 'success'; count: number; marker?: string; transactions: TxObject[] | TransactionSummary[] }> {
+  ): Promise<{
+    result: 'success';
+    coverage?: Coverage;
+    count: number;
+    marker?: string;
+    transactions: TxObject[] | TransactionSummary[];
+  }> {
     const common = {
       account: address,
       // a CSV has no `tx` or `meta` to serve as hex: `binary` does not change it
@@ -119,14 +160,35 @@ export class AccountTransactionsController {
     };
 
     // the checks come in the order of the original: a sequence query (min, then max) or else the dates (start, then
-    // end), then type, then result. A sequence query never reads the dates.
+    // end), then type, then result. A sequence query never reads the dates. The tag picks a list as the sequences do, so
+    // it is checked with them: its value, then whether a sequence comes with it.
     const minSequence = sequenceParam(query, 'min_sequence');
     const maxSequence = sequenceParam(query, 'max_sequence');
     // `options.minSequence || options.maxSequence` of the original: an empty value is none
     const bySequence = Boolean(first(query, 'min_sequence') || first(query, 'max_sequence'));
+    const destinationTag = destinationTagParam(query);
+    if (destinationTag !== undefined && bySequence) throw badRequest(TAG_WITH_SEQUENCE);
     const start = bySequence ? undefined : dateParam(query, 'start', 'invalid start date format', '1970-01-01');
     const end = bySequence ? undefined : dateParam(query, 'end', 'invalid end date format');
     const filters = transactionFilters(query, this.codec);
+
+    if (destinationTag !== undefined) {
+      const tagged = await this.transactions.listByDestinationTag({
+        ...common,
+        ...filters,
+        destinationTag,
+        start: start?.date,
+        ...(end && { endExclusive: endExclusive(end) }),
+      });
+      setLinkHeader(req, res, tagged.marker);
+      return {
+        result: 'success',
+        coverage: tagged.coverage,
+        count: tagged.transactions.length,
+        ...(tagged.marker !== undefined && { marker: tagged.marker }),
+        transactions: tagged.transactions,
+      };
+    }
 
     const page: TransactionsPage = bySequence
       ? await this.transactions.listBySequence({ ...common, ...filters, minSequence, maxSequence })
@@ -147,18 +209,23 @@ export class AccountTransactionsController {
   }
 
   /**
-   * The rows an export of the list holds, counted before it is queued (ticket #16): the list by time, with its window,
-   * `type` and `result`, read as `list` reads them. `undefined` for the list by sequence, which is not counted up front.
+   * The rows an export of the list holds, counted before it is queued (ticket #16): the list by time or by destination tag,
+   * with its window, `type` and `result`, read as `list` reads them; a tag `list` refuses is its 400 here too. `undefined`
+   * for the list by sequence, which is not counted up front.
    */
   async exportRows(address: string, query: QueryParams): Promise<number | undefined> {
     if (first(query, 'min_sequence') || first(query, 'max_sequence')) return undefined;
+    const destinationTag = destinationTagParam(query);
     const start = dateParam(query, 'start', 'invalid start date format', '1970-01-01');
     const end = dateParam(query, 'end', 'invalid end date format');
-    return this.transactions.countByTime({
+    const window = {
       account: address,
       ...transactionFilters(query, this.codec),
       start: start.date,
       ...(end && { endExclusive: endExclusive(end) }),
-    });
+    };
+    return destinationTag === undefined
+      ? this.transactions.countByTime(window)
+      : this.transactions.countByDestinationTag({ ...window, destinationTag });
   }
 }

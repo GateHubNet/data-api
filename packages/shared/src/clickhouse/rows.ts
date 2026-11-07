@@ -48,12 +48,16 @@ import type { TomlAccount, TomlCurrency, TomlValidator } from '../tomls/toml-rea
  *       payments in `payments`, `payments_by_currency` and `account_payments`, an `MPToken`'s rows in `balance_changes`, and
  *       the type `clawback` on the rows of a `Clawback`; `MPT_PARSER_VERSION`. Ledgers written with an older version have none of
  *       these; `--reprocess` rewrites them. Xahau has no MPT, so its ledgers hold no MPT row of any version.
+ *  - 11: the destination tag index (`account_tx_by_destination_tag`): a row for every transaction whose `Destination` is a
+ *       string and whose `DestinationTag` an integer from 0 to 4294967295, whatever its type and result;
+ *       `DESTINATION_TAG_PARSER_VERSION`. Ledgers written with an older version have none; `--reprocess` rewrites them.
  *
  * A reader that depends on a feature compares a ledger's version with that feature's constant (`AMM_PARSER_VERSION`,
  * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`, `NFT_PARSER_VERSION`, `DOMAIN_PARSER_VERSION`, `OBJECT_PARSER_VERSION`,
- * `TOKEN_PARSER_VERSION`, `MINT_PARSER_VERSION`, `MPT_PARSER_VERSION`), never with `PARSER_VERSION`.
+ * `TOKEN_PARSER_VERSION`, `MINT_PARSER_VERSION`, `MPT_PARSER_VERSION`, `DESTINATION_TAG_PARSER_VERSION`), never with
+ * `PARSER_VERSION`.
  */
-export const PARSER_VERSION = 10;
+export const PARSER_VERSION = 11;
 
 /** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
 export const AMM_PARSER_VERSION = 2;
@@ -110,6 +114,13 @@ export const MINT_PARSER_VERSION = 9;
  * on `PARSER_VERSION`, which later features move on.
  */
 export const MPT_PARSER_VERSION = 10;
+
+/**
+ * The first parser version that writes `account_tx_by_destination_tag`: a ledger written by an older one lacks its rows. Readers
+ * of the table (the coverage of the list by destination tag) gate on this constant, never on `PARSER_VERSION`, which later
+ * features move on.
+ */
+export const DESTINATION_TAG_PARSER_VERSION = 11;
 
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;
@@ -839,6 +850,20 @@ export interface MptIssuanceTransfersRow {
   destination: string;
   amount: UInt64Value;
   fee: UInt64Value;
+}
+
+/**
+ * A transaction sent to `account` under a destination tag (`account_tx_by_destination_tag`, migration 018): its own
+ * `Destination` and `DestinationTag`, whatever its type and result. Tag 0 is a tag like any other.
+ */
+export interface AccountTxByDestinationTagRow {
+  account: string;
+  destination_tag: number;
+  ledger_index: number;
+  tx_index: number;
+  tx_type: string;
+  result: string;
+  close_time: UnixSeconds;
 }
 
 // -- Node-sourced tables -----------------------------------------------------------------------------------------

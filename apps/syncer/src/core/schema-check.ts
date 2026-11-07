@@ -337,3 +337,31 @@ export async function assertMptSchema(
 ): Promise<void> {
   await assertTablesOf(ch, enabled, database, logger, MPT_MIGRATION, MPT_NEEDS);
 }
+
+/** Transactions by destination tag: the ledger table the ingest writes. */
+export const DESTINATION_TAG_MIGRATION = '018_destination_tags.sql';
+
+/**
+ * The table of `DESTINATION_TAG_MIGRATION` each worker needs, and what it does with it. The ingest writes
+ * `account_tx_by_destination_tag` whenever a ledger has a tagged transaction, on every network. No other worker reads or writes it:
+ * the aggregator does not need it.
+ */
+const DESTINATION_TAG_NEEDS: SchemaNeeds = new Map([
+  ['ingest', { tables: [Table.AccountTxByDestinationTag], does: 'writes' }],
+]);
+
+/**
+ * Fails the boot when the ingest worker is enabled and the database lacks the table of `018_destination_tags.sql`. The schema is
+ * one on every network, so the check does not ask which one this is. The ingest inserts into the table as soon as a ledger has a
+ * tagged transaction, and an insert into a missing table fails the batch, so that the live runner would retry the same ledgers
+ * without end. It runs after the boot-time migrations and after the check of 017. A check that cannot be made (ClickHouse
+ * unreachable) does not fail the boot: it is said, and the ingest reports the failures of its writes as it always does.
+ */
+export async function assertDestinationTagSchema(
+  ch: Pick<ClickHouseService, 'query'>,
+  enabled: ReadonlySet<WorkerName>,
+  database: string,
+  logger: { warn(message: string): void },
+): Promise<void> {
+  await assertTablesOf(ch, enabled, database, logger, DESTINATION_TAG_MIGRATION, DESTINATION_TAG_NEEDS);
+}

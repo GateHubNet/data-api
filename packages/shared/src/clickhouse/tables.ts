@@ -62,6 +62,10 @@ export enum Table {
   MptTouches = 'mpt_touches',
   MptTransfers = 'mpt_transfers',
   MptIssuanceTransfers = 'mpt_issuance_transfers',
+  // The destination tag index (migration 018, written by ingest from parser version 11, DESTINATION_TAG_PARSER_VERSION): every
+  // transaction whose own Destination and DestinationTag are set, of any type and whatever its result, under its destination
+  // and tag, so that a lookup of one tag reads only its rows.
+  AccountTxByDestinationTag = 'account_tx_by_destination_tag',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',

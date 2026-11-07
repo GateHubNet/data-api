@@ -15,7 +15,8 @@ toml says ([ADR-0017](docs/adr/0017-display-names.md)); and **ledger objects** o
 history of the transactions that changed it, the permission delegations of an account (XRP Ledger), and which kind of object an ID is, each stating its `coverage`
 ([ADR-0018](docs/adr/0018-ledger-object-history.md)); and the **native supply**: an hourly snapshot of the total, burned, escrowed and circulating figures, the AMM pools (XRP Ledger), the reserves, and Xahau's minting by source and day,
 each part read from history stating its `coverage` ([api reference](docs/api-reference.md#get-v2networksupply)); and **MPT data** on the XRP Ledger (XLS-33): an issuance with its flags and decoded metadata, its holders and transfers, the issuances ranked by holders, an account's holdings, and MPT payments and balance changes on the routes of the original,
-each answer stating its `coverage` ([ADR-0020](docs/adr/0020-mpt-data.md)).
+each answer stating its `coverage` ([ADR-0020](docs/adr/0020-mpt-data.md)); and the **transactions sent to an account under a destination tag** (`destination_tag` on the
+account transactions), stating their `coverage` ([ADR-0021](docs/adr/0021-transactions-by-destination-tag.md)).
 
 One deployment serves one network; the same images run all four. The API answers the same `/v2/...` paths on a host per network:
 
@@ -61,7 +62,7 @@ cp apps/syncer/.env.example apps/syncer/.env
 cp apps/api/.env.example    apps/api/.env  # GH_NETWORK=xrpl by default; GH_API_KEYS empty = no authentication (development only)
 
 export GH_CLICKHOUSE_URL=http://localhost:8123  # required, with no default; ch:migrate reads no .env file
-pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline ... 017_mpt)
+pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline ... 018_destination_tags)
 
 pnpm start:syncer                          # ingests the XRP Ledger from the validated head  (probe on :3002)
 pnpm start:api                             # serves /v2/* on :3001, Swagger at /internal/docs

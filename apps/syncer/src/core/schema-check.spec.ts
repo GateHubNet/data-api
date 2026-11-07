@@ -1,12 +1,14 @@
 import { ClickHouseService, Table } from '@gatehub/data-api-shared';
 import { WorkerName } from '../config/syncer.config';
 import {
+  assertDestinationTagSchema,
   assertIssuedTokensSchema,
   assertMptSchema,
   assertSupplySchema,
   assertTomlsSchema,
   assertValidatorsSchema,
   assertValidatorTomlSchema,
+  DESTINATION_TAG_MIGRATION,
   ISSUED_TOKENS_MIGRATION,
   MPT_MIGRATION,
   SUPPLY_MIGRATION,
@@ -514,5 +516,74 @@ describe('assertMptSchema', () => {
     await expect(assertMptSchema(ch, workers('ingest'), 'xrpl', { warn })).resolves.toBe(undefined);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(MPT_MIGRATION));
+  });
+});
+
+describe('assertDestinationTagSchema', () => {
+  it('checks nothing when the ingest worker is not enabled, the aggregator alone included', async () => {
+    const db = tablesOf();
+    const warn = jest.fn();
+    await assertDestinationTagSchema(
+      db.ch,
+      workers('aggregator', 'validations', 'fee_stats', 'validators', 'tomls'),
+      'xrpl',
+      { warn },
+    );
+    await assertDestinationTagSchema(db.ch, workers('aggregator'), 'xahau', { warn });
+    await assertDestinationTagSchema(db.ch, workers(), 'xrpl', { warn });
+    expect(db.query).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('passes a database with account_tx_by_destination_tag for the ingest, reading system.tables with bound values', async () => {
+    const db = tablesOf(Table.AccountTxByDestinationTag);
+    await expect(
+      assertDestinationTagSchema(db.ch, workers('ingest', 'aggregator'), 'xrpl', { warn: jest.fn() }),
+    ).resolves.toBe(undefined);
+    expect(db.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).toContain('FROM system.tables');
+    expect(sql).toContain('database = currentDatabase()');
+    expect(params).toEqual({ tables: [Table.AccountTxByDestinationTag] });
+  });
+
+  it('fails the boot of the ingest worker on a database without 018, naming the migration and the table, on every network', async () => {
+    for (const database of ['xrpl', 'xrpl_testnet', 'xahau', 'xahau_testnet']) {
+      const check = assertDestinationTagSchema(tablesOf(Table.Ledgers).ch, workers('ingest', 'fee_stats'), database, {
+        warn: jest.fn(),
+      });
+      await expect(check).rejects.toThrow(DESTINATION_TAG_MIGRATION);
+      await expect(check).rejects.toThrow(`(table ${Table.AccountTxByDestinationTag})`);
+      await expect(check).rejects.toThrow('the ingest worker writes');
+      await expect(check).rejects.toThrow(`database "${database}"`);
+      await expect(check).rejects.toThrow('apply the migrations');
+    }
+    expect(DESTINATION_TAG_MIGRATION).toBe('018_destination_tags.sql');
+  });
+
+  it('is a check of its own: a database with the ledger tables of 017 and not 018 passes 017 and fails 018, each naming its own file', async () => {
+    const db = tablesOf(
+      Table.MptIssuanceStates,
+      Table.MptHolderStates,
+      Table.MptTouches,
+      Table.MptTransfers,
+      Table.MptIssuanceTransfers,
+    );
+    await expect(assertMptSchema(db.ch, workers('ingest'), 'xrpl', { warn: jest.fn() })).resolves.toBe(undefined);
+    const check = assertDestinationTagSchema(db.ch, workers('ingest'), 'xrpl', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(DESTINATION_TAG_MIGRATION);
+    await expect(check).rejects.not.toThrow(MPT_MIGRATION);
+  });
+
+  it('does not fail the boot when the check cannot be made, and says so', async () => {
+    const ch = {
+      query: jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:8123')),
+    } as unknown as Pick<ClickHouseService, 'query'>;
+    const warn = jest.fn();
+    await expect(assertDestinationTagSchema(ch, workers('ingest'), 'xrpl', { warn })).resolves.toBe(undefined);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(DESTINATION_TAG_MIGRATION));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('the ingest worker starts without the check'));
   });
 });
