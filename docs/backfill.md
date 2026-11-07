@@ -582,8 +582,11 @@ lists nothing from before the deploy ([api-reference](api-reference.md#get-v2acc
   ```
 
   `<first>` is 32570 on the XRP Ledger and 1 on Xahau. From a public node that is `--concurrency 1` ([rate limits](#public-nodes-and-rate-limits)).
-- **Until then** `coverage` says `complete: false`. `from_ledger_index` is one above the newest ledger of an older parser, so every ledger from it up is indexed. Below it,
-  only the ledgers the reprocess has already rewritten are (an oldest-first run fills them from the bottom), and a tagged list leaves out what was sent in the others.
+- **Until then** the JSON answer's `coverage` says `complete: false`. A tagged CSV has no `coverage`, so it is incomplete without saying so. `from_ledger_index` is
+  one above the newest stored ledger of an older parser, so every stored ledger from it up is indexed. Below it, only the ledgers the reprocess has already rewritten
+  are (an oldest-first run fills them from the bottom), and a tagged list leaves out what was sent in the others.
+- **Coverage reads the stored ledgers only:** a missing ledger is not counted, so `complete: true` with a gap in the history still leaves out what was sent in the gap.
+  Before taking a tagged list as complete, check for gaps with the SQL in [operations](operations.md#sql-health-checks) and fill them ([Resuming](#resuming-gap-repair-reprocessing)).
 - **The testnets are never complete:** their index starts at their first boot and they are not backfilled.
 
 Check it:
