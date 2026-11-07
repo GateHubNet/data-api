@@ -10,14 +10,13 @@ Ledger and Xahau, with an **api** that serves it, a **syncer** that fills it, an
 
 | Tool | Version | Why |
 | --- | --- | --- |
-| Node.js | `>=20.19` (`engines` in the root and api `package.json`; the images use 22) | `ripple-binary-codec` 2.x loads ES-module-only dependencies with `require(esm)`, which Node enables by default from 20.19 / 22.12 |
-| pnpm | `10.x` (the repo pins `10.6.3` via `packageManager`) | Workspace package manager (`corepack enable`) |
+| Node.js | `>=20.19` (`engines` in the root and api `package.json`; the images use 26) | `ripple-binary-codec` 2.x loads ES-module-only dependencies with `require(esm)`, which Node enables by default from 20.19 / 22.12 |
+| pnpm | `10.x` (the repo pins `10.6.3` via `packageManager`) | Workspace package manager (from npm: Node 25 and later no longer bundle corepack) |
 | Docker | recent, with BuildKit | Local ClickHouse, the compose stacks and the testcontainers-based e2e suites |
 | npm access | a token that can read the private `@gatehub/toolbox` | Both apps depend on `@gatehub/toolbox`, which is on the npm registry but private |
 
 ```bash
-corepack enable
-corepack prepare pnpm@10.6.3 --activate
+npm install --global pnpm@10.6.3
 ```
 
 ### NPM access
@@ -322,7 +321,7 @@ and a global filter that renders `{error:{...}}` (overridden per controller by `
 `@RippleController`, or its errors come out in the wrong shape.
 
 **g. Node >= 20.19.** A lower Node fails at runtime requiring the ESM-only dependencies of `ripple-binary-codec` 2.x. The Dockerfiles pin one patch
-version of `node:22` for both images; `apps/api/src/node-version.spec.ts` checks it.
+version of `node:26` for every image; `apps/api/src/node-version.spec.ts` checks it.
 
 **h. Flaky e2e under load.** Parallel load on a laptop has caused rare ClickHouse timeouts in the recovery suites; rerun a failing suite
 once in isolation before looking for a bug.

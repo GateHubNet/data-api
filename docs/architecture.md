@@ -320,7 +320,7 @@ parser fix be re-run without touching the API.
 
 | Concern | Choice |
 | --- | --- |
-| Runtime | Node.js >= 20.19 (images: `node:22.23.2-bookworm-slim`), TypeScript |
+| Runtime | Node.js >= 20.19 (images: `node:26.12.1-bookworm-slim`), TypeScript |
 | Framework | NestJS 10 with the private `@gatehub/toolbox` (config, bootstrap, logger) |
 | Store | ClickHouse 26.8 (`@clickhouse/client`, HTTP) |
 | XRPL access | `xrpl` 2.14 (API v1 shape; both rippled and xahaud default to it) behind the shared `NodeClient`; `ripple-binary-codec` 2.x in the API for `binary=true` and canonical JSON |

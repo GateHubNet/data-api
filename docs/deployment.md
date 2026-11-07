@@ -129,7 +129,7 @@ function takes the env file of the host). The sandbox needs its own values for `
 
 ## Build
 
-The three images (api, syncer, exporter) build from the **repo root** (the context is the whole workspace) on the public `node:22.23.2-bookworm-slim` base
+The three images (api, syncer, exporter) build from the **repo root** (the context is the whole workspace) on the public `node:26.12.1-bookworm-slim` base
 (Node >= 20.19 is required) and run as the non-root `node` user. The private `@gatehub/toolbox` needs your npm token at install
 time. The token is passed as a **BuildKit secret** read from the `NPM_TOKEN` environment variable: it is mounted for one `RUN` only,
 written to `~/.npmrc` inside it and removed before the layer is committed. It is never a build argument or environment variable and

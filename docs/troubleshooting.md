@@ -50,7 +50,7 @@ and put the variables in the environment.
 
 ### `ERR_REQUIRE_ESM` / `require() of ES Module` at boot
 **Root cause:** Node older than 20.19 (22.12 on the 22 line): `ripple-binary-codec` 2.x pulls ES-module-only dependencies with `require(esm)`.
-**Fix:** Node >= 20.19 (the images pin `node:22.23.2-bookworm-slim`; do not go back to a floating `node:20` tag).
+**Fix:** Node >= 20.19 (the images pin `node:26.12.1-bookworm-slim`; do not go back to a floating `node:20` tag).
 
 ### A GH_* value rejected at boot
 **Symptom:** `GH_CATCHUP_CONCURRENCY must be a positive integer`, `GH_NODE_ENDPOINTS must be a comma separated list of ws:// or wss:// URLs`,
