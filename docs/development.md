@@ -19,6 +19,9 @@ Ledger and Xahau, with an **api** that serves it, a **syncer** that fills it, an
 npm install --global pnpm@10.6.3
 ```
 
+On Node 20 to 24 after an earlier `corepack enable`, npm will not replace Corepack's `pnpm` shim (`EEXIST`): either keep
+Corepack (`corepack prepare pnpm@10.6.3 --activate`) or remove its shim first (`corepack disable pnpm`).
+
 ### NPM access
 
 `@gatehub/toolbox` is private, so `pnpm install` needs an npm token that can read it. The committed `.npmrc` keeps its auth line
