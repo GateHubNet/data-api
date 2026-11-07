@@ -8,9 +8,14 @@ export interface PdfText {
   text: string;
 }
 
-/** The text of a PDF file, as a text extractor reads it. */
+/**
+ * The text of a PDF file, as a text extractor reads it.
+ *
+ * The pdf.js 1.10 inside pdf-parse 1.1.1 misreads some Node Buffers ("bad XRef entry"); since Node 26, whose buffer pool
+ * grew from 8 to 64 KB, the export files of the tests are among them. A plain Uint8Array copy reads right on every Node.
+ */
 export async function pdfText(file: Buffer): Promise<PdfText> {
-  const { numpages, text } = await pdfParse(file);
+  const { numpages, text } = await pdfParse(new Uint8Array(file) as Buffer);
   return { pages: numpages, text };
 }
 

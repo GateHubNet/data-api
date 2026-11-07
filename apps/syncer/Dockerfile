@@ -10,17 +10,18 @@
 #   ... migrate.js shared                                                       the same for the shared database (ADR-0014)
 #   node dist/cli/range-ingest.js --from <n> --to <m>                           ledger range (re)ingest
 #
-# Public base image (node:22.23.2-bookworm-slim).
+# Public base image (node:26.12.1-bookworm-slim).
 #
-# Node MUST be >= 20.19 (22.12 on the 22 line): the API's ripple-binary-codec 2.x loads
+# Node MUST be >= 20.19 (22.12 on the 22 line; the images run Node 26, the LTS line): the API's ripple-binary-codec 2.x loads
 # ES-module-only dependencies with require(esm), which Node enables by default from those
 # versions on. The tag is pinned to an explicit patch version at least two weeks old, the same
 # in the api and the syncer image (apps/api/src/node-version.spec.ts checks both). Do not go
 # back to a floating tag such as node:20-bookworm-slim; bump all FROM lines together.
-FROM node:22.23.2-bookworm-slim AS builder
+FROM node:26.12.1-bookworm-slim AS builder
 WORKDIR /app
 
-RUN corepack enable && corepack prepare pnpm@10.6.3 --activate
+# Node 25 and later no longer bundle corepack, so pnpm comes from npm (the version package.json's packageManager names).
+RUN npm install --global pnpm@10.6.3
 
 # Copy the whole workspace (see .dockerignore: no env files, no .git, no scratch), then install + build in a SINGLE
 # RUN. (pnpm's workspace symlinks don't survive across separate RUN layers in BuildKit, so the install and the build
@@ -49,7 +50,7 @@ RUN --mount=type=secret,id=npm_token,required=true \
   done \
   && test -f /app/out/dist/cli/range-ingest.js
 
-FROM node:22.23.2-bookworm-slim
+FROM node:26.12.1-bookworm-slim
 WORKDIR /app
 # NODE_ENV=production makes the toolbox config loader look for a `.env.production` file and refuse to start without it,
 # unless GH_ENV is set to anything: then the configuration comes from the environment only (compose `environment`).
