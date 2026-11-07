@@ -587,6 +587,8 @@ lists nothing from before the deploy ([api-reference](api-reference.md#get-v2acc
   are (an oldest-first run fills them from the bottom), and a tagged list leaves out what was sent in the others.
 - **Coverage reads the stored ledgers only:** a missing ledger is not counted, so `complete: true` with a gap in the history still leaves out what was sent in the gap.
   Before taking a tagged list as complete, check for gaps with the SQL in [operations](operations.md#sql-health-checks) and fill them ([Resuming](#resuming-gap-repair-reprocessing)).
+  Those queries see nothing above the newest stored ledger, so for recent transactions also check that the syncer has caught up (`syncer_lag_ledgers`,
+  [operations](operations.md#at-a-glance)).
 - **The testnets are never complete:** their index starts at their first boot and they are not backfilled.
 
 Check it:
