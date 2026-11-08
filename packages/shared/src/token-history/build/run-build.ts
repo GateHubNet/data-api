@@ -66,6 +66,8 @@ export interface TokenHistoryBuildOptions {
   signal?: AbortSignal;
   /** How fresh the worker's lease must be (default 30 s, its TTL). */
   workerLeaseFreshMs?: number;
+  /** How long the build waits after writing its lease before it reads it back (default 1 s). */
+  leaseSettleMs?: number;
   passAccounts?: number;
   levelTokens?: number;
   floor?: number;
@@ -78,6 +80,8 @@ export const TOKEN_HISTORY_LEVEL_TOKENS = 1_000;
 /** The TTL of the build's lease and of the worker's (as the live runner's), and how often the build renews its own. */
 export const TOKEN_HISTORY_LEASE_TTL_MS = 30_000;
 export const TOKEN_HISTORY_LEASE_HEARTBEAT_MS = 10_000;
+/** How long a build waits after writing its lease before it reads it back (as two builds that start together both write one). */
+export const TOKEN_HISTORY_LEASE_SETTLE_MS = 1_000;
 /** The `log_comment` of every statement of the build: its reads and writes can be found in `system.query_log`. */
 export const TOKEN_HISTORY_BUILD_COMMENT = 'token-history-build';
 
@@ -162,6 +166,14 @@ export async function runTokenHistoryBuild(
     throw new BuildRefused('build_running', `another token-history-build holds the lease (${lease.holder})`);
   }
   await writeLease(ch, leaseName, holder);
+  // ClickHouse has no transactions: a build that read the lease free at the same moment writes its row too, and the newest row wins.
+  // Each reads the lease back after a pause longer than the other's read-to-write, and the one that finds another holder newest
+  // leaves (without releasing what it does not hold).
+  await new Promise((resolve) => setTimeout(resolve, o.leaseSettleMs ?? TOKEN_HISTORY_LEASE_SETTLE_MS));
+  const taken = await readLease(ch, leaseName);
+  if (taken.holder !== holder) {
+    throw new BuildRefused('build_running', `another token-history-build took the lease (${taken.holder})`);
+  }
   const heartbeat = setInterval(() => void writeLease(plain, leaseName, holder).catch(() => undefined), TOKEN_HISTORY_LEASE_HEARTBEAT_MS);
   heartbeat.unref();
   try {

@@ -5,7 +5,14 @@ import { Table } from '../src/clickhouse/tables';
 import { LedgerWriter } from '../src/ingest/ledger-writer';
 import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
-import { BuildRefused, BuildStopped, runTokenHistoryBuild } from '../src/token-history/build/run-build';
+import {
+  buildLeaseName,
+  BuildRefused,
+  BuildStopped,
+  readLease,
+  runTokenHistoryBuild,
+  writeLease,
+} from '../src/token-history/build/run-build';
 import { patchTokenHistoryState, readTokenHistoryStates, writeTokenHistoryState } from '../src/token-history/state';
 import { mptIssuanceId } from '../src/util/mpt';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
@@ -137,6 +144,27 @@ describe('the token history build (e2e)', () => {
         { network: `${NETWORK}:token_history_build` },
       );
       await expect(build(ch)).rejects.toMatchObject({ reason: 'build_running' });
+    });
+
+    it('refuses when another build took the lease between its check and its write, and leaves that lease alone', async () => {
+      const ch = await fresh();
+      await seedBuildWorld(ch);
+      const name = buildLeaseName(NETWORK);
+      // a second build that read the lease free at the same moment, and wrote its own just after this one's
+      const racing = new Proxy(ch, {
+        get(target, prop, receiver) {
+          if (prop !== 'command') return Reflect.get(target, prop, receiver);
+          return async (q: string, p?: Record<string, unknown>, o?: never) => {
+            await target.command(q, p, o);
+            if (p?.network === name && String(p.holder).startsWith('token-history-build:')) {
+              await writeLease(target, name, 'another-build');
+            }
+          };
+        },
+      });
+      await expect(build(racing, { leaseSettleMs: 0 })).rejects.toMatchObject({ reason: 'build_running' });
+      expect((await readLease(ch, name)).holder).toBe('another-build');
+      expect(await readTokenHistoryStates(ch)).toEqual([]);
     });
 
     it('refuses without a fresh worker lease', async () => {
