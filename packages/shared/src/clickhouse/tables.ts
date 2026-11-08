@@ -113,6 +113,16 @@ export enum Table {
   // holder, the newest version of a key wins.
   MptIssuances = 'mpt_issuances',
   MptHolders = 'mpt_holders',
+  // The token history (migration 019), written by the syncer's `token_history` worker and the `token-history-build` command:
+  // the change log, the checkpoints and their heads and the hourly rollups of each generation, swapped and dropped by
+  // generation; the DEX hours, which have no generation; the state of each generation; and the ledger ranges to repair.
+  TokenHolderChanges = 'token_holder_changes',
+  TokenCheckpoints = 'token_checkpoints',
+  TokenCheckpointHeads = 'token_checkpoint_heads',
+  TokenHourly = 'token_hourly',
+  TokenHourlyDex = 'token_hourly_dex',
+  TokenHistoryState = 'token_history_state',
+  TokenHistoryDirty = 'token_history_dirty',
   // Migration 012, written by the syncer's tomls worker: one row per check of a domain's toml, the newest wins.
   DomainTomls = 'domain_tomls',
   // Written by the operator with plain SQL inserts (ADR-0014).

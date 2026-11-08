@@ -67,7 +67,14 @@ import {
   StateTouchesRow,
   StatsHourlyRow,
   SyncerLeaseRow,
+  TokenCheckpointHeadsRow,
+  TokenCheckpointsRow,
   TokenGenerationsRow,
+  TokenHistoryDirtyRow,
+  TokenHistoryStateRow,
+  TokenHolderChangesRow,
+  TokenHourlyDexRow,
+  TokenHourlyRow,
   TokenLinesRow,
   TokensRow,
   TransactionsRow,
@@ -168,6 +175,13 @@ export interface TableRows {
   [Table.NetworkSupply]: NetworkSupplyRow;
   [Table.MptIssuances]: MptIssuancesRow;
   [Table.MptHolders]: MptHoldersRow;
+  [Table.TokenHolderChanges]: TokenHolderChangesRow;
+  [Table.TokenCheckpoints]: TokenCheckpointsRow;
+  [Table.TokenCheckpointHeads]: TokenCheckpointHeadsRow;
+  [Table.TokenHourly]: TokenHourlyRow;
+  [Table.TokenHourlyDex]: TokenHourlyDexRow;
+  [Table.TokenHistoryState]: TokenHistoryStateRow;
+  [Table.TokenHistoryDirty]: TokenHistoryDirtyRow;
   [Table.DomainTomls]: DomainTomlsRow;
   [Table.AccountNetworkNames]: AccountNetworkNamesRow;
   [Table.IngestLog]: IngestLogRow;
@@ -1318,6 +1332,108 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     deleted: 0,
     version: VERSION_MS,
   },
+  // Alice's USD of the issuer rises from 1000 to 1250.75 in a payment: the line counted before and after, with a known before-state
+  [Table.TokenHolderChanges]: {
+    generation: 3,
+    issuer: ISSUER,
+    currency: 'USD',
+    ledger_index: LEDGER,
+    tx_index: 1,
+    node_index: 2,
+    holder: ALICE,
+    close_time: CLOSE,
+    clawback: 0,
+    amount_before: '1000',
+    amount_after: '1250.75',
+    counted_before: 1,
+    counted_after: 1,
+    before_known: 1,
+    limit: '5000',
+    frozen: 0,
+    authorized: 1,
+    escrowed: '0',
+    order_exp: -12,
+    order_mant: '1250750000000000',
+  },
+  // Alice's line in a checkpoint of the token at the ledger, first counted 1,000 ledgers back
+  [Table.TokenCheckpoints]: {
+    generation: 3,
+    issuer: ISSUER,
+    currency: 'USD',
+    checkpoint_ledger: LEDGER,
+    holder: ALICE,
+    amount: '1250.75',
+    escrowed: '0',
+    limit: '5000',
+    frozen: 0,
+    authorized: 1,
+    order_exp: -12,
+    order_mant: '1250750000000000',
+    first_ledger: LEDGER - 1_000,
+    last_ledger: LEDGER,
+  },
+  // the checkpoint's head: 1,200 holders on 1,500 lines, 60,000 changes since the previous checkpoint
+  [Table.TokenCheckpointHeads]: {
+    generation: 3,
+    issuer: ISSUER,
+    currency: 'USD',
+    checkpoint_ledger: LEDGER,
+    supply: '9876543.21',
+    holders: '1200',
+    trust_lines: '1500',
+    changes_since: '60000',
+    first_ledger: LEDGER - 50_000,
+  },
+  // an hour of the token that is final: 100 issued, 1 redeemed as a transfer fee, 200 moved between holders
+  [Table.TokenHourly]: {
+    generation: 3,
+    issuer: ISSUER,
+    currency: 'USD',
+    hour: 1_699_999_200,
+    supply: '9876543.21',
+    holders: '1200',
+    trust_lines: '1500',
+    issued: '100',
+    redeemed: '1',
+    clawed_back: '0',
+    transferred: '200',
+    transfers: 2,
+    changes: 7,
+    unknown_before: 0,
+    first_ledger: LEDGER - 10,
+    last_ledger: LEDGER,
+    final: 1,
+    version: VERSION_MS,
+  },
+  // the token's trades in the hour
+  [Table.TokenHourlyDex]: {
+    issuer: ISSUER,
+    currency: 'USD',
+    hour: 1_699_999_200,
+    exchanged: '52.5',
+    trades: 1,
+    config_version: 1,
+    version: VERSION_MS,
+  },
+  // a generation in the levels phase of its build, at the token after the issuer's USD
+  [Table.TokenHistoryState]: {
+    generation: 3,
+    state: 'building',
+    config_version: 1,
+    coverage_from: LEDGER - 1_000_000,
+    h0: LEDGER - 600,
+    h1: LEDGER - 100,
+    phase: 'levels',
+    account_cursor: BOB,
+    token_cursor_issuer: ISSUER,
+    token_cursor_currency: 'USD',
+    through_ledger: LEDGER,
+    levels_through: LEDGER - 600,
+    started_at: CLOSE_MS,
+    changed_at: 1_700_000_060.456,
+    version: VERSION_MS,
+  },
+  [Table.TokenHistoryDirty]: { from_ledger: LEDGER - 10_000, to_ledger: LEDGER, created_at: CLOSE_MS },
   [Table.DomainTomls]: {
     domain: 'sample.example',
     toml_url: 'https://sample.example/.well-known/xrp-ledger.toml',

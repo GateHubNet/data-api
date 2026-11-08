@@ -1684,6 +1684,149 @@ export interface MptHoldersRow {
   version: UInt64Value;
 }
 
+// -- Token history (migration 019) -------------------------------------------------------------------------------
+
+/**
+ * One row of `token_holder_changes`, the change log: a node of a transaction that changed a line's or an `MPToken`'s state for
+ * a token, where the line counted before or after. `issuer` and `currency` are the token (an MPT: its issuer and its issuance
+ * ID). `amount_before` and `amount_after` are the holder's amount as exact decimal text, `'0'` when the line does not count (an
+ * MPT in integer units, escrowed included). `before_known` is 0 when the line's first state row in the coverage is not its
+ * creation. `limit`, `frozen`, `authorized` and `escrowed` are the state after, from the token's side (`escrowed` is `'0'` for an
+ * issued token), and `order_exp` and `order_mant` the order key of `amount_after`.
+ */
+export interface TokenHolderChangesRow {
+  generation: number;
+  issuer: string;
+  currency: string;
+  ledger_index: number;
+  tx_index: number;
+  node_index: number;
+  holder: string;
+  close_time: UnixSeconds;
+  clawback: number;
+  amount_before: string;
+  amount_after: string;
+  counted_before: number;
+  counted_after: number;
+  before_known: number;
+  limit: string;
+  frozen: number;
+  authorized: number;
+  escrowed: string;
+  order_exp: number;
+  /** `UInt64`, as text. */
+  order_mant: string;
+}
+
+/** One counting line of a token at the end of `checkpoint_ledger` (`token_checkpoints`), with the holder's state. */
+export interface TokenCheckpointsRow {
+  generation: number;
+  issuer: string;
+  currency: string;
+  checkpoint_ledger: number;
+  holder: string;
+  amount: string;
+  escrowed: string;
+  limit: string;
+  frozen: number;
+  authorized: number;
+  order_exp: number;
+  /** `UInt64`, as text. */
+  order_mant: string;
+  first_ledger: number;
+  last_ledger: number;
+}
+
+/**
+ * The head of a checkpoint (`token_checkpoint_heads`), written after its rows: the totals at `checkpoint_ledger`, the changes
+ * since the previous checkpoint and the token's first ledger. The counts are `UInt64`, as text.
+ */
+export interface TokenCheckpointHeadsRow {
+  generation: number;
+  issuer: string;
+  currency: string;
+  checkpoint_ledger: number;
+  supply: string;
+  holders: string;
+  trust_lines: string;
+  changes_since: string;
+  first_ledger: number;
+}
+
+/**
+ * One token and UTC hour with a change (`token_hourly`): the levels at the end of the hour and the hour's flows, written whole.
+ * `holders` and `trust_lines` are `UInt64`, as text. `version` is the writer's clock in milliseconds, above the key's newest.
+ */
+export interface TokenHourlyRow {
+  generation: number;
+  issuer: string;
+  currency: string;
+  hour: UnixSeconds;
+  supply: string;
+  holders: string;
+  trust_lines: string;
+  issued: string;
+  redeemed: string;
+  clawed_back: string;
+  transferred: string;
+  transfers: number;
+  changes: number;
+  unknown_before: number;
+  first_ledger: number;
+  last_ledger: number;
+  final: number;
+  version: UInt64Value;
+}
+
+/**
+ * The DEX figures of a token and UTC hour (`token_hourly_dex`): the token's amounts in the hour's exchanges and their count. The
+ * hour's sentinel has `issuer` and `currency` empty and is written after the hour's rows.
+ */
+export interface TokenHourlyDexRow {
+  issuer: string;
+  currency: string;
+  hour: UnixSeconds;
+  exchanged: string;
+  trades: number;
+  config_version: number;
+  version: UInt64Value;
+}
+
+/** The phase of a token history build. */
+export type TokenHistoryPhase = 'changes' | 'mpt_changes' | 'levels' | 'dex' | 'done';
+
+/**
+ * One row of `token_history_state`, written for every change of a generation; the newest `version` of a `generation` is its
+ * state. `coverage_from` is the first ledger the generation covers, `h0` the commit marker when its build started and `h1` the
+ * ledger its build's levels are made up to. `account_cursor` is the last account (or holder) a changes pass finished,
+ * `token_cursor_issuer` and `token_cursor_currency` the last token the levels phase finished. Every change up to
+ * `through_ledger` is written, and every level and checkpoint up to `levels_through`.
+ */
+export interface TokenHistoryStateRow {
+  generation: number;
+  state: 'building' | 'live' | 'retired';
+  config_version: number;
+  coverage_from: number;
+  h0: number;
+  h1: number;
+  phase: TokenHistoryPhase;
+  account_cursor: string;
+  token_cursor_issuer: string;
+  token_cursor_currency: string;
+  through_ledger: number;
+  levels_through: number;
+  started_at: UnixSecondsMs;
+  changed_at: UnixSecondsMs;
+  version: UInt64Value;
+}
+
+/** A ledger range whose token history must be repaired after a re-ingest (`token_history_dirty`), as `nft_dirty` is for NFTs. */
+export interface TokenHistoryDirtyRow {
+  from_ledger: number;
+  to_ledger: number;
+  created_at: UnixSecondsMs;
+}
+
 // -- Domain tomls (migration 012) --------------------------------------------------------------------------------
 
 /**
