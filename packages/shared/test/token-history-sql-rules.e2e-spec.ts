@@ -1,6 +1,7 @@
+import BigNumber from 'bignumber.js';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
-import { TrustLineStatesRow } from '../src/clickhouse/rows';
+import { TokenHolderChangesRow, TrustLineStatesRow } from '../src/clickhouse/rows';
 import { Table } from '../src/clickhouse/tables';
 import { exactSumColumns } from '../src/query/decimal';
 import {
@@ -10,6 +11,7 @@ import {
   seededRandom,
   stateRowsOf,
 } from '../src/test-utils/token-history-cases';
+import { ChangeAmounts, FLOWS_BY_TX_SQL, flowsOfTransaction } from '../src/token-history/flows';
 import { orderKeyOf } from '../src/token-history/order-key';
 import { issuedSideOf } from '../src/token-history/token-side';
 import { ISSUED_SIDE_COLUMNS, ISSUED_SIDE_KEEP, orderKeySql } from '../src/token-history/token-side.sql';
@@ -153,6 +155,99 @@ describe('the token history SQL rules (e2e)', () => {
     expect(
       await sums(['1', '1e-81', `0.${'0'.repeat(80)}1`, '1e40', `1${'0'.repeat(40)}`, '-1e40']),
     ).toMatchObject({ s_unfit: 5 });
+  });
+
+  it('FLOWS_BY_TX_SQL agrees with flowsOfTransaction on 1,000 generated transactions', async () => {
+    const rnd = seededRandom(5);
+    // amounts the decimal holds, and now and then one it cannot (1e-81, 1e40)
+    const amount = (): string => {
+      const r = rnd();
+      if (r < 0.25) return '0';
+      if (r < 0.28) return rnd() < 0.5 ? new BigNumber('1e-81').toFixed() : new BigNumber('1e40').toFixed();
+      const digits = 1 + Math.floor(rnd() * 12);
+      const mantissa = Math.floor(rnd() * 10 ** digits) + 1;
+      return new BigNumber(mantissa).shiftedBy(-Math.floor(rnd() * 14)).toFixed();
+    };
+    const txs: Array<{ ledger: number; clawback: boolean; changes: ChangeAmounts[] }> = [];
+    const rows: TokenHolderChangesRow[] = [];
+    for (let t = 0; t < 1_000; t++) {
+      const ledger = 10_000 + t;
+      const clawback = rnd() < 0.2;
+      const changes: ChangeAmounts[] = [];
+      const n = 1 + Math.floor(rnd() * 5);
+      for (let i = 0; i < n; i++) {
+        const c = { before: amount(), after: amount(), beforeKnown: rnd() > 0.1 };
+        changes.push(c);
+        rows.push({
+          generation: 1,
+          issuer: 'rIssuer',
+          currency: 'USD',
+          ledger_index: ledger,
+          tx_index: 0,
+          node_index: i,
+          holder: `rHolder${i}`,
+          close_time: 1_700_000_000 + t,
+          clawback: clawback ? 1 : 0,
+          amount_before: c.before,
+          amount_after: c.after,
+          counted_before: 1,
+          counted_after: 1,
+          before_known: c.beforeKnown ? 1 : 0,
+          limit: '0',
+          frozen: 0,
+          authorized: 0,
+          escrowed: '0',
+          order_exp: 0,
+          order_mant: '0',
+        });
+      }
+      txs.push({ ledger, clawback, changes });
+    }
+    await ch.insert(Table.TokenHolderChanges, rows);
+    const got = await ch.query<{
+      ledger_index: number;
+      clawback: number;
+      changes: number;
+      unknown_before: number;
+      unfit: number;
+      issued: string;
+      redeemed: string;
+      clawed_back: string;
+      transferred: string;
+      transfers: number;
+    }>(
+      `WITH token_changes AS (SELECT * FROM ${Table.TokenHolderChanges} WHERE generation = 1)
+       SELECT ledger_index, clawback, changes, unknown_before, unfit, toString(issued) AS issued, toString(redeemed) AS redeemed,
+              toString(clawed_back) AS clawed_back, toString(transferred) AS transferred, transfers
+         FROM (${FLOWS_BY_TX_SQL})
+        ORDER BY ledger_index`,
+    );
+    expect(got).toHaveLength(txs.length);
+    const unfitAmount = (a: string) => new BigNumber(a).decimalPlaces()! > 30 || new BigNumber(a).abs().isGreaterThanOrEqualTo('1e36');
+    const wrong: unknown[] = [];
+    let unfitTxs = 0;
+    got.forEach((r, i) => {
+      const tx = txs[i];
+      const knownUnfit = tx.changes.some((c) => c.beforeKnown && (unfitAmount(c.before) || unfitAmount(c.after)));
+      if ((r.unfit > 0) !== knownUnfit) wrong.push({ tx, r, knownUnfit });
+      if (r.unfit > 0) {
+        unfitTxs++;
+        return;
+      }
+      const want = flowsOfTransaction(tx.changes, tx.clawback);
+      const fromSql = {
+        issued: r.issued,
+        redeemed: r.redeemed,
+        clawed_back: r.clawed_back,
+        transferred: r.transferred,
+        transfers: r.transfers,
+        unknown_before: r.unknown_before,
+      };
+      if (JSON.stringify(fromSql) !== JSON.stringify(want) || r.changes !== tx.changes.length) wrong.push({ tx, r, want });
+    });
+    expect(wrong).toEqual([]);
+    expect(unfitTxs).toBeGreaterThan(0);
+    expect(unfitTxs).toBeLessThan(txs.length / 2);
   });
 
   it('orderKeySql of an MPT is its integer', async () => {

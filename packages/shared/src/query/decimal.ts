@@ -126,7 +126,7 @@ export function sumOf(unfit: number, exact: string | null, float: number | null)
  * `exactAmount` (at most `EXACT_SCALE` decimal places, a magnitude below `EXACT_LIMIT`), and `NULL` when the decimal cannot hold
  * the amount whole. The token history's tables have no shadow, so the magnitude is read from the text.
  */
-function exactAmountOfText(column: string): string {
+export function exactAmountOfText(column: string): string {
   const places =
     `toInt64(if(position(${column}, '.') = 0, 0, length(splitByChar('e', ${column})[1]) - position(${column}, '.')))` +
     ` - toInt64OrZero(replaceOne(splitByChar('e', ${column})[2], '+', ''))`;
