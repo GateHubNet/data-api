@@ -338,6 +338,9 @@ The worker builds nothing itself. The answers keep the live generation's `covera
   - while a `range-ingest` run is in progress (an `ingest_log` range whose newest row is `started`, the live intents left out);
   - while the worker's lease shows no worker (the build needs its live windows above `h0`).
 - It checks the same `range-ingest` condition between batches, and stops with the generation `retired` if one starts: the build would read a history that is changing.
+- It renews its lease every 10 s only while the lease's newest row is still its own. Between batches, and before each state patch, it stops
+  (exit 3, the generation left `building`) once another holder is newest, or once no renewal has landed for 20 s, before the 30 s TTL
+  lets another build start. It releases the lease at the end only while the lease is still its own.
 - It resumes a building generation of the current config and coverage if there is one, else it starts a new one at `h0` = the commit marker.
 - It logs its progress as `range-ingest` does (phase, cursor, rows, rate), and exits when its last phase is done.
 - It runs its statements as `INSERT … SELECT` in ClickHouse with `max_threads = TOKEN_HISTORY_BUILD_THREADS` (default 4; `--threads` sets it), and does little work in Node.

@@ -275,6 +275,72 @@ describe('the token history build (e2e)', () => {
     });
   });
 
+  it('stops between two batches once another build took its lease, and leaves that lease and the state alone', async () => {
+    const ch = await fresh();
+    await seedBuildWorld(ch);
+    const name = buildLeaseName(NETWORK);
+    // a second build that found this one's lease expired (its renewals failing) took it, just after the first batch's step
+    let cursor: string | undefined;
+    const losing = new Proxy(ch, {
+      get(target, prop, receiver) {
+        if (prop !== 'command') return Reflect.get(target, prop, receiver);
+        return async (q: string, p?: Record<string, unknown>, o?: never) => {
+          await target.command(q, p, o);
+          const first =
+            cursor === undefined &&
+            q.includes(`INSERT INTO ${Table.TokenHistoryState}`) &&
+            typeof p?.p_account_cursor === 'string' &&
+            p.p_account_cursor !== '';
+          if (first) {
+            cursor = String(p!.p_account_cursor);
+            await writeLease(target, name, 'another-build');
+          }
+        };
+      },
+    });
+    await expect(build(losing, { leaseSettleMs: 0 })).rejects.toBeInstanceOf(BuildStopped);
+    expect(cursor).toBeDefined();
+    expect((await readLease(ch, name)).holder).toBe('another-build');
+    const [state] = await readTokenHistoryStates(ch);
+    expect(state).toMatchObject({ state: 'building', phase: 'changes', account_cursor: cursor });
+  });
+
+  it('stops before its lease can expire once no renewal has landed for two heartbeats, and releases it', async () => {
+    const ch = await fresh();
+    await seedBuildWorld(ch);
+    const name = buildLeaseName(NETWORK);
+    // after the first batch's step the clock passes 25 s without a renewal (the heartbeat's statements failing, say)
+    let cursor: string | undefined;
+    const realNow = Date.now.bind(Date);
+    const clock = jest.spyOn(Date, 'now');
+    const stalling = new Proxy(ch, {
+      get(target, prop, receiver) {
+        if (prop !== 'command') return Reflect.get(target, prop, receiver);
+        return async (q: string, p?: Record<string, unknown>, o?: never) => {
+          await target.command(q, p, o);
+          const first =
+            cursor === undefined &&
+            q.includes(`INSERT INTO ${Table.TokenHistoryState}`) &&
+            typeof p?.p_account_cursor === 'string' &&
+            p.p_account_cursor !== '';
+          if (first) {
+            cursor = String(p!.p_account_cursor);
+            clock.mockImplementation(() => realNow() + 25_000);
+          }
+        };
+      },
+    });
+    try {
+      await expect(build(stalling, { leaseSettleMs: 0, now: realNow })).rejects.toThrow(/no renewal landed for 20 s/);
+    } finally {
+      clock.mockRestore();
+    }
+    expect(cursor).toBeDefined();
+    expect((await readLease(ch, name)).holder).toBe('');
+    const [state] = await readTokenHistoryStates(ch);
+    expect(state).toMatchObject({ state: 'building', phase: 'changes', account_cursor: cursor });
+  });
+
   it('a phase patch lost to a concurrent patch of the worker is written again', async () => {
     const ch = await fresh();
     await seedBuildWorld(ch);
