@@ -67,7 +67,7 @@ export async function levelsDoneThrough(ch: ClickHouseService, g: number, token:
 }
 
 /** A ledger with changes of the token: how many (each once), the change of its trust lines, and the hour it closes in. */
-interface LedgerRead {
+export interface LedgerRead {
   ledger_index: number;
   hour: number;
   changes: string;
@@ -86,11 +86,15 @@ const LEDGER_TOTALS_SQL = `SELECT ledger_index, toUnixTimestamp(toStartOfHour(an
  ORDER BY ledger_index
  LIMIT {limit:UInt32}`;
 
+/** How many ledgers' totals a slice reads at a time while it counts its changes. */
+const SLICE_READ_LEDGERS = 100_000;
+
 /**
- * The next slice of the token after `after`: at most `slice` ledgers, cut back to the end of an hour when the read stopped at its cap.
- * When one hour alone has more ledgers, the slice is that whole hour.
+ * The next slice of the token after `after`: its ledgers up to the first at which the slice holds `slice` changes, cut back to the end
+ * of an hour when it stopped there. When one hour alone has more changes, the slice is that whole hour. The totals are read
+ * `SLICE_READ_LEDGERS` ledgers at a time, in order, so that a slice reads no further than its own ledgers and a few granules.
  */
-async function nextSlice(
+export async function nextLevelsSlice(
   ch: ClickHouseService,
   g: number,
   token: TokenKey,
@@ -98,15 +102,34 @@ async function nextSlice(
   upTo: number,
   slice: number,
 ): Promise<LedgerRead[]> {
-  const params = { g, ...token, after, upTo };
-  const read = await ch.query<LedgerRead>(LEDGER_TOTALS_SQL, { ...params, limit: slice }, IN_ORDER);
-  if (read.length < slice) return read;
-  const lastHour = read[read.length - 1].hour;
-  const whole = read.filter((r) => r.hour < lastHour);
+  const params = { g, ...token, upTo };
+  const rows: LedgerRead[] = [];
+  let changes = 0;
+  let capped = false;
+  for (let cursor = after; !capped; ) {
+    const read = await ch.query<LedgerRead>(
+      LEDGER_TOTALS_SQL,
+      { ...params, after: cursor, limit: SLICE_READ_LEDGERS },
+      IN_ORDER,
+    );
+    for (const r of read) {
+      rows.push(r);
+      changes += Number(r.changes);
+      if (changes >= slice) {
+        capped = true;
+        break;
+      }
+    }
+    if (read.length < SLICE_READ_LEDGERS) break;
+    cursor = read[read.length - 1].ledger_index;
+  }
+  if (!capped) return rows;
+  const lastHour = rows[rows.length - 1].hour;
+  const whole = rows.filter((r) => r.hour < lastHour);
   if (whole.length > 0) return whole;
   const hour = await ledgersOfHour(ch, lastHour);
   const end = Math.min(upTo, hour?.last ?? upTo);
-  return ch.query<LedgerRead>(LEDGER_TOTALS_SQL, { ...params, upTo: end, limit: 4_294_967_295 }, IN_ORDER);
+  return ch.query<LedgerRead>(LEDGER_TOTALS_SQL, { ...params, after, upTo: end, limit: 4_294_967_295 }, IN_ORDER);
 }
 
 /** Whether `Decimal256(30)` holds a supply whole, as `exactAmount`'s rule says. */
@@ -185,7 +208,7 @@ export async function buildTokenLevels(
 
   for (;;) {
     if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
-    const read = await nextSlice(ch, g, token, after, upTo, slice);
+    const read = await nextLevelsSlice(ch, g, token, after, upTo, slice);
     if (read.length === 0) break;
     const firstHour = read[0].hour;
     const levels = await levelsBefore(ch, g, token, firstHour);
@@ -240,7 +263,14 @@ export async function buildTokenLevels(
     if (!exact) {
       opts.onUnfit?.();
       const hours = [...new Set(read.map((r) => r.hour))];
-      await writeHourSets(ch, g, token, hours.map((h) => new Date(h * 1000)), upTo, { version });
+      await writeHourSets(
+        ch,
+        g,
+        token,
+        hours.map((h) => new Date(h * 1000)),
+        upTo,
+        { version },
+      );
       done.hours += hours.length;
     }
     after = to;

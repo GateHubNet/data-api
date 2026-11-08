@@ -8,7 +8,7 @@ import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
 import { runTokenHistoryBuild } from '../src/token-history/build/run-build';
 import { holdersAt, totalsAt } from '../src/token-history/holders-at';
-import { applyLiveWindow, OlderParserWindow } from '../src/token-history/live-window';
+import { applyLiveWindow, chunksOf, OlderParserWindow, windowHistories } from '../src/token-history/live-window';
 import { readTokenHistoryStates, writeTokenHistoryState } from '../src/token-history/state';
 import { mptIssuanceId } from '../src/util/mpt';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
@@ -51,7 +51,12 @@ async function seedMpt(ch: ClickHouseService, first: number): Promise<void> {
   await ch.insert(Table.MptHolderStates, rows);
   await ch.insert(
     Table.MptTouches,
-    rows.map((r) => ({ ledger_index: r.ledger_index, tx_index: r.tx_index, mpt_issuance_id: r.mpt_issuance_id, holder: r.holder })),
+    rows.map((r) => ({
+      ledger_index: r.ledger_index,
+      tx_index: r.tx_index,
+      mpt_issuance_id: r.mpt_issuance_id,
+      holder: r.holder,
+    })),
   );
 }
 
@@ -160,7 +165,10 @@ describe('live windows of the token history (e2e)', () => {
       const [a] = await readTokenHistoryStates(built);
       const [b] = await readTokenHistoryStates(live);
       expect(a.through_ledger).toBe(world.head);
-      expect({ through: b.through_ledger, levels: b.levels_through }).toEqual({ through: world.head, levels: world.head });
+      expect({ through: b.through_ledger, levels: b.levels_through }).toEqual({
+        through: world.head,
+        levels: world.head,
+      });
       const rows = await live.query<{ t: string; r: string }>(TABLES, { g: 1 });
       expect(new Set(rows.map((r) => r.t))).toEqual(new Set(['changes', 'checkpoints', 'heads', 'hours']));
       expect(rows).toEqual(await built.query(TABLES, { g: 1 }));
@@ -173,7 +181,9 @@ describe('live windows of the token history (e2e)', () => {
       const sort = (a: { holder: string }, b: { holder: string }) => (a.holder < b.holder ? -1 : 1);
       for (const token of tokens) {
         for (let n = world.first; n <= world.head; n++) {
-          expect((await holdersAt(live, 1, token, n)).sort(sort)).toEqual((await holdersAt(built, 1, token, n)).sort(sort));
+          expect((await holdersAt(live, 1, token, n)).sort(sort)).toEqual(
+            (await holdersAt(built, 1, token, n)).sort(sort),
+          );
           expect(await totalsAt(live, 1, token, n)).toEqual(await totalsAt(built, 1, token, n));
         }
       }
@@ -190,7 +200,8 @@ describe('live windows of the token history (e2e)', () => {
           ).map((r) => [r.k, r.final]),
         );
       const a = await finals(built);
-      for (const [k, final] of await finals(live)) if (final === 1) expect({ k, final: a.get(k) }).toEqual({ k, final: 1 });
+      for (const [k, final] of await finals(live))
+        if (final === 1) expect({ k, final: a.get(k) }).toEqual({ k, final: 1 });
     });
   });
 
@@ -296,5 +307,49 @@ describe('live windows of the token history (e2e)', () => {
     await expect(window).rejects.toThrow(`${world.head}`);
     const [state] = await readTokenHistoryStates(ch);
     expect(state.through_ledger).toBe(world.head);
+  });
+
+  describe('keys beyond what one parameter holds', () => {
+    it('chunksOf cuts a list in order into lists of at most the size', () => {
+      expect(chunksOf([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]]);
+      expect(chunksOf([], 2)).toEqual([]);
+    });
+
+    it('windowHistories reads the state rows of 4,500 lines of one ledger (both sides), more than one URL parameter holds', async () => {
+      const ch = await fresh();
+      const L = 5_000;
+      const issuer = 'rIssuerOfFourThousandLines000000';
+      const lines = Array.from({ length: 4_500 }, (_, i) => ({
+        account: `rHolderOfManyLines${String(i).padStart(14, '0')}`,
+        counterparty: issuer,
+        currency: 'BRS',
+      }));
+      const row = SAMPLE_ROWS[Table.TrustLineStates];
+      await ch.insert(
+        Table.TrustLineStates,
+        lines.flatMap((l, i) => [
+          {
+            ...row,
+            account: l.account,
+            counterparty: l.counterparty,
+            currency: l.currency,
+            ledger_index: L,
+            tx_index: i,
+            balance: '5',
+          },
+          {
+            ...row,
+            account: l.counterparty,
+            counterparty: l.account,
+            currency: l.currency,
+            ledger_index: L,
+            tx_index: i,
+            balance: '-5',
+          },
+        ]),
+      );
+      const histories = await windowHistories(ch, lines, [], L - 1, L);
+      expect(histories.size).toBe(9_000);
+    });
   });
 });

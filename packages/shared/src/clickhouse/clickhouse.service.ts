@@ -54,6 +54,14 @@ export class ClickHouseService implements OnApplicationShutdown {
     });
   }
 
+  /**
+   * A client of the same server, user and database with some of the config replaced: a caller whose statements may take minutes (the
+   * token history's catch-up and repair) gets the guards lifted without changing every other caller's. The caller closes it.
+   */
+  derive(overrides: Partial<ClickHouseConfig>): ClickHouseService {
+    return new ClickHouseService({ ...this.config, ...overrides });
+  }
+
   /** Per-query safety guards (wall-clock + memory cap) applied to every SELECT. */
   private get queryGuards(): ClickHouseSettings {
     const guards: ClickHouseSettings = {};

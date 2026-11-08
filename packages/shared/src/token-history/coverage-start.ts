@@ -1,7 +1,11 @@
 import { stateCoverageStart } from '../aggregate/tokens.job';
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
+import { MPT_PARSER_VERSION } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { firstCommittedLedger } from '../ingest/ingest-state';
+import { getNetworkProfile, NetworkName } from '../network';
+import { coverageFrom } from '../query/parser-coverage';
+import { loadAmendmentsConfig } from '../validators/amendments-config';
 
 /**
  * Where a generation of the token history starts (spec 4.6): the first ledger of the newest unbroken run of stored ledgers that
@@ -66,4 +70,30 @@ export async function rangeIngestRunning(ch: ClickHouseService): Promise<boolean
     { live: LIVE_INTENT_RUN_PREFIX },
   );
   return rows.length > 0;
+}
+
+/**
+ * Whether the MPT history of a coverage that starts at `from` is whole (spec 6): it starts at or before the ledger `MPTokensV1` was
+ * enabled in, and every ledger from there was written by a parser that records MPT states (`MPT_PARSER_VERSION`; the state coverage
+ * of `from` is parser 3's, which wrote none). An older parser's ledger above the enable ledger leaves the MPT states before it missing.
+ */
+export async function mptCoverageComplete(ch: ClickHouseService, network: string, from: number): Promise<boolean> {
+  const enabled = loadAmendmentsConfig(getNetworkProfile(network as NetworkName)).byName.get('MPTokensV1')?.enabled
+    ?.ledger_index;
+  if (enabled === undefined) return false;
+  const mptFrom = await mptCoverageFrom(ch);
+  return mptFrom !== null && Math.max(from, mptFrom) <= enabled;
+}
+
+/** How long the start of parser 10's ledgers is kept: it moves only with a reprocess or a fill, and the worker asks every window. */
+export const MPT_COVERAGE_CACHE_MS = 60_000;
+const mptCoverageCache = new WeakMap<ClickHouseService, { at: number; value: number | null }>();
+
+/** `coverageFrom(MPT_PARSER_VERSION)` (a scan of `ledgers.parser_version`), kept `MPT_COVERAGE_CACHE_MS` for each ClickHouse service. */
+async function mptCoverageFrom(ch: ClickHouseService): Promise<number | null> {
+  const kept = mptCoverageCache.get(ch);
+  if (kept !== undefined && Date.now() - kept.at < MPT_COVERAGE_CACHE_MS) return kept.value;
+  const value = await coverageFrom(ch, MPT_PARSER_VERSION);
+  mptCoverageCache.set(ch, { at: Date.now(), value });
+  return value;
 }
