@@ -27,7 +27,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import BigNumber from 'bignumber.js';
 import { CacheService } from '../common/cache.service';
 import { badRequest, notFound } from '../common/errors';
-import { Coverage } from '../common/feature-coverage.service';
+import { Coverage, FeatureCoverageService } from '../common/feature-coverage.service';
 import { fmtTime } from '../common/format';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { encodeMarker } from '../common/pagination';
@@ -88,6 +88,7 @@ export class TokenHistoryReadsService {
     private readonly amendments: AmendmentsService,
     @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
     private readonly cache: CacheService,
+    private readonly features: FeatureCoverageService,
   ) {}
 
   /** 404 `token not found` for a token no generation can have, before any read: an LP currency, an MPT on a network without MPT. */
@@ -115,11 +116,14 @@ export class TokenHistoryReadsService {
   /** The coverage of an answer of `kind` (spec 6): the MPT rule needs the ledger `MPTokensV1` was enabled in. */
   async coverage(live: LiveTokenHistory, kind: AnyToken['kind']): Promise<Coverage> {
     let mptStart: number | undefined;
+    let mptFrom: number | undefined;
     if (kind === 'mpt') {
-      const assembly = await this.amendments.get();
+      const [assembly, mpt] = await Promise.all([this.amendments.get(), this.features.coverage('mpt')]);
       mptStart = this.amendments.find(assembly, 'MPTokensV1')?.enabled?.ledgerIndex;
+      // where parser 10's ledgers start (the feature `mpt`'s coverage, kept 60 s)
+      mptFrom = mpt.from_ledger_index;
     }
-    return tokenHistoryCoverage(live, this.profile, mptStart, kind);
+    return tokenHistoryCoverage(live, this.profile, mptStart, kind, mptFrom);
   }
 
   /** The close times (unix seconds) of stored ledgers, in one read; a ledger that is not stored has none. */
