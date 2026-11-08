@@ -177,8 +177,10 @@ export const SAMPLES = {
   } satisfies DistributionAnswer,
   snapshot: {
     result: 'success',
-    ...ENVELOPE,
+    coverage: ENVELOPE.coverage,
+    ledger_index: ENVELOPE.ledger_index,
     ledger_hash: 'AB'.repeat(32),
+    close_time: ENVELOPE.close_time,
     token: { currency: 'USD', issuer: ISSUER, kind: 'issued', code: 'USD' },
     supply: '1250000.5',
     holders: 1_204,

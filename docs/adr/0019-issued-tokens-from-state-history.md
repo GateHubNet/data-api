@@ -71,3 +71,10 @@ issuer's toml says of it, its biggest holders and its recent transfers. The inde
 ## Amendment (2026-10-31): the hook of `tokens` is no longer the last
 
 Decision 4 and the consequence on a job that cannot read its tables call the hook of `tokens` the last of `hooksOfSlice`. Since D9 ([ADR-0020](0020-mpt-data.md)) the hook of `mpt_state` runs after it, so that is no longer so. Nothing else of those two passages changes: a hook that fails still fails the slice, the slice stays in `agg_dirty` and its hooks run again, so a `tokens` hook that throws holds back `mpt_state`'s hook of that slice as well.
+
+## Note (2026-11-08): the history this record deferred
+
+Decision 9 kept no supply or holders history. [ADR-0021](0021-token-history-in-clickhouse.md) keeps it: the token history, a change log of
+every counting line with checkpoints and hourly rollups, in generations of its own, serves a token's holders, supply and flows at any indexed
+ledger. The `tokens` job, its generations and D6's routes stay as this record decided them, except D6's `/holders`, which reads the token
+history once it is built ([ADR-0010](0010-ripple-v2-wire-compatibility.md) Amendment 12, item 123).
