@@ -215,17 +215,19 @@ describe('AppModule on a real ClickHouse', () => {
     await expect(bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' })).rejects.toThrow(
       /lacks the schema of 014_issued_tokens\.sql \(table state_touches, table token_generations, table token_lines, table tokens\), which the aggregator worker reads and writes/,
     );
-    // the same database lets a syncer without a worker that needs 014 start, and the migrations (015 and 017 too: the aggregator needs
-    // the tables of the supply job and of the mpt_state job as well) let the aggregator start
+    // the same database lets a syncer without a worker that needs 014 start, and the migrations (015, 017 and 019 too: the aggregator
+    // needs the tables of the supply job and of the mpt_state job, and the token history's dirty ranges, as well) let the aggregator start
     await bootApp({ GH_CLICKHOUSE_DATABASE: database });
     await closeApp();
-    await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql', '017_mpt.sql'], (schemaDir) =>
-      bootApp({
-        GH_CLICKHOUSE_DATABASE: database,
-        GH_WORKERS: 'aggregator',
-        GH_RUN_MIGRATIONS_ON_BOOT: 'true',
-        GH_SCHEMA_DIR: schemaDir,
-      }),
+    await withMigrations(
+      ['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql', '017_mpt.sql', '019_token_history.sql'],
+      (schemaDir) =>
+        bootApp({
+          GH_CLICKHOUSE_DATABASE: database,
+          GH_WORKERS: 'aggregator',
+          GH_RUN_MIGRATIONS_ON_BOOT: 'true',
+          GH_SCHEMA_DIR: schemaDir,
+        }),
     );
     expect(await tablesOf(database)).toEqual(
       expect.arrayContaining(['state_touches', 'token_generations', 'token_lines', 'tokens']),
