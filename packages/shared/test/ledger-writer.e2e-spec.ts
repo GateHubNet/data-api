@@ -67,6 +67,12 @@ const COUNTED_TABLES: Table[] = ALL_TABLES.filter((t) => !MERGED_TABLES.includes
  */
 const COLLECTOR_DEDUP_TABLES: Table[] = [Table.ValidatorValidations, Table.ValidatorSeen];
 
+/**
+ * The derived tables with a dedup window: the token history's change log (migration 019), whose batches are written with dedup
+ * tokens so that a retried one does not count twice. It is no ledger table: ingest recovery and the retention never delete from it.
+ */
+const DERIVED_DEDUP_TABLES: Table[] = [Table.TokenHolderChanges];
+
 /** The ledger tables of the AMM data: child tables like the others, with rows from the AMM parser. */
 const AMM_LEDGER_TABLES: Table[] = [
   Table.AmmPoolStates,
@@ -1836,7 +1842,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   });
 
   describe('schema contract', () => {
-    it('LEDGER_KEYED_TABLES all have a dedup window, partitioned as declared; the collector tables are the only others', async () => {
+    it('LEDGER_KEYED_TABLES all have a dedup window, partitioned as declared; the collector tables and the change log are the only others', async () => {
       const svc = await freshService();
       const tables = await svc.query<{ name: string; partition_key: string }>(
         "SELECT name, partition_key FROM system.tables WHERE database = currentDatabase() AND engine_full LIKE '%non_replicated_deduplication_window%'",
@@ -1844,7 +1850,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const withWindow = new Set(tables.map((t) => t.name));
       for (const table of ALL_TABLES)
         expect({ table, hasWindow: withWindow.has(table) }).toEqual({ table, hasWindow: true });
-      expect(withWindow).toEqual(new Set([...ALL_TABLES, ...COLLECTOR_DEDUP_TABLES]));
+      expect(withWindow).toEqual(new Set([...ALL_TABLES, ...COLLECTOR_DEDUP_TABLES, ...DERIVED_DEDUP_TABLES]));
+      for (const table of DERIVED_DEDUP_TABLES) expect(ALL_TABLES).not.toContain(table);
       // The ledgers table, ledger_by_hash and the child tables are exactly the ones LedgerWriter writes.
       const childTables = new Set(CHILD_TABLES.map(([t]) => t));
       expect(new Set(ALL_TABLES)).toEqual(new Set([Table.Ledgers, Table.LedgerByHash, ...childTables]));
