@@ -1375,7 +1375,9 @@ head, repairs after a re-ingest, catches a finished build's levels up and promot
 2. applies **live windows** until every generation that is live or building is at the head;
 3. then, while what is left of `TOKEN_HISTORY_PASS_BUDGET_MS` (1 s, counted from the start of the pass) lasts, takes **one step**: the **catch-up** of a
    generation whose levels are behind its changes (a live one, or a building one whose build is `done`); else the **repair** of the oldest range of
-   `token_history_dirty`, and, when there was no range to work on, the **DEX hours** of the final `pair_hourly` hours, as many as the budget allows;
+   `token_history_dirty`, and, unless that step repaired a range (a range that waits for a rebuild does not stop them), the **DEX hours** of the final
+   `pair_hourly` hours, as many as the budget allows. The catch-up and the repair run on a client of the same database with the build's lifted guards
+   (a request timeout of an hour and no `max_execution_time`; `ClickHouseService.derive`), the rest of the worker on the syncer's;
 4. promotes a finished build that is near the head, drops the partitions of the generations retired 15 minutes ago, sets the gauges, and every
    `TOKEN_HISTORY_CHECK_MS` (10 minutes, and at the first pass) checks whether a build is due.
 
@@ -1431,8 +1433,13 @@ the generation's own (`Token history: the partitions of retired generation <g> a
   due (`repair`), and its promotion clears them;
 - otherwise its part in `[coverage_from, through_ledger]` is **repaired**, in the live generation and in a building one whose build is `done`: the change rows of the
   tokens that `state_touches` and `mpt_touches` name in the range are deleted (a lightweight `DELETE` that the worker waits for) and written again from the state tables;
-  then those tokens' checkpoints, heads and hour rows from the hour of the range's first ledger on are deleted and built again from the checkpoint before it, up to
+  then, for each side of a line (or MPT pair) the range changed, the change of its first state row after the range (up to `through_ledger`) is written again from the
+  repaired state, which it starts from (a change that kept the state the repair replaced as its before-state would shift every sum of deltas after it); then
+  those tokens' checkpoints, heads and hour rows from the hour of the range's first ledger on are deleted and built again from the checkpoint before it, up to
   `levels_through`; last the range row is deleted.
+
+Every read and delete of the worker that names lines, MPT pairs or tokens binds at most `TOKEN_HISTORY_KEYS_CHUNK` (1,000) keys a parameter, chunk after chunk:
+query parameters travel in the URL, and ClickHouse refuses one over 128 KiB, which a ledger of a few thousand touched lines would reach.
 
 Between the rewrite and the end of the repair the token history is eventual, as every aggregate is after a re-ingest (ADR-0008): a token's rows of the range are
 missing between the delete and the insert.

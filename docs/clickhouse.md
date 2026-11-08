@@ -178,7 +178,8 @@ The expensive query families are the ones that read a lot by design: `/v2/stats`
 reduce windows, and filtered `balance_changes`. They are bounded by the guards above and by their own window parameters.
 `/v2/exchanges` over all pairs reads windows of ledgers since Ruling R107 (see [reading a page](#reading-a-page-what-stops-the-read)).
 
-**`token-history-build` lifts the 30 s guards for its own client**: no statement of a mainnet build stays under them, so its request timeout is 6 hours
+**The `token_history` worker's catch-up and repair lift them too**, on a client derived from the syncer's (`ClickHouseService.derive`: a request timeout of an
+hour, no `max_execution_time`); its live windows keep the syncer's. **`token-history-build` lifts the 30 s guards for its own client**: no statement of a mainnet build stays under them, so its request timeout is 6 hours
 (`BUILD_REQUEST_TIMEOUT_MS`) and `max_execution_time` is off, unless `GH_CLICKHOUSE_REQUEST_TIMEOUT` or `GH_CLICKHOUSE_MAX_EXECUTION_TIME` is set; `--threads`
 (default 4) is its `max_threads`. Its peak memory was set by the largest account of a `changes` batch (667 MiB for an issuer of 200,000 lines, the same at 1x and
 8x of the synthetic shape) and by the DEX scan of a partition (575 MiB): an issuer with millions of lines in one batch needs proportionally more

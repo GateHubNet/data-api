@@ -5324,7 +5324,8 @@ What every route of the section shares:
 - **The envelope** is `result, coverage, ledger_index, close_time, …`. `ledger_index` is the ledger the answer is as of: the one the
   request names, or the newest ledger of the token history (it follows the head by a few seconds). `coverage` is the feature
   `token_history`: `from_ledger_index` is the first ledger of the history the token history was built on, and `complete` is true when
-  that is the network's first ledger (for an MPT: the ledger `MPTokensV1` was enabled in). Until the history is filled, a line untouched
+  that is the network's first ledger (for an MPT: the ledger `MPTokensV1` was enabled in, with every ledger from there written by the parser that records
+  MPT states; `from_ledger_index` is that parser's start when it is later). Until the history is filled, a line untouched
   since `from_ledger_index` is missing from every figure, and the first change of a line that existed before has no flow (`unknown_before`).
 - **`{token}`** is D6's `{currency}.{issuer}` (split at its last `.`, `+` or `|`, with D6's messages), or an MPT issuance ID: 48 hex
   digits in any case, alone or as `{issuanceId}+{issuer}` (400 `issuer does not match mpt issuance` for another issuer). On a network
