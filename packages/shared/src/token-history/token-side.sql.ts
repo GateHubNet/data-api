@@ -81,3 +81,31 @@ export function orderKeySql(column: string, kind: 'issued' | 'mpt'): { exp: stri
     mant: `if(${digits} = '', toUInt64(0), toUInt64(rightPad(${digits}, 16, '0')))`,
   };
 }
+
+/** The columns of an `mpt_holder_states` row that the token side reads, or their lags. */
+export interface MptSideColumns {
+  amount: string;
+  escrowed_amount: string;
+  deleted: string;
+}
+
+const MPT_STATE_COLUMNS: MptSideColumns = { amount: 'amount', escrowed_amount: 'escrowed_amount', deleted: 'deleted' };
+
+/** Whether an `mpt_holder_states` row counts for its MPT (spec 1: the `MPToken` is not deleted). */
+export function mptCountedSql(c: MptSideColumns = MPT_STATE_COLUMNS): string {
+  return `(${c.deleted} = 0)`;
+}
+
+/** The holder's amount of an `mpt_holder_states` row as integer text: `amount + escrowed_amount` while it counts, else `'0'`. */
+export function mptAmountSql(c: MptSideColumns = MPT_STATE_COLUMNS): string {
+  return `if(${mptCountedSql(c)}, toString(toUInt64(${c.amount}) + toUInt64(${c.escrowed_amount})), '0')`;
+}
+
+/** The escrowed part of the holder's amount as integer text, `'0'` when the `MPToken` does not count. */
+export function mptEscrowedSql(c: MptSideColumns = MPT_STATE_COLUMNS): string {
+  return `if(${mptCountedSql(c)}, toString(${c.escrowed_amount}), '0')`;
+}
+
+/** `lsfMPTLocked` and `lsfMPTAuthorized` of an `MPToken`'s flags, as the token side's `frozen` and `authorized`. */
+export const MPT_FROZEN_SQL = 'toUInt8(bitAnd(flags, 1) != 0)';
+export const MPT_AUTHORIZED_SQL = 'toUInt8(bitAnd(flags, 2) != 0)';
