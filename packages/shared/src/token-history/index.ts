@@ -5,6 +5,7 @@ export * from './token-side.sql';
 export * from './checkpoint-rule';
 export * from './flows';
 export * from './coverage-start';
+export * from './digest';
 export * from './state';
 export * from './build/changes-pass';
 export * from './holders-at';
