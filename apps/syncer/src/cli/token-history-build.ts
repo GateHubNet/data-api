@@ -34,8 +34,9 @@ It refuses to start while another build runs, while a range-ingest runs, and whi
 Ctrl-C (or a SIGTERM, as docker stop sends) stops it after the statement in flight; run it again to resume.
 
 Exit status: 0 when the build is done (the worker then catches it up to the head and promotes it), 1 when it failed or was
-interrupted (run it again to resume), 2 when it refused to start or the command line is wrong, 3 when a range-ingest started
-while it ran (the generation is retired: build again once the fill is done).`;
+interrupted (run it again to resume), 2 when it refused to start or the command line is wrong, 3 when it was stopped while it
+ran: a range-ingest started (the generation is retired: build again once the fill is done), or another build took its lease
+(that build goes on with the generation); the message says which.`;
 
 /** The command line is wrong. */
 export class UsageError extends Error {
@@ -88,7 +89,7 @@ export function buildClickHouseConfig(env: NodeJS.ProcessEnv, profile: NetworkPr
   };
 }
 
-/** The exit status of a build that threw: 2 refused, 3 stopped by a range-ingest, 1 anything else (an interrupt included). */
+/** The exit status of a build that threw: 2 refused, 3 stopped (a range-ingest, a lost lease), 1 anything else (an interrupt too). */
 export function exitCodeOf(err: unknown): number {
   if (err instanceof BuildRefused) return 2;
   if (err instanceof BuildStopped) return 3;

@@ -338,6 +338,9 @@ The worker builds nothing itself. The answers keep the live generation's `covera
   - while a `range-ingest` run is in progress (an `ingest_log` range whose newest row is `started`, the live intents left out);
   - while the worker's lease shows no worker (the build needs its live windows above `h0`).
 - It checks the same `range-ingest` condition between batches, and stops with the generation `retired` if one starts: the build would read a history that is changing.
+- It renews its lease every 10 s only while the lease's newest row is still its own. Between batches, and before each state patch, it stops
+  (exit 3, the generation left `building`) once another holder is newest, or once no renewal has landed for 20 s, before the 30 s TTL
+  lets another build start. It releases the lease at the end only while the lease is still its own.
 - It resumes a building generation of the current config and coverage if there is one, else it starts a new one at `h0` = the commit marker.
 - It logs its progress as `range-ingest` does (phase, cursor, rows, rate), and exits when its last phase is done.
 - It runs its statements as `INSERT … SELECT` in ClickHouse with `max_threads = TOKEN_HISTORY_BUILD_THREADS` (default 4; `--threads` sets it), and does little work in Node.
@@ -423,13 +426,13 @@ A build that is due raises no alert: it waits for the operator by design, and th
 ### 5.0 Common to every route
 
 - **Envelope.** `result, coverage, ledger_index, close_time, …`.
-  - `ledger_index` is the ledger the answer is as of: the one asked for, or the live generation's `through_ledger`.
+  - `ledger_index` is the ledger the answer is as of: the one asked for, or the live generation's `levels_through` (§2.5: no reader reads past it).
   - `coverage` is the feature `token_history` (§6).
 - **`{token}`.** D6's `{currency}.{issuer}` (split at its last `.`, `+` or `|`, with D6's messages), or an issuance ID: `<48hex>`, or `<48hex>+<issuer>` with
   ADR-0020's `issuer does not match mpt issuance`. On a network without MPT an issuance ID is 404 `token not found`.
 - **A ledger** (the routes marked so below): `ledger_index` (alias `ledger`), `ledger_hash` or `date` (alias `close_time`), with the trust-lines route's
   parameters and messages (`invalid ledger hash`, `invalid date format`).
-  - A ledger above `through_ledger` is 400 `ledger is not in the token history yet`.
+  - A ledger above `levels_through` is 400 `ledger is not in the token history yet`.
   - One below the coverage's `from_ledger_index` is 400 `the date provided is too old`.
 - **`exclude`.** 1 to 20 comma-separated addresses: 400 `invalid ripple address`, or `too many addresses to exclude`; duplicates are ignored.
   - The figures are unchanged, and the answer adds `excluded` (the addresses, sorted) and `without_excluded: {supply, holders, trust_lines}`.
