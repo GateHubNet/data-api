@@ -1,6 +1,6 @@
 # ADR-0021: Token history in ClickHouse: a token-ordered change log, checkpoints and hourly rollups, built by a worker of its own
 
-**Status:** Proposed (2026-11-08). Issue [#28](https://github.com/GateHubNet/data-api/issues/28); the design is
+**Status:** Accepted (2026-11-08, approved by the owner with the spec). Issue [#28](https://github.com/GateHubNet/data-api/issues/28); the design is
 [the issuer analytics spec](../superpowers/specs/2026-11-08-issuer-analytics-design.md).
 - Applies [ADR-0015](0015-historical-account-state-from-clickhouse.md)'s approach (state from the ClickHouse history, never from a node), [ADR-0019](0019-issued-tokens-from-state-history.md)'s
   generations and touch index, and [ADR-0008](0008-no-aggregate-materialized-views.md)'s rule (aggregates are tables a syncer worker writes) to the history of every token.

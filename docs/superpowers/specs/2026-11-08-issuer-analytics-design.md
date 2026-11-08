@@ -1,6 +1,6 @@
 # Issuer analytics: design
 
-Status: proposed (2026-11-08). Issue [GateHubNet/data-api#28](https://github.com/GateHubNet/data-api/issues/28). Repository `GateHubNet/data-api`, branch
+Status: approved by the owner (2026-11-08). Issue [GateHubNet/data-api#28](https://github.com/GateHubNet/data-api/issues/28). Repository `GateHubNet/data-api`, branch
 `feature/issuer-analytics`, on `master` e6b445b. The storage decision is [ADR-0021](../../adr/0021-token-history-in-clickhouse.md).
 
 - **Builds on:**
