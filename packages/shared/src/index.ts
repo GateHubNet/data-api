@@ -78,6 +78,9 @@ export * from './aggregate/token-rules';
 export * from './aggregate/tokens.job';
 export * from './aggregate/volume.job';
 
+// Token history (issuer analytics)
+export * from './token-history';
+
 // Query
 export * from './query/account-day-groups';
 export * from './query/asset';
