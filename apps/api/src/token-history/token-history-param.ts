@@ -1,7 +1,7 @@
 import { mptIssuerOf } from '@gatehub/data-api-shared';
 import { isValidClassicAddress } from 'ripple-address-codec';
 import { badRequest } from '../common/errors';
-import { parseTokenParam } from '../tokens/token-param';
+import { parseTokenParam, tokenFileStemOfPath } from '../tokens/token-param';
 
 /**
  * A token of the token history's routes (spec 5.0): an issued token, its currency in the ledger's form, or an MPT, its issuance ID
@@ -32,4 +32,15 @@ export function parseAnyToken(raw: string, native: 'XRP' | 'XAH'): AnyToken {
     return { kind: 'mpt', currency, issuer };
   }
   return { kind: 'issued', ...parseTokenParam(raw, native) };
+}
+
+/**
+ * The stem of a CSV file of a `{token}` path that `parseAnyToken` has accepted: D6's `<code or currency> <issuer>` for an issued token,
+ * `<issuance ID> <issuer>` for an MPT, the same for every spelling of the path.
+ */
+export function anyTokenFileStem(raw: string): string {
+  const mpt = MPT_PATH.exec(raw);
+  if (mpt === null) return tokenFileStemOfPath(raw);
+  const id = mpt[1].toUpperCase();
+  return `${id} ${mptIssuerOf(id)}`;
 }

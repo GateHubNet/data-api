@@ -5,7 +5,15 @@ import { Table } from '../src/clickhouse/tables';
 import { generatedAmount, seededRandom } from '../src/test-utils/token-history-cases';
 import { ChangeAmounts, flowsOfTransaction } from '../src/token-history/flows';
 import { writeHourSets } from '../src/token-history/hour-sets';
-import { dexOfWindow, windowFlows } from '../src/token-history/reads';
+import {
+  dexOfWindow,
+  flowsPeriods,
+  periodStart,
+  SupplyPoint,
+  supplySeries,
+  topCounterparties,
+  windowFlows,
+} from '../src/token-history/reads';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 import { SAMPLE_ROWS } from './sample-rows';
 
@@ -44,7 +52,7 @@ function changeLog(seed: number): Change[] {
       while (holders.size < n) holders.add(`rHolder${Math.floor(rnd() * 8)}`.padEnd(33, '0'));
       let node = 0;
       for (const holder of holders) {
-        const before = amounts.get(holder) ?? '0';
+        const before = amounts.get(holder);
         const after = rnd() < 0.2 ? '0' : new BigNumber(generatedAmount(rnd)).abs().toFixed();
         amounts.set(holder, after);
         out.push({
@@ -53,9 +61,10 @@ function changeLog(seed: number): Change[] {
           node_index: node++,
           holder,
           clawback,
-          amount_before: before,
+          amount_before: before ?? '0',
           amount_after: after,
-          counted_before: 1,
+          // a holder's first change creates its line
+          counted_before: before === undefined ? 0 : 1,
           counted_after: 1,
           before_known: rnd() < 0.1 ? 0 : 1,
         });
@@ -105,6 +114,76 @@ function bruteFlows(log: Change[], from: number, to: number) {
     unknown_before: unknown,
   };
 }
+
+/** The levels of the token after every change closed before `t` (or at ledgers up to `ledger`), from the change log. */
+function bruteLevels(log: Change[], upTo: (c: Change) => boolean) {
+  const amounts = new Map<string, string>();
+  let ledger = 0;
+  for (const c of log) {
+    if (!upTo(c)) continue;
+    amounts.set(c.holder, c.amount_after);
+    ledger = c.ledger_index;
+  }
+  const values = [...amounts.values()];
+  const supply = values.reduce((s, a) => s.plus(a), new BigNumber(0));
+  return {
+    amounts,
+    ledger,
+    supply,
+    holders: values.filter((a) => new BigNumber(a).gt(0)).length,
+    trust_lines: values.length,
+  };
+}
+
+const t = (n: BigNumber) => (n.isZero() ? '0' : n.toFixed());
+
+/** The oracle of a row of the series: the levels at its end, the flows of its ledgers, and the levels without `exclude`. */
+function brutePoint(
+  log: Change[],
+  time: number,
+  ledgers: [number, number],
+  end: (c: Change) => boolean,
+  exclude?: string[],
+): SupplyPoint {
+  const lv = bruteLevels(log, end);
+  const f = bruteFlows(log, ledgers[0], ledgers[1]);
+  const point: SupplyPoint = {
+    time,
+    ledger_index: lv.ledger,
+    supply: t(lv.supply),
+    holders: lv.holders,
+    trust_lines: lv.trust_lines,
+    issued: f.issued,
+    redeemed: f.redeemed,
+    clawed_back: f.clawed_back,
+    net: t(new BigNumber(f.issued).minus(f.redeemed).minus(f.clawed_back)),
+    unknown_before: f.unknown_before,
+  };
+  if (exclude !== undefined) {
+    let supply = lv.supply;
+    let holders = lv.holders;
+    let lines = lv.trust_lines;
+    for (const x of exclude) {
+      const a = lv.amounts.get(x);
+      if (a === undefined) continue;
+      lines -= 1;
+      if (new BigNumber(a).gt(0)) {
+        supply = supply.minus(a);
+        holders -= 1;
+      }
+    }
+    point.without_excluded = { supply: t(supply), holders, trust_lines: lines };
+  }
+  return point;
+}
+
+/** The ledgers whose close is in `[a, b)`. */
+const ledgersIn = (a: number, b: number): [number, number] => {
+  const ls = Array.from({ length: LAST - FIRST + 1 }, (_, i) => FIRST + i).filter(
+    (l) => closeOf(l) >= a && closeOf(l) < b,
+  );
+  return ls.length === 0 ? [1, 0] : [ls[0], ls[ls.length - 1]];
+};
 
 describe('the reads of the token history routes (e2e)', () => {
   let container: StartedClickHouse;
@@ -213,5 +292,160 @@ describe('the reads of the token history routes (e2e)', () => {
       complete: false,
     });
     expect(await dexOfWindow(ch, TOKEN, h0 + 4 * HOUR, h0 + 6 * HOUR)).toBeUndefined();
+  });
+  const DAY = 86_400;
+  const HOLDERS = Array.from({ length: 8 }, (_, i) => `rHolder${i}`.padEnd(33, '0'));
+
+  it('day buckets carry levels forward and sum their hours, hour buckets too, with exclude on every row', async () => {
+    for (const [interval, size] of [
+      ['hour', HOUR],
+      ['day', DAY],
+    ] as const) {
+      const from = periodStart(closeOf(FIRST), interval);
+      const to = periodStart(closeOf(LAST), interval);
+      const exclude = [HOLDERS[1], HOLDERS[3], 'rNeverHeldThisToken000000000000000'];
+      const rows = await supplySeries(ch, 1, TOKEN, {
+        interval,
+        from,
+        to,
+        toLedger: LAST,
+        descending: false,
+        limit: 1_000,
+        exclude,
+      });
+      const expected: SupplyPoint[] = [];
+      for (let b = from; b <= to; b += size) {
+        expected.push(brutePoint(log, b, ledgersIn(b, b + size), (c) => closeOf(c.ledger_index) < b + size, exclude));
+      }
+      expect({ interval, rows }).toEqual({ interval, rows: expected });
+      if (interval === 'day') expect(rows.length).toBe(2);
+    }
+  });
+
+  it('pages concatenate to the unpaged series in both directions, by hour and by ledger', async () => {
+    const from = periodStart(closeOf(FIRST), 'hour');
+    const to = periodStart(closeOf(LAST), 'hour');
+    for (const o of [
+      { interval: 'hour' as const, from, to },
+      { interval: 'ledger' as const, from: FIRST + 3, to: LAST - 3 },
+    ]) {
+      for (const descending of [false, true]) {
+        const whole = await supplySeries(ch, 1, TOKEN, { ...o, toLedger: LAST, descending, limit: 1_000 });
+        const pages: SupplyPoint[] = [];
+        let after: number | undefined;
+        for (let i = 0; i < 100; i++) {
+          const rows = await supplySeries(ch, 1, TOKEN, { ...o, toLedger: LAST, descending, limit: 3, after });
+          pages.push(...rows.slice(0, 3));
+          if (rows.length <= 3) break;
+          const last = rows[2];
+          after = o.interval === 'ledger' ? last.ledger_index : last.time;
+        }
+        expect({ o, descending, pages }).toEqual({ o, descending, pages: whole });
+      }
+    }
+  });
+
+  it('interval ledger lists the ledgers with changes, the levels after each', async () => {
+    const exclude = [HOLDERS[2]];
+    const rows = await supplySeries(ch, 1, TOKEN, {
+      interval: 'ledger',
+      from: FIRST,
+      to: LAST,
+      toLedger: LAST,
+      descending: false,
+      limit: 1_000,
+      exclude,
+    });
+    const ledgers = [...new Set(log.map((c) => c.ledger_index))];
+    expect(rows.map((r) => r.ledger_index)).toEqual(ledgers);
+    expect(rows).toEqual(ledgers.map((l) => brutePoint(log, closeOf(l), [l, l], (c) => c.ledger_index <= l, exclude)));
+  });
+
+  it('flows totals equal the sum of the periods, and the brute force, by hour, day and month', async () => {
+    const start = closeOf(FIRST + 2) + 7;
+    const end = closeOf(LAST - 1) + 1;
+    for (const interval of ['hour', 'day', 'month'] as const) {
+      const got = await flowsPeriods(ch, 1, TOKEN, { fromLedger: FIRST + 3, toLedger: LAST - 1, start, end, interval });
+      expect(got.totals).toEqual(bruteFlows(log, FIRST + 3, LAST - 1));
+      const summed = { changes: 0, transfers: 0, unknown_before: 0, issued: new BigNumber(0) };
+      for (const p of got.periods) {
+        summed.changes += p.changes;
+        summed.transfers += p.transfers;
+        summed.unknown_before += p.unknown_before;
+        summed.issued = summed.issued.plus(p.issued);
+      }
+      expect({ interval, summed: { ...summed, issued: t(summed.issued) } }).toEqual({
+        interval,
+        summed: {
+          changes: got.totals.changes,
+          transfers: got.totals.transfers,
+          unknown_before: got.totals.unknown_before,
+          issued: got.totals.issued,
+        },
+      });
+      expect(got.periods[0].start).toBe(periodStart(start, interval));
+    }
+  });
+
+  /** The brute force of the counterparties of `[from, to]`. */
+  function bruteCounterparties(from: number, to: number, n: number) {
+    const sums = new Map<string, { received: BigNumber; sent: BigNumber; changes: number }>();
+    for (const c of log) {
+      if (c.ledger_index < from || c.ledger_index > to) continue;
+      const s = sums.get(c.holder) ?? { received: new BigNumber(0), sent: new BigNumber(0), changes: 0 };
+      s.changes += 1;
+      if (c.before_known === 1) {
+        const d = new BigNumber(c.amount_after).minus(c.amount_before);
+        if (d.gt(0)) s.received = s.received.plus(d);
+        else s.sent = s.sent.minus(d);
+      }
+      sums.set(c.holder, s);
+    }
+    return [...sums.entries()]
+      .sort(([a, x], [b, y]) => y.received.plus(y.sent).comparedTo(x.received.plus(x.sent)) || (a < b ? -1 : 1))
+      .slice(0, n)
+      .map(([account, s]) => ({
+        account,
+        received: t(s.received),
+        sent: t(s.sent),
+        net: t(s.received.minus(s.sent)),
+        changes: s.changes,
+      }));
+  }
+
+  it('top counterparties of a ledger equal the brute force, a holder that only received or only sent too', async () => {
+    for (let l = FIRST; l <= LAST; l++) {
+      expect({ l, top: await topCounterparties(ch, 1, TOKEN, l, l, 10) }).toEqual({
+        l,
+        top: bruteCounterparties(l, l, 10),
+      });
+    }
+  });
+
+  it('top counterparties equal the brute force', async () => {
+    const [from, to] = [FIRST + 4, LAST - 6];
+    const sums = new Map<string, { received: BigNumber; sent: BigNumber; changes: number }>();
+    for (const c of log) {
+      if (c.ledger_index < from || c.ledger_index > to) continue;
+      const s = sums.get(c.holder) ?? { received: new BigNumber(0), sent: new BigNumber(0), changes: 0 };
+      s.changes += 1;
+      if (c.before_known === 1) {
+        const d = new BigNumber(c.amount_after).minus(c.amount_before);
+        if (d.gt(0)) s.received = s.received.plus(d);
+        else s.sent = s.sent.minus(d);
+      }
+      sums.set(c.holder, s);
+    }
+    const expected = [...sums.entries()]
+      .sort(([a, x], [b, y]) => y.received.plus(y.sent).comparedTo(x.received.plus(x.sent)) || (a < b ? -1 : 1))
+      .slice(0, 5)
+      .map(([account, s]) => ({
+        account,
+        received: t(s.received),
+        sent: t(s.sent),
+        net: t(s.received.minus(s.sent)),
+        changes: s.changes,
+      }));
+    expect(await topCounterparties(ch, 1, TOKEN, from, to, 5)).toEqual(expected);
   });
 });

@@ -18,8 +18,14 @@ import {
   TokenHistoryWorld,
   tokenMapKey,
 } from '../../../packages/shared/test/tokens-world';
-import { ISSUER_TOKENS_SCHEMA, SUMMARY_SCHEMA } from '../src/token-history/schemas';
-import { ISSUER_TOKEN_KEYS, SUMMARY_KEYS, SUMMARY_WINDOW_KEYS } from '../src/token-history/token-history-objects';
+import { FLOWS_SCHEMA, ISSUER_TOKENS_SCHEMA, SUMMARY_SCHEMA, SUPPLY_SCHEMA } from '../src/token-history/schemas';
+import {
+  FLOWS_KEYS,
+  ISSUER_TOKEN_KEYS,
+  SUMMARY_KEYS,
+  SUMMARY_WINDOW_KEYS,
+  SUPPLY_ROW_KEYS,
+} from '../src/token-history/token-history-objects';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { expectSchema } from './support/ajv';
 import { expectNoMptRead } from './support/mpt-world';
@@ -396,6 +402,176 @@ describe('the token history routes', () => {
       expect((await api.get(`${usdPath}/summary?exclude=nobody`)).body.message).toBe('invalid ripple address');
     });
 
+    describe('the supply series and the flows', () => {
+      const iso = (t: number) => `${new Date(t * 1000).toISOString().slice(0, 19)}Z`;
+      const usd = () => ({ issuer: world.gate, currency: world.usd });
+
+      /** The ledgers with a change of gate's USD, in order. */
+      async function changeLedgers(): Promise<number[]> {
+        const rows = await h.ch.query<{ ledger_index: number }>(
+          `SELECT DISTINCT ledger_index FROM ${Table.TokenHolderChanges}
+            WHERE generation = 1 AND issuer = {issuer:String} AND currency = {currency:String} ORDER BY ledger_index`,
+          usd(),
+        );
+        return rows.map((r) => Number(r.ledger_index));
+      }
+
+      it('interval ledger lists the ledgers with changes', async () => {
+        const body = (await api.ok(`${usdPath}/supply?interval=ledger&limit=1000`, 'rows')).body;
+        expectSchema(body, SUPPLY_SCHEMA);
+        const rows = body.rows as Obj[];
+        expect(rows.map((r) => r.ledger_index)).toEqual(await changeLedgers());
+        for (const r of rows) {
+          expectKeysInOrder(r, SUPPLY_ROW_KEYS);
+          const brute = (await bruteForceTokens(h.ch as never, r.ledger_index as number)).get(tokenMapKey(usd()));
+          expect({ l: r.ledger_index, supply: r.supply, holders: r.holders, trust_lines: r.trust_lines }).toEqual({
+            l: r.ledger_index,
+            ...(brute ?? { supply: '0', holders: 0, trust_lines: 0 }),
+          });
+        }
+      });
+
+      it('day buckets carry levels forward and sum their hours', async () => {
+        const body = (await api.ok(`${usdPath}/supply`, 'rows')).body;
+        expectSchema(body, SUPPLY_SCHEMA);
+        expect(body.interval).toBe('day');
+        const rows = body.rows as Obj[];
+        const last = rows[rows.length - 1];
+        const head = (await bruteForceTokens(h.ch as never, world.head)).get(tokenMapKey(usd()))!;
+        expect({ supply: last.supply, holders: last.holders, trust_lines: last.trust_lines }).toEqual(head);
+        // the day's flows are those of every ledger of the day: here the whole world
+        const flows = await bruteFlows(h.ch, usd(), world.first, world.head);
+        const summed = rows.reduce<{ issued: BigNumber; redeemed: BigNumber; clawed_back: BigNumber }>(
+          (s, r) => ({
+            issued: s.issued.plus(r.issued as string),
+            redeemed: s.redeemed.plus(r.redeemed as string),
+            clawed_back: s.clawed_back.plus(r.clawed_back as string),
+          }),
+          { issued: new BigNumber(0), redeemed: new BigNumber(0), clawed_back: new BigNumber(0) },
+        );
+        expect({
+          issued: summed.issued.toFixed(),
+          redeemed: summed.redeemed.toFixed(),
+          clawed_back: summed.clawed_back.toFixed(),
+        }).toEqual({
+          issued: flows.issued,
+          redeemed: flows.redeemed,
+          clawed_back: flows.clawed_back,
+        });
+        // by the hour, the same levels at the end
+        const hourly = (await api.ok(`${usdPath}/supply?interval=hour`, 'rows')).body.rows as Obj[];
+        expect(hourly[hourly.length - 1].supply).toBe(last.supply);
+      });
+
+      it('pages concatenate to the unpaged series in both directions', async () => {
+        for (const descending of [false, true]) {
+          const path = `${usdPath}/supply?interval=ledger&descending=${descending}`;
+          const whole = (await api.ok(`${path}&limit=1000`, 'rows')).body.rows as Obj[];
+          const pages = await api.pages<{ rows: Obj[]; marker?: string }>(path, 3, 'rows');
+          expect({ descending, rows: pages.flatMap((p) => p.rows) }).toEqual({ descending, rows: whole });
+          expect(pages.length).toBeGreaterThan(1);
+        }
+      });
+
+      it('exclude adds without_excluded to every row', async () => {
+        const [key, line] = [...(await bruteForceLines(h.ch as never, world.head)).entries()].find(
+          ([k, v]) => k.startsWith(`${tokenMapKey(usd())} `) && new BigNumber(v.line.balance).gt(0),
+        )!;
+        const holder = key.split(' ')[2];
+        const body = (await api.ok(`${usdPath}/supply?interval=ledger&limit=1000&exclude=${holder}`, 'rows')).body;
+        expectSchema(body, SUPPLY_SCHEMA);
+        expect(body.excluded).toEqual([holder]);
+        const rows = body.rows as Obj[];
+        expect(rows.every((r) => r.without_excluded !== undefined)).toBe(true);
+        const last = rows[rows.length - 1];
+        expect((last.without_excluded as Obj).supply).toBe(
+          new BigNumber(last.supply as string).minus(line.line.balance).toFixed(),
+        );
+        const day = (await api.ok(`${usdPath}/supply?exclude=${holder}`, 'rows')).body.rows as Obj[];
+        expect(day[day.length - 1].without_excluded).toEqual(last.without_excluded);
+        // the CSV has the three columns
+        const csv = await api.get(`${usdPath}/supply?interval=ledger&exclude=${holder}&format=csv`);
+        expect(csv.text.split('\n')[0]).toContain('without_excluded.supply');
+      });
+
+      it('flows totals equal the sum of the periods, and top counterparties equal the brute force', async () => {
+        const close = await closeTimes(h.ch);
+        const start = close.get(world.first)! - HOUR;
+        const end = close.get(world.head)! + HOUR;
+        const body = (
+          await api.ok(`${usdPath}/flows?start=${iso(start)}&end=${iso(end)}&interval=hour&counterparties=3`, 'totals')
+        ).body;
+        expectSchema(body, FLOWS_SCHEMA);
+        expectKeysInOrder(body, FLOWS_KEYS);
+        const brute = await bruteFlows(h.ch, usd(), world.first, world.head);
+        const totals = body.totals as Obj;
+        expect({ ...totals }).toMatchObject({
+          issued: brute.issued,
+          redeemed: brute.redeemed,
+          clawed_back: brute.clawed_back,
+          transferred: brute.transferred,
+          transfers: brute.transfers,
+          unknown_before: brute.unknown_before,
+        });
+        const periods = body.periods as Obj[];
+        const sum = (k: string) => periods.reduce((s, p) => s.plus(p[k] as string), new BigNumber(0)).toFixed();
+        expect({ issued: sum('issued'), transferred: sum('transferred') }).toEqual({
+          issued: totals.issued,
+          transferred: totals.transferred,
+        });
+        expect(periods.length).toBeGreaterThanOrEqual(2);
+        // the counterparties, by the change log
+        const changes = await h.ch.query<{
+          holder: string;
+          amount_before: string;
+          amount_after: string;
+          before_known: number;
+        }>(
+          `SELECT holder, amount_before, amount_after, before_known FROM ${Table.TokenHolderChanges}
+            WHERE generation = 1 AND issuer = {issuer:String} AND currency = {currency:String}
+            LIMIT 1 BY ledger_index, tx_index, node_index, holder`,
+          usd(),
+        );
+        const by = new Map<string, { received: BigNumber; sent: BigNumber; changes: number }>();
+        for (const c of changes) {
+          const s = by.get(c.holder) ?? { received: new BigNumber(0), sent: new BigNumber(0), changes: 0 };
+          s.changes += 1;
+          if (Number(c.before_known) === 1) {
+            const d = new BigNumber(c.amount_after).minus(c.amount_before);
+            if (d.gt(0)) s.received = s.received.plus(d);
+            else s.sent = s.sent.minus(d);
+          }
+          by.set(c.holder, s);
+        }
+        const top = [...by.entries()]
+          .sort(([a, x], [b, y]) => y.received.plus(y.sent).comparedTo(x.received.plus(x.sent)) || (a < b ? -1 : 1))
+          .slice(0, 3)
+          .map(([account, s]) => ({
+            account,
+            received: s.received.toFixed(),
+            sent: s.sent.toFixed(),
+            net: s.received.minus(s.sent).toFixed(),
+            changes: s.changes,
+          }));
+        expect(body.counterparties).toEqual(top);
+      });
+
+      it('367 days is window too large, and hour over 32 days is window too large', async () => {
+        const message = async (q: string) => (await api.get(`${usdPath}/flows?${q}`)).body.message;
+        expect(await message('start=2024-01-01&end=2025-01-01')).toBe('window too large');
+        expect(await message('start=2024-01-02&end=2025-01-01')).not.toBe('window too large');
+        expect(await message('start=2024-01-01&end=2024-02-01&interval=hour')).toBe('window too large');
+        expect(await message('start=2024-01-01&end=2024-01-31&interval=hour')).not.toBe('window too large');
+        expect(await message('end=2024-01-31')).toBe('invalid start date format');
+        expect(await message('start=2024-01-01&end=2024-01-31&interval=week')).toBe(
+          'invalid interval - use: day, hour, month',
+        );
+        expect((await api.get(`${usdPath}/supply?interval=week`)).body.message).toBe(
+          'invalid interval - use: day, hour, ledger',
+        );
+      });
+    });
+
     it('every answer validates against its schema', async () => {
       const mptBody = (await api.ok(`/v2/tokens/${mpt}/summary`, 'supply')).body;
       expect(mptBody).toMatchObject({
@@ -406,6 +582,51 @@ describe('the token history routes', () => {
       expectSchema(mptBody, SUMMARY_SCHEMA);
       expectSchema((await api.ok(`/v2/issuers/${world.nostate}/tokens`, 'tokens')).body, ISSUER_TOKENS_SCHEMA);
       expectSchema((await api.ok(`/v2/tokens/USD.${world.plain}/summary`, 'supply')).body, SUMMARY_SCHEMA);
+    });
+  });
+
+  describe('a window of many ledgers', () => {
+    let h: Harness;
+
+    beforeAll(async () => {
+      h = await startHarness({ env: NO_RATE_LIMIT });
+      const ch = h.ch;
+      const world = await seedTokenHistoryWorld(ch as never, new LedgerWriter(ch, CTX) as never, { first: 300_000 });
+      await ch.command(
+        `INSERT INTO ${Table.SyncerLease} (network, holder, heartbeat) SELECT 'xrpl:token_history', 'worker-1', now64(3)`,
+      );
+      await runTokenHistoryBuild(ch, { network: 'xrpl', hasMpt: true, threads: 2, log, leaseSettleMs: 0, ...SMALL });
+      expect(await promoteIfCaughtUp(ch, await readTokenHistoryStates(ch))).toBe(true);
+      (h as unknown as { world: TokenHistoryWorld }).world = world;
+    }, 300_000);
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('interval ledger over 100,001 ledgers is window too large for interval ledger', async () => {
+      const api = await h.api();
+      const world = (h as unknown as { world: TokenHistoryWorld }).world;
+      const path = `/v2/tokens/USD.${world.gate}/supply?interval=ledger`;
+      // a stored ledger 200,000 below the world, 40 days before it (as a fill in progress leaves one)
+      const close = await closeTimes(h.ch);
+      const old = close.get(world.first)! - 40 * 86_400;
+      const [first] = await h.ch.query<Obj>(
+        `SELECT * EXCEPT (close_time), toUnixTimestamp(close_time) AS close_time FROM ${Table.Ledgers} WHERE ledger_index = {l:UInt32}`,
+        { l: world.first },
+      );
+      await h.ch.insert(Table.Ledgers, [
+        { ...first, ledger_index: world.first - 200_000, ledger_hash: 'F'.repeat(64), close_time: old },
+      ]);
+      const iso = `${new Date(old * 1000).toISOString().slice(0, 19)}Z`;
+      const res = await api.get(`${path}&start=${iso}`);
+      expect({ status: res.status, message: res.body.message }).toEqual({
+        status: 400,
+        message: 'window too large for interval ledger',
+      });
+      // the default window, from the token's first change, is not
+      expect((await api.get(path)).status).toBe(200);
+      // nor a window of the world's own ledgers, by the hour
+      expect((await api.get(`/v2/tokens/USD.${world.gate}/supply?interval=hour&start=${iso}`)).status).toBe(200);
     });
   });
 });
