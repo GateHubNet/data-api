@@ -200,17 +200,10 @@ export async function buildTokenLevels(
     for (const t of totals) {
       changesSince += t.changes;
       if (!cps.has(t.ledger_index)) continue;
-      await ch.command(
-        `INSERT INTO ${Table.TokenCheckpoints}
-           (generation, issuer, currency, checkpoint_ledger, holder, amount, escrowed, \`limit\`, frozen, authorized, order_exp,
-            order_mant, first_ledger, last_ledger)
-         SELECT {g:UInt32}, {issuer:String}, {currency:String}, {n:UInt32}, holder, amount, escrowed, \`limit\`, frozen, authorized,
-                exp, mant, first_ledger, last_ledger
-           FROM (${holdersAtSql()})`,
-        { ...base, cp: previousCp, n: t.ledger_index },
-        { settings },
-      );
-      await writeCheckpointHead(ch, g, token, t.ledger_index, changesSince, tokenFirst, opts.onUnfit);
+      await writeCheckpoint(ch, g, token, t.ledger_index, previousCp, changesSince, tokenFirst, {
+        threads: opts.threads,
+        onUnfit: opts.onUnfit,
+      });
       done.checkpoints++;
       previousCp = t.ledger_index;
       changesSince = 0;
@@ -255,6 +248,34 @@ export async function buildTokenLevels(
     if (to >= upTo) break;
   }
   return done;
+}
+
+/**
+ * Writes a checkpoint of a token at `ledger` in generation `g` (spec 4.3): its rows, the fold of `holdersAtSql` from the previous
+ * checkpoint `previousCp` (0: none) to `ledger`, then its head, which commits it. `changesSince` is the token's changes since the
+ * previous checkpoint, `tokenFirst` the ledger of its first change. The build and the live windows both write checkpoints with it.
+ */
+export async function writeCheckpoint(
+  ch: ClickHouseService,
+  g: number,
+  token: TokenKey,
+  ledger: number,
+  previousCp: number,
+  changesSince: number,
+  tokenFirst: number,
+  o: { threads?: number; onUnfit?: () => void } = {},
+): Promise<void> {
+  await ch.command(
+    `INSERT INTO ${Table.TokenCheckpoints}
+       (generation, issuer, currency, checkpoint_ledger, holder, amount, escrowed, \`limit\`, frozen, authorized, order_exp,
+        order_mant, first_ledger, last_ledger)
+     SELECT {g:UInt32}, {issuer:String}, {currency:String}, {n:UInt32}, holder, amount, escrowed, \`limit\`, frozen, authorized,
+            exp, mant, first_ledger, last_ledger
+       FROM (${holdersAtSql()})`,
+    { g, issuer: token.issuer, currency: token.currency, cp: previousCp, n: ledger },
+    { settings: o.threads === undefined ? {} : { max_threads: o.threads } },
+  );
+  await writeCheckpointHead(ch, g, token, ledger, changesSince, tokenFirst, o.onUnfit);
 }
 
 /** Writes the head of a checkpoint just written: its totals from its rows (the supply exact), the changes since the previous one. */

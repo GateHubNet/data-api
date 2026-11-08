@@ -130,13 +130,13 @@ function withBuildSettings(ch: ClickHouseService, threads: number): ClickHouseSe
 }
 
 /** Whether a coverage that starts at `from` is complete for issued tokens (spec 6): at or before the network's first ledger. */
-function issuedComplete(network: string, from: number): boolean {
+export function issuedComplete(network: string, from: number): boolean {
   const first = getNetworkProfile(network as NetworkName).firstLedger;
   return first !== undefined && from <= first;
 }
 
 /** Whether it is complete for MPTs: at or before the ledger `MPTokensV1` was enabled in (none known on a testnet). */
-function mptComplete(network: string, from: number): boolean {
+export function mptComplete(network: string, from: number): boolean {
   const profile = getNetworkProfile(network as NetworkName);
   const enabled = loadAmendmentsConfig(profile).byName.get('MPTokensV1')?.enabled?.ledger_index;
   return enabled !== undefined && from <= enabled;
