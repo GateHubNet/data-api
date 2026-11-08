@@ -10,3 +10,4 @@ export * from './build/changes-pass';
 export * from './holders-at';
 export * from './build/levels';
 export * from './hour-sets';
+export * from './build/dex';
