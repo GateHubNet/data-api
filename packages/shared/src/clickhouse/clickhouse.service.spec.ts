@@ -130,6 +130,26 @@ describe('ClickHouseService', () => {
     });
   });
 
+  it('command resolves to nothing, whatever the server summed up', async () => {
+    client.command.mockResolvedValueOnce({ query_id: 'q', summary: { read_rows: '5', written_rows: '3' } });
+    await expect(service.command('INSERT INTO t SELECT 1')).resolves.toBeUndefined();
+  });
+
+  it("commandSummary resolves to the rows the server read and wrote, and sends what command sends", async () => {
+    client.command.mockResolvedValueOnce({ query_id: 'q', summary: { read_rows: '5000', written_rows: '3000' } });
+    await expect(
+      service.commandSummary('INSERT INTO t SELECT {n:UInt32}', { n: 1 }, { settings: { max_threads: 2 } }),
+    ).resolves.toEqual({ read_rows: 5000, written_rows: 3000 });
+    expect(client.command).toHaveBeenLastCalledWith({
+      query: 'INSERT INTO t SELECT {n:UInt32}',
+      query_params: { n: 1 },
+      clickhouse_settings: { wait_end_of_query: 1, max_threads: 2 },
+    });
+    // a server that sends no summary wrote nothing the client can count
+    client.command.mockResolvedValueOnce({ query_id: 'q' });
+    await expect(service.commandSummary('OPTIMIZE TABLE t')).resolves.toEqual({ read_rows: 0, written_rows: 0 });
+  });
+
   describe('closing the client', () => {
     it('close() closes the client of the service', async () => {
       await service.close();

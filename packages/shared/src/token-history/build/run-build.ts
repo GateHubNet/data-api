@@ -108,7 +108,7 @@ export async function writeLease(ch: ClickHouseService, name: string, holder: st
   );
 }
 
-/** `ch` with `max_threads` and the build's `log_comment` on every query and command. */
+/** `ch` with `max_threads` and the build's `log_comment` on every query and command (`commandSummary` too). */
 function withBuildSettings(ch: ClickHouseService, threads: number): ClickHouseService {
   const extra = { max_threads: threads, log_comment: TOKEN_HISTORY_BUILD_COMMENT };
   return new Proxy(ch, {
@@ -120,9 +120,9 @@ function withBuildSettings(ch: ClickHouseService, threads: number): ClickHouseSe
         return (q: string, p?: Record<string, unknown>, s: Record<string, unknown> = {}) =>
           target.queryOne(q, p, { ...extra, ...s });
       }
-      if (prop === 'command') {
+      if (prop === 'command' || prop === 'commandSummary') {
         return (q: string, p?: Record<string, unknown>, o: { settings?: Record<string, unknown>; queryId?: string } = {}) =>
-          target.command(q, p, { ...o, settings: { ...extra, ...o.settings } });
+          target[prop](q, p, { ...o, settings: { ...extra, ...o.settings } });
       }
       return Reflect.get(target, prop, receiver);
     },

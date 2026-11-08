@@ -118,7 +118,7 @@ export async function writeChangesBatch(
 ): Promise<{ rows: number }> {
   if (accounts.length === 0) return { rows: 0 };
   const token = changesBatchToken(g, 'changes', accounts[0], accounts[accounts.length - 1]);
-  const summary = await ch.command(
+  const summary = await ch.commandSummary(
     changesBatchSql(o.coverageComplete),
     { g, accounts, from: coverageFrom, h0, clawbackTypes: [...CLAWBACK_TX_TYPES] },
     { settings: batchInsertSettings(token, o.threads) },
@@ -214,7 +214,7 @@ export async function writeMptChangesBatch(
     )
   ).map((r) => r.id);
   const token = changesBatchToken(g, 'mpt_changes', holders[0], holders[holders.length - 1]);
-  const summary = await ch.command(
+  const summary = await ch.commandSummary(
     mptChangesBatchSql(o.coverageComplete),
     {
       g,

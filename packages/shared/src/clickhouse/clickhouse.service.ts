@@ -111,12 +111,20 @@ export class ClickHouseService implements OnApplicationShutdown {
     });
   }
 
+  /** Run a DDL / DML command (CREATE TABLE, ALTER, lightweight DELETE …). Values go through `params`. */
+  async command(query: string, params: Record<string, unknown> = {}, opts: CommandOptions = {}): Promise<void> {
+    await this.commandSummary(query, params, opts);
+  }
+
   /**
-   * Run a DDL / DML command (CREATE TABLE, ALTER, lightweight DELETE, INSERT … SELECT …). Values go through `params`. Resolves to
-   * the server's summary of the statement (rows read and written; 0 when the server sent none), complete because the command waits
-   * for the end of the query.
+   * `command`, resolving to the server's summary of the statement (the rows it read and wrote; 0 when the server sent none),
+   * complete because the command waits for the end of the query. For an `INSERT … SELECT` whose writer counts what it wrote.
    */
-  async command(query: string, params: Record<string, unknown> = {}, opts: CommandOptions = {}): Promise<CommandSummary> {
+  async commandSummary(
+    query: string,
+    params: Record<string, unknown> = {},
+    opts: CommandOptions = {},
+  ): Promise<CommandSummary> {
     const result = await this.client.command({
       query,
       query_params: params,

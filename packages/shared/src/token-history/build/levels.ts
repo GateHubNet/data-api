@@ -223,7 +223,7 @@ export async function buildTokenLevels(
     let exact = Number(unfit?.n ?? 0) === 0 && fitsDecimal(levels.supply);
     if (exact) {
       try {
-        const summary = await ch.command(
+        const summary = await ch.commandSummary(
           HOURS_SQL,
           {
             ...base,
@@ -385,7 +385,7 @@ export async function buildSmallTokenLevels(
     const version = String(opts.version ?? Date.now());
     for (const keys of groups) {
       if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
-      const summary = await ch.command(
+      const summary = await ch.commandSummary(
         SMALL_HOURS_SQL,
         { ...range, to: upTo, keys, final_before: finalBefore, version },
         { settings },
