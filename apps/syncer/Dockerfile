@@ -4,11 +4,12 @@
 #   NPM_TOKEN=... docker build --secret id=npm_token,env=NPM_TOKEN -f apps/syncer/Dockerfile -t gatehub/data-syncer .
 # docker compose passes it from the NPM_TOKEN environment variable (`build.secrets`, see docker-compose*.yaml).
 #
-# One image, three entry points (all relative to /app):
+# One image, four entry points (all relative to /app):
 #   node dist/main.js                                                           the syncer (default)
 #   node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js       schema migration job (GH_NETWORK picks the database)
 #   ... migrate.js shared                                                       the same for the shared database (ADR-0014)
 #   node dist/cli/range-ingest.js --from <n> --to <m>                           ledger range (re)ingest
+#   node dist/cli/token-history-build.js [--threads N]                          token history build (issuer analytics)
 #
 # Public base image (node:22.23.2-bookworm-slim).
 #
@@ -47,7 +48,8 @@ RUN --mount=type=secret,id=npm_token,required=true \
     config/definitions/xrpl-testnet.json config/definitions/xahau-testnet.json; do \
     test -f "/app/out/node_modules/@gatehub/data-api-shared/$f" || { echo "missing $f in the deployed shared package"; exit 1; }; \
   done \
-  && test -f /app/out/dist/cli/range-ingest.js
+  && test -f /app/out/dist/cli/range-ingest.js \
+  && test -f /app/out/dist/cli/token-history-build.js
 
 FROM node:22.23.2-bookworm-slim
 WORKDIR /app
