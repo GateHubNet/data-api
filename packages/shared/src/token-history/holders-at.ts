@@ -29,14 +29,12 @@ export async function checkpointAt(ch: ClickHouseService, g: number, token: Toke
   return Number(row?.cp ?? 0);
 }
 
-/** A first ledger that no line has: `min` of the candidates leaves it out. */
-const NO_LEDGER = 4_294_967_295;
-
 /**
  * Spec 3.1 as SQL: the counting lines of a token at `{n}`, one row per holder, unsorted, from the rows of its checkpoint at `{cp}`
  * (0: none) and its changes in `({cp}, {n}]`. Each holder's state is the newest of those rows (a checkpoint row ranks as
- * `(cp, 0, 0)`); `first_ledger` is the checkpoint's or else the first change where the line counted, `last_ledger` the newest
- * change. Both sources are key ranges of their tables. A row stored twice changes nothing here (`argMax`, `min` and `max` of the
+ * `(cp, 0, 0)`); `first_ledger` is the first ledger of the line's current run of counting (the checkpoint's, or the first change
+ * where the line counted since it last stopped counting), so it is the same whichever side of a checkpoint `{n}` is, and
+ * `last_ledger` is the newest change. Both sources are key ranges of their tables. A row stored twice changes nothing here (`argMax`, `min` and `max` of the
  * same values), so no source needs deduplicating. Parameters: `{g}`, `{issuer}`, `{currency}`, `{cp}`, `{n}`, and with
  * `holderFilter: 'in'` `{holders:Array(String)}`. Columns: `holder, amount, counted, limit, frozen, authorized, escrowed, exp, mant,
  * first_ledger, last_ledger`. Ready to be wrapped for ordering, paging, grouping or an `INSERT … SELECT`.
@@ -53,19 +51,21 @@ export function holdersAtSql(opts: { holderFilter?: 'in' } = {}): string {
        tupleElement(s, 6) AS escrowed,
        tupleElement(s, 7) AS exp,
        tupleElement(s, 8) AS mant,
-       min(first_candidate) AS first_ledger,
+       maxIf(rank, counted_now = 0) AS stopped,
+       arrayMin(arrayMap(x -> x.2, arrayFilter(x -> x.1 > stopped, groupArrayIf(tuple(rank, first_candidate), counted_now = 1))))
+         AS first_ledger,
        max(last_candidate) AS last_ledger
   FROM (
     SELECT holder, tuple(checkpoint_ledger, toUInt32(0), toUInt16(0)) AS rank,
            tuple(amount, toUInt8(1), \`limit\`, frozen, authorized, escrowed, order_exp, order_mant) AS state,
-           first_ledger AS first_candidate, last_ledger AS last_candidate
+           toUInt8(1) AS counted_now, first_ledger AS first_candidate, last_ledger AS last_candidate
       FROM ${Table.TokenCheckpoints}
      WHERE generation = {g:UInt32} AND issuer = {issuer:String} AND currency = {currency:String}
        AND checkpoint_ledger = {cp:UInt32}${holders}
     UNION ALL
     SELECT holder, tuple(ledger_index, tx_index, node_index) AS rank,
            tuple(amount_after, counted_after, \`limit\`, frozen, authorized, escrowed, order_exp, order_mant) AS state,
-           if(counted_after = 1, ledger_index, toUInt32(${NO_LEDGER})) AS first_candidate, ledger_index AS last_candidate
+           counted_after AS counted_now, ledger_index AS first_candidate, ledger_index AS last_candidate
       FROM ${Table.TokenHolderChanges}
      WHERE generation = {g:UInt32} AND issuer = {issuer:String} AND currency = {currency:String}
        AND ledger_index > {cp:UInt32} AND ledger_index <= {n:UInt32}${holders}

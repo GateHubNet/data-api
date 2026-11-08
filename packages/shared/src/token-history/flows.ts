@@ -65,7 +65,8 @@ const DECIMAL_ZERO = `toDecimal256(0, ${EXACT_SCALE})`;
  * currency, ledger_index, tx_index)`, with `close_time`, `clawback`, `changes`, `unknown_before`, and `net`, `issued`, `redeemed`,
  * `clawed_back`, `transferred` as `Decimal256(30)` and `transfers` (`UInt8`). The decimals are exact only when `unfit` is 0: a
  * transaction with an amount the decimal cannot hold has `unfit > 0`, and the caller sums its changes again in BigNumber
- * (`flowsOfTransaction`).
+ * (`flowsOfTransaction`). The levels' parts are there too, over every change, an unknown before-state's included: `level_net` (the
+ * supply's change, exact when `level_unfit` is 0), `holders_delta` and `lines_delta`.
  */
 export const FLOWS_BY_TX_SQL = `
 SELECT issuer, currency, ledger_index, tx_index,
@@ -80,7 +81,11 @@ SELECT issuer, currency, ledger_index, tx_index,
        if(clawback = 1, ${DECIMAL_ZERO}, greatest(-net, ${DECIMAL_ZERO})) AS redeemed,
        if(clawback = 1, greatest(-net, ${DECIMAL_ZERO}), ${DECIMAL_ZERO}) AS clawed_back,
        gain - greatest(net, ${DECIMAL_ZERO}) AS transferred,
-       toUInt8(transferred > ${DECIMAL_ZERO}) AS transfers
+       toUInt8(transferred > ${DECIMAL_ZERO}) AS transfers,
+       ifNull(sum(d_after - d_before), ${DECIMAL_ZERO}) AS level_net,
+       toUInt32(countIf(isNull(d_after) OR isNull(d_before))) AS level_unfit,
+       sum(toInt64(amount_after != '0') - toInt64(amount_before != '0')) AS holders_delta,
+       sum(toInt64(counted_after) - toInt64(counted_before)) AS lines_delta
   FROM (SELECT *, ${exactAmountOfText('amount_before')} AS d_before, ${exactAmountOfText('amount_after')} AS d_after
           FROM token_changes)
  GROUP BY issuer, currency, ledger_index, tx_index`;

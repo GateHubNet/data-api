@@ -152,11 +152,27 @@ describe('holders and totals at a ledger (e2e)', () => {
   it('carries first and last activity across the checkpoint', async () => {
     const before = new Map((await holdersAt(ch, G, usd, cp)).map((h) => [h.holder, h]));
     const after = await holdersAt(ch, G, usd, world.head);
+    // the holders whose line stopped counting after the checkpoint and counts again
+    const stopped = new Set(
+      (
+        await ch.query<{ holder: string }>(
+          `SELECT DISTINCT holder FROM ${Table.TokenHolderChanges}
+            WHERE generation = {g:UInt32} AND issuer = {issuer:String} AND currency = {currency:String}
+              AND ledger_index > {cp:UInt32} AND counted_after = 0`,
+          { g: G, ...usd, cp },
+        )
+      ).map((r) => r.holder),
+    );
     for (const h of after) {
       const was = before.get(h.holder);
-      if (was !== undefined) expect(h.first_ledger).toBe(was.first_ledger);
+      // a line that kept counting keeps the start of its run; one that stopped and came back starts a new run
+      if (was !== undefined && !stopped.has(h.holder)) expect(h.first_ledger).toBe(was.first_ledger);
       expect(h.last_ledger).toBeGreaterThanOrEqual(was?.last_ledger ?? 0);
     }
+    // the line that turned round (250 became -4) and back (7) counts again from the ledger it came back in
+    expect(stopped.has(world.later.turnedRound)).toBe(true);
+    expect(after.find((h) => h.holder === world.later.turnedRound)?.first_ledger).toBe(world.later.first + 3);
+    expect(before.get(world.later.turnedRound)?.first_ledger).toBe(world.first);
     // the holder changed twice in the second batch: its last activity is the second change
     expect(after.find((h) => h.holder === world.later.changedTwice)?.last_ledger).toBe(world.later.first + 2);
   });
