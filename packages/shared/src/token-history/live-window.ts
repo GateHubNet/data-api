@@ -38,15 +38,19 @@ export class OlderParserWindow extends Error {
 /** The steps of a window, for `afterStep`. */
 export type LiveWindowStep = 'changes' | 'hours' | 'checkpoints';
 
-export interface LiveWindowOptions {
+export interface LiveWindowOptions extends WindowLevelsOptions {
   hasMpt: boolean;
   /** The network, for whether a generation's coverage is complete (spec 6). */
   network: string;
-  /** The checkpoint floor (default `TOKEN_HISTORY_CHECKPOINT_FLOOR`; the tests lower it). */
-  floor?: number;
   /** `touchesOfWindow`'s window and line cap (default D6's: 500 ledgers, halved above 20,000 lines). */
   window?: number;
   maxLines?: number;
+}
+
+/** The options of the levels of a window. */
+export interface WindowLevelsOptions {
+  /** The checkpoint floor (default `TOKEN_HISTORY_CHECKPOINT_FLOOR`; the tests lower it). */
+  floor?: number;
   /** Called after each step of the writes (the tests stop a window there). */
   afterStep?: (step: LiveWindowStep) => void | Promise<void>;
   /** Told when a sum falls back to BigNumber. */
@@ -54,7 +58,7 @@ export interface LiveWindowOptions {
 }
 
 /** Keys of three or two columns, as zipped arrays: `(a, b, c) IN` the zip, a prefix of the key of each table read. */
-function keysIn(columns: readonly string[], arrays: readonly string[]): string {
+export function keysIn(columns: readonly string[], arrays: readonly string[]): string {
   const parameters = arrays.map((name) => `{${name}:Array(String)}`).join(', ');
   const elements = columns.map((_, i) => `tupleElement(key, ${i + 1})`).join(', ');
   return `(${columns.join(', ')}) IN (SELECT ${elements} FROM (SELECT arrayJoin(arrayZip(${parameters})) AS key))`;
@@ -281,15 +285,16 @@ const tokenKey = (t: TokenKey): string => `${t.issuer}|${t.currency}`;
 const hourOf = (closeTime: number): number => Math.floor(closeTime / 3_600) * 3_600;
 
 /**
- * The levels of a generation over its window's change rows: the hour sets of the touched (token, hour) pairs, then the checkpoints the
- * rule calls for at the window's ledgers (rows, then head).
+ * The levels of a generation over its change rows of the ledgers `(gen.through_ledger, to]`: the hour sets of the touched (token,
+ * hour) pairs, then the checkpoints the rule calls for at those ledgers (rows, then head). The live window runs it over its own change
+ * rows; a finished build's catch-up over the rows of `(levels_through, to]`, with `through_ledger` read as `levels_through`.
  */
-async function windowLevels(
+export async function windowLevels(
   ch: ClickHouseService,
   gen: TokenHistoryStateRow,
   changes: TokenHolderChangesRow[],
   to: number,
-  o: LiveWindowOptions,
+  o: WindowLevelsOptions,
 ): Promise<void> {
   const tokens = new Map<string, { token: TokenKey; hours: Set<number>; rows: TokenHolderChangesRow[] }>();
   for (const c of changes) {

@@ -13,3 +13,4 @@ export * from './hour-sets';
 export * from './build/dex';
 export * from './build/run-build';
 export * from './live-window';
+export * from './promote';
