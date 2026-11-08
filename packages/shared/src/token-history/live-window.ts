@@ -68,7 +68,7 @@ const LINE_KEYS = keysIn(['account', 'counterparty', 'currency'], ['accounts', '
 const MPT_KEYS = keysIn(['holder', 'mpt_issuance_id'], ['holders', 'ids']);
 
 /** A state row of one side of a line, or of an `MPToken`, as the window reads it. */
-interface StateRead {
+export interface StateRead {
   key: string;
   ledger_index: number;
   tx_index: number;
@@ -112,7 +112,7 @@ interface MptRow {
 }
 
 /** The rows of a window and the newest row before it, of each key, with the kind of the token. */
-interface KeyHistory {
+export interface KeyHistory {
   kind: 'issued' | 'mpt';
   before?: StateRead;
   rows: StateRead[];
@@ -122,7 +122,7 @@ interface KeyHistory {
 }
 
 /** Reads the window's state rows of the lines `lines` (both sides of each) and of the MPT pairs, and the newest rows before it. */
-async function windowHistories(
+export async function windowHistories(
   ch: ClickHouseService,
   lines: LineKey[],
   mpts: Array<{ holder: string; id: string }>,
@@ -228,7 +228,7 @@ const NOT_COUNTED = { counted: false, amount: '0' } as const;
  * generation's `through_ledger` are written (the build's pass, or an earlier window, wrote the others); every row of the window serves
  * as a before-state. Only changes where the line counted before or after.
  */
-function changesOf(
+export function changesOf(
   gen: TokenHistoryStateRow,
   histories: Map<string, KeyHistory>,
   complete: { issued: boolean; mpt: boolean },

@@ -7,6 +7,8 @@ import {
   NetworkProfile,
   promoteIfCaughtUp,
   readTokenHistoryStates,
+  repairOldestRange,
+  RepairOutcome,
   ShutdownSignals,
   TOKEN_HISTORY_LEASE_HEARTBEAT_MS,
   TOKEN_HISTORY_PASS_BUDGET_MS,
@@ -29,6 +31,8 @@ export interface TokenHistoryPass {
   windows?: number;
   /** The generation whose levels a step caught up, and to which ledger. */
   caughtUp?: { generation: number; levels_through: number };
+  /** What a repair step did, when one ran. */
+  repair?: RepairOutcome;
   /** The generation promoted. */
   promoted?: number;
   /** The retired generations dropped. */
@@ -106,7 +110,7 @@ export class TokenHistoryWorker implements OnApplicationBootstrap, OnModuleDestr
       if (window.to <= from) break;
     }
 
-    // then, within the budget, one step of a catch-up: a finished build's levels, or a live generation's behind its changes
+    // then, within the budget, one step: a catch-up (a finished build's levels, or a live generation's behind its changes), or a repair
     const budget = this.options.budgetMs ?? TOKEN_HISTORY_PASS_BUDGET_MS;
     const behind = writableOf(gens).find(
       (g) => g.levels_through < g.through_ledger && (g.state === 'live' || g.phase === 'done'),
@@ -120,6 +124,14 @@ export class TokenHistoryWorker implements OnApplicationBootstrap, OnModuleDestr
       });
       result.caughtUp = { generation: behind.generation, levels_through: levels };
       gens = await readTokenHistoryStates(this.ch);
+    } else if (now() - started < budget && this.stopping === undefined) {
+      // or one step of the repair of a range a re-ingest rewrote (spec 4.7)
+      result.repair = await repairOldestRange(this.ch, gens, {
+        hasMpt: this.profile.hasMpt,
+        network: this.cfg.network,
+        floor: this.options.floor,
+      });
+      if (result.repair === 'repaired') gens = await readTokenHistoryStates(this.ch);
     }
 
     // a finished build near the head is promoted; a generation retired 15 minutes ago is dropped
