@@ -129,11 +129,88 @@ describe('repair of the token history (e2e)', () => {
         supply: lines.reduce((s, [, { line }]) => s.plus(line.balance), new BigNumber(0)).toFixed(),
       });
     }
-    expect(new BigNumber((after.get(`${usd} ${world.head}`) as { supply: string }).supply).minus(
-      (before.get(`${usd} ${world.head}`) as { supply: string }).supply,
-    ).toFixed()).toBe('5');
-    const holder = (await holdersAt(ch, 1, { issuer: world.gate, currency: world.usd }, at)).find((h) => h.amount === '30');
+    expect(
+      new BigNumber((after.get(`${usd} ${world.head}`) as { supply: string }).supply)
+        .minus((before.get(`${usd} ${world.head}`) as { supply: string }).supply)
+        .toFixed(),
+    ).toBe('5');
+    const holder = (await holdersAt(ch, 1, { issuer: world.gate, currency: world.usd }, at)).find(
+      (h) => h.amount === '30',
+    );
     expect(holder?.last_ledger).toBe(at);
+  });
+
+  it('a changed state row of a line that changes again after the range leaves its later changes right', async () => {
+    const { ch, world } = await liveWorld();
+    const usd = tokenMapKey({ issuer: world.gate, currency: world.usd });
+    // a line of gate's USD with a state row in the range and another after it: its row at `at` holds 5 more
+    const holders = [...(await bruteForceLines(ch, world.head)).keys()]
+      .filter((k) => k.startsWith(`${usd} `))
+      .map((k) => k.slice(usd.length + 1));
+    let picked: { account: string; counterparty: string } | undefined;
+    for (const holder of holders) {
+      const [row] = await ch.query<{ n: string; l: string }>(
+        `SELECT toString(count()) AS n, toString(uniqExact(ledger_index)) AS l FROM ${Table.TrustLineStates}
+          WHERE currency = {usd:String} AND account = {gate:String} AND counterparty = {holder:String}`,
+        { usd: world.usd, gate: world.gate, holder },
+      );
+      if (Number(row.l) >= 2) {
+        picked = { account: world.gate, counterparty: holder };
+        break;
+      }
+    }
+    expect(picked).toBeDefined();
+    const { account, counterparty } = picked!;
+    const states = await ch.query<TrustLineStatesRow>(
+      `SELECT * EXCEPT (close_time), toUnixTimestamp(close_time) AS close_time FROM ${Table.TrustLineStates}
+        WHERE currency = {usd:String} AND ((account = {a:String} AND counterparty = {b:String}) OR (account = {b:String} AND counterparty = {a:String}))
+        ORDER BY ledger_index, tx_index, node_index`,
+      { usd: world.usd, a: account, b: counterparty },
+    );
+    const at = states[0].ledger_index;
+    expect(states.some((r) => r.ledger_index > at)).toBe(true);
+    const first = states.filter((r) => r.ledger_index === at && r.tx_index === states[0].tx_index);
+    await ch.command(
+      `DELETE FROM ${Table.TrustLineStates}
+        WHERE currency = {usd:String} AND ledger_index = {at:UInt32} AND tx_index = {tx:UInt32}
+          AND ((account = {a:String} AND counterparty = {b:String}) OR (account = {b:String} AND counterparty = {a:String}))`,
+      { usd: world.usd, at, tx: states[0].tx_index, a: account, b: counterparty },
+      { settings: { lightweight_deletes_sync: '2' } },
+    );
+    const more = (balance: string) =>
+      (balance.startsWith('-') ? new BigNumber(balance).minus(5) : new BigNumber(balance).plus(5)).toFixed();
+    await ch.insert(
+      Table.TrustLineStates,
+      first.map((r) => ({ ...r, balance: more(r.balance) })),
+    );
+    await appendTokenHistoryDirty(ch, at, at);
+    expect(await repairOldestRange(ch, await readTokenHistoryStates(ch), REPAIR)).toBe('repaired');
+
+    // the holder's changes chain: each starts from where the one before it ended, the later one from the repaired state
+    const chain = await ch.query<{ ledger_index: number; amount_before: string; amount_after: string }>(
+      `SELECT ledger_index, amount_before, amount_after FROM ${Table.TokenHolderChanges}
+        WHERE generation = 1 AND issuer = {gate:String} AND currency = {usd:String} AND holder = {holder:String}
+        ORDER BY ledger_index, tx_index, node_index
+        LIMIT 1 BY ledger_index, tx_index, node_index`,
+      { gate: world.gate, usd: world.usd, holder: counterparty },
+    );
+    expect(chain.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < chain.length; i++) {
+      expect({ ledger: chain[i].ledger_index, before: chain[i].amount_before }).toEqual({
+        ledger: chain[i].ledger_index,
+        before: chain[i - 1].amount_after,
+      });
+    }
+    // every ledger's totals of gate's USD are the brute force's: the later change starts from the repaired state
+    for (const n of world.ledgers) {
+      const brute = (await bruteForceLines(ch, n)).entries();
+      const lines = [...brute].filter(([k]) => k.startsWith(`${usd} `));
+      const supply = lines.reduce((s, [, { line }]) => s.plus(line.balance), new BigNumber(0)).toFixed();
+      expect({ n, supply: (await totalsAt(ch, 1, { issuer: world.gate, currency: world.usd }, n)).supply }).toEqual({
+        n,
+        supply,
+      });
+    }
   });
 
   it('a range below the live coverage is dropped', async () => {
@@ -194,7 +271,7 @@ describe('repair of the token history (e2e)', () => {
       expect(await rebuildNeeded(ch, await readTokenHistoryStates(ch), 50)).toBeUndefined();
     });
 
-    it('filling a gap that joins the head\'s run sets reason coverage', async () => {
+    it("filling a gap that joins the head's run sets reason coverage", async () => {
       const ch = await fresh();
       await ch.insert(Table.Ledgers, [...range(10, 20), ...range(30, 50)].map(ledger));
       await writeTokenHistoryState(ch, live());

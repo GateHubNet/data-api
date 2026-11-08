@@ -1,15 +1,21 @@
 import type { TokenKey } from '../aggregate/token-rules';
 import { LineKey, parserFloorOf, touchesOfWindow } from '../aggregate/tokens.job';
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
-import { MPT_PARSER_VERSION, TOKEN_PARSER_VERSION, TokenHistoryStateRow, TokenHolderChangesRow } from '../clickhouse/rows';
+import {
+  MPT_PARSER_VERSION,
+  TOKEN_PARSER_VERSION,
+  TokenHistoryStateRow,
+  TokenHolderChangesRow,
+} from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { mptIssuerOf } from '../util/mpt';
 import { CLAWBACK_TX_TYPES } from './build/changes-pass';
 import { writeCheckpoint } from './build/levels';
-import { issuedComplete, mptComplete } from './build/run-build';
-import { checkpointAt, totalsAt } from './holders-at';
+import { issuedComplete } from './build/run-build';
 import { checkpointLedgers, LedgerTotals } from './checkpoint-rule';
 import { TOKEN_HISTORY_CHECKPOINT_FLOOR } from './constants';
+import { mptCoverageComplete } from './coverage-start';
+import { checkpointAt, totalsAt } from './holders-at';
 import { writeHourSets } from './hour-sets';
 import { orderKeyOf } from './order-key';
 import { patchTokenHistoryState } from './state';
@@ -55,6 +61,19 @@ export interface WindowLevelsOptions {
   afterStep?: (step: LiveWindowStep) => void | Promise<void>;
   /** Told when a sum falls back to BigNumber. */
   onUnfit?: () => void;
+}
+
+/**
+ * How many keys an array parameter holds at most. Query parameters travel in the URL and ClickHouse refuses one over 128 KiB
+ * (ADR-0012): every read or delete that names lines, MPT pairs or tokens goes by chunks of this many (a line is two sides).
+ */
+export const TOKEN_HISTORY_KEYS_CHUNK = 1_000;
+
+/** `items` cut in order into lists of at most `size`. */
+export function chunksOf<T>(items: readonly T[], size = TOKEN_HISTORY_KEYS_CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 /** Keys of three or two columns, as zipped arrays: `(a, b, c) IN` the zip, a prefix of the key of each table read. */
@@ -131,44 +150,49 @@ export async function windowHistories(
 ): Promise<Map<string, KeyHistory>> {
   const out = new Map<string, KeyHistory>();
   if (lines.length > 0) {
-    const sides = lines.flatMap((l) => [
-      [l.account, l.counterparty, l.currency],
-      [l.counterparty, l.account, l.currency],
-    ]);
-    const params = {
-      accounts: sides.map((s) => s[0]),
-      counterparties: sides.map((s) => s[1]),
-      currencies: sides.map((s) => s[2]),
-      from,
-      to,
-    };
-    const [rows, before, claws] = await Promise.all([
-      ch.query<IssuedRow>(
-        `SELECT ${ISSUED_COLUMNS} FROM ${Table.TrustLineStates}
-          WHERE ${LINE_KEYS} AND ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32}
-          ORDER BY account, counterparty, currency, ledger_index, tx_index, node_index
-          LIMIT 1 BY account, counterparty, currency, ledger_index, tx_index, node_index`,
-        params,
-      ),
-      ch.query<IssuedRow>(
-        `SELECT ${ISSUED_COLUMNS} FROM ${Table.TrustLineStates}
-          WHERE ${LINE_KEYS} AND ledger_index <= {from:UInt32}
-          ORDER BY account, counterparty, currency, ledger_index DESC, tx_index DESC, node_index DESC
-          LIMIT 1 BY account, counterparty, currency`,
-        params,
-      ),
-      ch.query<{ ledger_index: number; tx_index: number }>(
-        `SELECT ledger_index, tx_index FROM ${Table.TxByType}
-          WHERE tx_type IN {types:Array(String)} AND ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32}`,
-        { types: [...CLAWBACK_TX_TYPES], from, to },
-      ),
-    ]);
+    const rows: IssuedRow[] = [];
+    const before: IssuedRow[] = [];
+    // the lines a chunk at a time: both sides of a chunk's lines are one parameter of each column
+    for (const chunk of chunksOf(lines)) {
+      const sides = chunk.flatMap((l) => [
+        [l.account, l.counterparty, l.currency],
+        [l.counterparty, l.account, l.currency],
+      ]);
+      const params = {
+        accounts: sides.map((s) => s[0]),
+        counterparties: sides.map((s) => s[1]),
+        currencies: sides.map((s) => s[2]),
+        from,
+        to,
+      };
+      const [inWindow, newest] = await Promise.all([
+        ch.query<IssuedRow>(
+          `SELECT ${ISSUED_COLUMNS} FROM ${Table.TrustLineStates}
+            WHERE ${LINE_KEYS} AND ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32}
+            ORDER BY account, counterparty, currency, ledger_index, tx_index, node_index
+            LIMIT 1 BY account, counterparty, currency, ledger_index, tx_index, node_index`,
+          params,
+        ),
+        ch.query<IssuedRow>(
+          `SELECT ${ISSUED_COLUMNS} FROM ${Table.TrustLineStates}
+            WHERE ${LINE_KEYS} AND ledger_index <= {from:UInt32}
+            ORDER BY account, counterparty, currency, ledger_index DESC, tx_index DESC, node_index DESC
+            LIMIT 1 BY account, counterparty, currency`,
+          params,
+        ),
+      ]);
+      rows.push(...inWindow);
+      before.push(...newest);
+    }
+    const claws = await ch.query<{ ledger_index: number; tx_index: number }>(
+      `SELECT ledger_index, tx_index FROM ${Table.TxByType}
+        WHERE tx_type IN {types:Array(String)} AND ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32}`,
+      { types: [...CLAWBACK_TX_TYPES], from, to },
+    );
     const clawbacks = new Set(claws.map((c) => `${c.ledger_index}:${c.tx_index}`));
     const read = (r: IssuedRow): StateRead | undefined => {
       const side = issuedSideOf(r);
-      return side === null
-        ? undefined
-        : { key: `i|${r.account}|${r.counterparty}|${r.currency}`, ...r, side };
+      return side === null ? undefined : { key: `i|${r.account}|${r.counterparty}|${r.currency}`, ...r, side };
     };
     for (const r of before) {
       const s = read(r);
@@ -183,25 +207,33 @@ export async function windowHistories(
     }
   }
   if (mpts.length > 0) {
-    const params = { holders: mpts.map((m) => m.holder), ids: mpts.map((m) => m.id), from, to };
-    const [rows, before] = await Promise.all([
-      ch.query<MptRow>(
-        `SELECT ${MPT_COLUMNS} FROM ${Table.MptHolderStates}
-          WHERE ${MPT_KEYS} AND ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32}
-          ORDER BY holder, mpt_issuance_id, ledger_index, tx_index, node_index
-          LIMIT 1 BY holder, mpt_issuance_id, ledger_index, tx_index, node_index`,
-        params,
-      ),
-      ch.query<MptRow>(
-        `SELECT ${MPT_COLUMNS} FROM ${Table.MptHolderStates}
-          WHERE ${MPT_KEYS} AND ledger_index <= {from:UInt32}
-          ORDER BY holder, mpt_issuance_id, ledger_index DESC, tx_index DESC, node_index DESC
-          LIMIT 1 BY holder, mpt_issuance_id`,
-        params,
-      ),
-    ]);
+    const rows: MptRow[] = [];
+    const before: MptRow[] = [];
+    for (const chunk of chunksOf(mpts)) {
+      const params = { holders: chunk.map((m) => m.holder), ids: chunk.map((m) => m.id), from, to };
+      const [inWindow, newest] = await Promise.all([
+        ch.query<MptRow>(
+          `SELECT ${MPT_COLUMNS} FROM ${Table.MptHolderStates}
+            WHERE ${MPT_KEYS} AND ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32}
+            ORDER BY holder, mpt_issuance_id, ledger_index, tx_index, node_index
+            LIMIT 1 BY holder, mpt_issuance_id, ledger_index, tx_index, node_index`,
+          params,
+        ),
+        ch.query<MptRow>(
+          `SELECT ${MPT_COLUMNS} FROM ${Table.MptHolderStates}
+            WHERE ${MPT_KEYS} AND ledger_index <= {from:UInt32}
+            ORDER BY holder, mpt_issuance_id, ledger_index DESC, tx_index DESC, node_index DESC
+            LIMIT 1 BY holder, mpt_issuance_id`,
+          params,
+        ),
+      ]);
+      rows.push(...inWindow);
+      before.push(...newest);
+    }
     const mptClawbacks = new Set(
-      rows.filter((r) => (CLAWBACK_TX_TYPES as readonly string[]).includes(r.tx_type)).map((r) => `${r.ledger_index}:${r.tx_index}`),
+      rows
+        .filter((r) => (CLAWBACK_TX_TYPES as readonly string[]).includes(r.tx_type))
+        .map((r) => `${r.ledger_index}:${r.tx_index}`),
     );
     const read = (r: MptRow): StateRead => ({
       key: `m|${r.holder}|${r.mpt_issuance_id}`,
@@ -214,6 +246,83 @@ export async function windowHistories(
       const h = out.get(s.key) ?? { kind: 'mpt' as const, rows: [], mptClawbacks };
       h.rows.push(s);
       out.set(s.key, h);
+    }
+  }
+  return out;
+}
+
+/**
+ * The first state row after `to` (and at or before `through`) of each side of the lines `lines` and of each MPT pair, as one-row
+ * histories with the clawbacks of their transactions: a repair recomputes the change those rows made from the repaired state at `to`.
+ */
+export async function firstStatesAfter(
+  ch: ClickHouseService,
+  lines: LineKey[],
+  mpts: Array<{ holder: string; id: string }>,
+  to: number,
+  through: number,
+): Promise<Map<string, KeyHistory>> {
+  const out = new Map<string, KeyHistory>();
+  if (to >= through) return out;
+  const issued: IssuedRow[] = [];
+  for (const chunk of chunksOf(lines)) {
+    const sides = chunk.flatMap((l) => [
+      [l.account, l.counterparty, l.currency],
+      [l.counterparty, l.account, l.currency],
+    ]);
+    issued.push(
+      ...(await ch.query<IssuedRow>(
+        `SELECT ${ISSUED_COLUMNS} FROM ${Table.TrustLineStates}
+          WHERE ${LINE_KEYS} AND ledger_index > {to:UInt32} AND ledger_index <= {through:UInt32}
+          ORDER BY account, counterparty, currency, ledger_index, tx_index, node_index
+          LIMIT 1 BY account, counterparty, currency`,
+        {
+          accounts: sides.map((x) => x[0]),
+          counterparties: sides.map((x) => x[1]),
+          currencies: sides.map((x) => x[2]),
+          to,
+          through,
+        },
+      )),
+    );
+  }
+  if (issued.length > 0) {
+    const ledgers = [...new Set(issued.map((r) => r.ledger_index))];
+    const clawbacks = new Set<string>();
+    for (const chunk of chunksOf(ledgers)) {
+      for (const c of await ch.query<{ ledger_index: number; tx_index: number }>(
+        `SELECT ledger_index, tx_index FROM ${Table.TxByType}
+          WHERE tx_type IN {types:Array(String)} AND ledger_index IN {ledgers:Array(UInt32)}`,
+        { types: [...CLAWBACK_TX_TYPES], ledgers: chunk },
+      )) {
+        clawbacks.add(`${c.ledger_index}:${c.tx_index}`);
+      }
+    }
+    for (const r of issued) {
+      const side = issuedSideOf(r);
+      if (side === null) continue;
+      const key = `i|${r.account}|${r.counterparty}|${r.currency}`;
+      out.set(key, { kind: 'issued', rows: [{ key, ...r, side }], clawbacks });
+    }
+  }
+  for (const chunk of chunksOf(mpts)) {
+    const rows = await ch.query<MptRow>(
+      `SELECT ${MPT_COLUMNS} FROM ${Table.MptHolderStates}
+        WHERE ${MPT_KEYS} AND ledger_index > {to:UInt32} AND ledger_index <= {through:UInt32}
+        ORDER BY holder, mpt_issuance_id, ledger_index, tx_index, node_index
+        LIMIT 1 BY holder, mpt_issuance_id`,
+      { holders: chunk.map((m) => m.holder), ids: chunk.map((m) => m.id), to, through },
+    );
+    for (const r of rows) {
+      const key = `m|${r.holder}|${r.mpt_issuance_id}`;
+      const mptClawbacks = new Set(
+        (CLAWBACK_TX_TYPES as readonly string[]).includes(r.tx_type) ? [`${r.ledger_index}:${r.tx_index}`] : [],
+      );
+      out.set(key, {
+        kind: 'mpt',
+        rows: [{ key, ...r, side: mptSideOf(r, mptIssuerOf(r.mpt_issuance_id)) }],
+        mptClawbacks,
+      });
     }
   }
   return out;
@@ -299,13 +408,23 @@ export async function windowLevels(
   const tokens = new Map<string, { token: TokenKey; hours: Set<number>; rows: TokenHolderChangesRow[] }>();
   for (const c of changes) {
     const k = tokenKey(c);
-    const t = tokens.get(k) ?? { token: { issuer: c.issuer, currency: c.currency }, hours: new Set<number>(), rows: [] };
+    const t = tokens.get(k) ?? {
+      token: { issuer: c.issuer, currency: c.currency },
+      hours: new Set<number>(),
+      rows: [],
+    };
     t.hours.add(hourOf(c.close_time));
     t.rows.push(c);
     tokens.set(k, t);
   }
   for (const t of tokens.values()) {
-    await writeHourSets(ch, gen.generation, t.token, [...t.hours].map((h) => new Date(h * 1000)), to);
+    await writeHourSets(
+      ch,
+      gen.generation,
+      t.token,
+      [...t.hours].map((h) => new Date(h * 1000)),
+      to,
+    );
   }
   await o.afterStep?.('hours');
 
@@ -348,9 +467,18 @@ export async function windowLevels(
     for (const l of ledgers) {
       changesSince += l.changes;
       if (!cps.has(l.ledger_index)) continue;
-      await writeCheckpoint(ch, gen.generation, t.token, l.ledger_index, previousCp, changesSince, Number(first?.ledger_index ?? 0), {
-        onUnfit: o.onUnfit,
-      });
+      await writeCheckpoint(
+        ch,
+        gen.generation,
+        t.token,
+        l.ledger_index,
+        previousCp,
+        changesSince,
+        Number(first?.ledger_index ?? 0),
+        {
+          onUnfit: o.onUnfit,
+        },
+      );
       previousCp = l.ledger_index;
       changesSince = 0;
     }
@@ -385,12 +513,10 @@ export async function applyLiveWindow(
     throw new OlderParserWindow(from, to, floor);
   }
   const mpts = o.hasMpt
-    ? (
-        await ch.query<{ holder: string; id: string }>(
-          `SELECT DISTINCT holder, mpt_issuance_id AS id FROM ${Table.MptTouches}
+    ? await ch.query<{ holder: string; id: string }>(
+        `SELECT DISTINCT holder, mpt_issuance_id AS id FROM ${Table.MptTouches}
             WHERE ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32} AND holder != ''`,
-          { from, to },
-        )
+        { from, to },
       )
     : [];
   const histories = await windowHistories(ch, window.lines, mpts, from, to);
@@ -400,11 +526,13 @@ export async function applyLiveWindow(
   for (const gen of active) {
     const changes = changesOf(gen, histories, {
       issued: issuedComplete(o.network, gen.coverage_from),
-      mpt: mptComplete(o.network, gen.coverage_from),
+      mpt: await mptCoverageComplete(ch, o.network, gen.coverage_from),
     });
     changesByGen.set(gen.generation, changes);
     if (changes.length > 0) {
-      await ch.insert(Table.TokenHolderChanges, changes, { dedupToken: `token_history:${gen.generation}:live:${from}-${to}` });
+      await ch.insert(Table.TokenHolderChanges, changes, {
+        dedupToken: `token_history:${gen.generation}:live:${from}-${to}`,
+      });
       written += changes.length;
     }
   }
@@ -419,7 +547,11 @@ export async function applyLiveWindow(
   for (const gen of active) {
     const levels = levelled.includes(gen);
     if (to <= gen.through_ledger) continue;
-    await patchTokenHistoryState(ch, gen.generation, levels ? { through_ledger: to, levels_through: to } : { through_ledger: to });
+    await patchTokenHistoryState(
+      ch,
+      gen.generation,
+      levels ? { through_ledger: to, levels_through: to } : { through_ledger: to },
+    );
   }
   return { to, changes: written };
 }

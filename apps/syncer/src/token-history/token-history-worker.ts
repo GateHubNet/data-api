@@ -51,7 +51,8 @@ export interface TokenHistoryPass {
 }
 
 /** The generations a window writes: the live one and a building one. */
-const writableOf = (gens: readonly TokenHistoryStateRow[]): TokenHistoryStateRow[] => gens.filter((g) => g.state !== 'retired');
+const writableOf = (gens: readonly TokenHistoryStateRow[]): TokenHistoryStateRow[] =>
+  gens.filter((g) => g.state !== 'retired');
 
 /**
  * The `token_history` worker (spec 4.1): every `TOKEN_HISTORY_POLL_MS` it reads the commit marker, applies the live windows until it
@@ -60,6 +61,9 @@ const writableOf = (gens: readonly TokenHistoryStateRow[]): TokenHistoryStateRow
  * `TOKEN_HISTORY_CHECK_MS` it says whether a build is due. A failed step is counted and logged, and the pass goes on. It holds the
  * lease `<network>:token_history` and needs no node. It never builds a generation: that is the `token-history-build` command's.
  */
+/** The request timeout of the heavy client: the build's (6 h) is for a command; a worker's step gets an hour. */
+export const TOKEN_HISTORY_HEAVY_REQUEST_TIMEOUT_MS = 3_600_000;
+
 @Injectable()
 export class TokenHistoryWorker implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger: NonNullable<TokenHistoryWorkerOptions['logger']>;
@@ -83,7 +87,17 @@ export class TokenHistoryWorker implements OnApplicationBootstrap, OnModuleDestr
     this.logger = options.logger ?? new Logger(TokenHistoryWorker.name);
     this.lease = new TokenHistoryLease(ch, cfg.network, options.holder);
     this.steps = { ...TOKEN_HISTORY_STEPS, ...options.steps };
+    // the catch-up and the repair rebuild levels over many ledgers: their client has the build's lifted guards, not the syncer's 30 s
+    if (options.heavyClient !== undefined) this.heavy = options.heavyClient;
+    else if (typeof ch.derive === 'function') {
+      this.heavy = ch.derive({ requestTimeout: TOKEN_HISTORY_HEAVY_REQUEST_TIMEOUT_MS, maxExecutionTime: 0 });
+      this.ownsHeavy = true;
+    } else this.heavy = ch;
   }
+
+  /** The client of the catch-up and the repair (`TokenHistoryWorkerOptions.heavyClient`). */
+  private readonly heavy: ClickHouseService;
+  private ownsHeavy = false;
 
   onApplicationBootstrap(): void {
     this.shutdownSignals?.register('token_history', () => this.stop());
@@ -157,7 +171,7 @@ export class TokenHistoryWorker implements OnApplicationBootstrap, OnModuleDestr
     );
     if (behind !== undefined && left() > 0 && this.stopping === undefined) {
       try {
-        const levels = await this.steps.catchUpLevels(this.ch, behind, behind.through_ledger, Math.max(left(), 0), {
+        const levels = await this.steps.catchUpLevels(this.heavy, behind, behind.through_ledger, Math.max(left(), 0), {
           ...common,
           window: this.options.window,
           now,
@@ -169,12 +183,13 @@ export class TokenHistoryWorker implements OnApplicationBootstrap, OnModuleDestr
       }
     } else if (left() > 0 && this.stopping === undefined) {
       try {
-        result.repair = await this.steps.repairOldestRange(this.ch, gens, { ...common, network: this.cfg.network });
+        result.repair = await this.steps.repairOldestRange(this.heavy, gens, { ...common, network: this.cfg.network });
         if (result.repair === 'repaired') gens = await read();
       } catch (err) {
         this.failed('repair', err);
       }
-      if ((result.repair ?? 'none') === 'none' && left() > 0) {
+      // the DEX hours unless a range was repaired: a range that waits for a rebuild (an older parser) does not stop them
+      if (result.repair !== 'repaired' && left() > 0) {
         try {
           result.dexHours = await this.dexStep(now, left);
         } catch (err) {
@@ -196,7 +211,8 @@ export class TokenHistoryWorker implements OnApplicationBootstrap, OnModuleDestr
     }
     try {
       result.dropped = await this.steps.dropRetired(this.ch, gens, now());
-      for (const g of result.dropped) this.logger.log(`Token history: the partitions of retired generation ${g} are dropped`);
+      for (const g of result.dropped)
+        this.logger.log(`Token history: the partitions of retired generation ${g} are dropped`);
     } catch (err) {
       this.failed('drop', err);
     }
@@ -303,5 +319,6 @@ export class TokenHistoryWorker implements OnApplicationBootstrap, OnModuleDestr
     }
     if (this.leaseHeld) await this.lease.release().catch(() => undefined);
     this.leaseHeld = false;
+    if (this.ownsHeavy) await this.heavy.close().catch(() => undefined);
   }
 }

@@ -7,9 +7,8 @@ import { TokenHistoryStateRow } from '../../clickhouse/rows';
 import { Table } from '../../clickhouse/tables';
 import { committedCheckpoint } from '../../ingest/ingest-state';
 import { getNetworkProfile, NetworkName } from '../../network';
-import { loadAmendmentsConfig } from '../../validators/amendments-config';
 import { TOKEN_HISTORY_CONFIG_VERSION, TOKEN_HISTORY_PASS_ACCOUNTS } from '../constants';
-import { rangeIngestRunning, tokenHistoryCoverageFrom } from '../coverage-start';
+import { mptCoverageComplete, rangeIngestRunning, tokenHistoryCoverageFrom } from '../coverage-start';
 import {
   buildingTokenHistory,
   nextGeneration,
@@ -68,6 +67,8 @@ export interface TokenHistoryBuildOptions {
   workerLeaseFreshMs?: number;
   /** How long the build waits after writing its lease before it reads it back (default 1 s). */
   leaseSettleMs?: number;
+  /** How long the build waits after a phase patch before it reads it back (default 1 s). */
+  stateSettleMs?: number;
   passAccounts?: number;
   levelTokens?: number;
   floor?: number;
@@ -82,6 +83,9 @@ export const TOKEN_HISTORY_LEASE_TTL_MS = 30_000;
 export const TOKEN_HISTORY_LEASE_HEARTBEAT_MS = 10_000;
 /** How long a build waits after writing its lease before it reads it back (as two builds that start together both write one). */
 export const TOKEN_HISTORY_LEASE_SETTLE_MS = 1_000;
+/** How long a build waits after a patch of its phase before it reads it back, and how many times it writes one that did not hold. */
+export const TOKEN_HISTORY_STATE_SETTLE_MS = 1_000;
+const STATE_CONFIRM_ATTEMPTS = 5;
 /** The `log_comment` of every statement of the build: its reads and writes can be found in `system.query_log`. */
 export const TOKEN_HISTORY_BUILD_COMMENT = 'token-history-build';
 
@@ -118,15 +122,19 @@ function withBuildSettings(ch: ClickHouseService, threads: number): ClickHouseSe
   return new Proxy(ch, {
     get(target, prop, receiver) {
       if (prop === 'query') {
-        return (q: string, p?: Record<string, unknown>, s: Record<string, unknown> = {}) => target.query(q, p, { ...extra, ...s });
+        return (q: string, p?: Record<string, unknown>, s: Record<string, unknown> = {}) =>
+          target.query(q, p, { ...extra, ...s });
       }
       if (prop === 'queryOne') {
         return (q: string, p?: Record<string, unknown>, s: Record<string, unknown> = {}) =>
           target.queryOne(q, p, { ...extra, ...s });
       }
       if (prop === 'command' || prop === 'commandSummary') {
-        return (q: string, p?: Record<string, unknown>, o: { settings?: Record<string, unknown>; queryId?: string } = {}) =>
-          target[prop](q, p, { ...o, settings: { ...extra, ...o.settings } });
+        return (
+          q: string,
+          p?: Record<string, unknown>,
+          o: { settings?: Record<string, unknown>; queryId?: string } = {},
+        ) => target[prop](q, p, { ...o, settings: { ...extra, ...o.settings } });
       }
       return Reflect.get(target, prop, receiver);
     },
@@ -137,13 +145,6 @@ function withBuildSettings(ch: ClickHouseService, threads: number): ClickHouseSe
 export function issuedComplete(network: string, from: number): boolean {
   const first = getNetworkProfile(network as NetworkName).firstLedger;
   return first !== undefined && from <= first;
-}
-
-/** Whether it is complete for MPTs: at or before the ledger `MPTokensV1` was enabled in (none known on a testnet). */
-export function mptComplete(network: string, from: number): boolean {
-  const profile = getNetworkProfile(network as NetworkName);
-  const enabled = loadAmendmentsConfig(profile).byName.get('MPTokensV1')?.enabled?.ledger_index;
-  return enabled !== undefined && from <= enabled;
 }
 
 /**
@@ -174,11 +175,17 @@ export async function runTokenHistoryBuild(
   if (taken.holder !== holder) {
     throw new BuildRefused('build_running', `another token-history-build took the lease (${taken.holder})`);
   }
-  const heartbeat = setInterval(() => void writeLease(plain, leaseName, holder).catch(() => undefined), TOKEN_HISTORY_LEASE_HEARTBEAT_MS);
+  const heartbeat = setInterval(
+    () => void writeLease(plain, leaseName, holder).catch(() => undefined),
+    TOKEN_HISTORY_LEASE_HEARTBEAT_MS,
+  );
   heartbeat.unref();
   try {
     if (await rangeIngestRunning(ch)) {
-      throw new BuildRefused('range_ingest', 'a range-ingest is running: build the token history once the fill is done');
+      throw new BuildRefused(
+        'range_ingest',
+        'a range-ingest is running: build the token history once the fill is done',
+      );
     }
     const worker = await readLease(ch, workerLeaseName(o.network));
     if (worker.holder === '' || worker.ageMs >= (o.workerLeaseFreshMs ?? TOKEN_HISTORY_LEASE_TTL_MS)) {
@@ -195,7 +202,11 @@ export async function runTokenHistoryBuild(
 }
 
 /** The generation to work on: the building one of the current config and coverage, else a new one (the old one retired). */
-async function generationToBuild(ch: ClickHouseService, o: TokenHistoryBuildOptions, now: () => number): Promise<TokenHistoryStateRow> {
+async function generationToBuild(
+  ch: ClickHouseService,
+  o: TokenHistoryBuildOptions,
+  now: () => number,
+): Promise<TokenHistoryStateRow> {
   const states = await readTokenHistoryStates(ch);
   const head = await committedCheckpoint(ch);
   if (head === undefined) throw new Error('no ledger is committed: there is nothing to build the token history from');
@@ -203,7 +214,8 @@ async function generationToBuild(ch: ClickHouseService, o: TokenHistoryBuildOpti
   if (coverage === undefined) throw new Error(`no unbroken run of stored ledgers reaches the head ${head}`);
   const building = buildingTokenHistory(states);
   if (building !== undefined) {
-    if (building.config_version === TOKEN_HISTORY_CONFIG_VERSION && building.coverage_from === coverage) return building;
+    if (building.config_version === TOKEN_HISTORY_CONFIG_VERSION && building.coverage_from === coverage)
+      return building;
     await patchTokenHistoryState(ch, building.generation, { state: 'retired' });
     o.log.info(
       `token-history-build: generation ${building.generation} retired (config ${building.config_version}, coverage from ` +
@@ -249,6 +261,21 @@ async function runPhases(
       throw new BuildStopped(`a range-ingest started: generation ${g} is retired; build again once the fill is done`);
     }
   };
+  /**
+   * A patch of the phase (or of h1 and levels_through) that must hold: the worker patches the generation's through_ledger with each
+   * window, copying the newest row, so a patch of its that read the row before this one and wrote it after would undo this one. Read
+   * back after a pause longer than a statement, and written again until it holds.
+   */
+  const confirmed = async (patch: TokenHistoryStatePatch): Promise<void> => {
+    const fields = Object.entries(patch) as [keyof TokenHistoryStatePatch, unknown][];
+    for (let attempt = 0; attempt < STATE_CONFIRM_ATTEMPTS; attempt++) {
+      await patchTokenHistoryState(ch, g, patch);
+      await new Promise((resolve) => setTimeout(resolve, o.stateSettleMs ?? TOKEN_HISTORY_STATE_SETTLE_MS));
+      const now = (await readTokenHistoryStates(ch)).find((r) => r.generation === g);
+      if (now !== undefined && fields.every(([k, v]) => now[k] === v)) return;
+    }
+    throw new Error(`token-history-build: the state patch ${JSON.stringify(patch)} of generation ${g} did not hold`);
+  };
   const step = async (patch: TokenHistoryStatePatch, cursor: string, rows: number, started: number): Promise<void> => {
     await patchTokenHistoryState(ch, g, patch);
     state = { ...state, ...patch };
@@ -266,7 +293,7 @@ async function runPhases(
       case 'changes': {
         const accounts = await nextPassAccounts(ch, state.account_cursor, batch);
         if (accounts.length === 0) {
-          await patchTokenHistoryState(ch, g, { phase: o.hasMpt ? 'mpt_changes' : 'levels', account_cursor: '' });
+          await confirmed({ phase: o.hasMpt ? 'mpt_changes' : 'levels', account_cursor: '' });
           state = { ...state, phase: o.hasMpt ? 'mpt_changes' : 'levels', account_cursor: '' };
           break;
         }
@@ -281,12 +308,12 @@ async function runPhases(
       case 'mpt_changes': {
         const holders = await nextMptPassHolders(ch, state.account_cursor, batch);
         if (holders.length === 0) {
-          await patchTokenHistoryState(ch, g, { phase: 'levels', account_cursor: '' });
+          await confirmed({ phase: 'levels', account_cursor: '' });
           state = { ...state, phase: 'levels', account_cursor: '' };
           break;
         }
         const { rows } = await writeMptChangesBatch(ch, g, holders, state.coverage_from, state.h0, {
-          coverageComplete: mptComplete(o.network, state.coverage_from),
+          coverageComplete: await mptCoverageComplete(ch, o.network, state.coverage_from),
           threads: o.threads,
         });
         const last = holders[holders.length - 1];
@@ -297,7 +324,7 @@ async function runPhases(
         if (state.h1 === 0) {
           // h1 is the generation's through_ledger when the phase begins, fixed for the phase (the worker moves through_ledger on)
           const fresh = (await readTokenHistoryStates(ch)).find((r) => r.generation === g)!;
-          await patchTokenHistoryState(ch, g, { h1: fresh.through_ledger });
+          await confirmed({ h1: fresh.through_ledger });
           state = { ...state, h1: fresh.through_ledger };
         }
         const after: TokenKey | undefined =
@@ -306,7 +333,7 @@ async function runPhases(
             : { issuer: state.token_cursor_issuer, currency: state.token_cursor_currency };
         const tokens = await nextLevelTokens(ch, g, after, o.levelTokens ?? TOKEN_HISTORY_LEVEL_TOKENS);
         if (tokens.length === 0) {
-          await patchTokenHistoryState(ch, g, { phase: 'dex', levels_through: state.h1 });
+          await confirmed({ phase: 'dex', levels_through: state.h1 });
           state = { ...state, phase: 'dex', levels_through: state.h1 };
           break;
         }
@@ -331,7 +358,7 @@ async function runPhases(
       case 'dex': {
         const partition = await nextDexPartition(ch);
         if (partition === undefined) {
-          await patchTokenHistoryState(ch, g, { phase: 'done' });
+          await confirmed({ phase: 'done' });
           state = { ...state, phase: 'done' };
           break;
         }

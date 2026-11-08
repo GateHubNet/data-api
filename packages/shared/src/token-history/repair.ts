@@ -1,12 +1,18 @@
 import type { TokenKey } from '../aggregate/token-rules';
 import { LineKey, parserFloorOf, WINDOW_LINES_SQL } from '../aggregate/tokens.job';
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
-import { MPT_PARSER_VERSION, TOKEN_PARSER_VERSION, TokenHistoryDirtyRow, TokenHistoryStateRow } from '../clickhouse/rows';
+import {
+  MPT_PARSER_VERSION,
+  TOKEN_PARSER_VERSION,
+  TokenHistoryDirtyRow,
+  TokenHistoryStateRow,
+} from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { buildTokenLevels } from './build/levels';
-import { issuedComplete, mptComplete } from './build/run-build';
+import { issuedComplete } from './build/run-build';
+import { mptCoverageComplete } from './coverage-start';
 import { closeHourOf, ledgersOfHour } from './hour-sets';
-import { changesOf, keysIn, windowHistories } from './live-window';
+import { changesOf, chunksOf, firstStatesAfter, KeyHistory, keysIn, windowHistories } from './live-window';
 import { buildingTokenHistory, liveTokenHistory } from './state';
 
 /**
@@ -57,7 +63,12 @@ async function deleteDirtyRange(ch: ClickHouseService, range: { from: number; to
 }
 
 /** Whether the ledgers `[from, to]` hold one of a parser older than the token history reads (the touch indexes'). */
-export async function holdsOlderParser(ch: ClickHouseService, from: number, to: number, hasMpt: boolean): Promise<boolean> {
+export async function holdsOlderParser(
+  ch: ClickHouseService,
+  from: number,
+  to: number,
+  hasMpt: boolean,
+): Promise<boolean> {
   const floor = await parserFloorOf(ch, from - 1, to);
   return floor !== null && (floor < TOKEN_PARSER_VERSION || (hasMpt && floor < MPT_PARSER_VERSION));
 }
@@ -97,7 +108,7 @@ async function repairGeneration(
   const histories = await windowHistories(ch, lines, mpts, from - 1, to);
   const rows = changesOf({ ...gen, through_ledger: from - 1 }, histories, {
     issued: issuedComplete(o.network, gen.coverage_from),
-    mpt: mptComplete(o.network, gen.coverage_from),
+    mpt: await mptCoverageComplete(ch, o.network, gen.coverage_from),
   });
   const tokens = new Map<string, TokenKey>();
   for (const l of lines) {
@@ -106,19 +117,69 @@ async function repairGeneration(
   }
   for (const r of rows) tokens.set(`${r.issuer}|${r.currency}`, { issuer: r.issuer, currency: r.currency });
   if (tokens.size === 0) return;
-  const keys = { issuers: [...tokens.values()].map((t) => t.issuer), currencies: [...tokens.values()].map((t) => t.currency) };
+  const chunks = chunksOf([...tokens.values()]).map((c) => ({
+    issuers: c.map((t) => t.issuer),
+    currencies: c.map((t) => t.currency),
+  }));
+  const complete = {
+    issued: issuedComplete(o.network, gen.coverage_from),
+    mpt: await mptCoverageComplete(ch, o.network, gen.coverage_from),
+  };
 
   // 1-2: the tokens' change rows of the range, deleted and written again (a dedup token of its own: the content may equal an earlier insert's)
-  await ch.command(
-    `DELETE FROM ${Table.TokenHolderChanges}
-      WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}`,
-    { g: gen.generation, ...keys, from, to },
-    { settings: SYNC },
-  );
+  for (const keys of chunks) {
+    await ch.command(
+      `DELETE FROM ${Table.TokenHolderChanges}
+        WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}`,
+      { g: gen.generation, ...keys, from, to },
+      { settings: SYNC },
+    );
+  }
   if (rows.length > 0) {
     await ch.insert(Table.TokenHolderChanges, rows, {
       dedupToken: `token_history:${gen.generation}:repair:${from}-${to}:${Date.now()}`,
     });
+  }
+
+  // 2b: the first change after the range of each side the range changed starts from the repaired state, not the one it replaced
+  const after = await firstStatesAfter(ch, lines, mpts, to, gen.through_ledger);
+  const next = new Map<string, KeyHistory>();
+  for (const [key, h] of after) {
+    const changed = histories.get(key);
+    if (changed === undefined || changed.rows.length === 0) continue;
+    next.set(key, { ...h, before: changed.rows[changed.rows.length - 1] });
+  }
+  if (next.size > 0) {
+    const positions = [...next.values()].map((h) => {
+      const r = h.rows[0];
+      return {
+        token: { issuer: r.side.issuer, currency: r.side.currency },
+        key: `${r.side.issuer}|${r.side.currency}|${r.ledger_index}|${r.tx_index}|${r.node_index}|${r.side.holder}`,
+      };
+    });
+    for (const chunk of chunksOf(positions)) {
+      const own = new Map(chunk.map((p) => [`${p.token.issuer}|${p.token.currency}`, p.token]));
+      await ch.command(
+        `DELETE FROM ${Table.TokenHolderChanges}
+          WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND ledger_index > {to:UInt32}
+            AND concat(issuer, '|', currency, '|', toString(ledger_index), '|', toString(tx_index), '|', toString(node_index), '|', holder)
+                IN {positions:Array(String)}`,
+        {
+          g: gen.generation,
+          issuers: [...own.values()].map((t) => t.issuer),
+          currencies: [...own.values()].map((t) => t.currency),
+          to,
+          positions: chunk.map((p) => p.key),
+        },
+        { settings: SYNC },
+      );
+    }
+    const redone = changesOf({ ...gen, through_ledger: to }, next, complete);
+    if (redone.length > 0) {
+      await ch.insert(Table.TokenHolderChanges, redone, {
+        dedupToken: `token_history:${gen.generation}:repair-next:${from}-${to}:${Date.now()}`,
+      });
+    }
   }
 
   // 3: their checkpoints and hour rows from the hour of `from` on, built again from the checkpoint before it
@@ -126,23 +187,25 @@ async function repairGeneration(
   const hour = await closeHourOf(ch, from);
   if (hour === undefined) return;
   const hourStart = (await ledgersOfHour(ch, hour))?.first ?? from;
-  const levelKeys = { g: gen.generation, ...keys, ledger: hourStart, hour };
-  await ch.command(
-    `DELETE FROM ${Table.TokenCheckpoints} WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND checkpoint_ledger >= {ledger:UInt32}`,
-    levelKeys,
-    { settings: SYNC },
-  );
-  await ch.command(
-    `DELETE FROM ${Table.TokenCheckpointHeads} WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND checkpoint_ledger >= {ledger:UInt32}`,
-    levelKeys,
-    { settings: SYNC },
-  );
-  await ch.command(
-    `DELETE FROM ${Table.TokenHourly}
-      WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND hour >= toDateTime({hour:UInt32}, 'UTC')`,
-    levelKeys,
-    { settings: SYNC },
-  );
+  for (const keys of chunks) {
+    const levelKeys = { g: gen.generation, ...keys, ledger: hourStart, hour };
+    await ch.command(
+      `DELETE FROM ${Table.TokenCheckpoints} WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND checkpoint_ledger >= {ledger:UInt32}`,
+      levelKeys,
+      { settings: SYNC },
+    );
+    await ch.command(
+      `DELETE FROM ${Table.TokenCheckpointHeads} WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND checkpoint_ledger >= {ledger:UInt32}`,
+      levelKeys,
+      { settings: SYNC },
+    );
+    await ch.command(
+      `DELETE FROM ${Table.TokenHourly}
+        WHERE generation = {g:UInt32} AND ${TOKEN_KEYS} AND hour >= toDateTime({hour:UInt32}, 'UTC')`,
+      levelKeys,
+      { settings: SYNC },
+    );
+  }
   for (const token of tokens.values()) {
     await buildTokenLevels(ch, gen.generation, token, gen.levels_through, { floor: o.floor, onUnfit: o.onUnfit });
   }
@@ -180,7 +243,8 @@ export async function repairOldestRange(
   if (await holdsOlderParser(ch, from, to, o.hasMpt)) return 'older_parser';
   for (const gen of targets) {
     const end = Math.min(to, gen.through_ledger);
-    if (Math.max(from, gen.coverage_from) <= end) await repairGeneration(ch, gen, Math.max(from, gen.coverage_from), end, o);
+    if (Math.max(from, gen.coverage_from) <= end)
+      await repairGeneration(ch, gen, Math.max(from, gen.coverage_from), end, o);
   }
   await deleteDirtyRange(ch, range);
   return 'repaired';

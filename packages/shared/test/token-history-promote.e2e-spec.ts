@@ -10,7 +10,7 @@ import { runTokenHistoryBuild } from '../src/token-history/build/run-build';
 import { TOKEN_HISTORY_RETIRED_KEEP_MS } from '../src/token-history/constants';
 import { totalsAt } from '../src/token-history/holders-at';
 import { applyLiveWindow } from '../src/token-history/live-window';
-import { catchUpLevels, dropRetired, promoteIfCaughtUp } from '../src/token-history/promote';
+import { catchUpLevels, changesOfTokens, dropRetired, promoteIfCaughtUp } from '../src/token-history/promote';
 import { appendTokenHistoryDirty } from '../src/token-history/repair';
 import {
   liveTokenHistory,
@@ -19,6 +19,7 @@ import {
   writeTokenHistoryState,
 } from '../src/token-history/state';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
+import { SAMPLE_ROWS } from './sample-rows';
 import { seedTokenHistoryWorld, seedTokenHistoryWorldLater, seedTokensWorld, TokensWorld } from './tokens-world';
 
 const CTX = parseContextFor(getNetworkProfile('xrpl'));
@@ -105,7 +106,10 @@ describe('catch-up, promotion and drop of the token history (e2e)', () => {
     // an old live generation below the building one
     await writeTokenHistoryState(ch, { ...(await gen(ch, 1)), generation: 0, state: 'live', phase: 'done' });
     const behind = await gen(ch, 1);
-    expect({ levels: behind.levels_through, through: behind.through_ledger }).toEqual({ levels: world.head, through: head });
+    expect({ levels: behind.levels_through, through: behind.through_ledger }).toEqual({
+      levels: world.head,
+      through: head,
+    });
     expect(liveTokenHistory(await readTokenHistoryStates(ch))?.generation).toBe(0);
     // not caught up (the margin is 0 here; the world's gap of 5 ledgers is inside the default 10): no promotion
     expect(await promoteIfCaughtUp(ch, await readTokenHistoryStates(ch), 0)).toBe(false);
@@ -213,5 +217,18 @@ describe('catch-up, promotion and drop of the token history (e2e)', () => {
     // the live generation keeps its partitions, and a second drop finds nothing
     expect(await parts(2)).toBeGreaterThan(0);
     expect(await dropRetired(ch, states, retiredAt + TOKEN_HISTORY_RETIRED_KEEP_MS)).toEqual([]);
+  });
+
+  it('the catch-up reads the changes of 4,500 tokens, more than one URL parameter holds', async () => {
+    const ch = await fresh();
+    const tokens = Array.from({ length: 4_500 }, (_, i) => ({
+      issuer: `rIssuer${String(i).padStart(25, '0')}`,
+      currency: 'TKN',
+    }));
+    await ch.insert(
+      Table.TokenHolderChanges,
+      tokens.map((t) => ({ ...SAMPLE_ROWS[Table.TokenHolderChanges], generation: 1, ...t, ledger_index: 100 })),
+    );
+    expect(await changesOfTokens(ch, 1, tokens, 99, 100)).toHaveLength(4_500);
   });
 });
