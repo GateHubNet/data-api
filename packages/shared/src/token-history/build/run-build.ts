@@ -41,7 +41,10 @@ export class BuildRefused extends Error {
   }
 }
 
-/** A range-ingest started while the build ran: the generation is retired, and a new build is due once the fill is done. */
+/**
+ * The build stopped while it ran: a range-ingest started (the generation is retired, and a new build is due once the fill is
+ * done), or it lost its lease to another build (the generation stays building, for the build that holds the lease).
+ */
 export class BuildStopped extends Error {
   constructor(message: string) {
     super(message);
@@ -141,6 +144,74 @@ function withBuildSettings(ch: ClickHouseService, threads: number): ClickHouseSe
   });
 }
 
+/**
+ * The build's lease while it runs. The heartbeat renews it only while the newest row is still the build's. The build stops (between
+ * two batches, and before each state patch) once another holder is newest, or once no renewal has landed for two heartbeats, before
+ * the TTL lets another build take it. At the end the lease is released only while it is still the build's.
+ */
+class HeldLease {
+  private lost: string | undefined;
+  private renewedAt: number;
+  private renewing = false;
+
+  constructor(
+    private readonly ch: ClickHouseService,
+    private readonly name: string,
+    private readonly holder: string,
+  ) {
+    this.renewedAt = Date.now();
+  }
+
+  /** The heartbeat: renews the lease while the build holds it; a renewal that fails is retried by the next one. */
+  async renew(): Promise<void> {
+    if (this.lost !== undefined || this.renewing) return;
+    this.renewing = true;
+    try {
+      const newest = await readLease(this.ch, this.name);
+      if (newest.holder !== this.holder) {
+        this.lost = `another holder (${newest.holder || 'none'}) is newest`;
+        return;
+      }
+      await writeLease(this.ch, this.name, this.holder);
+      this.renewedAt = Date.now();
+    } catch {
+      // the next heartbeat tries again; `assertHeld` stops the build once none has landed for two heartbeats
+    } finally {
+      this.renewing = false;
+    }
+  }
+
+  /** Throws `BuildStopped` once the lease is lost, as far as the heartbeat knows (no statement). */
+  assertHeld(): void {
+    const stale = TOKEN_HISTORY_LEASE_TTL_MS - TOKEN_HISTORY_LEASE_HEARTBEAT_MS;
+    if (this.lost === undefined && Date.now() - this.renewedAt >= stale) {
+      this.lost = `no renewal landed for ${stale / 1000} s`;
+    }
+    if (this.lost !== undefined) {
+      throw new BuildStopped(
+        `token-history-build lost its lease (${this.lost}): it stops, and the generation stays building for the build that holds it`,
+      );
+    }
+  }
+
+  /** Reads the lease, then `assertHeld`. */
+  async check(): Promise<void> {
+    this.assertHeld();
+    const newest = await readLease(this.ch, this.name);
+    if (newest.holder !== this.holder) this.lost = `another holder (${newest.holder || 'none'}) is newest`;
+    this.assertHeld();
+  }
+
+  /** Releases the lease while the newest row is still the build's: never another build's. */
+  async release(): Promise<void> {
+    try {
+      if ((await readLease(this.ch, this.name)).holder === this.holder) await writeLease(this.ch, this.name, '');
+    } catch {
+      // a lease left behind ages out after its TTL
+    }
+  }
+}
+
 /** Whether a coverage that starts at `from` is complete for issued tokens (spec 6): at or before the network's first ledger. */
 function issuedComplete(network: string, from: number): boolean {
   const first = getNetworkProfile(network as NetworkName).firstLedger;
@@ -175,10 +246,8 @@ export async function runTokenHistoryBuild(
   if (taken.holder !== holder) {
     throw new BuildRefused('build_running', `another token-history-build took the lease (${taken.holder})`);
   }
-  const heartbeat = setInterval(
-    () => void writeLease(plain, leaseName, holder).catch(() => undefined),
-    TOKEN_HISTORY_LEASE_HEARTBEAT_MS,
-  );
+  const held = new HeldLease(plain, leaseName, holder);
+  const heartbeat = setInterval(() => void held.renew(), TOKEN_HISTORY_LEASE_HEARTBEAT_MS);
   heartbeat.unref();
   try {
     if (await rangeIngestRunning(ch)) {
@@ -194,10 +263,10 @@ export async function runTokenHistoryBuild(
         'no token_history worker holds a fresh lease: the build needs it to write the changes above its start',
       );
     }
-    return await runPhases(ch, o, now);
+    return await runPhases(ch, o, now, held);
   } finally {
     clearInterval(heartbeat);
-    await writeLease(plain, leaseName, '').catch(() => undefined);
+    await held.release();
   }
 }
 
@@ -247,15 +316,17 @@ async function runPhases(
   ch: ClickHouseService,
   o: TokenHistoryBuildOptions,
   now: () => number,
+  held: HeldLease,
 ): Promise<{ generation: number; phase: 'done' }> {
   let state = await generationToBuild(ch, o, now);
   const g = state.generation;
   const version = Math.round(state.started_at * 1000);
   const batch = o.passAccounts ?? TOKEN_HISTORY_PASS_ACCOUNTS;
 
-  /** Between two batches: an abort stops here; a range-ingest that started retires the generation. */
+  /** Between two batches: an abort stops here, and so does a lost lease; a range-ingest that started retires the generation. */
   const between = async (): Promise<void> => {
     o.signal?.throwIfAborted();
+    await held.check();
     if (await rangeIngestRunning(ch)) {
       await patchTokenHistoryState(ch, g, { state: 'retired' });
       throw new BuildStopped(`a range-ingest started: generation ${g} is retired; build again once the fill is done`);
@@ -269,6 +340,7 @@ async function runPhases(
   const confirmed = async (patch: TokenHistoryStatePatch): Promise<void> => {
     const fields = Object.entries(patch) as [keyof TokenHistoryStatePatch, unknown][];
     for (let attempt = 0; attempt < STATE_CONFIRM_ATTEMPTS; attempt++) {
+      held.assertHeld();
       await patchTokenHistoryState(ch, g, patch);
       await new Promise((resolve) => setTimeout(resolve, o.stateSettleMs ?? TOKEN_HISTORY_STATE_SETTLE_MS));
       const now = (await readTokenHistoryStates(ch)).find((r) => r.generation === g);
@@ -277,6 +349,7 @@ async function runPhases(
     throw new Error(`token-history-build: the state patch ${JSON.stringify(patch)} of generation ${g} did not hold`);
   };
   const step = async (patch: TokenHistoryStatePatch, cursor: string, rows: number, started: number): Promise<void> => {
+    held.assertHeld();
     await patchTokenHistoryState(ch, g, patch);
     state = { ...state, ...patch };
     const seconds = Math.max((now() - started) / 1000, 0.001);
@@ -343,6 +416,7 @@ async function runPhases(
         let rows = small.hours;
         for (const token of small.big) {
           o.signal?.throwIfAborted();
+          held.assertHeld();
           const built = await buildTokenLevels(ch, g, token, state.h1, levelOpts);
           rows += built.hours + built.checkpoints;
         }
