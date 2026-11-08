@@ -11,6 +11,7 @@ import { TOKEN_HISTORY_RETIRED_KEEP_MS } from '../src/token-history/constants';
 import { totalsAt } from '../src/token-history/holders-at';
 import { applyLiveWindow } from '../src/token-history/live-window';
 import { catchUpLevels, dropRetired, promoteIfCaughtUp } from '../src/token-history/promote';
+import { appendTokenHistoryDirty } from '../src/token-history/repair';
 import {
   liveTokenHistory,
   patchTokenHistoryState,
@@ -152,6 +153,26 @@ describe('catch-up, promotion and drop of the token history (e2e)', () => {
     expect(states.map((r) => [r.generation, r.state])).toEqual([[1, 'live']]);
     // nothing to promote any more
     expect(await promoteIfCaughtUp(ch, states)).toBe(false);
+  });
+
+  it('a promotion clears the ranges the build already reflects, and keeps the others', async () => {
+    const ch = await fresh();
+    const world = await seedTokensWorld(ch, new LedgerWriter(ch, CTX));
+    await workerLease(ch);
+    // a range of a recovery before the build started, and one past its h0
+    await appendTokenHistoryDirty(ch, world.first + 1, world.first + 2);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await runTokenHistoryBuild(ch, { network: NETWORK, hasMpt: true, threads: 2, log, ...SMALL });
+    await appendTokenHistoryDirty(ch, world.first + 2, world.first + 3);
+    await appendTokenHistoryDirty(ch, world.head + 1, world.head + 2);
+    expect(await promoteIfCaughtUp(ch, await readTokenHistoryStates(ch))).toBe(true);
+    const left = await ch.query<{ from_ledger: number; to_ledger: number }>(
+      `SELECT from_ledger, to_ledger FROM ${Table.TokenHistoryDirty} ORDER BY from_ledger`,
+    );
+    expect(left).toEqual([
+      { from_ledger: world.first + 2, to_ledger: world.first + 3 },
+      { from_ledger: world.head + 1, to_ledger: world.head + 2 },
+    ]);
   });
 
   it('a retired generation is dropped after 15 minutes and not before', async () => {

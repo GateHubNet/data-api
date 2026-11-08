@@ -87,7 +87,8 @@ export async function catchUpLevels(
 /**
  * Promotes the building generation once its build is done and its `levels_through` is within `near` ledgers of its `through_ledger`
  * (spec 4.6): a `live` row for it, then a `retired` row for the generation that was live, if there was one. Readers switch at the
- * first row. Returns whether it promoted.
+ * first row. The ranges to repair that a re-ingest left before the build started, up to its `h0`, are deleted: the build read the
+ * state they rewrote. Returns whether it promoted.
  */
 export async function promoteIfCaughtUp(
   ch: ClickHouseService,
@@ -102,6 +103,13 @@ export async function promoteIfCaughtUp(
   if (old !== undefined && old.generation !== building.generation) {
     await patchTokenHistoryState(ch, old.generation, { state: 'retired' });
   }
+  // the ranges of a re-ingest before the build started, up to its h0, are in what it read: nothing is left to repair there
+  await ch.command(
+    `DELETE FROM ${Table.TokenHistoryDirty}
+      WHERE to_ledger <= {h0:UInt32} AND created_at < fromUnixTimestamp64Milli({started:Int64}, 'UTC')`,
+    { h0: building.h0, started: Math.round(building.started_at * 1000) },
+    { settings: { lightweight_deletes_sync: '2' } },
+  );
   return true;
 }
 
