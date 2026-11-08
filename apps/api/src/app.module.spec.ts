@@ -1,6 +1,7 @@
 import { NotFoundModule } from './common/not-found.controller';
 import { LedgerObjectsModule } from './ledger-objects/ledger-objects.module';
 import { MptModule } from './mpt/mpt.module';
+import { TokenHistoryModule } from './token-history/token-history.module';
 import { TokensModule } from './tokens/tokens.module';
 import { ValidatorsModule } from './validators/validators.module';
 
@@ -40,5 +41,12 @@ describe('AppModule', () => {
     const imports = Reflect.getMetadata('imports', AppModule) as unknown[];
     expect(imports.filter((m) => m === MptModule)).toHaveLength(1);
     expect(imports.indexOf(MptModule)).toBeLessThan(imports.indexOf(NotFoundModule));
+  });
+
+  it('TokenHistoryModule is before NotFoundModule', async () => {
+    const { AppModule } = await import('./app.module');
+    const imports = Reflect.getMetadata('imports', AppModule) as unknown[];
+    expect(imports.filter((m) => m === TokenHistoryModule)).toHaveLength(1);
+    expect(imports.indexOf(TokenHistoryModule)).toBeLessThan(imports.indexOf(NotFoundModule));
   });
 });
