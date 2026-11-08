@@ -1,7 +1,11 @@
 import { stateCoverageStart } from '../aggregate/tokens.job';
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
+import { MPT_PARSER_VERSION } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { firstCommittedLedger } from '../ingest/ingest-state';
+import { getNetworkProfile, NetworkName } from '../network';
+import { coverageFrom } from '../query/parser-coverage';
+import { loadAmendmentsConfig } from '../validators/amendments-config';
 
 /**
  * Where a generation of the token history starts (spec 4.6): the first ledger of the newest unbroken run of stored ledgers that
@@ -66,4 +70,17 @@ export async function rangeIngestRunning(ch: ClickHouseService): Promise<boolean
     { live: LIVE_INTENT_RUN_PREFIX },
   );
   return rows.length > 0;
+}
+
+/**
+ * Whether the MPT history of a coverage that starts at `from` is whole (spec 6): it starts at or before the ledger `MPTokensV1` was
+ * enabled in, and every ledger from there was written by a parser that records MPT states (`MPT_PARSER_VERSION`; the state coverage
+ * of `from` is parser 3's, which wrote none). An older parser's ledger above the enable ledger leaves the MPT states before it missing.
+ */
+export async function mptCoverageComplete(ch: ClickHouseService, network: string, from: number): Promise<boolean> {
+  const enabled = loadAmendmentsConfig(getNetworkProfile(network as NetworkName)).byName.get('MPTokensV1')?.enabled
+    ?.ledger_index;
+  if (enabled === undefined) return false;
+  const mptFrom = await coverageFrom(ch, MPT_PARSER_VERSION);
+  return mptFrom !== null && Math.max(from, mptFrom) <= enabled;
 }
