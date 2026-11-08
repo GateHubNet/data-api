@@ -1,5 +1,6 @@
 import { CsvRow, toCsvRow } from '../common/csv.interceptor';
 import { Coverage } from '../common/feature-coverage.service';
+import { HOLDER_ROW_KEYS } from '../tokens/token-objects';
 
 /**
  * The answers of the token history's routes (spec 5): their keys in the order of `*_KEYS`, and builders that write them in that
@@ -381,6 +382,9 @@ export const snapshotAnswer = (o: SnapshotAnswer): SnapshotAnswer => ordered(o, 
 
 /** The keys a holder row of D6's `/holders` gains once it reads the token history: after D6's own, `escrowed` for an MPT. */
 export const HOLDER_ROW_EXTRA_KEYS = ['first_ledger', 'last_ledger', 'escrowed'] as const;
+
+/** A holder row of D6's `/holders` once it reads the token history: D6's keys (`HOLDER_ROW_KEYS`), then the extra ones. */
+export const HOLDER_ROW_TOKEN_HISTORY_KEYS = [...HOLDER_ROW_KEYS, ...HOLDER_ROW_EXTRA_KEYS] as const;
 
 // -- CSV -------------------------------------------------------------------------------------------------------------------
 

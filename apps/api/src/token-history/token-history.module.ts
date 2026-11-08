@@ -24,6 +24,6 @@ import { TokenSupplyController } from './token-supply.controller';
     TokenSnapshotController,
   ],
   providers: [TokenHistoryService, TokenHistoryReadsService],
-  exports: [TokenHistoryService],
+  exports: [TokenHistoryService, TokenHistoryReadsService],
 })
 export class TokenHistoryModule {}

@@ -18,3 +18,4 @@ export * from './promote';
 export * from './rebuild-needed';
 export * from './repair';
 export * from './reads';
+export * from './holders-page';

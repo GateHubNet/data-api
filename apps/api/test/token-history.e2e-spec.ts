@@ -23,6 +23,7 @@ import {
 import {
   DISTRIBUTION_SCHEMA,
   FLOWS_SCHEMA,
+  HOLDERS_SCHEMA,
   ISSUER_TOKENS_SCHEMA,
   SNAPSHOT_SCHEMA,
   SUMMARY_SCHEMA,
@@ -32,6 +33,7 @@ import {
   BUCKET_KEYS,
   DISTRIBUTION_KEYS,
   FLOWS_KEYS,
+  HOLDER_ROW_TOKEN_HISTORY_KEYS,
   ISSUER_TOKEN_KEYS,
   SNAPSHOT_KEYS,
   SNAPSHOT_ROW_KEYS,
@@ -42,6 +44,7 @@ import {
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { expectSchema } from './support/ajv';
 import { expectNoMptRead } from './support/mpt-world';
+import { ISSUER_A, seedTokensWorld as seedD6TokensWorld } from './support/tokens-seed';
 
 /**
  * The token history's read routes (issuer analytics, spec 5) on a real ClickHouse: the token history world of the shared suites
@@ -102,6 +105,40 @@ async function seedExtremeToken(ch: ClickHouseService, world: TokenHistoryWorld)
       rows.map((r) => ({ ...r, currency: 'XTR', balance: String(r.balance).startsWith('-') ? `-${amount}` : amount })),
     );
   }
+}
+
+/**
+ * A token of gate, `EQL`, with `count` holders of the same balance, 5: copies of the two sides of the newest change of one of gate's
+ * USD lines, the holder replaced, under the new currency.
+ */
+async function seedEqualToken(ch: ClickHouseService, world: TokenHistoryWorld, count: number): Promise<void> {
+  const usd = tokenMapKey({ issuer: world.gate, currency: world.usd });
+  const [key] = [...(await bruteForceLines(ch as never, world.head)).entries()].find(
+    ([k, v]) => k.startsWith(`${usd} `) && new BigNumber(v.line.balance).gt(0),
+  )!;
+  const holder = key.slice(usd.length + 1);
+  const rows = await ch.query<Obj>(
+    `SELECT * EXCEPT (close_time), toUnixTimestamp(close_time) AS close_time FROM ${Table.TrustLineStates}
+      WHERE currency = {usd:String}
+        AND ((account = {gate:String} AND counterparty = {holder:String}) OR (account = {holder:String} AND counterparty = {gate:String}))
+      ORDER BY ledger_index DESC, tx_index DESC, node_index DESC
+      LIMIT 2`,
+    { usd: world.usd, gate: world.gate, holder },
+  );
+  const copies: Obj[] = [];
+  for (let i = 0; i < count; i++) {
+    const other = encodeAccountID(Buffer.from(`eql-holder-${String(i).padStart(9, '0')}`.slice(0, 20)));
+    for (const r of rows) {
+      copies.push({
+        ...r,
+        currency: 'EQL',
+        account: r.account === holder ? other : r.account,
+        counterparty: r.counterparty === holder ? other : r.counterparty,
+        balance: String(r.balance).startsWith('-') ? '-5' : '5',
+      });
+    }
+  }
+  await ch.insert(Table.TrustLineStates, copies);
 }
 
 /** Three holders of an MPT of gate, with changes in the world's ledgers, at their ledgers' close times. */
@@ -202,6 +239,31 @@ describe('the token history routes', () => {
       await h?.close();
     });
 
+    it("before the first generation the answer is D6's, byte for byte", async () => {
+      await seedD6TokensWorld(h);
+      const usd = `/v2/tokens/USD.${ISSUER_A}/holders`;
+      const pages: Record<string, unknown> = {};
+      for (const path of [usd, `${usd}?limit=2`, `${usd}?descending=false`, `${usd}?format=csv`]) {
+        const res = await api.get(path);
+        pages[path.replace(ISSUER_A, '<issuer>')] = {
+          status: res.status,
+          // the listener's port changes from run to run
+          link: res.headers.link?.replace(/^<http:\/\/127\.0\.0\.1:\d+/, '<'),
+          body: path.endsWith('csv') ? res.text : res.body,
+        };
+      }
+      const first = (await api.ok(`${usd}?limit=2`, 'holders')).body as { marker: string };
+      const next = await api.get(`${usd}?limit=2&marker=${first.marker}`);
+      pages['next page'] = { status: next.status, body: next.body };
+      expect(pages).toMatchSnapshot();
+      // a ledger names the token history, which is not built
+      const res = await api.get(`${usd}?ledger_index=100`);
+      expect({ status: res.status, message: res.body.message }).toEqual({
+        status: 404,
+        message: 'token history is not built yet',
+      });
+    });
+
     it('404 token history is not built yet before the first generation', async () => {
       const issuer = 'rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq';
       for (const path of [`/v2/tokens/USD.${issuer}/summary`, `/v2/issuers/${issuer}/tokens`]) {
@@ -252,6 +314,7 @@ describe('the token history routes', () => {
       world = await seedTokenHistoryWorld(ch as never, new LedgerWriter(ch, CTX) as never);
       mpt = await seedGateMpt(ch, world);
       await seedExtremeToken(ch, world);
+      await seedEqualToken(ch, world, 300);
       await ch.command(
         `INSERT INTO ${Table.SyncerLease} (network, holder, heartbeat) SELECT 'xrpl:token_history', 'worker-1', now64(3)`,
       );
@@ -712,6 +775,85 @@ describe('the token history routes', () => {
         );
         expect(body.supply).toBe('110');
         expectSchema((await api.ok(`/v2/tokens/${mpt}/distribution`, 'buckets')).body, DISTRIBUTION_SCHEMA);
+      });
+    });
+
+    describe("D6's holders, extended", () => {
+      const usd = () => ({ issuer: world.gate, currency: world.usd });
+
+      it("after promotion the keys are D6's, then first_ledger and last_ledger", async () => {
+        const body = (await api.ok(`${usdPath}/holders`, 'holders')).body;
+        expectSchema(body, HOLDERS_SCHEMA);
+        expect(Object.keys(body)).toEqual([
+          'result',
+          'coverage',
+          'ledger_index',
+          'close_time',
+          'supply',
+          'count',
+          'holders',
+        ]);
+        for (const row of body.holders as Obj[]) {
+          expect(Object.keys(row)).toEqual(HOLDER_ROW_TOKEN_HISTORY_KEYS.filter((k) => k !== 'escrowed'));
+        }
+        expect(body.ledger_index).toBe(world.head);
+      });
+
+      it('holders at a past ledger equal the brute force', async () => {
+        const n = world.first + 3;
+        const body = (await api.ok(`${usdPath}/holders?ledger_index=${n}`, 'holders')).body;
+        expectSchema(body, HOLDERS_SCHEMA);
+        const prefix = `${tokenMapKey(usd())} `;
+        const brute = [...(await bruteForceLines(h.ch as never, n)).entries()]
+          .filter(([k, v]) => k.startsWith(prefix) && new BigNumber(v.line.balance).gt(0))
+          .map(([k, v]) => ({ holder: k.slice(prefix.length), balance: new BigNumber(v.line.balance) }))
+          .sort((a, b) => b.balance.comparedTo(a.balance) || (a.holder < b.holder ? -1 : 1));
+        const supply = brute.reduce((s, x) => s.plus(x.balance), new BigNumber(0));
+        expect(body.supply).toBe(supply.toFixed());
+        expect((body.holders as Obj[]).map((r) => [r.rank, r.holder, r.balance])).toEqual(
+          brute.map((x, i) => [i + 1, x.holder, x.balance.toFixed()]),
+        );
+      });
+
+      it('pages of 300 equal balances concatenate to the unpaged list in both directions', async () => {
+        const path = `/v2/tokens/EQL.${world.gate}/holders`;
+        for (const descending of [true, false]) {
+          const whole = (await api.ok(`${path}?descending=${descending}&limit=1000`, 'holders')).body.holders as Obj[];
+          expect(whole).toHaveLength(300);
+          const pages = await api.pages<{ holders: Obj[]; marker?: string }>(
+            `${path}?descending=${descending}`,
+            7,
+            'holders',
+          );
+          const rows = pages.flatMap((p) => p.holders);
+          expect({ descending, rows }).toEqual({ descending, rows: whole });
+          expect(new Set(rows.map((r) => r.holder)).size).toBe(300);
+        }
+        // the largest first, then by address; the reverse is the exact reverse, ranks kept
+        const down = (await api.ok(`${path}?limit=1000`, 'holders')).body.holders as Obj[];
+        const up = (await api.ok(`${path}?descending=false&limit=1000`, 'holders')).body.holders as Obj[];
+        expect(up).toEqual([...down].reverse());
+        expect(down.map((r) => r.holder)).toEqual([...down.map((r) => r.holder as string)].sort());
+      });
+
+      it('a D6 marker is invalid marker', async () => {
+        const d6 = Buffer.from(JSON.stringify([12.5, world.gate])).toString('base64url');
+        const notDecimal = Buffer.from(JSON.stringify([world.gate, '1e5'])).toString('base64url');
+        const notAnAddress = Buffer.from(JSON.stringify(['21.5', world.gate])).toString('base64url');
+        for (const marker of [d6, notDecimal, notAnAddress]) {
+          const res = await api.get(`${usdPath}/holders?marker=${marker}`);
+          expect({ status: res.status, message: res.body.message }).toEqual({ status: 400, message: 'invalid marker' });
+        }
+      });
+
+      it('an MPT ID lists its holders with escrowed', async () => {
+        const body = (await api.ok(`/v2/tokens/${mpt}/holders`, 'holders')).body;
+        expectSchema(body, HOLDERS_SCHEMA);
+        expect((body.holders as Obj[]).map((r) => [r.holder, r.balance, r.escrowed])).toEqual([
+          [MPT_A, '100', '0'],
+          [MPT_B, '10', '3'],
+        ]);
+        expect(Object.keys((body.holders as Obj[])[0])).toEqual([...HOLDER_ROW_TOKEN_HISTORY_KEYS]);
       });
     });
 

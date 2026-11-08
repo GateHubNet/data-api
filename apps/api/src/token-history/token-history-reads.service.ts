@@ -5,6 +5,7 @@ import {
   distributionAt,
   flowsPeriods,
   holdersAt,
+  holdersPage,
   isLpCurrency,
   issuerTokensAt,
   NetworkProfile,
@@ -502,6 +503,49 @@ export class TokenHistoryReadsService {
           }),
         ),
       }),
+    };
+  }
+
+  /**
+   * A page of the holders of `/v2/tokens/{token}/holders` from the token history (spec 5.5): D6's keys, then `first_ledger`,
+   * `last_ledger` and an MPT's `escrowed`; the shares of the supply at `n`; the marker the holder and the balance text of the last row.
+   */
+  async holders(
+    live: LiveTokenHistory,
+    token: AnyToken,
+    n: number,
+    o: { descending: boolean; after?: { balance: string; holder: string }; limit: number },
+  ): Promise<Record<string, unknown>> {
+    const key = { issuer: token.issuer, currency: token.currency, kind: token.kind };
+    const [coverage, close, totals, rows] = await Promise.all([
+      this.coverage(live, token.kind),
+      this.closeTimeOf(live, n),
+      totalsAt(this.ch, live.generation, key, n),
+      holdersPage(this.ch, live.generation, key, n, o),
+    ]);
+    const page = rows.slice(0, o.limit);
+    const last = page[page.length - 1];
+    const marker = rows.length > o.limit ? encodeMarker([last.holder, last.balance]) : undefined;
+    return {
+      result: 'success',
+      coverage,
+      ledger_index: n,
+      close_time: fmtTime(close),
+      supply: totals.supply,
+      count: page.length,
+      ...(marker !== undefined && { marker }),
+      holders: page.map((r) => ({
+        rank: r.rank,
+        holder: r.holder,
+        balance: r.balance,
+        share: shareOf(r.balance, totals.supply),
+        limit: r.limit,
+        frozen: r.frozen,
+        authorized: r.authorized,
+        first_ledger: r.first_ledger,
+        last_ledger: r.last_ledger,
+        ...(token.kind === 'mpt' && { escrowed: r.escrowed }),
+      })),
     };
   }
 }

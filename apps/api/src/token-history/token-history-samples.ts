@@ -40,7 +40,7 @@ const holders: { holders: HolderRow[] } & Record<string, unknown> = {
   ...ENVELOPE,
   supply: '1250000.5',
   count: 2,
-  marker: 'WyIxMDAiLCJyTXdqWWVkamM3cXF0S1lWTGlBY2NKU21Dd2loNExuRTJxIl0',
+  marker: 'WyJyTXdqWWVkamM3cXF0S1lWTGlBY2NKU21Dd2loNExuRTJxIiwiMTAwIl0',
   holders: [
     {
       rank: 1,
