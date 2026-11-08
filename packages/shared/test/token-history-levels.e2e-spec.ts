@@ -1,6 +1,6 @@
 import BigNumber from 'bignumber.js';
 import { TokenKey } from '../src/aggregate/token-rules';
-import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
+import { ClickHouseService, CommandOptions } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
 import { LedgersRow, TokenHolderChangesRow } from '../src/clickhouse/rows';
 import { Table } from '../src/clickhouse/tables';
@@ -348,6 +348,29 @@ describe('the levels phase of the token history build (e2e)', () => {
         expect((await holdersAt(ch, 1, token, n)).sort(sort)).toEqual((await holdersAt(ch, 3, token, n)).sort(sort));
       }
     }
+  });
+
+  it('an error of the hour rows statement stops the build, whatever its text says', async () => {
+    // A Decimal256 sum in ClickHouse wraps past its Int256 instead of failing, so no error of this statement means "summed past the
+    // decimal": the slice's bound keeps its sums far below (amounts under EXACT_LIMIT, at most a slice or an hour of changes).
+    await ch.insert(Table.TokenHolderChanges, generatedChangeLog(6));
+    let failed = false;
+    const failing = new Proxy(ch, {
+      get(target, prop, receiver) {
+        if (prop !== 'commandSummary') return Reflect.get(target, prop, receiver);
+        return (sql: string, ...rest: [Record<string, unknown>?, CommandOptions?]) => {
+          if (!failed && sql.trimStart().startsWith(`INSERT INTO ${Table.TokenHourly}`)) {
+            failed = true;
+            return Promise.reject(new Error('Memory limit (total) exceeded: a buffer overflow'));
+          }
+          return target.commandSummary(sql, ...rest);
+        };
+      },
+    });
+    await expect(buildTokenLevels(failing, 6, TOKENS[0], LEDGERS, { floor: FLOOR })).rejects.toThrow(
+      'a buffer overflow',
+    );
+    expect(failed).toBe(true);
   });
 
   it('a slice holds at most `slice` changes, or one hour, and the slices walk every ledger once', async () => {
