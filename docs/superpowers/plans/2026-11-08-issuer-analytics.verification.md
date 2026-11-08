@@ -186,3 +186,18 @@ Run on 2026-11-08 at ed0cbfb (the top of the stack, the fixes of every Part merg
 
 The branches below hold subsets of this code: each fix ran its own suites there (the build, levels and state suites on
 `-1-build`; the live, promote and repair suites and the worker's unit tests on `-2-worker`; the api's unit tests on `-3-routes`).
+
+## Gates after CodeRabbit's second review of PR 1
+
+Run on 2026-11-09 at 9b25735 (the top of the stack, with the lease, overflow-catch and spec 5.0 fixes of `-1-build` merged in), every
+ClickHouse a testcontainer:
+
+| Gate | Result |
+| --- | --- |
+| `pnpm build` | passed |
+| `pnpm test` | passed: shared 3,102, exporter 12, syncer 1,970, api 2,751 |
+| `pnpm --filter @gatehub/data-api-shared test:e2e` | 39 suites, 1,883 tests passed |
+| `pnpm --filter @gatehub/data-syncer test:e2e` | 21 suites, 445 tests passed |
+| `pnpm --filter @gatehub/data-api-service test:e2e` | 62 suites, 3,653 tests passed |
+
+On `-1-build` the fixes ran their own suites: the build and levels e2e suites (14 and 11 tests) and the CLI's unit tests (8).
