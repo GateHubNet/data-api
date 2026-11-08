@@ -1,8 +1,10 @@
 import {
   BuildRefused,
   BuildStopped,
+  ClickHouseConfig,
   clickHouseConfigFromEnv,
   ClickHouseService,
+  NetworkProfile,
   getNetworkProfile,
   runTokenHistoryBuild,
   TOKEN_HISTORY_BUILD_THREADS,
@@ -69,6 +71,23 @@ export function parseTokenHistoryBuildArgs(argv: string[]): { threads: number } 
   return { threads };
 }
 
+/** The request timeout of the build's client unless `GH_CLICKHOUSE_REQUEST_TIMEOUT` says otherwise: a batch can take long. */
+export const BUILD_REQUEST_TIMEOUT_MS = 6 * 3_600_000;
+
+/**
+ * The ClickHouse config of the build: the syncer's (`GH_CLICKHOUSE_*`), but without its 30 s guards, which no statement of a
+ * mainnet build stays under: the request timeout is `BUILD_REQUEST_TIMEOUT_MS` and `max_execution_time` is off, unless
+ * `GH_CLICKHOUSE_REQUEST_TIMEOUT` or `GH_CLICKHOUSE_MAX_EXECUTION_TIME` sets them.
+ */
+export function buildClickHouseConfig(env: NodeJS.ProcessEnv, profile: NetworkProfile): ClickHouseConfig {
+  const base = clickHouseConfigFromEnv(env, profile);
+  return {
+    ...base,
+    requestTimeout: env.GH_CLICKHOUSE_REQUEST_TIMEOUT === undefined ? BUILD_REQUEST_TIMEOUT_MS : base.requestTimeout,
+    maxExecutionTime: env.GH_CLICKHOUSE_MAX_EXECUTION_TIME === undefined ? 0 : base.maxExecutionTime,
+  };
+}
+
 /** The exit status of a build that threw: 2 refused, 3 stopped by a range-ingest, 1 anything else (an interrupt included). */
 export function exitCodeOf(err: unknown): number {
   if (err instanceof BuildRefused) return 2;
@@ -94,7 +113,7 @@ export async function main(argv: string[]): Promise<number> {
   const logger = new Logger('TokenHistoryBuild');
   const cfg = await loadSyncerConfig();
   const profile = getNetworkProfile(cfg.network);
-  const clickHouse = clickHouseConfigFromEnv(process.env, profile);
+  const clickHouse = buildClickHouseConfig(process.env, profile);
   const ch = new ClickHouseService(clickHouse);
   const abort = new AbortController();
   const onSigint = (): void => {

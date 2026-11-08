@@ -1,5 +1,13 @@
-import { TOKEN_HISTORY_BUILD_THREADS } from '@gatehub/data-api-shared';
-import { exitCodeOf, main, parseTokenHistoryBuildArgs, USAGE, UsageError } from './token-history-build';
+import { getNetworkProfile, TOKEN_HISTORY_BUILD_THREADS } from '@gatehub/data-api-shared';
+import {
+  BUILD_REQUEST_TIMEOUT_MS,
+  buildClickHouseConfig,
+  exitCodeOf,
+  main,
+  parseTokenHistoryBuildArgs,
+  USAGE,
+  UsageError,
+} from './token-history-build';
 
 describe('parseTokenHistoryBuildArgs', () => {
   it('parses --threads and defaults to 4', () => {
@@ -41,5 +49,24 @@ describe('exitCodeOf', () => {
     expect(exitCodeOf(new shared.BuildRefused('range_ingest', 'a range-ingest is running'))).toBe(2);
     expect(exitCodeOf(new shared.BuildStopped('stopped'))).toBe(3);
     expect(exitCodeOf(new Error('boom'))).toBe(1);
+  });
+});
+
+describe('buildClickHouseConfig', () => {
+  const profile = getNetworkProfile('xrpl');
+  const url = 'http://scratch.invalid:18123';
+
+  it('lifts the 30 s guards of the syncer for the long statements of a build', () => {
+    const cfg = buildClickHouseConfig({ GH_CLICKHOUSE_URL: url }, profile);
+    expect(cfg).toMatchObject({ url, database: 'xrpl', requestTimeout: BUILD_REQUEST_TIMEOUT_MS, maxExecutionTime: 0 });
+    expect(BUILD_REQUEST_TIMEOUT_MS).toBe(6 * 3_600_000);
+  });
+
+  it('keeps what the operator sets', () => {
+    const cfg = buildClickHouseConfig(
+      { GH_CLICKHOUSE_URL: url, GH_CLICKHOUSE_REQUEST_TIMEOUT: '60000', GH_CLICKHOUSE_MAX_EXECUTION_TIME: '120' },
+      profile,
+    );
+    expect(cfg).toMatchObject({ requestTimeout: 60_000, maxExecutionTime: 120 });
   });
 });
