@@ -189,7 +189,7 @@ const deletedRoot = (root: Root): Json => ({
 });
 
 interface WorldTx {
-  type: 'TrustSet' | 'AccountSet' | 'AccountDelete';
+  type: 'TrustSet' | 'AccountSet' | 'AccountDelete' | 'Clawback' | 'AMMClawback';
   account: string;
   nodes: Json[];
 }
@@ -694,6 +694,66 @@ export async function seedTokensWorldLater(writer: LedgerWriter, world: TokensWo
       { ledger: first, rate: 1_010_000_000 },
       { ledger: first + 2, rate: 1_015_000_000 },
     ],
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The token history's world
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** The world of the token history's suites: the tokens world, its second batch, and one ledger more (`clawbackLedger`, the head);
+ *  `ledgers` holds all of them. */
+export interface TokenHistoryWorld extends TokensWorld {
+  /** The second batch (`seedTokensWorldLater`). */
+  later: TokensWorldLater;
+  /** The ledger after the second batch, the world's head: a `Clawback`, an `AMMClawback`, and the first row of `preexisting`. */
+  clawbackLedger: number;
+  /** The holder of gate's USD that gate claws back 3 of (4 becomes 1), and the pool, which an `AMMClawback` takes 100 from (5000
+   *  becomes 4900). */
+  clawedHolder: string;
+  /** A holder of gate's USD whose line the world never makes: its first row is a `ModifiedNode` (20 becomes 25). */
+  preexisting: string;
+}
+
+/**
+ * Writes the tokens world, its second batch and one more ledger through `writer`, for the token history's suites: a `Clawback` and
+ * an `AMMClawback` (whose changes are clawed back), and a line whose first row is not its creation. `head` is that last ledger.
+ */
+export async function seedTokenHistoryWorld(
+  ch: ClickHouseService,
+  writer: LedgerWriter,
+  o: TokensWorldOptions = {},
+): Promise<TokenHistoryWorld> {
+  const world = await seedTokensWorld(ch, writer, o);
+  const later = await seedTokensWorldLater(writer, world);
+  const { gate, pool } = world;
+  const clawed: Line = {
+    issuer: gate,
+    holder: above(gate, 'gU15'),
+    currency: world.usd,
+    held: '4',
+    holderLimit: '100',
+    authorized: true,
+  };
+  const pooled: Line = { issuer: gate, holder: pool, currency: world.usd, held: '5000', holderLimit: '0', amm: true };
+  const pre: Line = { issuer: gate, holder: below(gate, 'pre'), currency: world.usd, held: '20', holderLimit: '100' };
+  const clawbackLedger = later.head + 1;
+  const [ledger] = ledgersOf(clawbackLedger, [
+    [
+      { type: 'Clawback', account: gate, nodes: [modifiedLine(clawed, { ...clawed, held: '1' })] },
+      { type: 'AMMClawback', account: gate, nodes: [modifiedLine(pooled, { ...pooled, held: '4900' })] },
+      { type: 'TrustSet', account: pre.holder, nodes: [modifiedLine(pre, { ...pre, held: '25' })] },
+    ],
+  ]);
+  await writer.write([ledger]);
+  return {
+    ...world,
+    head: clawbackLedger,
+    ledgers: [...world.ledgers, ...later.ledgers, clawbackLedger],
+    later,
+    clawbackLedger,
+    clawedHolder: clawed.holder,
+    preexisting: pre.holder,
   };
 }
 

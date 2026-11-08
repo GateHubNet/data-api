@@ -11,8 +11,30 @@ const negative = (column: string): string => `startsWith(${column}, '-')`;
 /** The text of a limit column is above 0. */
 const abovePositiveZero = (column: string): string => `(${column} != '0' AND NOT ${negative(column)})`;
 
-/** Whether a `trust_line_states` row counts for the token of its `account` (spec 1: `countsFor(balance, limit_peer)`, not deleted). */
-export const ISSUED_COUNTED_SQL = `(deleted = 0 AND (${negative('balance')} OR (balance = '0' AND ${abovePositiveZero('limit_peer')})))`;
+/** The columns of a `trust_line_states` row that the token side reads: `balance`, `limit_peer` and `deleted`, or their lags. */
+export interface IssuedSideColumns {
+  balance: string;
+  limit_peer: string;
+  deleted: string;
+}
+
+const STATE_COLUMNS: IssuedSideColumns = { balance: 'balance', limit_peer: 'limit_peer', deleted: 'deleted' };
+
+/**
+ * Whether a `trust_line_states` row counts for the token of its `account` (spec 1: `countsFor(balance, limit_peer)`, not deleted),
+ * over the named columns (code, never input).
+ */
+export function issuedCountedSql(c: IssuedSideColumns = STATE_COLUMNS): string {
+  return `(${c.deleted} = 0 AND (${negative(c.balance)} OR (${c.balance} = '0' AND ${abovePositiveZero(c.limit_peer)})))`;
+}
+
+/** The holder's amount of a row, over the named columns: `-balance` when the line counts, else `'0'`. */
+export function issuedAmountSql(c: IssuedSideColumns = STATE_COLUMNS): string {
+  return `if(${issuedCountedSql(c)} AND ${negative(c.balance)}, substring(${c.balance}, 2), '0')`;
+}
+
+/** Whether a `trust_line_states` row counts for the token of its `account`, over its own columns. */
+export const ISSUED_COUNTED_SQL = issuedCountedSql();
 
 /**
  * The SELECT expressions of the token side over the columns of `trust_line_states`: `issuer, holder, currency, counted, amount,
@@ -25,7 +47,7 @@ export const ISSUED_SIDE_COLUMNS = [
   'counterparty AS holder',
   'currency',
   `toUInt8(${ISSUED_COUNTED_SQL}) AS counted`,
-  `if(${ISSUED_COUNTED_SQL} AND ${negative('balance')}, substring(balance, 2), '0') AS amount`,
+  `${issuedAmountSql()} AS amount`,
   'limit_peer AS `limit`',
   'freeze AS frozen',
   'authorized',
