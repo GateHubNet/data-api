@@ -4,7 +4,8 @@ import { ClickHouseService } from '../clickhouse/clickhouse.service';
 import { MPT_PARSER_VERSION, TOKEN_PARSER_VERSION, TokenHistoryDirtyRow, TokenHistoryStateRow } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { buildTokenLevels } from './build/levels';
-import { issuedComplete, mptComplete } from './build/run-build';
+import { issuedComplete } from './build/run-build';
+import { mptCoverageComplete } from './coverage-start';
 import { closeHourOf, ledgersOfHour } from './hour-sets';
 import { changesOf, keysIn, windowHistories } from './live-window';
 import { buildingTokenHistory, liveTokenHistory } from './state';
@@ -97,7 +98,7 @@ async function repairGeneration(
   const histories = await windowHistories(ch, lines, mpts, from - 1, to);
   const rows = changesOf({ ...gen, through_ledger: from - 1 }, histories, {
     issued: issuedComplete(o.network, gen.coverage_from),
-    mpt: mptComplete(o.network, gen.coverage_from),
+    mpt: await mptCoverageComplete(ch, o.network, gen.coverage_from),
   });
   const tokens = new Map<string, TokenKey>();
   for (const l of lines) {

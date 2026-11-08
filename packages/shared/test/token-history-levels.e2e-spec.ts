@@ -5,7 +5,12 @@ import { runMigrations } from '../src/clickhouse/migrate';
 import { LedgersRow, TokenHolderChangesRow } from '../src/clickhouse/rows';
 import { Table } from '../src/clickhouse/tables';
 import { seededRandom } from '../src/test-utils/token-history-cases';
-import { buildSmallTokenLevels, buildTokenLevels, nextLevelTokens } from '../src/token-history/build/levels';
+import {
+  buildSmallTokenLevels,
+  buildTokenLevels,
+  nextLevelsSlice,
+  nextLevelTokens,
+} from '../src/token-history/build/levels';
 import { checkpointLedgers, LedgerTotals } from '../src/token-history/checkpoint-rule';
 import { ChangeAmounts, flowsOfTransaction } from '../src/token-history/flows';
 import { holdersAt, totalsAt } from '../src/token-history/holders-at';
@@ -51,7 +56,17 @@ function generatedChangeLog(g: number): TokenHolderChangesRow[] {
         const holders = 1 + Math.floor(rnd() * 3);
         for (let node = 0; node < holders; node++) {
           const holder = `rHolder${Math.floor(rnd() * 12)}`;
-          if (rows.some((r) => r.issuer === token.issuer && r.currency === token.currency && r.ledger_index === ledger && r.tx_index === tx && r.holder === holder)) continue;
+          if (
+            rows.some(
+              (r) =>
+                r.issuer === token.issuer &&
+                r.currency === token.currency &&
+                r.ledger_index === ledger &&
+                r.tx_index === tx &&
+                r.holder === holder,
+            )
+          )
+            continue;
           const was = state.get(holder);
           const counted = rnd() > 0.1;
           const after = counted ? amount() : '0';
@@ -195,7 +210,13 @@ describe('the levels phase of the token history build (e2e)', () => {
         const lastOfHour = Math.floor((h.hour + 3_600 - 1 - T0) / 600) + 1;
         const end = h.final === 1 ? lastOfHour : UP_TO;
         const totals = await totalsAt(ch, 1, token, Math.min(end, UP_TO));
-        expect({ token, hour: h.hour, supply: h.supply, holders: Number(h.holders), trust_lines: Number(h.trust_lines) }).toEqual({
+        expect({
+          token,
+          hour: h.hour,
+          supply: h.supply,
+          holders: Number(h.holders),
+          trust_lines: Number(h.trust_lines),
+        }).toEqual({
           token,
           hour: h.hour,
           supply: totals.supply,
@@ -326,6 +347,34 @@ describe('the levels phase of the token history build (e2e)', () => {
         const sort = (a: { holder: string }, b: { holder: string }) => (a.holder < b.holder ? -1 : 1);
         expect((await holdersAt(ch, 1, token, n)).sort(sort)).toEqual((await holdersAt(ch, 3, token, n)).sort(sort));
       }
+    }
+  });
+
+  it('a slice holds at most `slice` changes, or one hour, and the slices walk every ledger once', async () => {
+    for (const token of TOKENS) {
+      const all = (
+        await ch.query<{ l: number }>(
+          `SELECT DISTINCT ledger_index AS l FROM ${Table.TokenHolderChanges}
+            WHERE generation = 1 AND issuer = {issuer:String} AND currency = {currency:String} AND ledger_index <= {up:UInt32}
+            ORDER BY l`,
+          { ...token, up: UP_TO },
+        )
+      ).map((r) => Number(r.l));
+      const seen: number[] = [];
+      let after = 0;
+      for (let i = 0; i < 1_000; i++) {
+        const read = await nextLevelsSlice(ch, 1, token, after, UP_TO, 7);
+        if (read.length === 0) break;
+        const changes = read.reduce((s, r) => s + Number(r.changes), 0);
+        expect({ token, after, bounded: changes <= 7 || new Set(read.map((r) => r.hour)).size === 1 }).toEqual({
+          token,
+          after,
+          bounded: true,
+        });
+        seen.push(...read.map((r) => Number(r.ledger_index)));
+        after = Number(read[read.length - 1].ledger_index);
+      }
+      expect({ token, seen }).toEqual({ token, seen: all });
     }
   });
 

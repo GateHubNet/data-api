@@ -2,7 +2,12 @@ import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
 import { IngestLogRow, LedgersRow, TokenHistoryStateRow } from '../src/clickhouse/rows';
 import { Table } from '../src/clickhouse/tables';
-import { rangeIngestRunning, tokenHistoryCoverageFrom, unbrokenRunStart } from '../src/token-history/coverage-start';
+import {
+  mptCoverageComplete,
+  rangeIngestRunning,
+  tokenHistoryCoverageFrom,
+  unbrokenRunStart,
+} from '../src/token-history/coverage-start';
 import {
   buildingTokenHistory,
   liveTokenHistory,
@@ -66,7 +71,10 @@ describe('the token history state and coverage (e2e)', () => {
   describe('unbrokenRunStart', () => {
     it('unbrokenRunStart finds the start of the run that reaches the head', async () => {
       const ch = await fresh();
-      await ch.insert(Table.Ledgers, [...range(10, 20), ...range(30, 50)].map((l) => ledgerRow(l)));
+      await ch.insert(
+        Table.Ledgers,
+        [...range(10, 20), ...range(30, 50)].map((l) => ledgerRow(l)),
+      );
       expect(await unbrokenRunStart(ch, 50)).toBe(30);
       // a head inside the older run reaches back to its start
       expect(await unbrokenRunStart(ch, 15)).toBe(10);
@@ -74,18 +82,27 @@ describe('the token history state and coverage (e2e)', () => {
 
     it('it is the first ledger with no gap', async () => {
       const ch = await fresh();
-      await ch.insert(Table.Ledgers, range(10, 50).map((l) => ledgerRow(l)));
+      await ch.insert(
+        Table.Ledgers,
+        range(10, 50).map((l) => ledgerRow(l)),
+      );
       expect(await unbrokenRunStart(ch, 50)).toBe(10);
       // a gap of one ledger just below the head
       const gap = await fresh();
-      await gap.insert(Table.Ledgers, [...range(10, 48), 50].map((l) => ledgerRow(l)));
+      await gap.insert(
+        Table.Ledgers,
+        [...range(10, 48), 50].map((l) => ledgerRow(l)),
+      );
       expect(await unbrokenRunStart(gap, 50)).toBe(50);
     });
 
     it('is undefined when the head is not stored', async () => {
       const ch = await fresh();
       expect(await unbrokenRunStart(ch, 50)).toBeUndefined();
-      await ch.insert(Table.Ledgers, range(10, 20).map((l) => ledgerRow(l)));
+      await ch.insert(
+        Table.Ledgers,
+        range(10, 20).map((l) => ledgerRow(l)),
+      );
       expect(await unbrokenRunStart(ch, 50)).toBeUndefined();
     });
 
@@ -94,7 +111,10 @@ describe('the token history state and coverage (e2e)', () => {
       // no merge may collapse the two rows of 45 while the test reads them
       await ch.command(`SYSTEM STOP MERGES ${Table.Ledgers}`);
       // 30-50 with 40 missing, and 45 written twice (a re-ingest before the merge): count() of [30, 50] equals its span
-      await ch.insert(Table.Ledgers, [...range(30, 39), ...range(41, 50)].map((l) => ledgerRow(l)));
+      await ch.insert(
+        Table.Ledgers,
+        [...range(30, 39), ...range(41, 50)].map((l) => ledgerRow(l)),
+      );
       await ch.insert(Table.Ledgers, [{ ...ledgerRow(45), ingested_at: 1_700_000_999 }]);
       const n = await ch.queryOne<{ n: string }>(
         `SELECT toString(count()) AS n FROM ${Table.Ledgers} WHERE ledger_index BETWEEN 30 AND 50`,
@@ -107,8 +127,16 @@ describe('the token history state and coverage (e2e)', () => {
       const ch = await fresh();
       await ch.command(`SYSTEM STOP MERGES ${Table.Ledgers}`);
       // 30-50 with 42 and 44 missing, and 41 and 45 written twice: count() and sum() of [40, 50] are those of a whole range
-      await ch.insert(Table.Ledgers, range(30, 50).filter((l) => l !== 42 && l !== 44).map((l) => ledgerRow(l)));
-      await ch.insert(Table.Ledgers, [41, 45].map((l) => ({ ...ledgerRow(l), ingested_at: 1_700_000_999 })));
+      await ch.insert(
+        Table.Ledgers,
+        range(30, 50)
+          .filter((l) => l !== 42 && l !== 44)
+          .map((l) => ledgerRow(l)),
+      );
+      await ch.insert(
+        Table.Ledgers,
+        [41, 45].map((l) => ({ ...ledgerRow(l), ingested_at: 1_700_000_999 })),
+      );
       const figures = await ch.queryOne<{ n: string; s: string }>(
         `SELECT toString(count()) AS n, toString(sum(ledger_index)) AS s FROM ${Table.Ledgers} WHERE ledger_index BETWEEN 40 AND 50`,
       );
@@ -117,17 +145,53 @@ describe('the token history state and coverage (e2e)', () => {
     });
   });
 
+  describe('mptCoverageComplete', () => {
+    const ENABLED = 99_226_369; // MPTokensV1 on the XRP Ledger
+
+    it('is complete from the MPTokensV1 ledger only while every ledger from there was written by parser 10 or later', async () => {
+      const ch = await fresh();
+      await ch.insert(
+        Table.Ledgers,
+        range(ENABLED - 5, ENABLED + 5).map((l) => ledgerRow(l, 10)),
+      );
+      expect(await mptCoverageComplete(ch, 'xrpl', ENABLED - 5)).toBe(true);
+      expect(await mptCoverageComplete(ch, 'xrpl', ENABLED + 1)).toBe(false);
+      // a ledger above the enable ledger written by an older parser: its MPT states are missing, the MPT history is not whole
+      const older = await fresh();
+      await older.insert(Table.Ledgers, [
+        ...range(ENABLED - 5, ENABLED + 5).map((l) => ledgerRow(l, 10)),
+        ledgerRow(ENABLED + 6, 9),
+      ]);
+      expect(await mptCoverageComplete(older, 'xrpl', ENABLED - 5)).toBe(false);
+      // one below it does not matter: no MPT existed then
+      const below = await fresh();
+      await below.insert(Table.Ledgers, [
+        ...range(ENABLED - 5, ENABLED + 5).map((l) => ledgerRow(l, 10)),
+        ledgerRow(ENABLED - 9, 9),
+      ]);
+      expect(await mptCoverageComplete(below, 'xrpl', ENABLED - 9)).toBe(true);
+      // no enable ledger known: never complete
+      expect(await mptCoverageComplete(ch, 'xrpl-testnet', 1)).toBe(false);
+    });
+  });
+
   describe('tokenHistoryCoverageFrom', () => {
     it('tokenHistoryCoverageFrom never goes below the state coverage', async () => {
       const ch = await fresh();
-      await ch.insert(Table.Ledgers, range(30, 50).map((l) => ledgerRow(l, l === 35 ? 2 : 10)));
+      await ch.insert(
+        Table.Ledgers,
+        range(30, 50).map((l) => ledgerRow(l, l === 35 ? 2 : 10)),
+      );
       expect(await unbrokenRunStart(ch, 50)).toBe(30);
       expect(await tokenHistoryCoverageFrom(ch, 50)).toBe(36);
     });
 
     it('is the start of the head run when the state coverage is below it', async () => {
       const ch = await fresh();
-      await ch.insert(Table.Ledgers, [...range(10, 20), ...range(30, 50)].map((l) => ledgerRow(l)));
+      await ch.insert(
+        Table.Ledgers,
+        [...range(10, 20), ...range(30, 50)].map((l) => ledgerRow(l)),
+      );
       expect(await tokenHistoryCoverageFrom(ch, 50)).toBe(30);
     });
   });

@@ -231,10 +231,13 @@ describe('the token history build (e2e)', () => {
     });
 
     it('logs its progress as range-ingest does', () => {
-      expect(logs.some((m) => /^token-history-build: generation 1 phase changes cursor \S+ rows \d+ \(\d+ rows\/s\)$/.test(m))).toBe(
-        true,
-      );
-      for (const phase of ['mpt_changes', 'levels', 'dex']) expect(logs.some((m) => m.includes(`phase ${phase} `))).toBe(true);
+      expect(
+        logs.some((m) =>
+          /^token-history-build: generation 1 phase changes cursor \S+ rows \d+ \(\d+ rows\/s\)$/.test(m),
+        ),
+      ).toBe(true);
+      for (const phase of ['mpt_changes', 'levels', 'dex'])
+        expect(logs.some((m) => m.includes(`phase ${phase} `))).toBe(true);
     });
 
     it('sends every statement with max_threads = threads', async () => {
@@ -261,11 +264,40 @@ describe('the token history build (e2e)', () => {
         };
         await expect(build(other, { log: aborting, signal: abort.signal })).rejects.toThrow(`stopped in ${phase}`);
         const [state] = await readTokenHistoryStates(other);
-        expect({ phase, state: state.state, generation: state.generation }).toEqual({ phase, state: 'building', generation: 1 });
+        expect({ phase, state: state.state, generation: state.generation }).toEqual({
+          phase,
+          state: 'building',
+          generation: 1,
+        });
       }
       expect(await build(other)).toEqual({ generation: 1, phase: 'done' });
       expect(await other.query(TABLES, { g: 1 })).toEqual(await ch.query(TABLES, { g: 1 }));
     });
+  });
+
+  it('a phase patch lost to a concurrent patch of the worker is written again', async () => {
+    const ch = await fresh();
+    await seedBuildWorld(ch);
+    // the worker's patch of through_ledger, read before the build's `done` and written after it, copies the state before it
+    let raced = false;
+    const racing = new Proxy(ch, {
+      get(target, prop, receiver) {
+        if (prop !== 'command') return Reflect.get(target, prop, receiver);
+        return async (q: string, p?: Record<string, unknown>, o?: never) => {
+          const lose = !raced && q.includes(`INSERT INTO ${Table.TokenHistoryState}`) && p?.p_phase === 'done';
+          const before = lose ? (await readTokenHistoryStates(target)).find((r) => r.generation === p?.g) : undefined;
+          await target.command(q, p, o);
+          if (before !== undefined) {
+            raced = true;
+            await writeTokenHistoryState(target, before);
+          }
+        };
+      },
+    });
+    await build(racing, { leaseSettleMs: 0, stateSettleMs: 0 });
+    expect(raced).toBe(true);
+    const [state] = await readTokenHistoryStates(ch);
+    expect(state.phase).toBe('done');
   });
 
   it('a patch keeps the fields of the state it does not name', async () => {
@@ -288,6 +320,12 @@ describe('the token history build (e2e)', () => {
     await patchTokenHistoryState(ch, 4, { account_cursor: 'rZ' });
     await patchTokenHistoryState(ch, 4, { through_ledger: 30 });
     const [row] = await readTokenHistoryStates(ch);
-    expect(row).toMatchObject({ account_cursor: 'rZ', through_ledger: 30, h0: 20, coverage_from: 10, started_at: 1_700_000_000.25 });
+    expect(row).toMatchObject({
+      account_cursor: 'rZ',
+      through_ledger: 30,
+      h0: 20,
+      coverage_from: 10,
+      started_at: 1_700_000_000.25,
+    });
   });
 });

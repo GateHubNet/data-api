@@ -6,7 +6,8 @@ import { Table } from '../clickhouse/tables';
 import { mptIssuerOf } from '../util/mpt';
 import { CLAWBACK_TX_TYPES } from './build/changes-pass';
 import { writeCheckpoint } from './build/levels';
-import { issuedComplete, mptComplete } from './build/run-build';
+import { issuedComplete } from './build/run-build';
+import { mptCoverageComplete } from './coverage-start';
 import { checkpointAt, totalsAt } from './holders-at';
 import { checkpointLedgers, LedgerTotals } from './checkpoint-rule';
 import { TOKEN_HISTORY_CHECKPOINT_FLOOR } from './constants';
@@ -400,7 +401,7 @@ export async function applyLiveWindow(
   for (const gen of active) {
     const changes = changesOf(gen, histories, {
       issued: issuedComplete(o.network, gen.coverage_from),
-      mpt: mptComplete(o.network, gen.coverage_from),
+      mpt: await mptCoverageComplete(ch, o.network, gen.coverage_from),
     });
     changesByGen.set(gen.generation, changes);
     if (changes.length > 0) {
