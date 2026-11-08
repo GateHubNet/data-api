@@ -114,3 +114,53 @@ export async function writeTokenHistoryState(
     },
   );
 }
+
+/** The fields of a generation's state a writer may change. */
+export type TokenHistoryStatePatch = Partial<Omit<TokenHistoryStateRow, 'generation' | 'version' | 'changed_at' | 'started_at'>>;
+
+/** The columns of `token_history_state` a patch can name, with their types. */
+const PATCHABLE: ReadonlyArray<[keyof TokenHistoryStatePatch, string]> = [
+  ['state', 'String'],
+  ['config_version', 'UInt16'],
+  ['coverage_from', 'UInt32'],
+  ['h0', 'UInt32'],
+  ['h1', 'UInt32'],
+  ['phase', 'String'],
+  ['account_cursor', 'String'],
+  ['token_cursor_issuer', 'String'],
+  ['token_cursor_currency', 'String'],
+  ['through_ledger', 'UInt32'],
+  ['levels_through', 'UInt32'],
+];
+
+/**
+ * Writes a new state row of generation `g` that changes only the fields of `patch`: the other columns are copied from the newest
+ * row by the same statement, on the server. The build and the worker each patch their own fields of a building generation (the
+ * build its phase and cursors, the worker its `through_ledger`), so neither writes back a field it read before the other changed it,
+ * except across one statement; a lost update only makes its writer redo an idempotent step. Throws when the generation has no row.
+ */
+export async function patchTokenHistoryState(
+  ch: ClickHouseService,
+  g: number,
+  patch: TokenHistoryStatePatch,
+): Promise<void> {
+  const params: Record<string, unknown> = { g };
+  const columns = PATCHABLE.map(([name, type]) => {
+    if (patch[name] === undefined) return name;
+    params[`p_${name}`] = patch[name];
+    return `{p_${name}:${type}}`;
+  });
+  const exists = await ch.queryOne<{ n: string }>(
+    `SELECT toString(count()) AS n FROM ${Table.TokenHistoryState} WHERE generation = {g:UInt32}`,
+    { g },
+  );
+  if (exists === undefined || exists.n === '0') throw new Error(`token history generation ${g} has no state row`);
+  await ch.command(
+    `INSERT INTO ${Table.TokenHistoryState}
+       (generation, ${PATCHABLE.map(([n]) => n).join(', ')}, started_at, changed_at, version)
+     SELECT generation, ${columns.join(', ')}, started_at, now64(3, 'UTC'),
+            greatest(toUInt64(toUnixTimestamp64Milli(now64(3))), (SELECT max(version) FROM ${Table.TokenHistoryState}) + 1)
+       FROM (SELECT * FROM ${Table.TokenHistoryState} WHERE generation = {g:UInt32} ORDER BY version DESC LIMIT 1)`,
+    params,
+  );
+}
