@@ -50,6 +50,12 @@ What the owner asked for (issue #28 and the brainstorming of 2026-11-08):
 | 5 | Sections 1 to 4 of the design. | Approved as presented. They are §§2 to 11 below. |
 | 6 | The deployment runs the api and a syncer that follows the head, and the owner fills the history with `range-ingest`. A build started by the worker on its own would run on a history that a fill is still changing. | **The build is an operator command**, `token-history-build`, run like `range-ingest` once the fill is done. The worker only follows the head and repairs, and says when a build is needed (§4.6). |
 
+**After PR 1's review (2026-11-08):**
+- A flow cannot know a change whose before-state is unknown, so every answer with flows also gives `unknown_before`, the count of those changes (§1, §5).
+- A holder's `first_ledger` is the start of its current counting run, not its first counting change ever (§1, §3.1).
+- A generation is promoted within 10 ledgers of its `through_ledger`, and the worker catches up the rest as live (§4.6).
+- §2.6, §9 and §14 carry PR 1's measurement.
+
 Decided here and open to the owner's correction: the checkpoint floor (50,000), the limits of `exclude` (20 addresses), of `/flows` (366 days, hourly at most
 31) and of `interval=ledger` (100,000 ledgers); the snapshot `digest`; and the change of D6's holders marker (§5.5). See §14.
 
@@ -87,12 +93,15 @@ The glossary's terms (**token**, **issued token**, **MPT**, **issuer**, **holder
   - A `Clawback` or `AMMClawback` transaction is **clawed back** by `max(−net, 0)` and **issued** by `max(net, 0)`.
   - Any other transaction is **issued** by `max(net, 0)` and **redeemed** by `max(−net, 0)`. A transfer fee is redeemed supply: the issuer's obligation falls by it.
   - It is **transferred** by `Σ max(change, 0) − max(net, 0)`: what moved from holder to holder. It counts as one **transfer** when that is above 0.
-  - So over any range, `supply_end − supply_start = issued − redeemed − clawed_back`, exactly.
-  - A change whose before-state is not known (`before_known = 0`, §2.1) is in the levels and in no flow.
+  - So over any range with no change of unknown before-state, `supply_end − supply_start = issued − redeemed − clawed_back`, exactly.
+  - A change whose before-state is not known (`before_known = 0`, §2.1) is in the levels and in no flow. A transfer to or from such a line can then count
+    as issued or redeemed. **`unknown_before`** is the number of those changes. Every answer with flows gives it beside them (§5.2, §5.3, §5.6), and it
+    is 0 wherever the coverage is complete (§6).
 - **Exchanged.** The token's amounts in the `exchanges` rows (order-book trades and AMM swaps, as ADR-0011 stores them), on whichever side of the pair it
   is. **Trades** is the count of those rows.
-- **First and last activity.** For a holder of a token, the ledger of its first change where the line counted (`first_ledger`) and of its newest change
-  (`last_ledger`). For a token, the ledgers of its first and newest change.
+- **First and last activity.** For a holder of a token, `first_ledger` is the ledger where its current counting run began: its first counting change after
+  the newest change where the line stopped counting, or its first counting change if it never stopped. `last_ledger` is the ledger of its newest change.
+  For a token, they are the ledgers of its first and newest change.
 - **Token history**: the derived data of this design, one **generation** at a time. **Checkpoint**: the full set of a token's counting lines at the end of a
   ledger.
 
@@ -168,12 +177,13 @@ A row exists for every change where `counted_before = 1 OR counted_after = 1`.
 - `phase` (`changes`, `mpt_changes`, `levels`, `dex`, `done`), with the cursors `account_cursor`, `token_cursor_issuer`, `token_cursor_currency`;
 - `through_ledger` (every change up to it is written), `levels_through` (every level and checkpoint up to it is written), `started_at`, `changed_at`, `version`.
 
-**`through_ledger` and `levels_through` are the token history's commit marker.** In a live generation the two are equal: no reader reads past them, and the worker
-writes them last in every window. A building generation's `levels_through` lags until the worker has caught its levels up (§4.6).
+**`through_ledger` and `levels_through` are the token history's commit marker.** No reader reads past `levels_through`, and the worker writes both last in
+every window. In a live generation the two are equal, except just after a promotion (§4.6). A generation is promoted up to 10 ledgers short, and its
+`levels_through` reaches `through_ledger` within a pass or two. A building generation's `levels_through` lags until the worker has caught its levels up.
 
 `token_history_dirty`: `(from_ledger, to_ledger, created_at)`, `ReplacingMergeTree(created_at)`, `ORDER BY (from_ledger, to_ledger)`, as `nft_dirty`.
 
-### 2.6 Size on XRPL (estimates; PR 1 measures them, §9)
+### 2.6 Size on XRPL (estimates, with PR 1's measurement)
 
 | Table | Rows | Disk |
 |---|---|---|
@@ -181,6 +191,10 @@ writes them last in every window. A building generation's `levels_through` lags 
 | `token_checkpoints` | At most the change log's rows, by the rule of §4.3; in practice far fewer, since most tokens never reach 50,000 changes | — |
 | `token_hourly` | 50 to 200 million (active token-hours) | 4 to 16 GB |
 | `token_hourly_dex` | Under `token_hourly` | Small |
+
+PR 1 measured 31.7 bytes a change, 24 a checkpoint row and 33 an hour row (`2026-11-08-issuer-analytics.verification.md`). Those rows were synthetic,
+and their addresses and amounts repeat. Real rows have random 34-character addresses and amounts of up to 16 digits. So 60 to 90 bytes a change stays
+the planning figure, and the measured 32 to 110 GB for the change log is a floor.
 
 During a rebuild a second generation exists (§4.6), which doubles the generation-scoped tables until the old one is dropped.
 
@@ -195,7 +209,8 @@ Every holder read is the same read, at the head and at a historical N (`packages
    - Each source is first deduplicated in a capped inner read (`LIMIT 1 BY` its key, ADR-0003).
    - The rows are then grouped by `holder` with `argMax` of the state by `(ledger_index, tx_index, node_index)`; a checkpoint row ranks as `(cp, 0, 0)`.
    - The lines that count are kept.
-3. `first_ledger` is the checkpoint's or else the first counting change in the range. `last_ledger` is the newest change.
+3. `first_ledger` is the start of the holder's current counting run (§1). It is the checkpoint's when the line counted at `cp` and has not stopped since.
+   Otherwise it is the first counting change after the range's last change where the line stopped. `last_ledger` is the newest change.
 
 **Bound:** at most `lines(cp) + max(lines(N), 50,000) + one ledger's changes` rows, about `2 × max(lines, 50,000)`, wherever N is.
 
@@ -352,6 +367,9 @@ The worker builds nothing itself. The answers keep the live generation's `covera
   `(levels_through, through_ledger]`, with the live window's level logic, a step per pass.
 - Once `levels_through` is within 10 ledgers of its own `through_ledger` (which the worker keeps at the head), it promotes it: a `live` row, then a `retired` row for the old
   one, if there is one. Readers switch at the first row.
+- The same catch-up step then closes the rest. It serves a `live` generation whose `levels_through` is behind as it serves a `done` one. The live window
+  writes levels only to a generation whose `levels_through` has reached its `through_ledger`, so it leaves those ledgers to the catch-up. Until then readers
+  answer at `levels_through`, at most 10 ledgers behind the head.
 - The retired generation's partitions are dropped 15 minutes later (`ALTER TABLE … DROP PARTITION`, so the syncer's user needs `ALTER DELETE` on the four generation
   tables, as it does for D6's).
 - For a build of two days, the catch-up is about 40,000 ledgers: minutes.
@@ -437,11 +455,12 @@ A build that is due raises no alert: it waits for the operator by design, and th
 
 - **Keys:** `result, coverage, ledger_index, close_time, token: {currency, issuer, kind, code?}, supply, holders, trust_lines, first_ledger, first_time,
   last_ledger, last_time, windows: {"24h", "7d", "30d"}`.
-- **Each window:** `{start, end, issued, redeemed, clawed_back, transferred, transfers, changes, exchanged?, trades?, exchanged_through?}`.
+- **Each window:** `{start, end, issued, redeemed, clawed_back, transferred, transfers, changes, unknown_before, exchanged?, trades?, exchanged_through?}`.
   - The windows end at the close time of the answer's ledger.
-  - The flows are exact (§3.5).
+  - The flows are exact over the changes whose before-state is known (§3.5). `unknown_before` counts the others (§1).
   - `exchanged` and `trades` sum the whole DEX hours of the window up to the newest computed one, and `exchanged_through` names that hour's end. They are partial and say so, never estimated.
-- `exclude` applies to the levels. No CSV. **Nothing in the summary is approximate**, so the brief's allowance for an approximate summary is not used.
+- `exclude` applies to the levels. No CSV. **Nothing in the summary is approximate**, so the brief's allowance for an approximate summary is not used. What a
+  flow cannot know is counted in `unknown_before`, not estimated.
 
 ### 5.3 `GET /v2/tokens/{token}/supply`
 
@@ -450,7 +469,7 @@ defaults: the token's first change and the answer's ledger); `descending`; `limi
 
 **Rows.**
 - `hour` and `day`: every bucket of the window, levels at the bucket's end carried forward and flows of the bucket (0 when none): `{time, ledger_index,
-  supply, holders, trust_lines, issued, redeemed, clawed_back, net}`, plus `without_excluded` with `exclude`. A day is the sum of its 24 hour rows.
+  supply, holders, trust_lines, issued, redeemed, clawed_back, net, unknown_before}`, plus `without_excluded` with `exclude`. A day is the sum of its 24 hour rows.
 - `ledger`: the ledgers with a change, with the same keys. The window is at most 100,000 ledgers, else 400 `window too large for interval ledger`.
 
 400 `invalid interval - use: day, hour, ledger`, the date messages, `invalid marker`. CSV `<code or currency> <issuer> - supply.csv`.
@@ -488,7 +507,7 @@ holders: [{rank, holder, balance, share, limit, frozen, authorized}]`.
 
 **Keys:**
 - `result, coverage, ledger_index, close_time, start, end, interval`;
-- `totals: {issued, redeemed, clawed_back, transferred, transfers, exchanged?, trades?, exchanged_through?}`;
+- `totals: {issued, redeemed, clawed_back, transferred, transfers, unknown_before, exchanged?, trades?, exchanged_through?}`;
 - `periods: [{start, …the same keys}]`;
 - `counterparties: [{account, received, sent, net, changes}]`. These are the holders with the largest `received + sent` in the window, then by account, read from the change log's key range of the window (bounded by the token's changes in it).
 - `exchanged` and `trades` are present only when every hour of the window has its DEX sentinel (§2.4). Otherwise they are left out, never given as part of the window's figure.
@@ -546,16 +565,22 @@ Every read starts from a key prefix, and the e2e suites pin its `read_rows` over
 
 ## 9. Build cost, measurement and rollout
 
-**Estimates for XRPL** (assumptions stated; PR 1 replaces them with measurements on real-shaped data and the scratch sync's tables, and
-`operations.md` records them):
+**Estimates for XRPL**, with the assumptions stated. PR 1 measured the build on synthetic tables at 1x and 8x of D6's shape, warm, at 4 threads
+(`2026-11-08-issuer-analytics.verification.md`): 18 s and 111 s, with rates that stayed linear. Its column below scales those rates to XRPL's sizes.
+`operations.md` records them.
 
-| Step | Estimate |
-|---|---|
-| `changes` | Reads 2 to 7 billion `trust_line_states` rows (both sides of 1 to 3.5 billion changes). D6's pass ran at about 1M rows/s warm, so 1 to 2 hours warm and a few hours to a day cold. It writes 1 to 3.5 billion rows. |
-| `mpt_changes` | `mpt_holder_states` since ledger 99,226,369: minutes |
-| `levels` | One read of the change log in token order; writes 50 to 200 million hour rows and the checkpoints: hours |
-| DEX history (`dex`) | One scan of `exchanges`, one partition at a time: hours |
-| **Total** | **Half a day to two days** of `token-history-build` running without pause at 4 threads (D6's rate was measured with ClickHouse's default threads on 16 CPUs). More `--threads` shorten it and load the server more. |
+| Step | Estimate | From PR 1's rates (warm) |
+|---|---|---|
+| `changes` | Reads 2 to 7 billion `trust_line_states` rows (both sides of 1 to 3.5 billion changes). D6's pass ran at about 1M rows/s warm, so 1 to 2 hours warm and a few hours to a day cold. It writes 1 to 3.5 billion rows. | 0.78 to 1.14 million state rows a second: **30 minutes to 2.5 hours** |
+| `mpt_changes` | `mpt_holder_states` since ledger 99,226,369: minutes | Not measured at scale; the same rule as `changes`, so minutes |
+| `levels` | One read of the change log in token order; writes 50 to 200 million hour rows and the checkpoints: hours | 0.44 to 0.63 million changes a second: **30 minutes to 2.2 hours** |
+| DEX history (`dex`) | One scan of `exchanges`, one partition at a time: hours | **Not measured at scale** |
+| **Total** | **Half a day to two days** of `token-history-build` running without pause at 4 threads (D6's rate was measured with ClickHouse's default threads on 16 CPUs). More `--threads` shorten it and load the server more. | **1 to 5 hours warm**, before the DEX history and a cold disk |
+
+On a cold disk, the read rate bounds `changes` and `levels`: at 200 to 500 MB/s, 300 GB of state rows take 10 to 25 minutes to read. That is the same
+order as the warm figures, so "half a day to two days" is pessimistic for those two phases. Still unmeasured: real-shaped tables, the DEX history at
+scale, a cold disk, and the build's effect on the ingest and the api. Peak memory is set by the largest account of a `changes` batch: 667 MiB for an
+issuer of 200,000 lines.
 
 These are the costs of the build alone. Filling the history with `range-ingest` first is the existing, node-bound job of `backfill.md`: days to weeks for full XRPL
 history, with or without this feature.
@@ -660,10 +685,12 @@ Each PR is mergeable on its own, with its own tests, stacked in this order, each
 
 ## 14. Risks and open items for the owner
 
-- **Disk:** 70 to 350 GB, doubled during a rebuild. The real figure comes from PR 1's measurement before production.
-- **The build shares ClickHouse with everything else.** The ingest never waits for it, but while `token-history-build` runs (half a day to two days on
-  XRPL, estimated), the ingest's inserts and the api's reads compete with it for the server's disk and CPU (§9). It runs only when the operator starts it, and can
-  be stopped and resumed and given fewer threads. The measurement of PR 1 sets its default thread count.
+- **Disk:** 70 to 350 GB, doubled during a rebuild. PR 1's synthetic rows give a floor of 32 to 110 GB for the change log (§2.6). Real-shaped tables
+  should be measured before production.
+- **The build shares ClickHouse with everything else.** The ingest never waits for it. But while `token-history-build` runs, the ingest's inserts and the
+  api's reads compete with it for the server's disk and CPU (§9). On XRPL that is 1 to 5 hours warm by PR 1's rates, plus the DEX history and a cold disk;
+  the estimate was half a day to two days. It runs only when the operator starts it, and it can be stopped, resumed and given fewer threads. PR 1
+  measured it at the default of 4 threads.
 - **D6's marker change** invalidates markers in flight once (§5.5).
 - **Decided here, open to the owner:**
   - the checkpoint floor of 50,000;

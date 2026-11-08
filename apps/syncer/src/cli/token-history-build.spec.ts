@@ -1,10 +1,12 @@
 import { getNetworkProfile, TOKEN_HISTORY_BUILD_THREADS } from '@gatehub/data-api-shared';
+import { EventEmitter } from 'node:events';
 import {
   BUILD_REQUEST_TIMEOUT_MS,
   buildClickHouseConfig,
   exitCodeOf,
   main,
   parseTokenHistoryBuildArgs,
+  stopOnSignals,
   USAGE,
   UsageError,
 } from './token-history-build';
@@ -68,5 +70,24 @@ describe('buildClickHouseConfig', () => {
       profile,
     );
     expect(cfg).toMatchObject({ requestTimeout: 60_000, maxExecutionTime: 120 });
+  });
+});
+
+describe('stopOnSignals', () => {
+  const procOf = () => Object.assign(new EventEmitter(), { exit: jest.fn() });
+
+  it.each(['SIGTERM', 'SIGINT'] as const)('stops the build after the statement in flight on %s, and exits 130 on a second', (signal) => {
+    const proc = procOf();
+    const abort = new AbortController();
+    const warn = jest.fn();
+    const release = stopOnSignals(abort, warn, proc as never);
+    proc.emit(signal);
+    expect(abort.signal.aborted).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('stopping after the statement in flight'));
+    expect(proc.exit).not.toHaveBeenCalled();
+    proc.emit(signal === 'SIGTERM' ? 'SIGINT' : 'SIGTERM');
+    expect(proc.exit).toHaveBeenCalledWith(130);
+    release();
+    expect(proc.listenerCount('SIGTERM') + proc.listenerCount('SIGINT')).toBe(0);
   });
 });
