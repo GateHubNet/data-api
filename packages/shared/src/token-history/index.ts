@@ -17,3 +17,4 @@ export * from './live-window';
 export * from './promote';
 export * from './rebuild-needed';
 export * from './repair';
+export * from './reads';
