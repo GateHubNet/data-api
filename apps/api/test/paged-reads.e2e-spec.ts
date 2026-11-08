@@ -2854,3 +2854,291 @@ describe('the MPT routes read the rows of the issuance, not the table (read_rows
     });
   });
 });
+
+describe('the token history routes read the rows of the token, not the tables (read_rows over a bulk of two other tokens)', () => {
+  const GRANULE = 8192;
+  const PARTS = BULK_BASES.length;
+  /** The token asked for, and two whose keys lie on either side of it in every part of a bulk. */
+  const ISSUER = accountAt(0xb001);
+  const BELOW = accountAt(0xb000);
+  const ABOVE = accountAt(0xb002);
+  const CURRENCY = 'TKN';
+  const TOKEN = `${CURRENCY}.${ISSUER}`;
+  /** 20 holders, each with 2 changes, 10 changes in each part of the ledgers: the token's own rows. */
+  const HOLDERS = 20;
+  const CHANGES = 40;
+  /** The first ledger of the bulk closes at this time, one second a ledger from there. */
+  const T0 = 1_700_000_000;
+  const HEAD = BULK_BASES[PARTS - 1] + BULK_LEDGERS - 1;
+  const closeOf = (ledger: number): number => T0 + (ledger - BULK_BASES[0]);
+  const HOUR = 3_600;
+  const hourOf = (ledger: number): number => Math.floor(closeOf(ledger) / HOUR) * HOUR;
+  const iso = (t: number): string => `${new Date(t * 1000).toISOString().slice(0, 19)}Z`;
+  const holderOf = (k: number): string => accountAt(0xd000 + k);
+  /** The token's change ledgers: 10 a part. */
+  const LEDGERS = BULK_BASES.flatMap((base) => Array.from({ length: 10 }, (_, j) => base + 100 + j * 4_000));
+
+  let h: Harness;
+  let api: ApiClient;
+  const parts = async (table: Table): Promise<number> => {
+    const [row] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM system.parts WHERE database = {db:String} AND table = {table:String} AND active`,
+      { db: h.database, table },
+    );
+    return Number(row.n);
+  };
+  /** What a read of a table may cost: its rows, and two granules of each part. */
+  const boundOf = async (table: Table, rows: number): Promise<number> => rows + 2 * GRANULE * (await parts(table));
+  /** Every SELECT of `table` the request makes reads at most `bound` rows; at least one reads it. */
+  async function expectBounded(table: Table, path: string, bound: number): Promise<void> {
+    await h.ch.command('SYSTEM DROP QUERY CONDITION CACHE');
+    const reads = await readsOf(h, table, () => api.ok(path));
+    expect({ table, path, reads: reads.length > 0 }).toEqual({ table, path, reads: true });
+    for (const r of reads)
+      expect({ table, path, read_rows: r.read_rows <= bound, rows: r.read_rows }).toMatchObject({ read_rows: true });
+  }
+  /** The mutant of a bound: the same table without the token's prefix reads the bulk, far above the bound. */
+  async function expectMutantAbove(table: Table, sql: string, bound: number): Promise<void> {
+    await h.ch.command('SYSTEM DROP QUERY CONDITION CACHE');
+    const reads = await readsOf(h, table, () => h.ch.query(sql));
+    expect(reads[0].read_rows).toBeGreaterThan(bound);
+  }
+
+  beforeAll(async () => {
+    h = await startHarness({ env: NO_RATE_LIMIT });
+    api = await h.api();
+    // the ledgers of the bulk's ranges, one second apart
+    await h.ch.insert(Table.Ledgers, [ledgerRow(BULK_BASES[0], closeOf(BULK_BASES[0]))]);
+    await insertBulk(
+      h,
+      Table.Ledgers,
+      `SELECT * FROM ${Table.Ledgers} WHERE ledger_index = {l:UInt32} LIMIT 1`,
+      { l: BULK_BASES[0], t0: T0 },
+      (base) =>
+        `toUInt32(${base} + n.number) AS ledger_index, leftPad(hex(toUInt32(${base} + n.number)), 64, '0') AS ledger_hash, ` +
+        `${closeTimeOf(`(${base} + n.number)`)} AS close_time`,
+      BULK_LEDGERS,
+    );
+    // the token's changes: holder k is given 10, then gives 5 back
+    const sample = SAMPLE_ROWS[Table.TokenHolderChanges];
+    await h.ch.insert(
+      Table.TokenHolderChanges,
+      LEDGERS.map((ledger, i) => {
+        const k = i % HOLDERS;
+        const first = i < HOLDERS;
+        return {
+          ...sample,
+          generation: 1,
+          issuer: ISSUER,
+          currency: CURRENCY,
+          ledger_index: ledger,
+          tx_index: 0,
+          node_index: 0,
+          holder: holderOf(k),
+          close_time: closeOf(ledger),
+          amount_before: first ? '0' : '10',
+          amount_after: first ? '10' : '5',
+          counted_before: first ? 0 : 1,
+          counted_after: 1,
+          order_exp: -15,
+          order_mant: first ? '1000000000000000' : '5000000000000000',
+        };
+      }),
+    );
+    // the two other tokens' changes, 800,000 rows in the same ledgers
+    await insertBulk(
+      h,
+      Table.TokenHolderChanges,
+      `SELECT * FROM ${Table.TokenHolderChanges} WHERE generation = 1 AND issuer = {issuer:String} LIMIT 1`,
+      { issuer: ISSUER, below: BELOW, above: ABOVE },
+      (base) =>
+        `if(n.number % 2 = 0, {below:String}, {above:String}) AS issuer, ${bulkLedger(base)} AS ledger_index, ` +
+        `toUInt32(n.number % 4) AS tx_index, concat('rBulk', toString(n.number)) AS holder`,
+    );
+    // checkpoints of the other tokens (the token has none: every read folds its changes from 0)
+    await h.ch.insert(Table.TokenCheckpoints, [
+      { ...SAMPLE_ROWS[Table.TokenCheckpoints], generation: 1, issuer: BELOW, currency: CURRENCY },
+    ]);
+    await insertBulk(
+      h,
+      Table.TokenCheckpoints,
+      `SELECT * FROM ${Table.TokenCheckpoints} WHERE generation = 1 AND issuer = {below:String} LIMIT 1`,
+      { below: BELOW, above: ABOVE },
+      (base) =>
+        `if(n.number % 2 = 0, {below:String}, {above:String}) AS issuer, toUInt32(${base} + intDiv(n.number, 50000)) AS checkpoint_ledger, ` +
+        `concat('rBulk', toString(n.number)) AS holder`,
+    );
+    // the hour rows: the token's own, and 800,000 of the others
+    const hourly = SAMPLE_ROWS[Table.TokenHourly];
+    await h.ch.insert(
+      Table.TokenHourly,
+      [...new Set(LEDGERS.map(hourOf))].map((hour) => ({
+        ...hourly,
+        generation: 1,
+        issuer: ISSUER,
+        currency: CURRENCY,
+        hour,
+        first_ledger: LEDGERS.find((l) => hourOf(l) === hour)!,
+        last_ledger: LEDGERS.find((l) => hourOf(l) === hour)!,
+      })),
+    );
+    await insertBulk(
+      h,
+      Table.TokenHourly,
+      `SELECT * FROM ${Table.TokenHourly} WHERE generation = 1 AND issuer = {issuer:String} LIMIT 1`,
+      { issuer: ISSUER, below: BELOW, above: ABOVE },
+      (base) =>
+        `if(n.number % 2 = 0, {below:String}, {above:String}) AS issuer, ` +
+        `concat('B', toString(intDiv(n.number, 2) % 1000)) AS currency, toDateTime(${hourOf(base)} + intDiv(n.number, 2000) * 3600, 'UTC') AS hour`,
+    );
+    // the DEX hours: a sentinel for every hour of the bulk, the token's rows, 800,000 of the others
+    const firstHour = hourOf(BULK_BASES[0]);
+    const lastHour = hourOf(HEAD);
+    const dex = SAMPLE_ROWS[Table.TokenHourlyDex];
+    const sentinels = Array.from({ length: (lastHour - firstHour) / HOUR + 1 }, (_, i) => ({
+      ...dex,
+      issuer: '',
+      currency: '',
+      hour: firstHour + i * HOUR,
+      exchanged: '0',
+      trades: 0,
+    }));
+    await h.ch.insert(Table.TokenHourlyDex, [
+      ...sentinels,
+      ...[...new Set(LEDGERS.map(hourOf))].map((hour) => ({ ...dex, issuer: ISSUER, currency: CURRENCY, hour })),
+    ]);
+    await insertBulk(
+      h,
+      Table.TokenHourlyDex,
+      `SELECT * FROM ${Table.TokenHourlyDex} WHERE issuer = {issuer:String} LIMIT 1`,
+      { issuer: ISSUER, below: BELOW, above: ABOVE },
+      (base) =>
+        `if(n.number % 2 = 0, {below:String}, {above:String}) AS issuer, ` +
+        `concat('B', toString(intDiv(n.number, 2) % 1000)) AS currency, toDateTime(${hourOf(base)} + intDiv(n.number, 2000) * 3600, 'UTC') AS hour`,
+    );
+    // the live generation, through the head
+    await h.ch.insert(Table.TokenHistoryState, [
+      {
+        ...SAMPLE_ROWS[Table.TokenHistoryState],
+        generation: 1,
+        state: 'live',
+        phase: 'done',
+        coverage_from: BULK_BASES[0],
+        h0: HEAD,
+        h1: HEAD,
+        through_ledger: HEAD,
+        levels_through: HEAD,
+      },
+    ]);
+  }, 600_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the seed is as assumed: the token among the bulk of two others, in four parts of each table', async () => {
+    const count = async (table: Table, where = 'TRUE') =>
+      Number((await h.ch.query<{ n: string }>(`SELECT toString(count()) AS n FROM ${table} WHERE ${where}`))[0].n);
+    expect(await count(Table.TokenHolderChanges, `issuer = '${ISSUER}'`)).toBe(CHANGES);
+    expect(await count(Table.TokenHolderChanges)).toBe(CHANGES + BULK_ROWS);
+    expect(await count(Table.TokenCheckpoints)).toBe(1 + BULK_ROWS);
+    expect(await count(Table.TokenHourly)).toBeGreaterThan(BULK_ROWS);
+    expect(await count(Table.TokenHourlyDex)).toBeGreaterThan(BULK_ROWS);
+    expect(await parts(Table.TokenHolderChanges)).toBeGreaterThanOrEqual(PARTS);
+    // the hours of the bulk are in one year: a part an insert, so that two granules a part stay far below the bulk
+    for (const table of [Table.TokenHourly, Table.TokenHourlyDex])
+      expect(await parts(table)).toBeLessThanOrEqual(PARTS + 2);
+    const body = (await api.ok(`/v2/tokens/${TOKEN}/summary`, 'supply')).body;
+    expect(body).toMatchObject({ supply: String(HOLDERS * 5), holders: HOLDERS, trust_lines: HOLDERS });
+  });
+
+  it('the holder reads (snapshot, holders, distribution) read at most 2 × max(lines, 50,000) rows of the change log and the checkpoints', async () => {
+    for (const table of [Table.TokenHolderChanges, Table.TokenCheckpoints]) {
+      const bound = await boundOf(table, 2 * 50_000);
+      for (const path of [
+        `/v2/tokens/${TOKEN}/snapshot?ledger_index=${HEAD}`,
+        `/v2/tokens/${TOKEN}/holders`,
+        `/v2/tokens/${TOKEN}/distribution?exclude=${holderOf(1)}`,
+      ]) {
+        await expectBounded(table, path, bound);
+      }
+      await expectMutantAbove(table, `SELECT count() FROM ${table} WHERE generation = 1 AND holder != ''`, bound);
+    }
+  });
+
+  it('the totals and the flows read the changes of the token, not the change log', async () => {
+    const bound = await boundOf(Table.TokenHolderChanges, CHANGES);
+    for (const path of [
+      `/v2/tokens/${TOKEN}/summary?exclude=${holderOf(2)}`,
+      `/v2/issuers/${ISSUER}/tokens`,
+      `/v2/tokens/${TOKEN}/flows?start=${iso(T0)}&end=${iso(closeOf(HEAD) - 86_400)}&counterparties=5`,
+      // a window of the last part's ledgers: the whole range is more than 100,000 ledgers
+      `/v2/tokens/${TOKEN}/supply?interval=ledger&start=${iso(closeOf(BULK_BASES[PARTS - 1]))}&exclude=${holderOf(3)}`,
+    ]) {
+      await expectBounded(Table.TokenHolderChanges, path, bound);
+    }
+    await expectMutantAbove(
+      Table.TokenHolderChanges,
+      `SELECT count() FROM ${Table.TokenHolderChanges} WHERE generation = 1 AND ledger_index >= ${BULK_BASES[0]}`,
+      bound,
+    );
+  });
+
+  it('the hour series reads the hour rows of the token in the window', async () => {
+    const own = new Set(LEDGERS.map(hourOf)).size;
+    const bound = await boundOf(Table.TokenHourly, own);
+    for (const path of [
+      `/v2/tokens/${TOKEN}/supply`,
+      `/v2/tokens/${TOKEN}/supply?interval=hour&descending=true&exclude=${holderOf(4)}`,
+      `/v2/issuers/${ISSUER}/tokens`,
+      `/v2/tokens/${TOKEN}/flows?start=${iso(T0)}&end=${iso(closeOf(HEAD) - 86_400)}`,
+    ]) {
+      await expectBounded(Table.TokenHourly, path, bound);
+    }
+    await expectMutantAbove(
+      Table.TokenHourly,
+      `SELECT count() FROM ${Table.TokenHourly} WHERE generation = 1 AND supply != ''`,
+      bound,
+    );
+  });
+
+  it('the DEX figures read the DEX rows of the token and the sentinels of the window', async () => {
+    const hours = (hourOf(HEAD) - hourOf(BULK_BASES[0])) / HOUR + 1;
+    const bound = await boundOf(Table.TokenHourlyDex, hours + new Set(LEDGERS.map(hourOf)).size);
+    for (const path of [
+      `/v2/tokens/${TOKEN}/summary`,
+      `/v2/tokens/${TOKEN}/flows?start=${iso(T0)}&end=${iso(closeOf(HEAD) - 86_400)}`,
+    ]) {
+      await expectBounded(Table.TokenHourlyDex, path, bound);
+    }
+    await expectMutantAbove(
+      Table.TokenHourlyDex,
+      `SELECT count() FROM ${Table.TokenHourlyDex} WHERE exchanged != ''`,
+      bound,
+    );
+  });
+
+  it('the change-log read is a ReadFromMergeTree on the token prefix, with no FINAL', async () => {
+    await h.ch.command('SYSTEM DROP QUERY CONDITION CACHE');
+    const reads = await readsOf(h, Table.TokenHolderChanges, () =>
+      api.ok(`/v2/tokens/${TOKEN}/snapshot?ledger_index=${HEAD}`),
+    );
+    // the fold's reads (a read with scalar subqueries only, such as the token's first and newest change, plans as constants)
+    const folds = reads.filter((r) => r.query.includes('argMax(state, rank)'));
+    expect(folds.length).toBeGreaterThan(0);
+    for (const r of folds) {
+      expect(r.query).not.toMatch(/\bFINAL\b/);
+      const plan = await explain(h, 'indexes = 1', r.query.replace(/\s+FORMAT\s+\w+\s*$/, ''), {
+        g: 1,
+        issuer: ISSUER,
+        currency: CURRENCY,
+        cp: 0,
+        n: HEAD,
+        after: '',
+        limit: 1001,
+      });
+      expect(plan).toContain('ReadFromMergeTree');
+      // the primary key narrows the read by the token: issuer and currency are the key's first columns
+      expect(plan).toMatch(/Keys:\s*\n\s*issuer\s*\n\s*currency/);
+    }
+  });
+});
