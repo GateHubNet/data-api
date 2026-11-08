@@ -48,13 +48,14 @@ What the owner asked for (issue #28 and the brainstorming of 2026-11-08):
 | 3 | The EURGH report may need the issuer's own wallets left out of supply. | **`exclude=` parameter.** The caller names addresses, and the answer adds the figures without them. Nothing about whose wallets they are is stored, so entity attribution stays a non-goal. |
 | 4 | Approach. | **A:** a new syncer worker writes a token-ordered change log with checkpoints and hourly rollups from the state history. Rejected: writing the change log in ingest (a parser version and a node-bound reprocess of ~108M ledgers), and daily full snapshots (a snapshot between days scans an issuer's whole history; storage grows with lines × days). |
 | 5 | Sections 1 to 4 of the design. | Approved as presented. They are §§2 to 11 below. |
+| 6 | The deployment runs the api and a syncer that follows the head, and the owner fills the history with `range-ingest`. A build started by the worker on its own would run on a history that a fill is still changing. | **The build is an operator command**, `token-history-build`, run like `range-ingest` once the fill is done. The worker only follows the head and repairs, and says when a build is needed (§4.6). |
 
 Decided here and open to the owner's correction: the checkpoint floor (50,000), the limits of `exclude` (20 addresses), of `/flows` (366 days, hourly at most
 31) and of `interval=ledger` (100,000 ledgers); the snapshot `digest`; and the change of D6's holders marker (§5.5). See §14.
 
 ## Scope and non-goals
 
-In scope: the seven routes of the issue (§5), the tables and the worker that feed them (§§2 to 4), and their backfill from the network's first ledger.
+In scope: the seven routes of the issue (§5), the tables, the worker and the build command that feed them (§§2 to 4), and the build of their history from the network's first ledger.
 
 Not in v1, as the issue says:
 - fiat valuations and market cap, which need a price oracle;
@@ -163,11 +164,12 @@ A row exists for every change where `counted_before = 1 OR counted_after = 1`.
 
 `token_history_state`: `ReplacingMergeTree(version)`, `ORDER BY generation`, as `token_generations`. It holds one row for every change of a generation:
 - `state` (`building`, `live`, `retired`) and `config_version` (`TOKEN_HISTORY_CONFIG_VERSION`, 1);
-- `coverage_from`, and `h0` (the commit marker when the build started);
-- `phase` (`changes`, `mpt_changes`, `levels`, `done`), with the cursors `account_cursor`, `token_cursor_issuer`, `token_cursor_currency`;
-- `through_ledger`, `started_at`, `changed_at`, `version`.
+- `coverage_from` (§4.6), `h0` (the commit marker when the build started) and `h1` (the ledger the build's levels are made up to);
+- `phase` (`changes`, `mpt_changes`, `levels`, `dex`, `done`), with the cursors `account_cursor`, `token_cursor_issuer`, `token_cursor_currency`;
+- `through_ledger` (every change up to it is written), `levels_through` (every level and checkpoint up to it is written), `started_at`, `changed_at`, `version`.
 
-**`through_ledger` is the token history's commit marker:** no reader reads past it, and it is written last in every window.
+**`through_ledger` and `levels_through` are the token history's commit marker.** In a live generation the two are equal: no reader reads past them, and the worker
+writes them last in every window. A building generation's `levels_through` lags until the worker has caught its levels up (§4.6).
 
 `token_history_dirty`: `(from_ledger, to_ledger, created_at)`, `ReplacingMergeTree(created_at)`, `ORDER BY (from_ledger, to_ledger)`, as `nft_dirty`.
 
@@ -213,7 +215,7 @@ Every holder read is the same read, at the head and at a historical N (`packages
 
 - Holder balances of an issued token are ledger `STAmount`s: a mantissa of 16 digits and an exponent from −96 to 80. The order key of an amount above 0 is
   `(exponent, mantissa)` with the mantissa normalised to `[10^15, 10^16)`; of 0 it is `(−32768, 0)`. An MPT amount (an integer below 2^64) is `(0, amount)`.
-- One SQL expression (for the backfill's `INSERT … SELECT`) and one TypeScript function (for the live writes) compute it. A property test pins both against
+- One SQL expression (for the build's `INSERT … SELECT`) and one TypeScript function (for the live writes) compute it. A property test pins both against
   BigNumber's comparison.
 - A text the key cannot hold (more than 16 significant digits, which a ledger balance cannot have) fails the write and is counted.
 - Holders are ordered by the key, then by `holder`, so the order is exact and the marker carries the balance as text.
@@ -227,19 +229,23 @@ Every holder read is the same read, at the head and at a historical N (`packages
 
 ## 4. The worker: `token_history`
 
-A seventh syncer worker, in `GH_WORKERS` and on by default. It needs no node, and it is the only writer of the seven tables. It lives in `apps/syncer/src/token-history/`, and its rules and reads in `packages/shared/src/token-history/`.
+Two writers share the seven tables, each with its own part of them:
 
-### 4.1 The loop
+- **The worker `token_history`**, the seventh syncer worker, in `GH_WORKERS` and on by default. It needs no node, and it **follows the head**: the live
+  windows, the repairs, catching a finished build's levels up to the head, and the promotion. It never starts a build. Its code is in `apps/syncer/src/token-history/`.
+- **The command `token-history-build`**, in the syncer image beside `range-ingest`. It does **the build**: the heavy one-off work of a new generation (§4.6). It runs
+  only when the operator starts it, with the syncer running.
+
+Their rules and reads are in `packages/shared/src/token-history/`.
+
+### 4.1 The worker's loop
 
 - Every `TOKEN_HISTORY_POLL_MS` (1 s) it reads the commit marker.
 - If a ledger was committed since `through_ledger`, it applies the live windows (§4.2) until it has caught up. Then it spends what is left of `TOKEN_HISTORY_PASS_BUDGET_MS` (1 s) on one
-  step of the repair (§4.7) or the backfill (§4.6): the live window always comes first.
-- The heavy statements are `INSERT … SELECT` run in ClickHouse with `max_threads = TOKEN_HISTORY_BACKFILL_THREADS` (4), so the Node process does little work and the ingest's
-  inserts are not starved.
-- It has its own loop and budget: the aggregator's 17 jobs and its 30 s tick are unchanged.
+  step of the repair (§4.7) or of a finished build's catch-up (§4.6): the live window always comes first.
+- Its work is a few small reads and inserts per ledger. It has its own loop and budget, so the aggregator's 17 jobs and their 30 s tick are unchanged.
 - A step is never cut once started (as in the tokens job), and a shutdown waits at most 2 s for the step in flight.
-- The worker holds a lease of its own, a `syncer_lease` row named `<network>:token_history`, so the `token-history-build` CLI (§13, PR 1) and a worker never
-  write at once. The CLI refuses to start while the lease is held, as `range-ingest` checks the ingest's.
+- It holds a `syncer_lease` row named `<network>:token_history`, so two workers never run against one database.
 
 ### 4.2 The live window
 
@@ -250,14 +256,16 @@ A seventh syncer worker, in `GH_WORKERS` and on by default. It needs no node, an
    - For MPTs, the same over `mpt_holder_states`.
    - `clawback` comes from `tx_by_type` (`tx_type IN ('Clawback', 'AMMClawback')`, a key prefix with the window's ledger range).
 3. **Writes, in this order:**
-   1. the change rows, to the live generation and to a building one (whatever its phase: its `changes` pass stops at `h0`, and the windows write every change above it);
-   2. the hour sets of the touched (token, hour) pairs (§4.4), in each generation whose `levels` cursor has passed the token;
-   3. the checkpoints the rule calls for (§4.3), rows then head;
-   4. the state row with the new `through_ledger`.
+   1. the change rows, to the live generation and to a building one (whatever its phase: the command's `changes` pass stops at `h0`, and the windows write every
+      change above it);
+   2. the hour sets of the touched (token, hour) pairs (§4.4), in each generation whose `levels_through` has reached the window's start: the live one, and a
+      building one once the worker has caught its levels up;
+   3. the checkpoints the rule calls for (§4.3), rows then head, in the same generations;
+   4. the state row of each generation, with the new `through_ledger` (and `levels_through` where step 2 ran).
 
-   A crash before the state row leaves invisible rows (readers stop at `through_ledger`), and the window is applied again with the same keys.
+   A crash before the state row leaves invisible rows (readers stop at the live generation's `levels_through`), and the window is applied again with the same keys.
 4. **Ledgers of an older parser.** A window holding a ledger of a parser older than `TOKEN_PARSER_VERSION` (8), or for MPTs `MPT_PARSER_VERSION`, is never applied live (`parserFloorOf`). A
-   live window at the head never holds one; a repair that meets one starts a rebuild (§4.7).
+   live window at the head never holds one; a repair that meets one reports a build as due (§4.7).
 
 ### 4.3 The checkpoint rule
 
@@ -283,49 +291,91 @@ A seventh syncer worker, in `GH_WORKERS` and on by default. It needs no node, an
 - A pair-hour with `unfit > 0` on a side is summed again exactly from `exchanges` (the pair's prefix and the hour's ledgers) in BigNumber.
 - The sentinel is written last.
 
-**History** (hours older than the oldest final `pair_hourly` hour, whose TTL is 45 days):
+**History** (hours older than the oldest final `pair_hourly` hour, whose TTL is 45 days), by the command's `dex` phase (§4.6):
 - one scan of `exchanges` per P7 partition, newest first, grouped by hour, base and counter, with the same exact rule, then the sentinels of every hour of the partition;
 - resumable from the sentinels.
+- Until it has run, the DEX figures of hours before `pair_hourly`'s window are absent, and `exchanged_through` says where the unbroken run of DEX hours ends (§5.2).
 
-### 4.6 Generations and the backfill
+### 4.6 Generations and the build
 
 **What a generation is.**
 - A generation is one build of the token history. Readers name the `live` one.
-- A new generation is built beside it when there is none yet, when `coverage_from` (`stateCoverageStart`, reused) moves, when `TOKEN_HISTORY_CONFIG_VERSION`
-  changes, or when a repair meets an older parser (§4.7).
-- It is promoted once its phase is `done` and its `through_ledger` is within 10 ledgers of the live one's (a `live` row, then a `retired` row for the old one).
-  Readers switch at the first row, and the retired generation's partitions are dropped 15 minutes later (`ALTER TABLE … DROP PARTITION`, so the syncer's
-  user needs `ALTER DELETE` on the four generation tables, as it does for D6's).
+- **Its coverage start, `coverage_from`, is the first ledger of the newest unbroken run of stored ledgers that reaches the head**, and never below
+  `stateCoverageStart` (reused: the ledgers written by a parser older than 3 have no state rows).
+  - "Unbroken" means no ledger number is missing: `count()` of `ledgers` over `[a, head]` equals `head − a + 1`. The command finds the lowest such `a` by a binary search over index-only
+    counts.
+  - This differs on purpose from the coverage of the other features, which ignore gaps (api-reference, Coverage). The token history adds levels up ledger by
+    ledger, so a missing ledger would be wrong in every figure after it, not missing from one list.
+  - During an ascending `range-ingest` from 32,570, the run that reaches the head is the one the live syncer wrote, until the fill joins it.
+
+**When a build is needed.** The worker checks every `TOKEN_HISTORY_CHECK_MS` (10 minutes) and logs once when one is due. The gauge
+`syncer_token_history_rebuild_needed{reason}` names the reason:
+- `none`: there is no generation yet;
+- `coverage`: the start of the unbroken run is below the live generation's `coverage_from` (a fill has joined the head's run);
+- `config`: `TOKEN_HISTORY_CONFIG_VERSION` differs from the live generation's;
+- `repair`: a repair met an older parser (§4.7).
+
+The worker builds nothing itself. The answers keep the live generation's `coverage`, so a generation built on part of the history says `complete: false` until a new one replaces it.
+
+**The command `token-history-build`.**
+- It refuses to start, with a message that names why:
+  - while another build holds the lease `<network>:token_history_build`;
+  - while a `range-ingest` run is in progress (an `ingest_log` range whose newest row is `started`, the live intents left out);
+  - while the worker's lease shows no worker (the build needs its live windows above `h0`).
+- It checks the same `range-ingest` condition between batches, and stops with the generation `retired` if one starts: the build would read a history that is changing.
+- It resumes a building generation of the current config and coverage if there is one, else it starts a new one at `h0` = the commit marker.
+- It logs its progress as `range-ingest` does (phase, cursor, rows, rate), and exits when its last phase is done.
+- It runs its statements as `INSERT … SELECT` in ClickHouse with `max_threads = TOKEN_HISTORY_BUILD_THREADS` (default 4; `--threads` sets it), and does little work in Node.
 
 **The phases of a build**, each resumable from the state row:
 
-1. **`changes`.** One pass over `trust_line_states` in key order, by batches of `TOKEN_HISTORY_PASS_ACCOUNTS` accounts (`nextPassAccounts`, reused), up to `h0`.
+1. **`changes`.** One pass over `trust_line_states` in key order, by batches of `TOKEN_HISTORY_PASS_ACCOUNTS` accounts (`nextPassAccounts`, reused), the rows
+   from `coverage_from` up to `h0`.
    - Each batch is one `INSERT … SELECT`: the token side of every row (§1) as sign tests on the text, so no decimal range is involved; the before-state by
-     `lagInFrame` over the line's rows ordered by `(ledger_index, tx_index, node_index)`; `before_known = 0` on a line's first row when that row is not a creation;
+     `lagInFrame` over the line's rows ordered by `(ledger_index, tx_index, node_index)`; `before_known = 0` on a line's first row from `coverage_from` when that row
+     is not a creation (a row below `coverage_from` never serves as a before-state);
      the order key; and `clawback` by `(ledger_index, tx_index) IN` the `tx_by_type` rows of the two types.
    - A batch is deterministic and has a dedup token `token_history:<g>:changes:<first>-<last>`, so running it again is harmless.
    - A property test pins the SQL rule to the TypeScript rule over generated lines.
    - Live windows already write the changes above `h0` for this generation.
 2. **`mpt_changes`.** The same over `mpt_holder_states` by holder batches, where `hasMpt`.
-3. **`levels`.** Per token, in key order (the cursor):
-   - stream the token's per-ledger totals from the change log (`ledger_index`, changes, net, trust lines), up to the current `through_ledger`;
+3. **`levels`.** `h1` is the generation's `through_ledger` when the phase begins, fixed for the phase. Per token, in key order (the cursor):
+   - stream the token's per-ledger totals from the change log (`ledger_index`, changes, net, trust lines), up to `h1`;
    - apply §4.3 and write its checkpoints and its hour rows;
    - a token with more than 5,000,000 changes is done in ledger slices of that many, resumable inside the token.
-   - After the cursor has passed a token, the live windows keep its levels too.
-4. **`done`**, then the promotion.
+   - At the end, `levels_through = h1`.
+4. **`dex`.** The DEX history of §4.5, once per database: hours that already have a sentinel are skipped, so a later build costs nothing here.
+5. **`done`.** The command exits.
 
-The DEX history (§4.5) is not generation-scoped and runs in the same budget once the first build is `done`.
+**The worker finishes the build.**
+- It sees a building generation that is `done` with `levels_through < through_ledger`. It applies levels and checkpoints to it in windows over
+  `(levels_through, through_ledger]`, with the live window's level logic, a step per pass.
+- Once `levels_through` is within 10 ledgers of its own `through_ledger` (which the worker keeps at the head), it promotes it: a `live` row, then a `retired` row for the old
+  one, if there is one. Readers switch at the first row.
+- The retired generation's partitions are dropped 15 minutes later (`ALTER TABLE … DROP PARTITION`, so the syncer's user needs `ALTER DELETE` on the four generation
+  tables, as it does for D6's).
+- For a build of two days, the catch-up is about 40,000 ledgers: minutes.
+
+**Who writes what.**
+- The command writes a building generation's changes up to `h0`, its levels up to `h1`, and the DEX history.
+- The worker writes every change above `h0`, the levels above `levels_through` once the build is `done`, and everything of the live generation.
+- The two never write the same rows.
 
 ### 4.7 Re-ingest and repair
 
 - The aggregator gets an eighth `agg_dirty` hook, after `mpt_state`'s. It only appends the slice's ledger range to `token_history_dirty` and rebuilds nothing. It
   runs whether or not the worker is enabled.
-- The worker takes the oldest range, below its `through_ledger`:
-  1. It rewrites the change rows of the tokens that `state_touches` and `mpt_touches` name in the range.
-  2. It deletes, by a lightweight `DELETE` inside the range's partition, the keys of those tokens in the range that the rewrite did not produce.
-  3. It deletes those tokens' checkpoints at or above the range's first ledger, and recomputes their hours and checkpoints from the checkpoint before it.
-  4. It deletes the range row.
-- A range that holds a ledger of an older parser marks a rebuild instead (§4.6), as the tokens job does.
+- The worker takes the oldest range.
+  - **Its part below the live generation's `coverage_from` is dropped.** Those ledgers are outside the generation: a fill writing below the head's run. When
+    the fill joins the run, the gauge says `coverage` (§4.6).
+  - **Its part in `[coverage_from, through_ledger]` is repaired:**
+    1. It rewrites the change rows of the tokens that `state_touches` and `mpt_touches` name in the range.
+    2. It deletes, by a lightweight `DELETE` inside the range's partition, the keys of those tokens in the range that the rewrite did not produce.
+    3. It deletes those tokens' checkpoints at or above the range's first ledger, and recomputes their hours and checkpoints from the checkpoint before it.
+    4. It deletes the range row.
+- A building generation gets the same repair once its build is `done`; until then its ranges are kept. A range inside a build's `[coverage_from, h0]` cannot be
+  written while it builds: the command stops when a `range-ingest` starts (§4.6).
+- A range that holds a ledger of an older parser is not repaired. The gauge says `repair` (§4.6), as the tokens job marks a rebuild.
 - Between the rewrite and the end of the repair the token history is eventual, as every aggregate here is after a re-ingest (ADR-0008). A given ledger always gets the same
   answer, except across the repair of a ledger at or below it.
 
@@ -334,18 +384,21 @@ The DEX history (§4.5) is not generation-scoped and runs in the same budget onc
 **Boot.** With the worker enabled, the boot checks the tables of 019 and the tables it reads (014, 017, `tx_by_type`), and refuses with
 `lacks the schema of 019_token_history.sql`. With the aggregator enabled it checks `token_history_dirty`.
 
-**Metrics**, every labelled counter seeded at 0:
-- `syncer_token_history_lag_ledgers` (commit marker − live `through_ledger`);
-- `syncer_token_history_build_phase{generation}`;
-- `syncer_token_history_build_progress` (accounts or tokens done);
+**Metrics of the worker**, every labelled counter seeded at 0:
+- `syncer_token_history_lag_ledgers` (commit marker − the live generation's `levels_through`);
+- `syncer_token_history_rebuild_needed{reason}` (1 for the reason a build is due, §4.6; `remove()` when none);
+- `syncer_token_history_building{phase}` (1 while a building generation is in that phase, read from the state rows);
 - `syncer_token_history_window_seconds`;
 - `syncer_token_history_errors_total{step}`;
 - `syncer_token_history_unfit_sums_total`.
 
+The command is short-lived and reports in its log, as `range-ingest` does. The state rows are the record of a build (`operations.md` gets the query).
+
 **Alerts:**
 - the lag above 30 ledgers for 10 minutes while a generation is live;
-- errors rising for 15 minutes;
-- no build progress for an hour while building.
+- errors rising for 15 minutes.
+
+A build that is due raises no alert: it waits for the operator by design, and the gauge and the coverage say so.
 
 ## 5. Endpoints
 
@@ -438,6 +491,7 @@ holders: [{rank, holder, balance, share, limit, frozen, authorized}]`.
 - `totals: {issued, redeemed, clawed_back, transferred, transfers, exchanged?, trades?, exchanged_through?}`;
 - `periods: [{start, …the same keys}]`;
 - `counterparties: [{account, received, sent, net, changes}]`. These are the holders with the largest `received + sent` in the window, then by account, read from the change log's key range of the window (bounded by the token's changes in it).
+- `exchanged` and `trades` are present only when every hour of the window has its DEX sentinel (§2.4). Otherwise they are left out, never given as part of the window's figure.
 
 No CSV, no pagination.
 
@@ -455,17 +509,19 @@ No CSV, no pagination.
 
 ## 6. Coverage
 
-`token_history` is a feature of `FeatureCoverageService`.
-- For an issued token it is the state tables' coverage: D3's case of a feature with no amendment, from the network's first ledger, gated on `STATE_PARSER_VERSION` like
-  `issued_tokens`.
-- For an MPT it is the feature `mpt` (from `MPTokensV1`).
-- `/issuers/{issuer}/tokens` combines both: `complete` when both are, `from_ledger_index` the higher of the two.
+`token_history` is a feature of `FeatureCoverageService` whose start is not read from the ledgers at request time: it is the **live generation's
+`coverage_from`** (§4.6), the history that generation was built on.
+- `from_ledger_index` is that ledger.
+- For an issued token, `complete` is true when it is at or before the network's first ledger (D3's case of a feature with no amendment, as `issued_tokens`).
+- For an MPT, `complete` is true when it is at or before the ledger `MPTokensV1` was enabled in (the feature `mpt`'s start). A network without MPT has none to answer.
+- `/issuers/{issuer}/tokens` uses the issued tokens' rule, the stricter of the two.
 
-Until the state tables are filled back to ledger 32,570 (ADR-0015's history fill), `complete` is false:
+Until the history is filled back to ledger 32,570 (ADR-0015's history fill) and a build has run on it, `complete` is false:
 - a line untouched since the coverage start is missing from every figure, as it is from D6;
 - the first known change of a line that existed before has `before_known = 0` and no flow.
 
-The fill moves `coverage_from`, which builds a new generation (§4.6).
+A fill that joins the head's run makes the worker report a build as due (`coverage`). The answers stay those of the live generation, with its `complete: false`, until the operator's
+build replaces it.
 
 ## 7. Query bounds
 
@@ -488,7 +544,7 @@ Every read starts from a key prefix, and the e2e suites pin its `read_rows` over
 | Xahau | Yes | No (`hasMpt` false: no MPT read, an issuance ID is 404) | Complete from ledger 1 |
 | The testnets | Yes | XRPL Testnet only | Never complete; from the sandbox's first boot |
 
-## 9. Backfill cost, measurement and rollout
+## 9. Build cost, measurement and rollout
 
 **Estimates for XRPL** (assumptions stated; PR 1 replaces them with measurements on real-shaped data and the scratch sync's tables, and
 `operations.md` records them):
@@ -498,18 +554,32 @@ Every read starts from a key prefix, and the e2e suites pin its `read_rows` over
 | `changes` | Reads 2 to 7 billion `trust_line_states` rows (both sides of 1 to 3.5 billion changes). D6's pass ran at about 1M rows/s warm, so 1 to 2 hours warm and a few hours to a day cold. It writes 1 to 3.5 billion rows. |
 | `mpt_changes` | `mpt_holder_states` since ledger 99,226,369: minutes |
 | `levels` | One read of the change log in token order; writes 50 to 200 million hour rows and the checkpoints: hours |
-| DEX history | One scan of `exchanges`, one partition at a time: hours |
-| **Total** | **Half a day to two days**, with the backfill held to 1 s of work after each 1 s poll (about half the wall clock) at 4 threads. Raising `TOKEN_HISTORY_PASS_BUDGET_MS`, or running the CLI with the worker stopped, shortens it. |
+| DEX history (`dex`) | One scan of `exchanges`, one partition at a time: hours |
+| **Total** | **Half a day to two days** of `token-history-build` running without pause at 4 threads (D6's rate was measured with ClickHouse's default threads on 16 CPUs). More `--threads` shorten it and load the server more. |
 
-**Disk:** about 70 to 350 GB in steady state, twice the generation tables during a rebuild.
+These are the costs of the build alone. Filling the history with `range-ingest` first is the existing, node-bound job of `backfill.md`: days to weeks for full XRPL
+history, with or without this feature.
 
-**Rollout order:**
+**What the build costs the rest of the system.** The ingest never waits for the build: they are separate processes, and the build's work happens in
+ClickHouse. But they share one ClickHouse server. While the command runs, it reads hundreds of GB from disk and writes tens to hundreds, and the merges of what it
+writes follow. So the ingest's inserts and the api's reads can be slower, and a heavy api read can come nearer its 30 s guard. The command runs only when the operator starts it, so
+it can be run off-peak, stopped (it resumes where it was) and given fewer threads.
+
+**Disk:** about 70 to 350 GB in steady state, twice the generation tables while a new build exists beside the live one.
+
+**Rollout order** (a deployment that runs the api and a syncer at the head and fills its history with `range-ingest`):
 1. `migrate` (019).
-2. The syncer (worker and hook). It builds the first generation by itself; `syncer_token_history_build_phase` shows it.
-3. The api, at any time after 019. The new routes answer 404 `token history is not built yet` and D6's `/holders` serves as today until the generation is live.
-4. The explorer, when it wants the extended `/holders`.
+2. The syncer (worker and hook). The worker follows the head with no generation to write to yet, and reports `rebuild_needed{reason="none"}`.
+3. The api, at any time after 019. The new routes answer 404 `token history is not built yet`, and D6's `/holders` serves as today until a generation is live.
+4. `range-ingest` from the first ledger to the head, as `backfill.md` says (the command refuses to start while it runs).
+5. `token-history-build`, once. The worker catches the levels up and promotes the generation, and the routes answer with `complete: true`.
+6. The explorer, when it wants the extended `/holders`.
 
-**Prerequisite for `complete: true`:** the state history filled back to 32,570. The program's one reprocess or the history load makes one more build.
+**For analytics before the fill ends,** run the command after step 3. It builds on the head's unbroken run (`complete: false`). After step 4 the gauge says `coverage`,
+and one more run of the command replaces that generation.
+
+Until a first generation exists, the worker's live windows have no generation to write to. The first build's `changes` pass therefore reads the state tables up
+to its own `h0`, and the live windows write from `h0` on, so no ledger is missed.
 
 ## 10. OpenAPI and Ajv
 
@@ -538,14 +608,20 @@ TDD in every PR, and the gates of `docs/development.md`.
 - The digest test vectors, and the parsers of every parameter in the order of their checks.
 
 **e2e** (testcontainers ClickHouse, seeded through the real `LedgerWriter` from fixtures and generated ledgers)
-- **Backfill equals live:** a generation built by the backfill and one built by live windows over the same ledgers give byte-identical answers on every route.
+- **Build equals live:** a generation built by `token-history-build` and one built by live windows over the same ledgers give byte-identical answers on every route.
 - **An independent oracle:** a naive `argMax` over `trust_line_states` (and `mpt_holder_states`) at N gives the same holders, balances and supply as
   `/snapshot`, `/holders` and `/supply` at sampled ledgers, including ledgers on, just before and just after checkpoints. An MPT's supply equals its issuance's
   `outstanding_amount`.
 - **Read bounds:** `read_rows` over a bulk of other tokens, with a mutant. The query condition cache is dropped before a measured read (agent-handoffs lesson).
 - **Repair:** a `--reprocess` of a range gives the same answers; a changed fixture in the range changes exactly the tokens it touches. A range of an older parser
-  starts a rebuild.
-- **Generations:** promotion, drop, and readers that never mix generations.
+  is not repaired and sets `rebuild_needed{reason="repair"}`. A range below the live generation's `coverage_from` is dropped.
+- **The command:**
+  - it refuses to start during a `range-ingest`, while another build holds its lease, and without a worker;
+  - it stops, retiring the generation, when a `range-ingest` starts;
+  - it resumes after a kill at every phase.
+  - `coverage_from` is the start of the head's unbroken run: a gap below it is never crossed, and a gap filled moves it.
+- **Generations:** a build alongside live windows (the hand-over at `h0` and at `h1` loses no ledger and writes no row twice), the worker's catch-up and promotion, the
+  drop, and readers that never mix generations.
 - `exclude`, D6's `/holders` before and after the switch (keys and order unchanged), the 404 before the first generation, Xahau (no MPT read), and every route's Ajv schema.
 - **Boot checks and the hook:** the hook appends and rebuilds nothing.
 
@@ -571,21 +647,23 @@ TDD in every PR, and the gates of `docs/development.md`.
 
 Each PR is mergeable on its own, with its own tests, stacked in this order, each with a sub-issue of #28:
 
-1. **Derived tables and the backfill.**
+1. **Derived tables and the build.**
    - Migration 019, `Table` entries and row types.
-   - The shared rules (token side, order key, `exactSum`, checkpoint rule, flows).
-   - The build steps of §4.6 and the DEX history of §4.5 as shared functions, with the state rows and generations.
-   - A `token-history-build` CLI that runs a build to its end (for measurement and forced rebuilds).
-   - The measurements of §9.
-2. **Syncer integration.** The `token_history` worker: loop, live windows, hour sets and checkpoints live, DEX from `pair_hourly`, promotion and drop, repair and the eighth hook, boot checks, metrics and alerts.
+   - The shared rules (token side, order key, `exactSum`, checkpoint rule, flows, the start of the head's unbroken run).
+   - The build's phases of §4.6 and the DEX history of §4.5, with the state rows and generations.
+   - The `token-history-build` command with its refusals, its lease and its log.
+   - The measurements of §9. Until PR 2, the command's tests stand in for the worker's live windows above `h0`.
+2. **Syncer integration.** The `token_history` worker: its loop and lease, live windows, hour sets and checkpoints live, DEX from `pair_hourly`, the catch-up of a finished
+   build, promotion and drop, repair and the eighth hook, the `rebuild_needed` gauge, boot checks, metrics and alerts.
 3. **Read endpoints.** The shared reads (§3), `TokensModule`'s new controllers and `IssuersController`, the `/holders` extension and switch, the JSON Schemas and the Ajv e2e checks, and the digest test vectors.
 4. **OpenAPI and docs.** `openapi.yaml` regenerated, and every document of §12.
 
 ## 14. Risks and open items for the owner
 
 - **Disk:** 70 to 350 GB, doubled during a rebuild. The real figure comes from PR 1's measurement before production.
-- **The build runs inside the syncer process.** It holds itself to its budget and thread cap, and the live ingest is never blocked by it, but it does load ClickHouse for hours. Its budget is
-  a constant to raise or lower after the measurement.
+- **The build shares ClickHouse with everything else.** The ingest never waits for it, but while `token-history-build` runs (half a day to two days on
+  XRPL, estimated), the ingest's inserts and the api's reads compete with it for the server's disk and CPU (§9). It runs only when the operator starts it, and can
+  be stopped and resumed and given fewer threads. The measurement of PR 1 sets its default thread count.
 - **D6's marker change** invalidates markers in flight once (§5.5).
 - **Decided here, open to the owner:**
   - the checkpoint floor of 50,000;

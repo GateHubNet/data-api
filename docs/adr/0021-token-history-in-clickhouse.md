@@ -26,6 +26,9 @@ facts that decide where and how it is stored:
 - **The history is large.** Full XRPL history holds an estimated 1 to 3.5 billion changes of counting lines (10 to 31 a ledger over ~108 million ledgers).
 - **The ingest and the aggregator have no room.** The ingest writes 40 tables per ledger. The aggregator's 30 s tick gives the jobs before `stats_live` 27 s
   already.
+- **History arrives late and in pieces.** A deployment runs its syncer at the head and fills the history with `range-ingest`, which is node-bound and takes days to
+  weeks for XRPL. The state tables change under anything built on them until that fill is done, and while the fill runs the stored ledgers have a gap that the
+  coverage rule of the other features ignores.
 - **Exactness rules out the shortcuts.** No sampling, no HyperLogLog, and no Float64 sums. D6's `sumOf` falls back to them when an amount does not fit `Decimal256(30)`; issued amounts run from 1e-81 to 1e96.
 
 ## Decision
@@ -45,21 +48,29 @@ facts that decide where and how it is stored:
    - The rule is a function of the history, so a rebuild writes the same checkpoints, and checkpoints never hold more rows than the change log.
 4. **Series are hourly.** A row per token and UTC hour with activity holds the levels at the hour's end and the hour's flows. Days are summed from hours on read,
    ledger points are read from the change log, and a rolling 24 h, 7 d or 30 d window is whole hours plus two edge hours of changes, so every window is exact.
-5. **A syncer worker of its own, `token_history`, writes them.**
-   - It has its own 1 s loop and lease, follows the commit marker through `state_touches` and `mpt_touches`, and does its heavy work as `INSERT … SELECT` in ClickHouse with
-     a capped thread count.
+5. **A syncer worker of its own, `token_history`, follows the head.**
+   - It has its own 1 s loop and lease, follows the commit marker through `state_touches` and `mpt_touches`, and writes a few small rows per ledger.
+   - It repairs after a re-ingest, catches a finished build's levels up to the head and promotes it.
    - The ingest and the aggregator's jobs are unchanged; the aggregator gains one `agg_dirty` hook that only appends a range for the worker to repair.
-   - `through_ledger` in its state row is the token history's commit marker.
-6. **Generations, as D6's.** A build runs beside the live generation, is promoted whole and the old one is dropped by partition. A build is started by a change
-   of the state coverage, of the config version, or a repair that meets an older parser.
-7. **Sums are exact or not served.** SQL sums use `Decimal256(30)` where every amount fits. A sum holding one that does not is redone over the same bounded rows in
+   - `through_ledger` and `levels_through` in a generation's state row are the token history's commit marker.
+6. **The build is an operator command, `token-history-build`, never the worker's.**
+   - It is the one-off heavy work of a generation: the pass over the state history, the levels, the DEX history. It runs as `INSERT … SELECT` in ClickHouse with a
+     thread cap the operator can set.
+   - It refuses to start, and stops, while a `range-ingest` runs. It resumes where it stopped.
+   - The worker only reports that a build is due (a gauge, a log line, and the `complete: false` its answers keep), for one of four reasons: no generation yet, the
+     coverage has grown, the config changed, or a repair met an older parser.
+7. **Generations, as D6's, on an unbroken history.**
+   - A build runs beside the live generation, is promoted whole, and the old one is dropped by partition.
+   - A generation's coverage starts at the first ledger of the newest unbroken run of stored ledgers that reaches the head. Unlike the other features, it never
+     reaches across a gap, because levels are added up ledger by ledger and a missing ledger would falsify every figure after it.
+8. **Sums are exact or not served.** SQL sums use `Decimal256(30)` where every amount fits. A sum holding one that does not is redone over the same bounded rows in
    BigNumber, never as a Float64. This is a deliberate departure from `sumOf` for this feature only.
 
 ## Consequences
 
 **Positive**
-- **No node and no reprocess for the history.** The backfill reads tables the index already holds: one pass over `trust_line_states`, one over the change log, one
-  scan of `exchanges`. It resumes from cursors in its state rows, an estimated half a day to two days for full XRPL history, against weeks for a node-bound reprocess.
+- **No node and no reprocess for the history.** The build reads tables the index already holds: one pass over `trust_line_states`, one over the change log, one
+  scan of `exchanges`. The build resumes from cursors in its state rows, an estimated half a day to two days for full XRPL history, against weeks for a node-bound reprocess.
 - **The same query at the same ledger gives the same answer**, at the head and in 2014, and every read starts from a key prefix with a pinned bound.
 - **The answers trail the head by a ledger and a pass**, seconds, instead of D6's minute. D6's `/holders` moves to the new tables once they are built.
 - One database to run, back up and reason about. The derived tables sit beside the state tables they are made from, and a build is a server-side `INSERT … SELECT`, not
@@ -68,14 +79,16 @@ facts that decide where and how it is stored:
 **Negative / trade-offs**
 - **Disk:** an estimated 70 to 350 GB per XRPL database, a second ordering of the state history, doubled while a rebuild runs beside the live generation.
   The first PR measures it.
-- **The build loads ClickHouse for hours,** inside the syncer process. It is held to a budget per pass and a thread cap, but it competes with the ingest's
-  inserts and the api's reads for the server.
-- **One more worker to operate**: a lease, three alerts (lag, errors, a stalled build), and a forced rebuild in the runbook. The syncer's ClickHouse user needs
-  `ALTER DELETE` on the four generation tables.
+- **A build shares the server.** The ingest never waits for `token-history-build`, but for the half a day to two days it runs on XRPL (estimated) it reads
+  hundreds of GB and writes tens to hundreds. The ingest's inserts and the api's reads compete with it for ClickHouse's disk and CPU. It runs only when the
+  operator starts it (off-peak, with fewer threads, stopped and resumed).
+- **A step for the operator.** A build is due after the first deploy, after the history fill, after a config change, and after a repair that met an older parser.
+  Until it runs, the answers stay those of the last generation, with its coverage, or 404 before the first. There is one more worker to operate (a lease, two alerts:
+  lag and errors) and one more command in the runbook. The syncer's ClickHouse user needs `ALTER DELETE` on the four generation tables.
 - **Eventual after a re-ingest**, like every aggregate (ADR-0008): between a rewrite and its repair the token history shows the old data. Reproducibility
   holds except across the repair of a ledger at or below the one asked.
-- **Complete only after the history fill.** Until the state tables reach ledger 32,570 (ADR-0015), a line untouched since the coverage start is missing, and the
-  fill builds a new generation.
+- **Complete only after the history fill and a build on it.** Until the state tables reach ledger 32,570 (ADR-0015) and the command has run after the fill, a line
+  untouched since the coverage start is missing.
 - **Retention.** The token history is not dropped with a ledger block, and a rebuild after a dropped block is exact only for lines with a state row above it, as
   for D6's tables.
 
