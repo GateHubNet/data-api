@@ -12,27 +12,19 @@ import { firstCommittedLedger } from '../ingest/ingest-state';
 /** The `run_id` prefix of the live runner's first-write intents in `ingest_log` (`LIVE_INTENT_PREFIX` of the syncer's live runner). */
 export const LIVE_INTENT_RUN_PREFIX = 'live:';
 
-const RANGE_COUNTS_SQL = `SELECT toString(count()) AS n, toString(sum(ledger_index)) AS s
-  FROM ${Table.Ledgers}
- WHERE ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}`;
-
-const RANGE_DISTINCT_SQL = `SELECT toString(uniqExact(ledger_index)) AS n
+const RANGE_DISTINCT_SQL = `SELECT toString(groupBitmap(ledger_index)) AS n
   FROM ${Table.Ledgers}
  WHERE ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}`;
 
 /**
- * Whether every ledger of `[from, to]` is stored. The read is a `count()` and a `sum()` of the key column over a key range. They
- * prove the range whole when they are those of `from..to`. A ledger stored twice (a re-ingest before the merge) could make up for
- * a missing one in the count, never in both, so only a range whose figures disagree is counted again by distinct ledgers.
+ * Whether every ledger of `[from, to]` is stored: the number of distinct ledgers of the key range is its span. A ledger stored twice
+ * (a re-ingest before the merge) counts once, so no duplicate can make up for a missing ledger. `groupBitmap` counts them exactly in
+ * a roaring bitmap (about a bit a ledger for a dense run): on 90 million ledgers 0.08 s, where `count()` and `sum()` took 0.04 s
+ * and `uniqExact` 0.25 s.
  */
 async function wholeRange(ch: ClickHouseService, from: number, to: number): Promise<boolean> {
-  const span = BigInt(to - from + 1);
-  const row = await ch.queryOne<{ n: string; s: string }>(RANGE_COUNTS_SQL, { from, to });
-  const n = BigInt(row?.n ?? '0');
-  if (n < span) return false;
-  if (n === span && BigInt(row?.s ?? '0') === ((BigInt(from) + BigInt(to)) * span) / 2n) return true;
-  const distinct = await ch.queryOne<{ n: string }>(RANGE_DISTINCT_SQL, { from, to });
-  return BigInt(distinct?.n ?? '0') === span;
+  const row = await ch.queryOne<{ n: string }>(RANGE_DISTINCT_SQL, { from, to });
+  return BigInt(row?.n ?? '0') === BigInt(to - from + 1);
 }
 
 /**

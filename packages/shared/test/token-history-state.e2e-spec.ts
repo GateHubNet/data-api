@@ -102,6 +102,19 @@ describe('the token history state and coverage (e2e)', () => {
       expect(n?.n).toBe('21');
       expect(await unbrokenRunStart(ch, 50)).toBe(41);
     });
+
+    it('is not fooled by two gaps whose ledgers two duplicates make up for in the count and the sum', async () => {
+      const ch = await fresh();
+      await ch.command(`SYSTEM STOP MERGES ${Table.Ledgers}`);
+      // 30-50 with 42 and 44 missing, and 41 and 45 written twice: count() and sum() of [40, 50] are those of a whole range
+      await ch.insert(Table.Ledgers, range(30, 50).filter((l) => l !== 42 && l !== 44).map((l) => ledgerRow(l)));
+      await ch.insert(Table.Ledgers, [41, 45].map((l) => ({ ...ledgerRow(l), ingested_at: 1_700_000_999 })));
+      const figures = await ch.queryOne<{ n: string; s: string }>(
+        `SELECT toString(count()) AS n, toString(sum(ledger_index)) AS s FROM ${Table.Ledgers} WHERE ledger_index BETWEEN 40 AND 50`,
+      );
+      expect(figures).toEqual({ n: '11', s: String(((40 + 50) * 11) / 2) });
+      expect(await unbrokenRunStart(ch, 50)).toBe(45);
+    });
   });
 
   describe('tokenHistoryCoverageFrom', () => {
