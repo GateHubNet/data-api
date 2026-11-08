@@ -2,6 +2,7 @@ import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
 import { TrustLineStatesRow } from '../src/clickhouse/rows';
 import { Table } from '../src/clickhouse/tables';
+import { exactSumColumns } from '../src/query/decimal';
 import {
   EDGE_AMOUNTS,
   generatedAmount,
@@ -135,6 +136,23 @@ describe('the token history SQL rules (e2e)', () => {
     await expect(
       ch.query(`SELECT ${key.exp} AS exp, ${key.mant} AS mant FROM (SELECT {a:String} AS a)`, { a: '12345678901234567' }),
     ).rejects.toThrow(/more than 16 significant digits/);
+  });
+
+  it('exactSumColumns counts 1e-81 and 1e40 as unfit', async () => {
+    const sums = async (amounts: string[]) =>
+      ch.queryOne<{ s_exact: string | null; s_unfit: number }>(
+        `SELECT ${exactSumColumns('a', 's')} FROM (SELECT arrayJoin({amounts:Array(String)}) AS a)`,
+        { amounts },
+      );
+    // signed amounts and 30 places sum exactly
+    expect(await sums(['1.5', '-0.25', '0.000000000000000000000000000001', '123456789012345678901234567890'])).toEqual({
+      s_exact: '123456789012345678901234567891.250000000000000000000000000001',
+      s_unfit: 0,
+    });
+    // 1e-81 (plain or with an exponent) has more than 30 places, 1e40 is at or above the limit, -1e40 too
+    expect(
+      await sums(['1', '1e-81', `0.${'0'.repeat(80)}1`, '1e40', `1${'0'.repeat(40)}`, '-1e40']),
+    ).toMatchObject({ s_unfit: 5 });
   });
 
   it('orderKeySql of an MPT is its integer', async () => {

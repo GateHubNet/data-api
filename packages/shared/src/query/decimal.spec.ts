@@ -4,6 +4,8 @@ import {
   EXACT_SCALE,
   exactAmount,
   exactSum,
+  exactSumColumns,
+  exactSumOf,
   floatSum,
   ratio,
   sumOf,
@@ -178,5 +180,35 @@ describe('sumOf', () => {
   it('nothing to sum is 0 either way', () => {
     expect(sumOf(0, null, null).toFixed()).toBe('0');
     expect(sumOf(1, null, null).toFixed()).toBe('0');
+  });
+});
+
+describe('exactSumColumns', () => {
+  it('sums the exact decimal of any amount column and counts the amounts it cannot hold', () => {
+    const sql = exactSumColumns('amount_after', 'supply');
+    expect(sql).toMatch(/AS supply_exact/);
+    expect(sql).toMatch(/AS supply_unfit/);
+    expect(sql).toContain('toDecimal256OrNull(amount_after, 30)');
+    // no Float64 shadow is read: the token history has none
+    expect(sql).not.toMatch(/_f\b/);
+  });
+});
+
+describe('exactSumOf', () => {
+  it('exactSumOf uses the decimal when nothing is unfit', async () => {
+    const rows = jest.fn(async () => ['999']);
+    expect((await exactSumOf('12.5', 0, rows)).toFixed()).toBe('12.5');
+    expect((await exactSumOf(null, 0, rows)).toFixed()).toBe('0');
+    expect(rows).not.toHaveBeenCalled();
+  });
+
+  it('exactSumOf falls back to BigNumber when an amount is unfit', async () => {
+    const rows = jest.fn(async () => ['1e-81', '9.999999999999999e80', '1']);
+    const sum = await exactSumOf('1', 2, rows);
+    expect(rows).toHaveBeenCalledTimes(1);
+    expect(sum.toFixed()).toBe(
+      new BigNumber('9.999999999999999e80').plus(1).plus('1e-81').toFixed(),
+    );
+    expect(sum.toFixed()).toBe(`9999999999999999${'0'.repeat(64)}1.${'0'.repeat(80)}1`);
   });
 });
