@@ -1156,8 +1156,10 @@ current config and coverage, else it starts a new one at `h0` = the commit marke
   syncer is down).
 
 **Exit status:** `0` the build is done (`Generation <g> is built; the token_history worker catches it up to the head and promotes it`); `1` it failed or was
-interrupted: run it again to resume; `2` it refused to start, or the command line is wrong; `3` a `range-ingest` started while it ran, and the generation is retired
-(`a range-ingest started: generation <g> is retired; build again once the fill is done`). Two failures name their cause: `no ledger is committed: there is nothing to
+interrupted: run it again to resume; `2` it refused to start, or the command line is wrong; `3` it was stopped while it ran: a `range-ingest` started, and the
+generation is retired (`a range-ingest started: generation <g> is retired; build again once the fill is done`), or it lost its lease (`token-history-build lost its
+lease (...)`: another holder is newest, or no renewal landed for 20 s). A lost lease leaves the generation `building`: look for the other build before running it
+again, or wait 30 s if none runs. Two failures name their cause: `no ledger is committed: there is nothing to
 build the token history from` and `no unbroken run of stored ledgers reaches the head <h>`.
 
 **Stopping it.** Ctrl-C (SIGINT) or a SIGTERM (`docker stop`) stops it after the statement in flight (`Interrupted: stopping after the statement in flight ...`),

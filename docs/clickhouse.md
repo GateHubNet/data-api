@@ -126,7 +126,8 @@ the aggregate families, with a generation:
   `Σ(amount_after − amount_before)`, the holders and trust lines the head's counts plus the changes'.
 - **Exact sums.** A sum in SQL is `Decimal256(30)` with a count of the amounts the decimal cannot hold (`exactSumColumns`); when that count is above 0 the same
   bounded rows are read again and summed in BigNumber (the syncer counts it in `syncer_token_history_unfit_sums_total`). A Float64 sum is never served, unlike
-  `sumOf`'s fallback.
+  `sumOf`'s fallback. ClickHouse raises no error when a `Decimal256(30)` sum passes its Int256 (about 5.8e46): it wraps. So the bound keeps the sums exact: every
+  summed amount is under `EXACT_LIMIT` (1e36), and a token's whole history holds far fewer than the 1e10 changes it would take to reach the wrap.
 - **The order of holders** is the order key `(order_exp, order_mant)`, then `holder`: exact where a double would tie.
 
 The token history's writes: the build's `INSERT … SELECT`s run on the server with `max_threads` = `--threads` and `log_comment = 'token-history-build'` (so they can
