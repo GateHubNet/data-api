@@ -1,4 +1,5 @@
 import {
+  ClickHouseService,
   applyLiveWindow,
   catchUpLevels,
   dexHoursFromPairHourly,
@@ -32,6 +33,11 @@ export type TokenHistorySteps = typeof TOKEN_HISTORY_STEPS;
 export interface TokenHistoryWorkerOptions {
   /** `false`: the loop is not started at boot (the tests run passes themselves). */
   start?: boolean;
+  /**
+   * The client of the catch-up and the repair, whose statements can take minutes: the syncer's client with the build's lifted guards
+   * (`ClickHouseService.derive`) unless given (the tests).
+   */
+  heavyClient?: ClickHouseService;
   logger?: Pick<Logger, 'log' | 'warn' | 'error' | 'debug'>;
   /** The lease holder's name (default: host, pid and a nonce). */
   holder?: string;

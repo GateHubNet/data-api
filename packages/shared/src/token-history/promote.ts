@@ -5,7 +5,7 @@ import { TokenHistoryStateRow, TokenHolderChangesRow } from '../clickhouse/rows'
 import { Table } from '../clickhouse/tables';
 import { mptIssuerOf } from '../util/mpt';
 import { TOKEN_HISTORY_PROMOTE_NEAR, TOKEN_HISTORY_RETIRED_KEEP_MS } from './constants';
-import { keysIn, windowLevels, WindowLevelsOptions } from './live-window';
+import { chunksOf, keysIn, windowLevels, WindowLevelsOptions } from './live-window';
 import { buildingTokenHistory, liveTokenHistory, patchTokenHistoryState } from './state';
 
 /**
@@ -24,14 +24,37 @@ export const GENERATION_TABLES: readonly Table[] = [
 const TOKEN_KEYS = keysIn(['issuer', 'currency'], ['issuers', 'currencies']);
 
 /** The generation's change rows of the tokens `tokens` in the ledgers `(from, to]`, each once: the rows a catch-up step levels. */
-async function changesOfTokens(
+export async function changesOfTokens(
   ch: ClickHouseService,
   g: number,
   tokens: TokenKey[],
   from: number,
   to: number,
 ): Promise<TokenHolderChangesRow[]> {
-  if (tokens.length === 0) return [];
+  const out: TokenHolderChangesRow[] = [];
+  // the tokens a chunk at a time: the order of the rows is the key's, chunk after chunk (the tokens come in key order)
+  const sorted = [...tokens].sort((a, b) =>
+    a.issuer !== b.issuer
+      ? a.issuer < b.issuer
+        ? -1
+        : 1
+      : a.currency < b.currency
+        ? -1
+        : a.currency > b.currency
+          ? 1
+          : 0,
+  );
+  for (const chunk of chunksOf(sorted)) out.push(...(await changesOfTokenChunk(ch, g, chunk, from, to)));
+  return out;
+}
+
+async function changesOfTokenChunk(
+  ch: ClickHouseService,
+  g: number,
+  tokens: TokenKey[],
+  from: number,
+  to: number,
+): Promise<TokenHolderChangesRow[]> {
   return ch.query<TokenHolderChangesRow>(
     `SELECT generation, issuer, currency, ledger_index, tx_index, node_index, holder, toUnixTimestamp(close_time) AS close_time,
             clawback, amount_before, amount_after, counted_before, counted_after, before_known, \`limit\`, frozen, authorized, escrowed,
@@ -121,7 +144,11 @@ const PARTITION_ID = /^\d+(-\d+)?$/;
  * checked to be a whole number and each partition ID read from `system.parts` to be one of its own before it is named in a statement.
  * Returns the generations whose partitions it dropped.
  */
-export async function dropRetired(ch: ClickHouseService, gens: readonly TokenHistoryStateRow[], now: number): Promise<number[]> {
+export async function dropRetired(
+  ch: ClickHouseService,
+  gens: readonly TokenHistoryStateRow[],
+  now: number,
+): Promise<number[]> {
   const dropped: number[] = [];
   for (const gen of gens) {
     if (gen.state !== 'retired' || now - gen.changed_at * 1000 < TOKEN_HISTORY_RETIRED_KEEP_MS) continue;
