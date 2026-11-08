@@ -5,7 +5,7 @@ import { runMigrations } from '../src/clickhouse/migrate';
 import { LedgersRow, TokenHolderChangesRow } from '../src/clickhouse/rows';
 import { Table } from '../src/clickhouse/tables';
 import { seededRandom } from '../src/test-utils/token-history-cases';
-import { buildTokenLevels, nextLevelTokens } from '../src/token-history/build/levels';
+import { buildSmallTokenLevels, buildTokenLevels, nextLevelTokens } from '../src/token-history/build/levels';
 import { checkpointLedgers, LedgerTotals } from '../src/token-history/checkpoint-rule';
 import { ChangeAmounts, flowsOfTransaction } from '../src/token-history/flows';
 import { holdersAt, totalsAt } from '../src/token-history/holders-at';
@@ -170,7 +170,7 @@ describe('the levels phase of the token history build (e2e)', () => {
       close_time: closeOf(i + 1),
     }));
     await ch.insert(Table.Ledgers, ledgers);
-    for (const g of [1, 2, 3]) await ch.insert(Table.TokenHolderChanges, generatedChangeLog(g));
+    for (const g of [1, 2, 3, 4, 5]) await ch.insert(Table.TokenHolderChanges, generatedChangeLog(g));
     expect(await buildAll(1)).toBe(TOKENS.length);
     await buildAll(2, { slice: 3 });
   }, 300_000);
@@ -349,6 +349,24 @@ describe('the levels phase of the token history build (e2e)', () => {
     await buildAll(1);
     expect(await versions()).toEqual(before);
     expect(await tablesOf(1)).toEqual(tables);
+  });
+
+  it('a batch of small tokens is built in one statement and gives the rows of one token at a time', async () => {
+    // a floor above every token's changes: no token can have a checkpoint, so each is small unless an amount does not fit
+    const opts = { floor: 1_000_000, version: 7 };
+    const all = await nextLevelTokens(ch, 4, undefined, 10);
+    for (const token of all) await buildTokenLevels(ch, 4, token, UP_TO, opts);
+    const { big, hours } = await buildSmallTokenLevels(ch, 5, all, UP_TO, opts);
+    // HUG has amounts the decimal cannot hold: it is left to buildTokenLevels
+    expect(big).toEqual([TOKENS[2]]);
+    expect(hours).toBeGreaterThan(40);
+    for (const token of big) await buildTokenLevels(ch, 5, token, UP_TO, opts);
+    expect(await tablesOf(5)).toEqual(await tablesOf(4));
+    expect((await tablesOf(5)).heads).toEqual([]);
+    // a token with as many changes as the floor is big too
+    const small = await buildSmallTokenLevels(ch, 5, all, UP_TO, { floor: 10, version: 7 });
+    expect(small.big).toEqual(all);
+    expect(small.hours).toBe(0);
   });
 
   it('writeHourSets rewrites an hour whole, as the build wrote it', async () => {

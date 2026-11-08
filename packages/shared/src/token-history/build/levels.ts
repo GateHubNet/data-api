@@ -291,3 +291,107 @@ async function writeCheckpointHead(
   };
   await ch.insert(Table.TokenCheckpointHeads, [head]);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Small tokens, many at a time
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** The key range of the tokens `[{first_issuer}.{first_currency}, {last_issuer}.{last_currency}]` of a generation's change log. */
+const TOKENS_RANGE = `generation = {g:UInt32}
+   AND (issuer > {first_issuer:String} OR (issuer = {first_issuer:String} AND currency >= {first_currency:String}))
+   AND (issuer < {last_issuer:String} OR (issuer = {last_issuer:String} AND currency <= {last_currency:String}))`;
+
+/** The hour rows of the small tokens `{keys}` (`issuer|currency`) up to `{to}`, from their first change: one statement for them all. */
+const SMALL_HOURS_SQL = `INSERT INTO ${Table.TokenHourly}
+  (generation, issuer, currency, hour, supply, holders, trust_lines, issued, redeemed, clawed_back, transferred, transfers, changes,
+   unknown_before, first_ledger, last_ledger, final, version)
+WITH token_changes AS (
+  SELECT * FROM ${Table.TokenHolderChanges}
+   WHERE ${TOKENS_RANGE} AND ledger_index <= {to:UInt32} AND concat(issuer, '|', currency) IN {keys:Array(String)}
+   LIMIT 1 BY issuer, currency, ledger_index, tx_index, node_index, holder)
+SELECT {g:UInt32}, issuer, currency, hour,
+       toString(sum(h_net) OVER w), toUInt64(sum(h_holders) OVER w), toUInt64(sum(h_lines) OVER w),
+       toString(h_issued), toString(h_redeemed), toString(h_clawed), toString(h_transferred),
+       h_transfers, h_changes, h_unknown, h_first, h_last,
+       toUInt8(hour < toDateTime({final_before:UInt32}, 'UTC')), {version:UInt64}
+  FROM (SELECT issuer, currency, toStartOfHour(close_time) AS hour, sum(issued) AS h_issued, sum(redeemed) AS h_redeemed,
+               sum(clawed_back) AS h_clawed, sum(transferred) AS h_transferred, toUInt32(sum(transfers)) AS h_transfers,
+               toUInt32(sum(changes)) AS h_changes, toUInt32(sum(unknown_before)) AS h_unknown, min(ledger_index) AS h_first,
+               max(ledger_index) AS h_last, sum(level_net) AS h_net, sum(holders_delta) AS h_holders, sum(lines_delta) AS h_lines
+          FROM (${FLOWS_BY_TX_SQL})
+         GROUP BY issuer, currency, hour)
+WINDOW w AS (PARTITION BY issuer, currency ORDER BY hour ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`;
+
+/**
+ * Builds the hour rows of the small tokens of `tokens` (a batch of `nextLevelTokens`, in key order) in generation `g` up to `upTo`,
+ * in one statement per group of at most `opts.slice` changes, and returns the others. A token is small when it has fewer changes
+ * than the checkpoint floor, so it can have no checkpoint, and every amount of it fits the decimal; its rows are then those
+ * `buildTokenLevels` writes, from levels of 0 at its first change. The big ones (`big`) are left to `buildTokenLevels`; a token with no
+ * change up to `upTo` is in neither. A batch run again writes the same rows under the same version.
+ */
+export async function buildSmallTokenLevels(
+  ch: ClickHouseService,
+  g: number,
+  tokens: TokenKey[],
+  upTo: number,
+  opts: TokenLevelsOptions = {},
+): Promise<{ big: TokenKey[]; hours: number }> {
+  if (tokens.length === 0) return { big: [], hours: 0 };
+  const floor = opts.floor ?? TOKEN_HISTORY_CHECKPOINT_FLOOR;
+  const slice = opts.slice ?? TOKEN_HISTORY_LEVELS_SLICE;
+  const settings = opts.threads === undefined ? {} : { max_threads: opts.threads };
+  const range = {
+    g,
+    first_issuer: tokens[0].issuer,
+    first_currency: tokens[0].currency,
+    last_issuer: tokens[tokens.length - 1].issuer,
+    last_currency: tokens[tokens.length - 1].currency,
+  };
+  const stats = await ch.query<{ issuer: string; currency: string; n: string; unfit: string }>(
+    `SELECT issuer, currency, toString(count()) AS n,
+            toString(countIf(isNull(${exactAmountOfText('amount_before')}) OR isNull(${exactAmountOfText('amount_after')}))) AS unfit
+       FROM ${Table.TokenHolderChanges}
+      WHERE ${TOKENS_RANGE} AND ledger_index <= {upTo:UInt32}
+      GROUP BY issuer, currency`,
+    { ...range, upTo },
+  );
+  const byKey = new Map(stats.map((s) => [`${s.issuer}|${s.currency}`, s]));
+  const big: TokenKey[] = [];
+  const groups: string[][] = [];
+  let group: string[] = [];
+  let size = 0;
+  for (const token of tokens) {
+    const key = `${token.issuer}|${token.currency}`;
+    const s = byKey.get(key);
+    if (s === undefined) continue;
+    const n = Number(s.n);
+    if (n >= floor || Number(s.unfit) > 0) {
+      big.push(token);
+      continue;
+    }
+    if (group.length > 0 && size + n > slice) {
+      groups.push(group);
+      group = [];
+      size = 0;
+    }
+    group.push(key);
+    size += n;
+  }
+  if (group.length > 0) groups.push(group);
+
+  let hours = 0;
+  if (groups.length > 0) {
+    const finalBefore = (await closeHourOf(ch, upTo)) ?? 0;
+    const version = String(opts.version ?? Date.now());
+    for (const keys of groups) {
+      if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
+      const summary = await ch.command(
+        SMALL_HOURS_SQL,
+        { ...range, to: upTo, keys, final_before: finalBefore, version },
+        { settings },
+      );
+      hours += summary.written_rows;
+    }
+  }
+  return { big, hours };
+}

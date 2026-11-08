@@ -20,7 +20,7 @@ import {
 } from '../state';
 import { nextMptPassHolders, writeChangesBatch, writeMptChangesBatch } from './changes-pass';
 import { dexHistoryPartition, nextDexPartition } from './dex';
-import { buildTokenLevels, nextLevelTokens } from './levels';
+import { buildSmallTokenLevels, buildTokenLevels, nextLevelTokens } from './levels';
 
 /**
  * The `token-history-build` command's work (spec 4.6): a generation of the token history, phase by phase, resumable from its state
@@ -71,6 +71,9 @@ export interface TokenHistoryBuildOptions {
   floor?: number;
   slice?: number;
 }
+
+/** The tokens of one batch of the levels phase: the small ones of a batch are built in one statement. */
+export const TOKEN_HISTORY_LEVEL_TOKENS = 1_000;
 
 /** The TTL of the build's lease and of the worker's (as the live runner's), and how often the build renews its own. */
 export const TOKEN_HISTORY_LEASE_TTL_MS = 30_000;
@@ -289,22 +292,19 @@ async function runPhases(
           state.token_cursor_issuer === '' && state.token_cursor_currency === ''
             ? undefined
             : { issuer: state.token_cursor_issuer, currency: state.token_cursor_currency };
-        const tokens = await nextLevelTokens(ch, g, after, o.levelTokens ?? 100);
+        const tokens = await nextLevelTokens(ch, g, after, o.levelTokens ?? TOKEN_HISTORY_LEVEL_TOKENS);
         if (tokens.length === 0) {
           await patchTokenHistoryState(ch, g, { phase: 'dex', levels_through: state.h1 });
           state = { ...state, phase: 'dex', levels_through: state.h1 };
           break;
         }
-        let rows = 0;
-        for (const token of tokens) {
+        const levelOpts = { version, threads: o.threads, floor: o.floor, slice: o.slice, signal: o.signal };
+        // the small tokens of the batch in one statement, then each big one (checkpoints, slices, BigNumber) on its own
+        const small = await buildSmallTokenLevels(ch, g, tokens, state.h1, levelOpts);
+        let rows = small.hours;
+        for (const token of small.big) {
           o.signal?.throwIfAborted();
-          const built = await buildTokenLevels(ch, g, token, state.h1, {
-            version,
-            threads: o.threads,
-            floor: o.floor,
-            slice: o.slice,
-            signal: o.signal,
-          });
+          const built = await buildTokenLevels(ch, g, token, state.h1, levelOpts);
           rows += built.hours + built.checkpoints;
         }
         const last = tokens[tokens.length - 1];
