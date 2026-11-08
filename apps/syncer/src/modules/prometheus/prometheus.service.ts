@@ -1,6 +1,6 @@
 import { nodeThrottle, ThrottlePause } from '@gatehub/data-api-shared';
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { collectDefaultMetrics, Counter, Gauge, Registry } from 'prom-client';
+import { collectDefaultMetrics, Counter, Gauge, Histogram, Registry } from 'prom-client';
 
 /**
  * One registry and one set of metrics per process. The toolbox `bootstrap()` runs the Prometheus module as a second
@@ -193,6 +193,40 @@ const metrics = {
     help: 'through_ledger less repair_from of the live generation of the issued tokens: the ledgers its repair applies again, 0 without a repair.',
     registers: [registry],
   }),
+  tokenHistoryLagLedgers: new Gauge({
+    name: 'syncer_token_history_lag_ledgers',
+    help: 'Ledgers between the committed head and the levels_through of the live generation of the token history; no sample without one. Alert above 30 for 10 minutes.',
+    registers: [registry],
+  }),
+  tokenHistoryRebuildNeeded: new Gauge({
+    name: 'syncer_token_history_rebuild_needed',
+    help: 'A build of the token history is due, by reason (none: no generation yet; coverage; config; repair): 1 for the reason, no series when none is due. A build is run by the operator (token-history-build).',
+    labelNames: ['reason'],
+    registers: [registry],
+  }),
+  tokenHistoryBuilding: new Gauge({
+    name: 'syncer_token_history_building',
+    help: '1 while a building generation of the token history is in this phase (changes, mpt_changes, levels, dex, done), from its state rows.',
+    labelNames: ['phase'],
+    registers: [registry],
+  }),
+  tokenHistoryWindowSeconds: new Histogram({
+    name: 'syncer_token_history_window_seconds',
+    help: 'Seconds a live window of the token history took, from its read to its state row.',
+    buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+    registers: [registry],
+  }),
+  tokenHistoryErrorsTotal: new Counter({
+    name: 'syncer_token_history_errors_total',
+    help: 'Failed steps of the token_history worker, by step (live, repair, catch_up, dex, drop). Alert when it rises for 15 minutes.',
+    labelNames: ['step'],
+    registers: [registry],
+  }),
+  tokenHistoryUnfitSumsTotal: new Counter({
+    name: 'syncer_token_history_unfit_sums_total',
+    help: 'Sums of the token history that held an amount Decimal256(30) cannot hold, and were summed again in BigNumber.',
+    registers: [registry],
+  }),
   mptStateLagLedgers: new Gauge({
     name: 'syncer_mpt_state_lag_ledgers',
     help: 'Ledgers between the committed head and the mpt_state cursor',
@@ -311,11 +345,15 @@ metrics.validatorsTomlStoreWritesTotal.inc({ outcome: 'error' }, 0);
 // the same: an issuance set aside moves no lag, and its errors are all that say so, up to an hour apart
 metrics.aggregatorErrorsTotal.inc({ job: 'mpt_state' }, 0);
 metrics.aggregatorErrorsTotal.inc({ job: 'mpt_state_dirty' }, 0);
+metrics.aggregatorErrorsTotal.inc({ job: 'token_history_dirty' }, 0);
+for (const step of ['live', 'repair', 'catch_up', 'dex', 'drop']) metrics.tokenHistoryErrorsTotal.inc({ step }, 0);
 
 // prom-client gives a gauge without labels a sample of 0 when it is registered. These two are not known until the supply job has seen
 // a snapshot, or written a row: a 0 would read as a snapshot that has just been written, and no alert could fire on a job that
 // never writes one. So they start without a sample (the HELP and TYPE lines stay, `absent()` is true), and a `set` brings it.
 metrics.supplySnapshotAgeSeconds.remove();
+// the same for the token history's lag: not known until the worker has read a live generation
+metrics.tokenHistoryLagLedgers.remove();
 metrics.supplyCycleSeconds.remove();
 
 // Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
@@ -385,6 +423,12 @@ export class PrometheusService implements OnModuleInit {
   readonly tomlsDomains = metrics.tomlsDomains;
   readonly tomlsDue = metrics.tomlsDue;
   readonly tomlsDiscoverySeconds = metrics.tomlsDiscoverySeconds;
+  readonly tokenHistoryLagLedgers = metrics.tokenHistoryLagLedgers;
+  readonly tokenHistoryRebuildNeeded = metrics.tokenHistoryRebuildNeeded;
+  readonly tokenHistoryBuilding = metrics.tokenHistoryBuilding;
+  readonly tokenHistoryWindowSeconds = metrics.tokenHistoryWindowSeconds;
+  readonly tokenHistoryErrorsTotal = metrics.tokenHistoryErrorsTotal;
+  readonly tokenHistoryUnfitSumsTotal = metrics.tokenHistoryUnfitSumsTotal;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

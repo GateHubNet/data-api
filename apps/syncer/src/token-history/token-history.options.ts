@@ -1,4 +1,32 @@
+import {
+  applyLiveWindow,
+  catchUpLevels,
+  dexHoursFromPairHourly,
+  dexThrough,
+  dropRetired,
+  oldestFinalPairHour,
+  promoteIfCaughtUp,
+  readTokenHistoryStates,
+  rebuildNeeded,
+  repairOldestRange,
+} from '@gatehub/data-api-shared';
 import { Logger } from '@nestjs/common';
+
+/** The shared functions the worker's steps call; the unit tests replace them. */
+export const TOKEN_HISTORY_STEPS = {
+  readStates: readTokenHistoryStates,
+  applyLiveWindow,
+  catchUpLevels,
+  repairOldestRange,
+  promoteIfCaughtUp,
+  dropRetired,
+  rebuildNeeded,
+  dexThrough,
+  oldestFinalPairHour,
+  dexHoursFromPairHourly,
+};
+
+export type TokenHistorySteps = typeof TOKEN_HISTORY_STEPS;
 
 /** The options of the `token_history` worker that the tests set (the defaults are the spec's). */
 export interface TokenHistoryWorkerOptions {
@@ -14,6 +42,8 @@ export interface TokenHistoryWorkerOptions {
   /** What a pass may spend on the steps after the live windows (default `TOKEN_HISTORY_PASS_BUDGET_MS`). */
   budgetMs?: number;
   now?: () => number;
+  /** The shared functions of the steps (the unit tests' fakes). */
+  steps?: Partial<TokenHistorySteps>;
 }
 
 export const TOKEN_HISTORY_WORKER_OPTIONS = Symbol('TOKEN_HISTORY_WORKER_OPTIONS');
