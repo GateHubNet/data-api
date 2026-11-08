@@ -155,3 +155,7 @@ Run on 2026-11-08 in the worktree at 0315449, every ClickHouse a testcontainer (
 The syncer e2e's first run failed one test of `app.e2e-spec.ts`: it let the aggregator boot on migrations 001, 014, 015 and 017,
 and the aggregator now needs the token history's dirty ranges of 019 as well. The test applies 019 too (commit 5c8ab0c); the other
 20 suites of that run passed, and the fix changes that test alone.
+
+Run again at 0dfa8a2, after PR 1's review fixes were merged in (SIGTERM, the build lease read back, the exact coverage count):
+build passed; unit shared 3,098, exporter 12, syncer 1,966, api 2,708; e2e shared 38 suites and 1,865 tests, syncer 21 and 445,
+api 61 and 3,617, all passed.
