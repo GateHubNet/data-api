@@ -1,7 +1,7 @@
 # The syncer (ingestion service)
 
 `apps/syncer` (`@gatehub/data-syncer`) fills the ClickHouse database of **one network** with everything the
-[API](api-reference.md) serves. It is a NestJS process that runs up to six **workers** and exposes a liveliness probe
+[API](api-reference.md) serves. It is a NestJS process that runs up to seven **workers** and exposes a liveliness probe
 (`GET /liveliness/healthz`, port 3002) and Prometheus metrics (`GET /metricz`, port 3000). Run **exactly one syncer per network
 and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer); metrics: [observability](observability.md).
 
@@ -31,17 +31,21 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
                                                    + supply (reads   validator_
                                                    state, ledgers)   agreement_hourly
                           ClickHouse, database = the network name
+
+   token_history (no node; reads state_touches, mpt_touches, the state tables, tx_by_type, pair_hourly)
+     ──▶ token_holder_changes, token_checkpoints, token_checkpoint_heads, token_hourly, token_hourly_dex, token_history_state
 ```
 
 Besides the node, the fifth worker, `validators` ([section 8](#8-the-validators-worker)), fetches the validator lists of the UNL publishers and
 the TOML files of the validators' domains over HTTPS, and reads the ledgers and validations the other workers stored.
 The sixth, `tomls` ([section 8a](#8a-the-tomls-worker)), needs no node: it reads which domains accounts name from `account_domains` and fetches
-their tomls over HTTPS.
+their tomls over HTTPS. The seventh, `token_history` ([section 8b](#8b-the-token_history-worker)), needs no node either: it keeps the token history
+of every issued token and MPT at the head, from the state tables and the touch indexes the ingest wrote.
 
 ## 1. Boot
 
 `main.ts` loads and validates the configuration (the process exits with a message naming the bad variable), builds the app from
-the **enabled workers** only (`GH_WORKERS`, default all six), and starts the toolbox bootstrap (probe + metrics ports).
+the **enabled workers** only (`GH_WORKERS`, default all seven), and starts the toolbox bootstrap (probe + metrics ports).
 Then, in order:
 
 1. If `GH_RUN_MIGRATIONS_ON_BOOT=true`, the schema is applied (the compose stacks leave this off: the `migrate-<network>` job
@@ -55,6 +59,9 @@ Then, in order:
    and the `supply` job reads them, while it writes `network_supply` on both networks). The check of 015 runs after the one of 014.
    With the `validators` worker enabled, the five columns of `016_validator_toml_details.sql` on `validator_domains` are checked after those (`system.columns`: `lacks the schema of 016_validator_toml_details.sql`).
    With the `ingest` or the `aggregator` worker enabled, the tables of `017_mpt.sql` are checked after that (the ingest the five ledger tables `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers`, `mpt_issuance_transfers`; the aggregator `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches` and the two aggregates `mpt_issuances`, `mpt_holders`), on every network, since the schema is one (on XRPL and XRPL Testnet an insert into a missing MPT table fails the batch, and the `mpt_state` job and its hook would fail at every run: `lacks the schema of 017_mpt.sql`).
+   Last, the tables of `019_token_history.sql` are checked the same way: with the `token_history` worker enabled, the seven tables of the file and the
+   tables its windows, repairs and DEX hours read (`state_touches`, `trust_line_states`, `mpt_touches`, `mpt_holder_states`, `tx_by_type`, `pair_hourly`);
+   with the `aggregator` worker enabled, `token_history_dirty`, which its eighth hook writes (`lacks the schema of 019_token_history.sql`).
 2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
    (`server_info.network_id` must be one of the profile's `acceptedNodeNetworkIds`: `xrpl` 0 or nothing, `xahau` 21337, `xrpl-testnet` 1, `xahau-testnet` 21338, and no other). A node of another network refuses the boot.
 3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,
@@ -306,6 +313,10 @@ How it works (aligned chunks, `ingest_log` intents):
 Do not run two range ingests over overlapping ranges at the same time. Throughput is bound first by the node, then by
 ClickHouse; raise `--concurrency` with your own node.
 
+While a range-ingest is in progress (an `ingest_log` range whose newest row is `started`, the live intents left out) `token-history-build` refuses
+to start, and a build that runs retires its generation and stops ([8b](#8b-the-token_history-worker)). A run that died leaves its chunk `started`
+until a rerun redoes it, so a build waits for that rerun too.
+
 ## 5. The validations worker
 
 `ValidationsCollector` listens to the `validations` and `manifests` streams of every node of `GH_VALIDATION_ENDPOINTS` (one
@@ -368,7 +379,7 @@ constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment
 | 7 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
 | 8 | `tokens` | 4 s | The generations of the issued tokens (`token_generations`, `token_lines`, `tokens`): the touches of the live generation, its repair after a re-ingest, every tenth run the housekeeping (the rebuild check, the distinct holders, the toml sweep), the account pass and the touches of the generation that builds, its promotion, and the drop of the generations retired. Its state is in the generation rows, so a restart goes on where it was ([the tokens job](#the-tokens-job)). |
 | 9 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
-| 10 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)), marks the slice's ledgers in `nft_dirty` for `nft_state` ([the NFT jobs](#the-nft-jobs)), recomputes the escrows of the slice's ledgers ([the escrows job](#the-escrows-job)), marks the slice for the repair of the issued-token generations, and, last, rebuilds the issuances the slice names ([the mpt_state job](#the-mpt_state-job)). |
+| 10 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)), marks the slice's ledgers in `nft_dirty` for `nft_state` ([the NFT jobs](#the-nft-jobs)), recomputes the escrows of the slice's ledgers ([the escrows job](#the-escrows-job)), marks the slice for the repair of the issued-token generations, rebuilds the issuances the slice names ([the mpt_state job](#the-mpt_state-job)), and, last, marks the slice's ledgers in `token_history_dirty` for the `token_history` worker to repair ([8b](#8b-the-token_history-worker)). |
 | 11 | `mpt_state` | 3 s | Rebuilds the `mpt_issuances` row of every issuance with a touch that its row has not seen yet, and the `mpt_holders` rows of the pairs touched, 200 issuances at a time ([the mpt_state job](#the-mpt_state-job)). After the stats, so that the jobs before `stats_live` keep to their 27 of the 30 s; during a stats catch-up it gets nothing, and a new issuance waits. |
 | 12 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
 | 13 | `nft_collections` | 3 s, **every 5th tick** | Computes the `nft_collections` row and the holders of every collection whose NFTs `nft_state` rebuilt, 50 collections at a time, oldest first ([the NFT jobs](#the-nft-jobs)). |
@@ -534,7 +545,7 @@ in a tick; a shutdown aborts the set in flight before it writes (`AggregateSetAb
 
 ### 7.6 The `agg_dirty` hooks
 
-A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order** (and then the fourth, of `nft_state`, the fifth, of `escrows`, the sixth, of `tokens`, and the seventh, of `mpt_state`, which do not depend on the other three):
+A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order** (and then the fourth, of `nft_state`, the fifth, of `escrows`, the sixth, of `tokens`, the seventh, of `mpt_state`, and the eighth, of the token history, which do not depend on the other three):
 
 1. `rates_daily`: a slice that touches the days X..Y marks the days X..Y+14 **stale** (the rate of a day reads the trades of the 14 days before it): for each of them that has a valid set, a new sentinel with `stale = 1` and no rows. The back-fill then computes them again, newest first; until it has, the readers value those days on read.
 2. `pair_hourly`: the hours of the slice that lie in the last 31 days are recomputed, a call for each UTC day.
@@ -546,11 +557,13 @@ A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `sta
 
 5. `escrows`: the escrows of the ledgers that closed in the slice are recomputed **as of the watermark of the `escrows` job** (the `through_ledger` of its sentinel: a slice above it is the live steps' to read, and a job that has written no sentinel yet has its first steps read the rows the slice rewrote, so the hook does nothing), and the total is read again, with the sentinel rewritten at the same watermark, if an escrow was written or removed. **After a step of the tick that failed** it reads nothing and fails the slice (`the escrows step of this tick failed`): that step may have written some of its rows without its sentinel, and a total read then would not be the state at the watermark. It runs with the `escrows` option, with or without the others. When it fails the slice stays in `agg_dirty`, the hook of `tokens` after it is skipped for the tick, and the earlier hooks of the slice run again at the next tick, with no backoff ([the escrows job](#the-escrows-job)).
 
-6. `tokens`: every generation of the issued tokens that is live or builds, and whose `through_ledger` reaches the first ledger of the slice, gets its `repair_from` lowered to that ledger (no lower than its `coverage_from`: a slice below it is left to the rebuild check), one generation row each; the next run of the `tokens` job applies the touches of `[repair_from, through_ledger]` again. The hook applies nothing itself, and writes nothing when `repair_from` would not change. It throws before it reads while the job has not read its version floor yet (before its first run) or when the reads that open its last run failed, so that the slice fails and its range stays in `agg_dirty`; a step of the job that failed does not stop it. It runs with the `tokens` option, with or without the others. When it fails the slice stays in `agg_dirty`, the hook of `mpt_state` after it waits, and the earlier hooks of the slice run again at the next tick, with no backoff.
+6. `tokens`: every generation of the issued tokens that is live or builds, and whose `through_ledger` reaches the first ledger of the slice, gets its `repair_from` lowered to that ledger (no lower than its `coverage_from`: a slice below it is left to the rebuild check), one generation row each; the next run of the `tokens` job applies the touches of `[repair_from, through_ledger]` again. The hook applies nothing itself, and writes nothing when `repair_from` would not change. It throws before it reads while the job has not read its version floor yet (before its first run) or when the reads that open its last run failed, so that the slice fails and its range stays in `agg_dirty`; a step of the job that failed does not stop it. It runs with the `tokens` option, with or without the others. When it fails the slice stays in `agg_dirty`, the hooks of `mpt_state` and of the token history after it wait, and the earlier hooks of the slice run again at the next tick, with no backoff.
 
-7. `mpt_state`, the last hook: the issuances the slice names are rebuilt at the head read then, 200 at a time: those with a touch in the slice's ledgers, with the holders touched there; those whose newest `mpt_issuances` row last saw one of its ledgers; and every pair, of any issuance, whose newest `mpt_holders` row last saw one, so that a pair a re-ingest dropped is deleted although its issuance was last seen elsewhere. An issuance that fails on its own is set aside, not the slice, and its retry keeps what the slice named. It runs with the `mptState` option, with or without the others ([the mpt_state job](#the-mpt_state-job)).
+7. `mpt_state`: the issuances the slice names are rebuilt at the head read then, 200 at a time: those with a touch in the slice's ledgers, with the holders touched there; those whose newest `mpt_issuances` row last saw one of its ledgers; and every pair, of any issuance, whose newest `mpt_holders` row last saw one, so that a pair a re-ingest dropped is deleted although its issuance was last seen elsewhere. An issuance that fails on its own is set aside, not the slice, and its retry keeps what the slice named. It runs with the `mptState` option, with or without the others ([the mpt_state job](#the-mpt_state-job)). When it fails the slice stays in `agg_dirty` and the hook of the token history after it waits.
 
-A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`, `tokens_dirty`, `mpt_state_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
+8. The token history, the last hook (`markTokenHistoryDirty`): the ledgers that closed in the slice are appended to `token_history_dirty` as one range (a slice with no ledger appends nothing), for the `token_history` worker to repair ([8b](#8b-the-token_history-worker)). The hook rebuilds nothing. `aggregator.module.ts` always sets it, so it runs **whether or not the `token_history` worker is enabled**, with or without the other options. When it fails the slice stays in `agg_dirty`, and the earlier hooks of the slice run again at the next tick, with no backoff.
+
+A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`, `tokens_dirty`, `mpt_state_dirty`, `token_history_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
 because the range is not changed after it. Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`).
 
 ### 7.7 The back-fills
@@ -829,7 +842,7 @@ never cut inside, so the last one of a run can end past the budget) and the part
 - **A restart goes on where it was**: the state is in the generation rows. What is in memory is only what a restart finds again or does without (the housekeeping count, the version floor, the halved windows,
   the sweep's cursor, the backoffs, the generations marked for a rebuild: the mark of a rebuild is found again by the same window).
 - **Shutdown** aborts a step before its next write (`TokensAborted`, neither logged nor counted).
-- **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), item 6, error label `tokens_dirty`. Only the hook of `mpt_state` comes after it, and it only lowers `repair_from` of every generation that is
+- **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), item 6, error label `tokens_dirty`. Only the hooks of `mpt_state` and of the token history come after it, and it only lowers `repair_from` of every generation that is
   live or builds and whose `through_ledger` reaches the slice (no lower than its `coverage_from`: a slice below it is left to the rebuild check), writing one generation row each; the next run of the job
   applies the repair. It throws before it reads while the job has not read its version floor yet (before its first run) or when the reads that open its last run failed, so that the slice fails and
   its range stays in `agg_dirty` (a mark is never lost). **A job that cannot read its tables therefore keeps `agg_dirty` from draining for every job**, and that is why the syncer refuses to boot
@@ -1346,6 +1359,127 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 (`warn`; the check loop's pass failed to read or write, and what was not written is due again). The alerts are in
 [observability](observability.md#recommended-alerts).
 
+## 8b. The token_history worker
+
+The `token_history` worker (`apps/syncer/src/token-history/`; its rules and reads are in `packages/shared/src/token-history/`, shared with the api and the build)
+keeps the **token history** at the head: for every issued token and MPT a change log in the order of the token, its checkpoints and its hourly rollups, from which the
+api answers holders, supply, distribution and flows at any ledger ([data-model](data-model.md#token-history-migration-019), [ADR-0021](adr/0021-token-history-in-clickhouse.md),
+[spec](superpowers/specs/2026-11-08-issuer-analytics-design.md)). It needs ClickHouse only, **not the node** (`NODE_CLIENT_WORKERS` does not list it), is in `GH_WORKERS` and
+on by default, and has a loop and a budget of its own, so the aggregator's jobs and their 30 s tick are unchanged. **It never builds a generation**: the heavy
+one-off work of a build is the operator's `token-history-build` command ([below](#the-build-command), [operations](operations.md#the-token-history)). The worker follows the
+head, repairs after a re-ingest, catches a finished build's levels up and promotes it, drops retired generations, and says when a build is due.
+
+**The pass.** A `PassLoop` runs a pass every `TOKEN_HISTORY_POLL_MS` (1 s) after the previous one ended. A pass:
+
+1. reads the commit marker (the newest committed ledger; with none it does nothing) and takes or renews the lease;
+2. applies **live windows** until every generation that is live or building is at the head;
+3. then, while what is left of `TOKEN_HISTORY_PASS_BUDGET_MS` (1 s, counted from the start of the pass) lasts, takes **one step**: the **catch-up** of a
+   generation whose levels are behind its changes (a live one, or a building one whose build is `done`); else the **repair** of the oldest range of
+   `token_history_dirty`, and, when there was no range to work on, the **DEX hours** of the final `pair_hourly` hours, as many as the budget allows;
+4. promotes a finished build that is near the head, drops the partitions of the generations retired 15 minutes ago, sets the gauges, and every
+   `TOKEN_HISTORY_CHECK_MS` (10 minutes, and at the first pass) checks whether a build is due.
+
+A step is never cut once it has started. A step that fails is counted (`syncer_token_history_errors_total{step}`, `step` one of `live`, `repair`, `catch_up`,
+`dex`, `drop`), logged (`Token history: the <step> step failed: <message>`) and tried again at the next pass, a second later, with no backoff; the pass goes on
+with the steps after it. A failure outside the steps (the read of the commit marker, of the lease or of the state rows) ends the pass, is logged
+(`Token history: the pass failed: <message>`) and is not counted; the gauges keep their values until a pass gets through. The state is in
+`token_history_state`, so a restart goes on where it was. A stop (SIGTERM, SIGINT) ends the loop, waits at most 2 s for the
+step in flight (`TOKEN_HISTORY_STOP_WAIT_MS`) and releases the lease.
+
+**The lease.** The worker holds the `syncer_lease` row `<network>:token_history` (a TTL of 30 s, renewed every 10 s from inside a pass), so that two workers never
+write one database's token history. A worker that finds another holder's lease fresh writes nothing and tries again at each pass
+(`Token history: another token_history worker holds the lease (<holder>); this worker waits`). `token-history-build` reads the lease to know that a worker runs: it
+needs the worker's live windows above its start.
+
+**The live window** (`applyLiveWindow`). The window `(through_ledger, to]` starts at the lowest `through_ledger` of the live and the building generation and is
+`touchesOfWindow`'s, as the `tokens` job's (at most 500 ledgers, halved above 20,000 lines), capped at the commit marker; at the head it is a ledger or two.
+- **What changed:** the issued-token lines from `state_touches` (`kind = 'line'`) and, on a network with MPTs, the pairs from `mpt_touches` (`holder != ''`); then,
+  per line, both sides' `trust_line_states` rows in the window and the newest row before it (the before-state, a key prefix per line), the same over
+  `mpt_holder_states`, and the clawbacks from `tx_by_type` (`Clawback`, `AMMClawback`). The newest row before the window serves as a before-state only when it is at or
+  above the generation's `coverage_from`.
+- **Writes, in this order:** the change rows of each generation above its own `through_ledger` (dedup token `token_history:<g>:live:<from>-<to>`), to the live
+  generation and to a building one whatever its phase (the command's `changes` pass stops at its `h0`, and the windows write every change above it); then the hour
+  sets and the checkpoints, only in the live generation and in a building one whose build is `done` and whose `levels_through` has reached its `through_ledger`; and
+  last each generation's state row (`through_ledger`, and `levels_through` where the levels ran). A crash before the state row leaves rows no reader reaches, and the
+  window is applied again under the same keys.
+- **A window that holds a ledger of an older parser** than `TOKEN_PARSER_VERSION` (8), or than `MPT_PARSER_VERSION` (10) on a network with MPTs, is not applied: the
+  `live` step fails. A window at the head never holds one.
+
+**Hour sets and checkpoints.** For each (token, hour) a window touches, the `token_hourly` row is computed again whole from the change log, in BigNumber: the flows
+grouped by transaction first, then summed; the levels the previous hour row's plus the hour's net change. Then a token whose changes since its previous checkpoint (or
+since its first change) reach `max(its trust lines, TOKEN_HISTORY_CHECKPOINT_FLOOR)` (50,000) after a ledger gets a checkpoint at that ledger: its rows (the fold of its
+holders there), then its head. The rule is a function of the history, so a build and the live windows write the same checkpoints.
+
+**The catch-up and the promotion** (`catchUpLevels`, `promoteIfCaughtUp`). A build's levels end at its `h1`, while the live windows have gone on writing its changes to
+the head. The catch-up applies the window's level logic to such a generation over `(levels_through, through_ledger]`, a window at a time while the budget lasts. Once a
+`done` build's `levels_through` is within `TOKEN_HISTORY_PROMOTE_NEAR` (10) ledgers of its `through_ledger`, it is promoted: a `live` row for it, then a `retired` row for
+the generation that was live (`Token history: generation <g> is live`). Readers switch at the first row and answer at its `levels_through`, at most 10 ledgers behind,
+until the catch-up, which serves a live generation as it serves a `done` one, closes the rest. The promotion also deletes the ranges of `token_history_dirty` that a
+re-ingest left before the build started, up to its `h0`: the build read the state they rewrote.
+
+**The drop** (`dropRetired`). The partitions of the four generation tables (`token_holder_changes`, `token_checkpoints`, `token_checkpoint_heads`, `token_hourly`) of every
+generation retired at least `TOKEN_HISTORY_RETIRED_KEEP_MS` (15 minutes) before: `ALTER TABLE … DROP PARTITION ID '<id>'`, each ID read from `system.parts` and checked to be
+the generation's own (`Token history: the partitions of retired generation <g> are dropped`). The syncer's ClickHouse user needs `ALTER DELETE` on them
+([clickhouse](clickhouse.md#memory-and-safety-guards)).
+
+**The repair** (`repairOldestRange`). The aggregator's eighth hook ([7.6](#76-the-agg_dirty-hooks)) appends the ledgers of each re-ingested slice to
+`token_history_dirty`. The worker takes the oldest range:
+- with no generation at all, or for the part of it below the live generation's `coverage_from` (a fill below the head's unbroken run) or above its
+  `through_ledger` (the live windows will read it), the range is **dropped**;
+- while a building generation is not `done`, the ranges **wait**;
+- a range that holds a ledger of an older parser (the rule of the live window) is **not repaired** and stays, and the ranges after it wait behind it: a build is
+  due (`repair`), and its promotion clears them;
+- otherwise its part in `[coverage_from, through_ledger]` is **repaired**, in the live generation and in a building one whose build is `done`: the change rows of the
+  tokens that `state_touches` and `mpt_touches` name in the range are deleted (a lightweight `DELETE` that the worker waits for) and written again from the state tables;
+  then those tokens' checkpoints, heads and hour rows from the hour of the range's first ledger on are deleted and built again from the checkpoint before it, up to
+  `levels_through`; last the range row is deleted.
+
+Between the rewrite and the end of the repair the token history is eventual, as every aggregate is after a re-ingest (ADR-0008): a token's rows of the range are
+missing between the delete and the insert.
+
+**The DEX hours** (`dexHoursFromPairHourly`). Each UTC hour after the newest `token_hourly_dex` sentinel (from the oldest final `pair_hourly` hour when there is none)
+whose `pair_hourly` set is final and of the current `PAIR_HOURLY_CONFIG_VERSION` gives its `token_hourly_dex` rows: per pair row (`book` and `amm`), `base_sum` to the
+base token and `counter_sum` to the counter token, `count` to both, a pair-hour with an amount its exact sums could not hold summed again from `exchanges` in BigNumber;
+the native currency is no token; the hour's sentinel last. The hours older than `pair_hourly`'s 45 days are the build's `dex` phase.
+
+**Is a build due?** Every `TOKEN_HISTORY_CHECK_MS` the worker reads the reason (`rebuildNeeded`), sets the gauge `syncer_token_history_rebuild_needed{reason}` to 1
+for it (and removes the series of the others), and logs once when the reason changes: `Token history: a build is due (<reason>); run token-history-build`. No
+reason is given while a building generation exists. The reasons:
+- `none`: there is no generation yet;
+- `config`: the live generation's `config_version` is not `TOKEN_HISTORY_CONFIG_VERSION`;
+- `coverage`: the start of the head's unbroken run of stored ledgers is below the live generation's `coverage_from` (a fill has joined the run);
+- `repair`: the oldest range to repair holds a ledger of an older parser.
+
+The worker builds nothing itself: the answers keep the live generation and its `coverage` (`complete: false` on a generation built on part of the history) until the
+operator's build replaces it.
+
+**Gauges and counters** ([observability](observability.md#4-metrics-syncer)): `syncer_token_history_lag_ledgers` (the commit marker less the live generation's
+`levels_through`; no sample without a live generation), `syncer_token_history_rebuild_needed{reason}`, `syncer_token_history_building{phase}` (1 for the phase of a
+building generation, from its state row), `syncer_token_history_window_seconds` (a histogram of the live windows), `syncer_token_history_errors_total{step}` and
+`syncer_token_history_unfit_sums_total` (sums summed again in BigNumber because an amount did not fit `Decimal256(30)`). The labelled counters start at 0.
+
+### The build command
+
+`token-history-build` (`apps/syncer/src/cli/token-history-build.ts`, in the syncer image beside `range-ingest`; the work is `runTokenHistoryBuild` of
+`packages/shared/src/token-history/build/`) builds a generation, or finishes the one that is building, then exits. It runs only when the operator starts it, with the
+syncer running; how to run it, its refusals, exit statuses and the measured cost are in [operations](operations.md#the-token-history). Its statements are
+`INSERT … SELECT`s in ClickHouse with `max_threads` = `--threads` (default `TOKEN_HISTORY_BUILD_THREADS`, 4) and the `log_comment` `token-history-build`, and its state
+row is written after every batch, so it resumes where it stopped. It holds the lease `<network>:token_history_build`. A new generation starts at `h0` = the commit
+marker, with `coverage_from` the start of the head's unbroken run (never below the state coverage start); a building generation of another config or coverage is
+retired first. The phases:
+
+1. **`changes`**: one pass over `trust_line_states` in key order, `TOKEN_HISTORY_PASS_ACCOUNTS` (500) accounts a batch (`nextPassAccounts`), each batch one
+   `INSERT … SELECT` of the rows of `[coverage_from, h0]` from the token's side, with the before-state by `lagInFrame` over the line, under the dedup token
+   `token_history:<g>:changes:<first>-<last>`.
+2. **`mpt_changes`**: the same over `mpt_holder_states`, by holders, on a network with MPTs.
+3. **`levels`**: `h1` is the generation's `through_ledger` when the phase begins (the live windows have moved it on since `h0`). Tokens in key order, 1,000 a batch: the
+   tokens with fewer changes than the checkpoint floor and amounts that fit get their hour rows in one statement a batch; each other token on its own, with its
+   checkpoints, in ledger slices of `TOKEN_HISTORY_LEVELS_SLICE` (5,000,000) changes cut at the end of an hour. At the end, `levels_through` = `h1`.
+4. **`dex`**: the DEX history, one scan of `exchanges` a P7 partition, the newest first, for the hours older than the oldest final `pair_hourly` hour (and the
+   hour of the newest ledger), then the sentinels of the partition's hours; a partition whose hours all have their sentinel is skipped, so a later build costs
+   little here (the table has no generation).
+5. **`done`**: the command exits, and the worker catches the levels up from `h1` and promotes the generation.
+
 ## 9. What the syncer does not do
 
 - It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
@@ -1389,6 +1523,12 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | Boot refuses: `lacks the schema of 014_issued_tokens.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs `state_touches`) or the `aggregator` worker (it needs all four tables of the file) | Apply it (`migrate-<network>`) and start the syncer again. |
 | Boot refuses: `lacks the schema of 015_supply.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the three mint tables `genesis_mints`, `imports` and `reward_claims`) or the `aggregator` worker (those and `network_supply`), on either network: the schema is one, on Xahau an insert into a missing mint table fails the batch and the `supply` job reads them, while it writes `network_supply` on both | Apply it (`migrate-<network>`) and start the syncer again. |
 | Boot refuses: `lacks the schema of 017_mpt.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the five MPT ledger tables) or the `aggregator` worker (it needs `mpt_touches`, the two state tables and the two aggregates) | Apply it (`migrate-<network>`) and start the syncer again. |
+| Boot refuses: `lacks the schema of 019_token_history.sql` | The migration was not applied before a syncer with the `token_history` worker (it needs the seven tables of the file and the tables it reads: `state_touches`, `trust_line_states`, `mpt_touches`, `mpt_holder_states`, `tx_by_type`, `pair_hourly`) or the `aggregator` worker (its eighth hook writes `token_history_dirty`) | Apply it (`migrate-<network>`) and start the syncer again. |
+| `Token history: the <step> step failed: ...` and `syncer_token_history_errors_total{step}` rises | A step of the `token_history` worker failed: ClickHouse refusing a read or an insert; for `drop`, the `ALTER DELETE` privilege that `DROP PARTITION` asks for; for `live`, a window that holds a ledger of an older parser | The pass goes on with its other steps, and the step is tried again at the next pass, a second later, with no backoff: a step that keeps failing raises the counter by about one a second. See [8b](#8b-the-token_history-worker). |
+| `Token history: the pass failed: ...` | The worker could not read the commit marker, its lease or the state rows (ClickHouse down or refusing) | Not counted in `syncer_token_history_errors_total`, and the gauges keep their values: the next pass, a second later, tries again. The syncer's ClickHouse alerts say the rest. |
+| `Token history: a build is due (<reason>); run token-history-build` | No generation yet (`none`), a new config (`config`), a fill that joined the head's unbroken run (`coverage`), or a range to repair that holds a ledger of an older parser (`repair`) | Nothing happens by itself: the answers stay those of the live generation (or 404 `token history is not built yet` before the first) until the operator runs the command ([operations](operations.md#the-token-history)). |
+| `Token history: another token_history worker holds the lease (<holder>); this worker waits` | Another syncer runs the worker against this database, or one stopped less than 30 s ago without releasing its lease | This one writes no token history and tries again at each pass; stop the other one. |
+| `Aggregator job token_history_dirty failed in <from> - <to>: ...` | The eighth hook of an `agg_dirty` slice could not append its range (ClickHouse refusing the read of `ledgers` or the insert) | The slice stays queued and its earlier hooks run again at the next tick, until it works ([7.6](#76-the-agg_dirty-hooks)). |
 | Boot refuses: `lacks the schema of 016_validator_toml_details.sql` | The migration was not applied before a syncer with the `validators` worker: the domain checker reads and writes the five columns on `validator_domains` | Apply the migrations (`pnpm ch:migrate`, or `GH_RUN_MIGRATIONS_ON_BOOT=true`) and start the syncer again |
 | `Aggregator job escrows failed: ...` and `syncer_escrows_lag_ledgers` grows with the head | A step of the `escrows` job failed (ClickHouse refusing a read or an insert, mostly) | The window `(watermark, head]` is done again at the next tick; the sentinel keeps its old total and watermark, which agree. The gauge follows the head. See [the escrows job](#the-escrows-job). |
 | `Aggregator job escrows failed for escrow <id>, set aside: <reason>` | The rows of one escrow cannot be mapped to an `escrows` row, for the reason given | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |
@@ -1410,6 +1550,8 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | Three more workers |
 | `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `compute-loop`, `rounds.job` and `tally` (the compute loop, the voting rounds and the pure tally), `agreement.job` and `agreement` (the hourly agreement and its pure counting), `seen-seed`, `stored-lists`, `safe-fetch` (the only outbound HTTP) |
 | `apps/syncer/src/tomls/*` | The tomls worker: `domain-discovery` (which domains accounts name), `toml-checker` (the pass: due order, the fetches, the batched writes), `toml-row` (`nextTomlRow`, the row of a check), `tomls-worker` (the two loops), `tomls.module` |
+| `apps/syncer/src/token-history/*`, `apps/syncer/src/cli/token-history-{build,check}.ts` | The `token_history` worker (`token-history-worker`: the pass, the steps, the gauges; `token-history-lease`), the build command and the mainnet check ([8b](#8b-the-token_history-worker)) |
+| `packages/shared/src/token-history/*` | What the worker, the build and the api share: the token side (`token-side.ts`, `token-side.sql.ts`), the order key, the flows of a transaction, the checkpoint rule, the fold of the holders at a ledger and the totals (`holders-at.ts`), the live window, hour sets, repair, promotion and drop, the reason a build is due, the state rows, the coverage start, the reads of the routes and the snapshot digest; the build's phases in `build/` |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
 | `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`), the Domain of an account (`account-domains.parser.ts`), the history of escrows, checks, payment channels and delegations (`object-changes.parser.ts`, with `permissions.ts` and `util/keylets.ts`) |

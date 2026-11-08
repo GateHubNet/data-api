@@ -9,7 +9,7 @@ The workload is append-only, ledger-ordered data read two ways: selective lookup
 and aggregates (candles, rates, volumes, stats). That is columnar-OLAP territory and what the previous design (a search engine
 used for aggregations) was weakest at ([ADR-0001](adr/0001-use-clickhouse.md)).
 
-One ClickHouse **server** holds one **database per network**, each with the same 85 tables
+One ClickHouse **server** holds one **database per network**, each with the same 92 tables
 ([ADR-0009](adr/0009-one-deployment-per-network.md)). The names are the profiles': `xrpl`, `xahau`, `xrpl_testnet` and `xahau_testnet`. Production's
 server holds `xrpl` and `xahau`, the sandbox's own server `xrpl_testnet` and `xahau_testnet`, and both have the `shared` database (account names and labels).
 The SQL on this page names `xrpl`; on a testnet write its database in its place. A testnet is never on the production server: the sandbox is a stack of
@@ -46,6 +46,7 @@ errors), while the same query without `FINAL` ran at 127 QPS with zero errors.
 | Rollups the aggregator writes (`stats_hourly`, `volume_*`) | **No** | readers keep the newest `version` of a row/set (`argMax` / `max(version)`), so a half-written newer version is never mixed with an older one |
 | The account and market aggregates (`native_rates_daily`, `pair_hourly`, `markets_live`, the account rollups) | **No** | the newest version of a set, found from its sentinel or as `max(version)` of its key prefix; see [the aggregate families](#the-aggregate-families-and-their-reads) |
 | `validations` (AggregatingMergeTree) | **No** | readers `GROUP BY (ledger_hash, validation_public_key)` and add the partial rows up |
+| The token history (`token_holder_changes`, `token_checkpoints`, `token_checkpoint_heads`, `token_hourly`, `token_hourly_dex`) | **No** | one generation (`token_hourly_dex` has none) and the token's prefix of the key; the change log read `LIMIT 1 BY` its key, an hour row as the newest `version` of its key, the holders at a ledger folded with `argMax`; see [the token history reads](#the-token-history-reads) |
 
 > A new list endpoint must not use `FINAL` on its scan ([ADR-0003](adr/0003-no-final-on-list-queries.md)); the unit test
 > `sql-tables.spec.ts` also keeps table names to the `Table` enum, and the e2e suites check query plans (`EXPLAIN PIPELINE` for the read
@@ -102,6 +103,38 @@ part is one day), so a TTL merge never rewrites a part. The query plans are pinn
 `ReadFromMergeTree` on a key range that starts with `account`, the set reads on their key prefixes, no `FINAL`), and a light account's
 All window reads about its own rows (`system.query_log.read_rows`).
 
+## The token history reads
+
+The seven tables of migration 019 ([data-model](data-model.md#token-history-migration-019), [ADR-0021](adr/0021-token-history-in-clickhouse.md)) follow the rules of
+the aggregate families, with a generation:
+
+- **Every read names one generation and starts from the token's prefix of the key.** The generation is the live one, from `token_history_state`
+  (`ORDER BY generation, version DESC LIMIT 1 BY generation`, the newest row of each); every read of a generation table is `generation = {g:UInt32} AND
+  issuer = ... AND currency = ...` and then a range of the next column of the key (`ledger_index`, `checkpoint_ledger` or `hour`), `token_hourly_dex` (no
+  generation) is read by the token's prefix and an hour range, and an issuer's tokens are its prefix of `token_hourly`. A read costs the token's rows of the range and about a granule a part, never the table: the bounds are pinned by `read_rows` tests over a bulk of
+  two other tokens' rows, each with a mutant that reads the same table without the token's prefix (`apps/api/test/paged-reads.e2e-spec.ts`).
+- **No `FINAL`.** A row stored twice (a retried insert before its merge) is read once: the change log `LIMIT 1 BY ledger_index, tx_index, node_index, holder`, an hour
+  row `ORDER BY hour, version DESC LIMIT 1 BY hour` (the newest `version` of its key), a DEX hour the same, counted only when its `version` is at least its hour's
+  sentinel's. These reads want the whole of the token's range, not a page of it, so the `LIMIT 1 BY` sits beside the ordered read (the shape that
+  [a page](#reading-a-page-what-stops-the-read) must not use); what bounds them is the range.
+- **The holders at a ledger N** (`holdersAtSql`, `packages/shared/src/token-history/holders-at.ts`) are a fold: the token's newest head at or before N
+  (`max(checkpoint_ledger)` of its prefix of `token_checkpoint_heads`, 0 when none), then that checkpoint's rows `UNION ALL` the token's changes in `(cp, N]`,
+  grouped by `holder` with `argMax` of the state by `(ledger_index, tx_index, node_index)` (a checkpoint row ranks as `(cp, 0, 0)`), keeping the lines that count. A
+  row stored twice changes no `argMax`, `min` or `max`, so the fold does not deduplicate its sources. It reads the checkpoint's lines and the changes since it,
+  about `2 × max(lines, 50,000)` rows, wherever N is.
+- **The totals at N** (`totalsAt`) read only the head and the changes after it, deduplicated, never the fold: the supply is the head's plus
+  `Σ(amount_after − amount_before)`, the holders and trust lines the head's counts plus the changes'.
+- **Exact sums.** A sum in SQL is `Decimal256(30)` with a count of the amounts the decimal cannot hold (`exactSumColumns`); when that count is above 0 the same
+  bounded rows are read again and summed in BigNumber (the syncer counts it in `syncer_token_history_unfit_sums_total`). A Float64 sum is never served, unlike
+  `sumOf`'s fallback.
+- **The order of holders** is the order key `(order_exp, order_mant)`, then `holder`: exact where a double would tie.
+
+The token history's writes: the build's `INSERT … SELECT`s run on the server with `max_threads` = `--threads` and `log_comment = 'token-history-build'` (so they can
+be found in `system.query_log`), each batch of the change log under the dedup token of its range with `insert_deduplicate = 1`, `max_insert_threads = 1` and its
+rows in the table's order, so that a batch run again is dropped by the server (`token_holder_changes` has `non_replicated_deduplication_window = 1000`). Its deletes are
+a repair's lightweight `DELETE`s, named by the generation, the tokens and the range and waited for (`lightweight_deletes_sync = 2`), and the drop of a retired
+generation by `ALTER TABLE … DROP PARTITION ID`.
+
 ## Writes: parts, insert modes, deduplication
 
 - ClickHouse makes one **part** per insert, so the syncer batches (300 ledgers / 100,000 transactions / 5 s in catch-up, one commit per
@@ -145,12 +178,24 @@ The expensive query families are the ones that read a lot by design: `/v2/stats`
 reduce windows, and filtered `balance_changes`. They are bounded by the guards above and by their own window parameters.
 `/v2/exchanges` over all pairs reads windows of ledgers since Ruling R107 (see [reading a page](#reading-a-page-what-stops-the-read)).
 
+**`token-history-build` lifts the 30 s guards for its own client**: no statement of a mainnet build stays under them, so its request timeout is 6 hours
+(`BUILD_REQUEST_TIMEOUT_MS`) and `max_execution_time` is off, unless `GH_CLICKHOUSE_REQUEST_TIMEOUT` or `GH_CLICKHOUSE_MAX_EXECUTION_TIME` is set; `--threads`
+(default 4) is its `max_threads`. Its peak memory was set by the largest account of a `changes` batch (667 MiB for an issuer of 200,000 lines, the same at 1x and
+8x of the synthetic shape) and by the DEX scan of a partition (575 MiB): an issuer with millions of lines in one batch needs proportionally more
+([operations](operations.md#the-token-history)). While it runs it shares the server's disk and CPU with the ingest and the api.
+
 The API and the syncer use the **same ClickHouse user** (`data_api`, a full-access user that the compose creates); a read-only
 user for the API would be better and is a known hardening gap ([security](security.md#10-security-checklist)).
 **If the syncer's access is ever narrowed, it needs `ALTER DELETE` on `token_lines` and `tokens`** (the privilege that `ALTER TABLE ... DROP PARTITION` asks for) (and, for the ledger tables' recovery and retention, the privileges it has today): the `tokens` job swaps the issued tokens
 in whole generations, each a partition (`PARTITION BY generation`), and drops a retired generation's partitions 15 minutes after it was replaced ([syncer](syncer.md#the-tokens-job), [ADR-0019](adr/0019-issued-tokens-from-state-history.md)).
 Without the privilege the drop fails (a wait that doubles up to an hour), the retired partitions stay and the disk grows by one generation at each rebuild; nothing else is affected.
 It also needs `ALTER DELETE` on `mpt_holders` and `mpt_issuances`: the `mpt_state` job deletes, with a lightweight `DELETE`, a pair or an issuance that a re-ingest left with no state row ([syncer](syncer.md#the-mpt_state-job)). Without it the rebuild of such an issuance fails and the issuance is set aside.
+And it needs `ALTER DELETE` on the four generation tables of the token history, `token_holder_changes`, `token_checkpoints`, `token_checkpoint_heads` and
+`token_hourly` (`GENERATION_TABLES` of `packages/shared/src/token-history/promote.ts`): the `token_history` worker drops a retired generation's partitions 15 minutes
+after it was retired, and a repair deletes the rows it writes again with a lightweight `DELETE`. It deletes from `token_history_dirty` the same way, the ranges
+it has repaired or dropped and, at a promotion, those the build already read ([syncer](syncer.md#8b-the-token_history-worker)). Without the privilege the drop fails at
+every pass (`syncer_token_history_errors_total{step="drop"}`), the retired partitions stay and the disk grows by a generation at each rebuild; a repair fails
+(`step="repair"`) and its range stays, and the ranges after it wait.
 
 ## High availability and replication
 
@@ -191,7 +236,9 @@ Do not run production without a tested restore:
   days). `validator_votes`, `amendment_tallies` and `validator_agreement_hourly` are recomputed from `validations`, `ledgers`, the stored
   lists and `network_state` within the 90 days `validations` keeps.
   The nine aggregate tables of migration 003 are recomputed by the aggregator from the ledger tables once those are back (the back-fills are in
-  [operations](operations.md#account-and-market-aggregates)), so a restore does not need them.
+  [operations](operations.md#account-and-market-aggregates)), so a restore does not need them. The token history (migration 019) is built again by
+  `token-history-build` from `trust_line_states`, `mpt_holder_states` and `exchanges` once those are back ([operations](operations.md#the-token-history)): a restore
+  can do without it, at the cost of a build (hours on XRPL).
 
 ## Retention and TTL
 
@@ -224,7 +271,10 @@ Five tables expire by TTL, none of them a ledger table, so no ledger retention t
 `fee_stats`, the rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and the other tables of migration 002 (`validator_seen`, `validator_votes`, `amendment_tallies`,
 `unl_lists`, `unl_publishers`, `validator_domains`, `amendment_features`) are small, keep them. The aggregate tables of migration 003 are not ledger tables
 either: apart from `pair_hourly` they are recomputable and kept (`native_rates_daily`, `markets_live` and the six account rollup tables), and the retention
-procedure leaves all nine alone. A re-ingest of a range reaches them through `agg_dirty` ([syncer](syncer.md#76-the-agg_dirty-hooks)).
+procedure leaves all nine alone. A re-ingest of a range reaches them through `agg_dirty` ([syncer](syncer.md#76-the-agg_dirty-hooks)). The seven tables of the
+token history (migration 019) are not ledger tables either, and the procedure leaves them alone too: the `token_history` worker drops a retired generation, and a
+re-ingest reaches the live one through `token_history_dirty`. A build after a dropped block starts its coverage above it, so it says `complete: false`, and a line
+whose state rows were all in the dropped block is missing from it ([operations](operations.md#the-token-history)).
 
 ## Useful operational queries
 

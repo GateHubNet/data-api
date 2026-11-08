@@ -18,6 +18,8 @@ exporter and a shared library. This page explains the moving parts; the reasons 
  │                escrows, issued tokens, MPT, supply                │
  │   validators ─ UNL lists, domains (HTTPS), votes, agreement       │
  │   tomls ─ the toml of every domain accounts name (HTTPS)          │
+ │   token_history ─ the token history of every token (no node)      │
+ │   token-history-build CLI ─ builds a generation of it             │
  └──────────────────────────────┬────────────────────────────────────┘
                                 │ bulk inserts (ledger tables: children first, `ledgers` row = commit)
                                 ▼
@@ -82,15 +84,22 @@ Everything both services need, written once:
   (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`), the NFT jobs (`nft_state`, `nft_collections`, with `foldNftEvents`, the one
   fold of an NFT's events that the job and the API's detail route share, and the prices of sales in `query/nft-prices.ts`) and the `escrows` job (the
   current state of every escrow and the sentinel that holds the escrowed total for D7) and the `tokens` job (the generations of the issued tokens built from the state history and the touch index: `tokens.job.ts`, with the pure rules of a token in `token-rules.ts`), and the `supply` job (the hourly snapshot of the native supply: `supply.job.ts`, its reads in `query/supply.ts`), and the `mpt_state` job (the current holders and issuances of MPTs, rebuilt per touched issuance: `mpt-state.job.ts`, with the lenient decoding of the metadata in `util/mpt-metadata.ts`).
+- **`token-history/`**: the token history ([ADR-0021](adr/0021-token-history-in-clickhouse.md)), written once for the syncer's `token_history` worker, the
+  `token-history-build` command and the api: the token side of a trust line or an MPT balance (in TypeScript and as SQL, pinned together by a property test), the
+  order key of an amount, the flows of a transaction, the checkpoint rule, the fold of a token's holders at a ledger (`holders-at.ts`: the newest checkpoint and the
+  changes after it), the live window, the hour sets, the repair, the promotion and the drop, the state rows of the generations, the build's phases (`build/`) and
+  the reads of the routes (`reads.ts`, `holders-page.ts`, the snapshot digest).
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
-A NestJS process with six optional **workers** (`GH_WORKERS`) and a probe/metrics HTTP surface: `ingest` (the single writer of the
+A NestJS process with seven optional **workers** (`GH_WORKERS`) and a probe/metrics HTTP surface: `ingest` (the single writer of the
 ledger tables, atomic per ledger), `validations`, `fee_stats`, `aggregator`, `validators` (the validator lists of the UNL publishers,
 domain verification, the node's amendment state, voting rounds and validator agreement; it makes outbound HTTPS requests to the
-publishers and to the validators' domains, [ADR-0012](adr/0012-validators-and-amendments-data.md)) and `tomls` (reads the toml of every domain that an account's
-`Domain` field names into `domain_tomls`, over HTTPS and through the same safe fetcher; it needs no node, [ADR-0017](adr/0017-display-names.md)), plus the
-`range-ingest` CLI in the same image. Exactly one per network. Details: [syncer](syncer.md).
+publishers and to the validators' domains, [ADR-0012](adr/0012-validators-and-amendments-data.md)), `tomls` (reads the toml of every domain that an account's
+`Domain` field names into `domain_tomls`, over HTTPS and through the same safe fetcher; it needs no node, [ADR-0017](adr/0017-display-names.md)) and
+`token_history` (keeps the token history at the head from the state tables and the touch indexes, repairs it after a re-ingest, and promotes a finished build; it
+needs no node and has its own 1 s loop, [ADR-0021](adr/0021-token-history-in-clickhouse.md)), plus the `range-ingest` and `token-history-build` CLIs in the same image
+(the build is the operator's one-off work of a generation, never the worker's). Exactly one per network. Details: [syncer](syncer.md).
 
 ### API: `apps/api` (`@gatehub/data-api-service`)
 
@@ -106,7 +115,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets and supply routes, `amm`,
-  `nft`, `names`, `ledger-objects`, `tokens`, `mpt`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+  `nft`, `names`, `ledger-objects`, `tokens`, `mpt`, `token-history`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
@@ -202,6 +211,26 @@ The routes of the MPT issuances are GateHub extras ([ADR-0020](adr/0020-mpt-data
 - **Objects in one file.** `mpt-objects.ts` holds every object, its key order (the `*_KEYS` constants that the tests and `mpt/api-reference.spec.ts` pin), its CSV columns and the builders; amounts are integer strings beside the ID, never scaled.
 - **Reads** are bounded by `read_rows` tests (`paged-reads.e2e-spec.ts`, over a bulk of other rows): their rows and two granules a part.
 
+#### The token history module (`apps/api/src/token-history`)
+
+The issuer analytics routes (an issuer's tokens, and a token's summary, supply, flows, distribution and snapshot) are GateHub extras
+([ADR-0021](adr/0021-token-history-in-clickhouse.md), [spec](superpowers/specs/2026-11-08-issuer-analytics-design.md)). `TokenHistoryModule` is in `ENDPOINT_MODULES`
+before `NotFoundModule` (`app.module.spec.ts` pins its place) and exports its services to `TokensModule`, whose `/v2/tokens/{token}/holders` reads the token history once a
+generation is live and D6's `token_lines` until then.
+
+- **Controllers:** `IssuersController` (`v2/issuers/:issuer/tokens`) and one controller a route under `v2/tokens/:token` (`summary`, `supply`, `flows`, `distribution`,
+  `snapshot`); every path has one segment after the token, so no route shadows another or `TokensController`'s.
+- **The generation.** `TokenHistoryService` reads `token_history_state` once for all requests of five seconds (`TOKEN_HISTORY_LIVE_CACHE_MS`) and takes the live
+  generation and its `levels_through`, the ledger every answer is as of unless the request names an earlier one. Before the first generation is live the routes
+  answer 404 `token history is not built yet` (after the checks that need no read).
+- **Coverage** is not read from the ledgers at request time: it is the live generation's `coverage_from`, complete for an issued token when it is at or before the
+  network's first ledger and for an MPT when it is at or before the ledger `MPTokensV1` was enabled in (`token-history-coverage.ts`).
+- **Reads** are the shared ones of `packages/shared/src/token-history/` (`TokenHistoryReadsService` calls them): the fold of the holders at a ledger, the totals
+  without the fold, the hour rows of a window and the change log of its two edge hours, the DEX hours. They are bounded by `read_rows` tests
+  (`paged-reads.e2e-spec.ts`, over a bulk of two other tokens' rows).
+- **Objects and schemas.** `token-history-objects.ts` holds the objects and their key orders (the `*_KEYS` constants that `token-history/api-reference.spec.ts` pins),
+  and `schemas.ts` the JSON Schema of each answer, which is both the route's `@ApiOkResponse` and what the e2e suites check every answer against with Ajv.
+
 #### The supply routes (`apps/api/src/network`)
 
 `GET /v2/network/supply` and `/minted` are GateHub extras (ADR-0010, Amendment 9) in the existing `NetworkModule`. `SupplyService` reads the newest `network_supply` row and the coverage of each part; `/minted` reads the mint tables by day, and
@@ -239,7 +268,7 @@ next one starts. The api queues the jobs (`POST /v2/exports`) and signs the down
 
 ### ClickHouse
 
-One server, one database per network (`xrpl`, `xahau` in production; `xrpl_testnet`, `xahau_testnet` on the sandbox's own server), 85 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network (`xrpl`, `xahau` in production; `xrpl_testnet`, `xahau_testnet` on the sandbox's own server), 92 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 
@@ -259,7 +288,10 @@ views. See [clickhouse](clickhouse.md).
    aggregates (daily native rates, `pair_hourly` and `markets_live` from `exchanges`, rollups of heavy accounts from `balance_changes`,
    `account_transactions` and `account_exchanges`), the escrowed total from `object_changes`, and the issued tokens (`token_generations`, `token_lines`, `tokens`: generations built from `trust_line_states`, `account_states` and the
    `state_touches` index, swapped whole), the MPT state (`mpt_holders`, `mpt_issuances`: rebuilt per touched issuance from the state tables and the `mpt_touches` index) and the hourly supply snapshot (`network_supply`); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
-   rounds and the hourly agreement from `validations` and `ledgers`.
+   rounds and the hourly agreement from `validations` and `ledgers`; and the `token_history` worker follows the commit marker through `state_touches` and
+   `mpt_touches`, writes the changes of every touched line to the token history's change log (`token_holder_changes`, in the order of the token) with the hour rows
+   and checkpoints they call for, and repairs the ranges a re-ingest rewrote (`token_history_dirty`, appended by the aggregator). A generation's history before the
+   head is built once by the operator's `token-history-build`, server-side, from `trust_line_states` and `mpt_holder_states`; the worker catches it up and promotes it.
 5. Crashes recover from the database alone: re-read the checkpoint, delete the uncommitted tail, carry on
    ([syncer](syncer.md#checkpoint-boot-and-recovery)).
 
@@ -272,6 +304,9 @@ views. See [clickhouse](clickhouse.md).
 3. Balances and orders are the exception: they read the **live node** (`account_info`, `account_lines`, `account_offers`) and cache the
    answer briefly. Balances at a historical ledger (a hash, a date or a ledger number) are not: they come from the account and trust
    line state history in ClickHouse ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)).
+4. A token's holders, supply and flows, at the head and at any ledger, come from the token history: the holders at a ledger N are the token's newest
+   checkpoint at or before N folded with its changes after it, a key range bounded by about `2 × max(lines, 50,000)` rows wherever N is, and its series and windows
+   are its hour rows ([ADR-0021](adr/0021-token-history-in-clickhouse.md)).
 
 ## Key design decisions
 

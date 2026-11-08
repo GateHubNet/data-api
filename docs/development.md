@@ -45,7 +45,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 | Path | Package | Role |
 | --- | --- | --- |
 | `apps/api` | `@gatehub/data-api-service` | NestJS REST API: the `/v2` Ripple-compatible endpoints over ClickHouse, plus live-node lookups (balances, orders) |
-| `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the six workers `ingest`, `validations`, `fee_stats`, `aggregator`, `validators` and `tomls`, and the `range-ingest` CLI |
+| `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the seven workers `ingest`, `validations`, `fee_stats`, `aggregator`, `validators`, `tomls` and `token_history`, and the CLIs `range-ingest`, `token-history-build` and `token-history-check` |
 | `apps/exporter` | `@gatehub/data-exporter` | NestJS worker, one per network: takes the queued export jobs and makes each file (CSV, or PDF with `pdfkit`) by walking the list's CSV pages through the api, then uploads it to Google Cloud Storage ([architecture](architecture.md#exporter-appsexporter-gatehubdata-exporter)); its e2e test is `apps/api/test/exports.e2e-spec.ts`, against the api harness |
 | `packages/shared` | `@gatehub/data-api-shared` | ClickHouse client and migration runner, the `Table` enum and row types, parsers, `buildLedgerRows` / `LedgerWriter`, the `NodeClient`, `RatesService`, the aggregation jobs, the network profiles |
 
