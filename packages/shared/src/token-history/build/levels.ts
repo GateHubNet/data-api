@@ -243,31 +243,27 @@ export async function buildTokenLevels(
     const from = after + 1;
     const to = read[read.length - 1].ledger_index;
     const unfit = await ch.queryOne<{ n: string }>(SLICE_UNFIT_SQL, { ...base, from, to });
-    let exact = Number(unfit?.n ?? 0) === 0 && fitsDecimal(levels.supply);
+    // A Decimal256(30) sum in ClickHouse wraps past its Int256 (about 5.8e46) instead of failing. The slice's sums stay far below:
+    // every amount is under EXACT_LIMIT (1e36, else the slice is unfit), the base supply too, and a slice holds at most `slice`
+    // changes or one hour of them, so a running sum stays under some 1e43. Any error of the statement is the build's error.
+    const exact = Number(unfit?.n ?? 0) === 0 && fitsDecimal(levels.supply);
     if (exact) {
-      try {
-        const summary = await ch.commandSummary(
-          HOURS_SQL,
-          {
-            ...base,
-            from,
-            to,
-            base_supply: levels.supply,
-            base_holders: levels.holders,
-            base_lines: levels.trust_lines,
-            final_before: finalBefore,
-            version,
-          },
-          { settings },
-        );
-        done.hours += summary.written_rows;
-      } catch (e) {
-        // a sum past what the decimal holds fails the statement (DECIMAL_OVERFLOW): the slice is summed in BigNumber instead
-        if (!/DECIMAL_OVERFLOW|overflow/i.test(String((e as Error)?.message))) throw e;
-        exact = false;
-      }
-    }
-    if (!exact) {
+      const summary = await ch.commandSummary(
+        HOURS_SQL,
+        {
+          ...base,
+          from,
+          to,
+          base_supply: levels.supply,
+          base_holders: levels.holders,
+          base_lines: levels.trust_lines,
+          final_before: finalBefore,
+          version,
+        },
+        { settings },
+      );
+      done.hours += summary.written_rows;
+    } else {
       opts.onUnfit?.();
       const hours = [...new Set(read.map((r) => r.hour))];
       await writeHourSets(
