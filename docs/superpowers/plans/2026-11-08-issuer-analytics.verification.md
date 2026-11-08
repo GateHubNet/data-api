@@ -139,3 +139,19 @@ reach another server):
 The first run of the shared e2e found two faults of this branch, fixed before the run above: `ClickHouseService.command` had been
 made to resolve to a summary, which broke the types of five suites (now `commandSummary`, commit 2ee67c6), and the schema contract of
 `ledger-writer.e2e-spec.ts` did not know the change log's dedup window (commit afdab7f).
+
+## Gates of PR 2
+
+Run on 2026-11-08 in the worktree at 0315449, every ClickHouse a testcontainer (`GH_CLICKHOUSE_URL` pointed at a closed port):
+
+| Gate | Result |
+| --- | --- |
+| `pnpm build` | passed |
+| `pnpm test` | passed: shared 3,098, exporter 12, syncer 1,964, api 2,708 |
+| `pnpm --filter @gatehub/data-api-shared test:e2e` | 38 suites, 1,863 tests passed |
+| `pnpm --filter @gatehub/data-syncer test:e2e` | 21 suites, 445 tests passed (`app.e2e-spec.ts` re-run at 5c8ab0c: 16 passed) |
+| `pnpm --filter @gatehub/data-api-service test:e2e` | 61 suites, 3,617 tests passed |
+
+The syncer e2e's first run failed one test of `app.e2e-spec.ts`: it let the aggregator boot on migrations 001, 014, 015 and 017,
+and the aggregator now needs the token history's dirty ranges of 019 as well. The test applies 019 too (commit 5c8ab0c); the other
+20 suites of that run passed, and the fix changes that test alone.
