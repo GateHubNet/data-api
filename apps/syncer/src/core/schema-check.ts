@@ -337,3 +337,52 @@ export async function assertMptSchema(
 ): Promise<void> {
   await assertTablesOf(ch, enabled, database, logger, MPT_MIGRATION, MPT_NEEDS);
 }
+
+/** The token history (issuer analytics): the seven tables the `token_history` worker reads and writes, and the aggregator's dirty ranges. */
+export const TOKEN_HISTORY_MIGRATION = '019_token_history.sql';
+
+/**
+ * The tables `TOKEN_HISTORY_MIGRATION` each worker needs, and what it does with them. The `token_history` worker reads and writes the
+ * seven tables of 019 and reads the state tables, the touches, `tx_by_type` and `pair_hourly` (of 006, 014, 017, 001 and 003) that its
+ * live windows, repairs and DEX hours start from. The aggregator's eighth `agg_dirty` hook writes `token_history_dirty`, whether or
+ * not the worker runs.
+ */
+const TOKEN_HISTORY_NEEDS: SchemaNeeds = new Map([
+  [
+    'token_history',
+    {
+      tables: [
+        Table.TokenHolderChanges,
+        Table.TokenCheckpoints,
+        Table.TokenCheckpointHeads,
+        Table.TokenHourly,
+        Table.TokenHourlyDex,
+        Table.TokenHistoryState,
+        Table.TokenHistoryDirty,
+        Table.StateTouches,
+        Table.TrustLineStates,
+        Table.MptTouches,
+        Table.MptHolderStates,
+        Table.TxByType,
+        Table.PairHourly,
+      ],
+      does: 'reads and writes',
+    },
+  ],
+  ['aggregator', { tables: [Table.TokenHistoryDirty], does: 'writes' }],
+]);
+
+/**
+ * Fails the boot when the `token_history` worker or the aggregator is enabled and the database lacks the tables of
+ * `019_token_history.sql` it needs (the worker all of them, the aggregator `token_history_dirty`): the worker would fail every pass, and
+ * the aggregator's hook would throw on every `agg_dirty` slice. It runs after the boot-time migrations. A check that cannot be made
+ * (ClickHouse unreachable) does not fail the boot: it is said, and the workers report the failures of their reads and writes.
+ */
+export async function assertTokenHistorySchema(
+  ch: Pick<ClickHouseService, 'query'>,
+  enabled: ReadonlySet<WorkerName>,
+  database: string,
+  logger: { warn(message: string): void },
+): Promise<void> {
+  await assertTablesOf(ch, enabled, database, logger, TOKEN_HISTORY_MIGRATION, TOKEN_HISTORY_NEEDS);
+}

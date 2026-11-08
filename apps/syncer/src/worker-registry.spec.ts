@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { enabledWorkers, SyncerConfig, WORKER_NAMES, WorkerName } from './config/syncer.config';
+import { TokenHistoryModule } from './token-history/token-history.module';
 import { TomlsModule } from './tomls/tomls.module';
 import { ValidatorsModule } from './validators/validators.module';
 import {
@@ -26,9 +27,9 @@ describe('the worker registry', () => {
     ]);
   });
 
-  it('registers the tomls worker, the last one', () => {
+  it('registers the tomls worker, before the token_history one', () => {
     expect(WORKER_MODULES.tomls).toBe(TomlsModule);
-    expect(WORKER_NAMES[WORKER_NAMES.length - 1]).toBe('tomls');
+    expect(WORKER_NAMES[WORKER_NAMES.length - 2]).toBe('tomls');
     expect(selectWorkerModules(new Set<WorkerName>(['tomls']), WORKER_MODULES, logger())).toEqual([TomlsModule]);
     // after the validators, in worker order whatever the order of the set
     expect(selectWorkerModules(new Set<WorkerName>(['tomls', 'validators']), WORKER_MODULES, logger())).toEqual([
@@ -37,9 +38,18 @@ describe('the worker registry', () => {
     ]);
   });
 
-  it('runs all six workers by default: GH_WORKERS defaults to the names in order, tomls last', () => {
-    expect(WORKER_NAMES.join(',')).toBe('ingest,validations,fee_stats,aggregator,validators,tomls');
-    expect(new SyncerConfig().workers).toBe('ingest,validations,fee_stats,aggregator,validators,tomls');
+  it('registers the token_history worker, the last one', () => {
+    expect(WORKER_MODULES.token_history).toBe(TokenHistoryModule);
+    expect(WORKER_NAMES[WORKER_NAMES.length - 1]).toBe('token_history');
+    expect(selectWorkerModules(new Set<WorkerName>(['token_history', 'tomls']), WORKER_MODULES, logger())).toEqual([
+      TomlsModule,
+      TokenHistoryModule,
+    ]);
+  });
+
+  it('runs all seven workers by default: GH_WORKERS defaults to the names in order, token_history last', () => {
+    expect(WORKER_NAMES.join(',')).toBe('ingest,validations,fee_stats,aggregator,validators,tomls,token_history');
+    expect(new SyncerConfig().workers).toBe('ingest,validations,fee_stats,aggregator,validators,tomls,token_history');
     expect(enabledWorkers(new SyncerConfig())).toEqual(new Set(WORKER_NAMES));
   });
 
@@ -51,6 +61,12 @@ describe('the worker registry', () => {
     expect(NODE_CLIENT_WORKERS.has('validators')).toBe(true);
     expect(needsNodeClient(new Set<WorkerName>(['validators']))).toBe(true);
     expect(needsNodeClient(new Set<WorkerName>(['aggregator', 'validations']))).toBe(false);
+  });
+
+  it('the token_history worker needs no node client', () => {
+    expect(NODE_CLIENT_WORKERS.has('token_history')).toBe(false);
+    expect(needsNodeClient(new Set<WorkerName>(['token_history']))).toBe(false);
+    expect(needsNodeClient(new Set<WorkerName>(['token_history', 'aggregator', 'tomls']))).toBe(false);
   });
 
   it('makes no node client for a syncer of only the tomls worker: it reads ClickHouse and the web', () => {
