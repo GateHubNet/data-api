@@ -8,9 +8,11 @@ import {
   promoteIfCaughtUp,
   readTokenHistoryStates,
   runTokenHistoryBuild,
+  snapshotDigest,
   Table,
 } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
+import { encodeAccountID } from 'ripple-address-codec';
 import {
   bruteForceLines,
   bruteForceTokens,
@@ -18,10 +20,21 @@ import {
   TokenHistoryWorld,
   tokenMapKey,
 } from '../../../packages/shared/test/tokens-world';
-import { FLOWS_SCHEMA, ISSUER_TOKENS_SCHEMA, SUMMARY_SCHEMA, SUPPLY_SCHEMA } from '../src/token-history/schemas';
 import {
+  DISTRIBUTION_SCHEMA,
+  FLOWS_SCHEMA,
+  ISSUER_TOKENS_SCHEMA,
+  SNAPSHOT_SCHEMA,
+  SUMMARY_SCHEMA,
+  SUPPLY_SCHEMA,
+} from '../src/token-history/schemas';
+import {
+  BUCKET_KEYS,
+  DISTRIBUTION_KEYS,
   FLOWS_KEYS,
   ISSUER_TOKEN_KEYS,
+  SNAPSHOT_KEYS,
+  SNAPSHOT_ROW_KEYS,
   SUMMARY_KEYS,
   SUMMARY_WINDOW_KEYS,
   SUPPLY_ROW_KEYS,
@@ -42,6 +55,9 @@ const log = { info: () => undefined };
 const HOUR = 3_600;
 const HUGE = new BigNumber('9.999999999999999e80').toFixed();
 const TINY = new BigNumber('1e-81').toFixed();
+/** Two holders of gate's MPT. */
+const MPT_A = encodeAccountID(Buffer.alloc(20, 0x11));
+const MPT_B = encodeAccountID(Buffer.alloc(20, 0x77));
 
 type Obj = Record<string, unknown>;
 
@@ -92,7 +108,7 @@ async function seedExtremeToken(ch: ClickHouseService, world: TokenHistoryWorld)
 async function seedGateMpt(ch: ClickHouseService, world: TokenHistoryWorld): Promise<string> {
   const id = mptIssuanceId(1, world.gate);
   const close = await closeTimes(ch);
-  const row = (holder: string, ledger: number, amount: string) => ({
+  const row = (holder: string, ledger: number, amount: string, escrowed = '0') => ({
     holder,
     mpt_issuance_id: id,
     ledger_index: ledger,
@@ -102,15 +118,16 @@ async function seedGateMpt(ch: ClickHouseService, world: TokenHistoryWorld): Pro
     tx_type: 'Payment',
     close_time: close.get(ledger)!,
     amount,
-    escrowed_amount: '0',
+    escrowed_amount: escrowed,
     flags: 0,
     deleted: 0,
   });
   await ch.insert(Table.MptHolderStates, [
-    row('rMptHolderA00000000000000000000000', world.first, '0'),
-    row('rMptHolderA00000000000000000000000', world.first + 2, '100'),
-    row('rMptHolderB00000000000000000000000', world.first + 1, '0'),
-    row('rMptHolderB00000000000000000000000', world.first + 3, '7'),
+    row(MPT_A, world.first, '0'),
+    row(MPT_A, world.first + 2, '100'),
+    row(MPT_B, world.first + 1, '0'),
+    // 7 held and 3 in escrow: the holder's balance is 10
+    row(MPT_B, world.first + 3, '7', '3'),
   ]);
   return id;
 }
@@ -254,7 +271,7 @@ describe('the token history routes', () => {
       expect(currencies).toEqual(expect.arrayContaining([world.usd, 'XTR', mpt]));
       expect((whole.tokens as Obj[]).find((t) => t.currency === mpt)).toMatchObject({
         kind: 'mpt',
-        supply: '107',
+        supply: '110',
         holders: 2,
       });
       for (const t of whole.tokens as Obj[]) expectKeysInOrder(t, ISSUER_TOKEN_KEYS);
@@ -572,11 +589,137 @@ describe('the token history routes', () => {
       });
     });
 
+    describe('the distribution and the snapshot', () => {
+      const usd = () => ({ issuer: world.gate, currency: world.usd });
+
+      /** The holders of gate's USD at `n` by the brute force: address and balance, by address. */
+      async function bruteHolders(n: number): Promise<{ holder: string; balance: string }[]> {
+        const prefix = `${tokenMapKey(usd())} `;
+        return [...(await bruteForceLines(h.ch as never, n)).entries()]
+          .filter(([k, v]) => k.startsWith(prefix) && new BigNumber(v.line.balance).gt(0))
+          .map(([k, v]) => ({ holder: k.slice(prefix.length), balance: new BigNumber(v.line.balance).toFixed() }))
+          .sort((a, b) => (a.holder < b.holder ? -1 : 1));
+      }
+
+      it('distribution buckets count every holder once and sum to the supply', async () => {
+        const body = (await api.ok(`${usdPath}/distribution`, 'buckets')).body;
+        expectSchema(body, DISTRIBUTION_SCHEMA);
+        expectKeysInOrder(body, DISTRIBUTION_KEYS);
+        const buckets = body.buckets as Obj[];
+        for (const b of buckets) expectKeysInOrder(b, BUCKET_KEYS);
+        const holders = await bruteHolders(world.head);
+        expect(buckets.reduce((s, b) => s + (b.holders as number), 0)).toBe(holders.length);
+        expect(buckets.reduce((s, b) => s.plus(b.balance as string), new BigNumber(0)).toFixed()).toBe(body.supply);
+        // each holder in its bucket, the buckets one power of ten apart with none missing
+        for (const { balance } of holders) {
+          const b = buckets.find(
+            (x) => new BigNumber(balance).gte(x.min as string) && new BigNumber(balance).lt(x.max as string),
+          );
+          expect({ balance, found: b !== undefined }).toEqual({ balance, found: true });
+        }
+        for (let i = 1; i < buckets.length; i++) expect(buckets[i].min).toBe(buckets[i - 1].max);
+        const sorted = holders.map((x) => new BigNumber(x.balance)).sort((a, b) => b.comparedTo(a) ?? 0);
+        const top10 = sorted
+          .slice(0, 10)
+          .reduce((s, x) => s.plus(x), new BigNumber(0))
+          .toFixed();
+        expect((body.top as Record<string, Obj>)['10'].balance).toBe(top10);
+        // without a holder, its own buckets
+        const without = (await api.ok(`${usdPath}/distribution?exclude=${holders[0].holder}`, 'buckets')).body;
+        expectSchema(without, DISTRIBUTION_SCHEMA);
+        expect((without.without_excluded as Obj).holders).toBe(holders.length - 1);
+        expect((without.without_excluded as Obj).supply).toBe(
+          new BigNumber(body.supply as string).minus(holders[0].balance).toFixed(),
+        );
+      });
+
+      it('snapshot balances equal the brute force at a past ledger, and every page has the same digest', async () => {
+        const n = world.first + 3;
+        const path = `${usdPath}/snapshot?ledger_index=${n}`;
+        const pages = await api.pages<{ balances: Obj[]; digest: string; marker?: string }>(path, 2, 'balances');
+        expect(pages.length).toBeGreaterThan(1);
+        const brute = await bruteHolders(n);
+        expect(pages.flatMap((p) => p.balances).map((b) => ({ holder: b.holder, balance: b.balance }))).toEqual(brute);
+        expect(new Set(pages.map((p) => p.digest))).toEqual(new Set([snapshotDigest(brute)]));
+        const whole = (await api.ok(path, 'balances')).body;
+        expectSchema(whole, SNAPSHOT_SCHEMA);
+        expectKeysInOrder(whole, SNAPSHOT_KEYS);
+        for (const b of whole.balances as Obj[]) expectKeysInOrder(b, SNAPSHOT_ROW_KEYS);
+        expect(whole.ledger_hash).toMatch(/^[0-9A-F]{64}$/);
+        // exclude changes the figures, not the digest
+        const without = (await api.ok(`${path}&exclude=${brute[0].holder}`, 'balances')).body;
+        expect(without.digest).toBe(whole.digest);
+        expect((without.without_excluded as Obj).holders).toBe(brute.length - 1);
+        const csv = await api.get(`${path}&format=csv`);
+        expect(csv.headers['content-disposition']).toContain(` - snapshot ${n}.csv`);
+      });
+
+      it('the ClickHouse digest equals snapshotDigest over the same set', async () => {
+        for (const token of [`USD.${world.gate}`, `XTR.${world.gate}`, mpt, `ABC.${world.nostate}`]) {
+          const body = (await api.ok(`/v2/tokens/${token}/snapshot?ledger_index=${world.head}&limit=10000`, 'balances'))
+            .body;
+          const lines = (body.balances as Obj[]).map((b) => ({
+            holder: b.holder as string,
+            balance: b.balance as string,
+          }));
+          expect({ token, digest: body.digest }).toEqual({ token, digest: snapshotDigest(lines) });
+        }
+      });
+
+      it("snapshot before the token's first change is empty, not 404", async () => {
+        const res = await api.ok(`/v2/tokens/XTR.${world.gate}/snapshot?ledger_index=${world.first}`, 'balances');
+        expect(res.body).toMatchObject({
+          supply: '0',
+          holders: 0,
+          trust_lines: 0,
+          count: 0,
+          balances: [],
+          digest: snapshotDigest([]),
+        });
+        expectSchema(res.body, SNAPSHOT_SCHEMA);
+      });
+
+      it('snapshot without a ledger is a ledger is required', async () => {
+        const res = await api.get(`${usdPath}/snapshot`);
+        expect({ status: res.status, message: res.body.message }).toEqual({
+          status: 400,
+          message: 'a ledger is required',
+        });
+      });
+
+      it('snapshot of an MPT has escrowed and its balance includes it', async () => {
+        const body = (await api.ok(`/v2/tokens/${mpt}/snapshot?ledger_index=${world.head}`, 'balances')).body;
+        expectSchema(body, SNAPSHOT_SCHEMA);
+        expect(body.balances).toEqual(
+          [
+            {
+              holder: MPT_A,
+              balance: '100',
+              escrowed: '0',
+              limit: '',
+              frozen: false,
+              authorized: false,
+            },
+            {
+              holder: MPT_B,
+              balance: '10',
+              escrowed: '3',
+              limit: '',
+              frozen: false,
+              authorized: false,
+            },
+          ].sort((a, b) => (a.holder < b.holder ? -1 : 1)),
+        );
+        expect(body.supply).toBe('110');
+        expectSchema((await api.ok(`/v2/tokens/${mpt}/distribution`, 'buckets')).body, DISTRIBUTION_SCHEMA);
+      });
+    });
+
     it('every answer validates against its schema', async () => {
       const mptBody = (await api.ok(`/v2/tokens/${mpt}/summary`, 'supply')).body;
       expect(mptBody).toMatchObject({
         token: { currency: mpt, issuer: world.gate, kind: 'mpt' },
-        supply: '107',
+        supply: '110',
         holders: 2,
       });
       expectSchema(mptBody, SUMMARY_SCHEMA);

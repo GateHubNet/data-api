@@ -2,6 +2,7 @@ import {
   ClickHouseService,
   currencyCode,
   dexOfWindow,
+  distributionAt,
   flowsPeriods,
   holdersAt,
   isLpCurrency,
@@ -10,6 +11,8 @@ import {
   PeriodInterval,
   periodStart,
   SeriesInterval,
+  snapshotDigestAt,
+  snapshotPage,
   supplySeries,
   Table,
   TOKEN_HISTORY_FLOWS_HOURLY_MAX_DAYS,
@@ -21,23 +24,32 @@ import {
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable } from '@nestjs/common';
 import BigNumber from 'bignumber.js';
+import { CacheService } from '../common/cache.service';
 import { badRequest, notFound } from '../common/errors';
 import { Coverage } from '../common/feature-coverage.service';
 import { fmtTime } from '../common/format';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { encodeMarker } from '../common/pagination';
 import { NETWORK_PROFILE } from '../config/api.config';
+import { shareOf } from '../tokens/token-objects';
 import { AmendmentsService } from '../validators/amendments.service';
 import { tokenHistoryCoverage } from './token-history-coverage';
 import { LiveTokenHistory } from './token-history-ledger';
 import {
   counterpartyRow,
+  DistributionAnswer,
+  distributionAnswer,
+  distributionBucket,
+  DistributionTop,
   FlowsAnswer,
   flowsAnswer,
   flowsPeriod,
   flowsTotals,
   issuerTokenRow,
   IssuerTokenRow,
+  SnapshotAnswer,
+  snapshotAnswer,
+  snapshotRow,
   SummaryAnswer,
   summaryAnswer,
   summaryToken,
@@ -74,6 +86,7 @@ export class TokenHistoryReadsService {
     private readonly ranges: LedgerRangeResolver,
     private readonly amendments: AmendmentsService,
     @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
+    private readonly cache: CacheService,
   ) {}
 
   /** 404 `token not found` for a token no generation can have, before any read: an LP currency, an MPT on a network without MPT. */
@@ -382,6 +395,114 @@ export class TokenHistoryReadsService {
       ),
       counterparties: counterparties.map(counterpartyRow),
     });
+  }
+
+  /** The distribution of a token at `n` (spec 5.4), and without the excluded holders, with their own buckets and top. */
+  async distribution(
+    live: LiveTokenHistory,
+    token: AnyToken,
+    n: number,
+    exclude: string[] | undefined,
+  ): Promise<DistributionAnswer> {
+    const key = { issuer: token.issuer, currency: token.currency, kind: token.kind };
+    const [coverage, close, whole, without] = await Promise.all([
+      this.coverage(live, token.kind),
+      this.closeTimeOf(live, n),
+      distributionAt(this.ch, live.generation, key, n),
+      exclude === undefined ? Promise.resolve(undefined) : distributionAt(this.ch, live.generation, key, n, exclude),
+    ]);
+    const top = (d: { supply: string; top10: string; top100: string }): DistributionTop => ({
+      '10': { balance: d.top10, share: shareOf(d.top10, d.supply) },
+      '100': { balance: d.top100, share: shareOf(d.top100, d.supply) },
+    });
+    const buckets = (d: typeof whole) =>
+      d.buckets.map((b) => distributionBucket({ min: b.min, max: b.max, holders: b.holders, balance: b.balance }));
+    return distributionAnswer({
+      result: 'success',
+      coverage,
+      ledger_index: n,
+      close_time: fmtTime(close),
+      supply: whole.supply,
+      holders: whole.holders,
+      buckets: buckets(whole),
+      top: top(whole),
+      excluded: exclude,
+      without_excluded:
+        without === undefined
+          ? undefined
+          : {
+              supply: without.supply,
+              holders: without.holders,
+              trust_lines: without.trust_lines,
+              buckets: buckets(without),
+              top: top(without),
+            },
+    });
+  }
+
+  /**
+   * A page of a token's snapshot at `n` (spec 5.7), by holder, after `after`. The digest of the whole set is kept 60 s per generation,
+   * token and ledger: every page of a walk carries the same one.
+   */
+  async snapshot(
+    live: LiveTokenHistory,
+    token: AnyToken,
+    n: number,
+    o: { after?: string; limit: number; exclude?: string[] },
+  ): Promise<{ answer: SnapshotAnswer; marker?: string }> {
+    const key = { issuer: token.issuer, currency: token.currency };
+    const g = live.generation;
+    const [coverage, close, hash, totals, rows, digest] = await Promise.all([
+      this.coverage(live, token.kind),
+      this.closeTimeOf(live, n),
+      this.ch.query<{ ledger_hash: string }>(
+        `SELECT ledger_hash FROM ${Table.Ledgers} WHERE ledger_index = {n:UInt32} LIMIT 1`,
+        { n },
+      ),
+      totalsAt(this.ch, g, key, n),
+      snapshotPage(this.ch, g, key, n, o.after, o.limit),
+      this.cache.wrap(`token-history:digest:${g}:${token.issuer}:${token.currency}:${n}`, 60_000, () =>
+        snapshotDigestAt(this.ch, g, key, n),
+      ),
+    ]);
+    const page = rows.slice(0, o.limit);
+    const marker = rows.length > o.limit ? encodeMarker([page[page.length - 1].holder]) : undefined;
+    return {
+      marker,
+      answer: snapshotAnswer({
+        result: 'success',
+        coverage,
+        ledger_index: n,
+        ledger_hash: hash[0]?.ledger_hash ?? '',
+        close_time: fmtTime(close),
+        token: summaryToken({
+          currency: token.currency,
+          issuer: token.issuer,
+          kind: token.kind,
+          ...(token.kind === 'issued' && { code: currencyCode(token.currency) }),
+        }),
+        supply: totals.supply,
+        holders: totals.holders,
+        trust_lines: totals.trust_lines,
+        digest,
+        ...(o.exclude !== undefined && {
+          without_excluded: await this.withoutExcluded(live, token, n, totals, o.exclude),
+          excluded: o.exclude,
+        }),
+        count: page.length,
+        marker,
+        balances: page.map((r) =>
+          snapshotRow({
+            holder: r.holder,
+            balance: r.balance,
+            ...(token.kind === 'mpt' && { escrowed: r.escrowed }),
+            limit: r.limit,
+            frozen: r.frozen,
+            authorized: r.authorized,
+          }),
+        ),
+      }),
+    };
   }
 }
 

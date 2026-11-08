@@ -2,10 +2,11 @@ import BigNumber from 'bignumber.js';
 import type { TokenKey } from '../aggregate/token-rules';
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
 import { Table } from '../clickhouse/tables';
-import { EXACT_SCALE, exactAmountOfText } from '../query/decimal';
+import { EXACT_SCALE, exactAmountOfText, exactSumColumns } from '../query/decimal';
 import { isMptIssuanceId } from '../util/mpt';
+import { snapshotDigest } from './digest';
 import { ChangeAmounts, flowsOfTransaction } from './flows';
-import { holdersAt, totalsAt } from './holders-at';
+import { checkpointAt, holdersAt, holdersAtSql, totalsAt } from './holders-at';
 import { closeHourOf } from './hour-sets';
 
 /**
@@ -804,4 +805,166 @@ async function ledgerSeries(
     });
   }
   return out;
+}
+
+// -- the distribution and the snapshot ---------------------------------------------------------------------------------------
+
+/** A decade of the balances: `[10^decade, 10^(decade+1))`, its holders and their balance. */
+export interface DecadeBucket {
+  decade: number;
+  min: string;
+  max: string;
+  holders: number;
+  balance: string;
+}
+
+/** A token's distribution at a ledger (spec 5.4), with or without some holders. */
+export interface Distribution {
+  supply: string;
+  holders: number;
+  trust_lines: number;
+  buckets: DecadeBucket[];
+  /** The sums of the 10 and the 100 largest balances. */
+  top10: string;
+  top100: string;
+}
+
+const powerOfTen = (d: number): string => new BigNumber(10).pow(d).toFixed();
+
+/**
+ * The distribution of a token at `n` (spec 5.4), over the fold (`holdersAtSql`): one bucket per power of ten from the smallest
+ * holder's to the largest's, the empty ones between included, by the order key (an issued amount's decade is `exp + 15`, its
+ * mantissa being in [1e15, 1e16); an MPT's is its number of digits less one), and the sums of the largest 10 and 100 balances.
+ * `exclude` leaves those holders out. The sums are exact: in the decimal, or in BigNumber over the fold when an amount does not fit.
+ */
+export async function distributionAt(
+  ch: ClickHouseService,
+  g: number,
+  token: TokenKey & { kind: 'issued' | 'mpt' },
+  n: number,
+  exclude?: string[],
+): Promise<Distribution> {
+  const cp = await checkpointAt(ch, g, token, n);
+  const params = {
+    g,
+    issuer: token.issuer,
+    currency: token.currency,
+    cp,
+    n,
+    mpt: token.kind === 'mpt' ? 1 : 0,
+    exclude: exclude ?? [],
+  };
+  const fold = `(${holdersAtSql()})`;
+  const without = exclude === undefined ? '' : ' AND holder NOT IN {exclude:Array(String)}';
+  const decade = `toInt32(if({mpt:UInt8} = 1, length(toString(mant)) - 1, exp + 15))`;
+  const [decades, lines, top] = await Promise.all([
+    ch.query<{ decade: number | string; holders: number | string; b_exact: string | null; b_unfit: number | string }>(
+      `SELECT ${decade} AS decade, toUInt64(count()) AS holders, ${exactSumColumns('amount', 'b')}
+         FROM ${fold} WHERE amount != '0'${without}
+        GROUP BY decade ORDER BY decade`,
+      params,
+    ),
+    ch.queryOne<{ n: number | string }>(`SELECT toUInt64(count()) AS n FROM ${fold} WHERE TRUE${without}`, params),
+    ch.query<{ amount: string }>(
+      `SELECT amount FROM ${fold} WHERE amount != '0'${without} ORDER BY exp DESC, mant DESC, holder LIMIT 100`,
+      params,
+    ),
+  ]);
+  let sums = new Map(decades.map((d) => [Number(d.decade), new BigNumber(d.b_exact ?? 0)]));
+  if (decades.some((d) => Number(d.b_unfit) > 0)) {
+    sums = new Map();
+    for (const r of await ch.query<{ decade: number | string; amount: string }>(
+      `SELECT ${decade} AS decade, amount FROM ${fold} WHERE amount != '0'${without}`,
+      params,
+    )) {
+      const d = Number(r.decade);
+      sums.set(d, (sums.get(d) ?? new BigNumber(0)).plus(r.amount));
+    }
+  }
+  const counts = new Map(decades.map((d) => [Number(d.decade), Number(d.holders)]));
+  const buckets: DecadeBucket[] = [];
+  if (decades.length > 0) {
+    const lo = Number(decades[0].decade);
+    const hi = Number(decades[decades.length - 1].decade);
+    for (let d = lo; d <= hi; d++) {
+      buckets.push({
+        decade: d,
+        min: powerOfTen(d),
+        max: powerOfTen(d + 1),
+        holders: counts.get(d) ?? 0,
+        balance: text(sums.get(d) ?? new BigNumber(0)),
+      });
+    }
+  }
+  const sumOf = (rows: { amount: string }[]) => text(rows.reduce((s, r) => s.plus(r.amount), new BigNumber(0)));
+  return {
+    supply: text([...sums.values()].reduce((s, b) => s.plus(b), new BigNumber(0))),
+    holders: [...counts.values()].reduce((s, c) => s + c, 0),
+    trust_lines: Number(lines?.n ?? 0),
+    buckets,
+    top10: sumOf(top.slice(0, 10)),
+    top100: sumOf(top),
+  };
+}
+
+/** A holder of a snapshot (spec 5.7): `balance` is the served text, an MPT's `amount + escrowed`. */
+export interface SnapshotHolder {
+  holder: string;
+  balance: string;
+  escrowed: string;
+  limit: string;
+  frozen: boolean;
+  authorized: boolean;
+}
+
+/**
+ * A page of a token's holders at `n` (amount above 0), by `holder` (the byte order of the address), after `after`, `limit + 1` rows at
+ * most so that the caller can tell there is more. Each page folds the token at `n` (`holdersAtSql`).
+ */
+export async function snapshotPage(
+  ch: ClickHouseService,
+  g: number,
+  token: TokenKey,
+  n: number,
+  after: string | undefined,
+  limit: number,
+): Promise<SnapshotHolder[]> {
+  const cp = await checkpointAt(ch, g, token, n);
+  const rows = await ch.query<{
+    holder: string;
+    amount: string;
+    limit: string;
+    frozen: number;
+    authorized: number;
+    escrowed: string;
+  }>(
+    `SELECT holder, amount, \`limit\`, frozen, authorized, escrowed FROM (${holdersAtSql()})
+      WHERE amount != '0' AND holder > {after:String}
+      ORDER BY holder
+      LIMIT {limit:UInt32}`,
+    { g, issuer: token.issuer, currency: token.currency, cp, n, after: after ?? '', limit: limit + 1 },
+  );
+  return rows.map((r) => ({
+    holder: r.holder,
+    balance: r.amount,
+    escrowed: r.escrowed,
+    limit: r.limit,
+    frozen: Number(r.frozen) === 1,
+    authorized: Number(r.authorized) === 1,
+  }));
+}
+
+/**
+ * The `digest` of a token's snapshot at `n` (spec 5.7), in ClickHouse: SHA-256 of `<holder>,<balance>\n` for every holder, by
+ * `holder`, as `snapshotDigest` computes it from the same lines.
+ */
+export async function snapshotDigestAt(ch: ClickHouseService, g: number, token: TokenKey, n: number): Promise<string> {
+  const cp = await checkpointAt(ch, g, token, n);
+  const row = await ch.queryOne<{ digest: string }>(
+    `SELECT lower(hex(SHA256(arrayStringConcat(
+              arrayMap(x -> concat(x.1, ',', x.2, '\\n'), arraySort(groupArray(tuple(holder, amount)))), '')))) AS digest
+       FROM (${holdersAtSql()}) WHERE amount != '0'`,
+    { g, issuer: token.issuer, currency: token.currency, cp, n },
+  );
+  return row?.digest ?? snapshotDigest([]);
 }

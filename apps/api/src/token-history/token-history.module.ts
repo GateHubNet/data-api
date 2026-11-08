@@ -1,9 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ValidatorsModule } from '../validators/validators.module';
 import { IssuersController } from './issuers.controller';
+import { TokenDistributionController } from './token-distribution.controller';
 import { TokenFlowsController } from './token-flows.controller';
 import { TokenHistoryReadsService } from './token-history-reads.service';
 import { TokenHistoryService } from './token-history.service';
+import { TokenSnapshotController } from './token-snapshot.controller';
 import { TokenSummaryController } from './token-summary.controller';
 import { TokenSupplyController } from './token-supply.controller';
 
@@ -13,7 +15,14 @@ import { TokenSupplyController } from './token-supply.controller';
  */
 @Module({
   imports: [ValidatorsModule],
-  controllers: [IssuersController, TokenSummaryController, TokenSupplyController, TokenFlowsController],
+  controllers: [
+    IssuersController,
+    TokenSummaryController,
+    TokenSupplyController,
+    TokenFlowsController,
+    TokenDistributionController,
+    TokenSnapshotController,
+  ],
   providers: [TokenHistoryService, TokenHistoryReadsService],
   exports: [TokenHistoryService],
 })
