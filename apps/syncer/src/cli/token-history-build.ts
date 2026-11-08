@@ -31,7 +31,7 @@ and ClickHouse come from the same GH_* environment as the syncer.
   --help            print this text
 
 It refuses to start while another build runs, while a range-ingest runs, and while no syncer runs the token_history worker.
-Ctrl-C stops it after the statement in flight; run it again to resume.
+Ctrl-C (or a SIGTERM, as docker stop sends) stops it after the statement in flight; run it again to resume.
 
 Exit status: 0 when the build is done (the worker then catches it up to the head and promotes it), 1 when it failed or was
 interrupted (run it again to resume), 2 when it refused to start or the command line is wrong, 3 when a range-ingest started
@@ -95,6 +95,28 @@ export function exitCodeOf(err: unknown): number {
   return 1;
 }
 
+/**
+ * Stops the build on SIGINT (Ctrl-C) or SIGTERM (`docker stop`, Kubernetes), after the statement in flight; a second signal exits at
+ * once (130). Returns the function that removes the handlers.
+ */
+export function stopOnSignals(
+  abort: AbortController,
+  warn: (message: string) => void,
+  proc: Pick<NodeJS.Process, 'on' | 'off' | 'exit'> = process,
+): () => void {
+  const onSignal = (): void => {
+    if (abort.signal.aborted) proc.exit(130);
+    warn('Interrupted: stopping after the statement in flight (Ctrl-C again to quit at once); run again to resume');
+    abort.abort(new Error('interrupted'));
+  };
+  proc.on('SIGINT', onSignal);
+  proc.on('SIGTERM', onSignal);
+  return () => {
+    proc.off('SIGINT', onSignal);
+    proc.off('SIGTERM', onSignal);
+  };
+}
+
 /** Runs the CLI; resolves to the exit status. */
 export async function main(argv: string[]): Promise<number> {
   let parsed: { threads: number } | 'help';
@@ -116,12 +138,7 @@ export async function main(argv: string[]): Promise<number> {
   const clickHouse = buildClickHouseConfig(process.env, profile);
   const ch = new ClickHouseService(clickHouse);
   const abort = new AbortController();
-  const onSigint = (): void => {
-    if (abort.signal.aborted) process.exit(130);
-    logger.warn('Interrupted: stopping after the statement in flight (Ctrl-C again to quit at once); run again to resume');
-    abort.abort(new Error('interrupted'));
-  };
-  process.on('SIGINT', onSigint);
+  const releaseSignals = stopOnSignals(abort, (m) => logger.warn(m));
   try {
     await migrateOnBoot(cfg, clickHouse, logger);
     logger.log(
@@ -143,7 +160,7 @@ export async function main(argv: string[]): Promise<number> {
     else logger.warn(describe(err));
     return code;
   } finally {
-    process.off('SIGINT', onSigint);
+    releaseSignals();
     await ch.close().catch((err: unknown) => logger.warn(`Closing ClickHouse failed: ${describe(err)}`));
   }
 }
