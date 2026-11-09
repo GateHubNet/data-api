@@ -33,6 +33,13 @@ describe('ClickHouseService', () => {
     expect(options.clickhouse_settings ?? {}).not.toHaveProperty('async_insert');
   });
 
+  it('derive makes a client of the same server and database with the overrides', () => {
+    const derived = service.derive({ requestTimeout: 3_600_000, maxExecutionTime: 0 });
+    expect(derived).not.toBe(service);
+    const options = (createClient as jest.Mock).mock.calls[1][0];
+    expect(options).toMatchObject({ url: 'http://ch:8123', database: 'xrpl', username: 'u', request_timeout: 3_600_000 });
+  });
+
   describe('insert', () => {
     it('always sends async_insert: 0, and insert_deduplication_token only when a dedupToken is given', async () => {
       await service.insert('t', [{ a: 1 }], { dedupToken: 'run1:t:1-2' });

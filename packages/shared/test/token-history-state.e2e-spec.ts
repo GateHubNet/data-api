@@ -157,8 +157,12 @@ describe('the token history state and coverage (e2e)', () => {
       expect(await mptCoverageComplete(ch, 'xrpl', ENABLED - 5)).toBe(true);
       expect(await mptCoverageComplete(ch, 'xrpl', ENABLED + 1)).toBe(false);
       // a ledger above the enable ledger written by an older parser: its MPT states are missing, the MPT history is not whole
-      await ch.insert(Table.Ledgers, [ledgerRow(ENABLED + 6, 9)]);
-      expect(await mptCoverageComplete(ch, 'xrpl', ENABLED - 5)).toBe(false);
+      const older = await fresh();
+      await older.insert(Table.Ledgers, [
+        ...range(ENABLED - 5, ENABLED + 5).map((l) => ledgerRow(l, 10)),
+        ledgerRow(ENABLED + 6, 9),
+      ]);
+      expect(await mptCoverageComplete(older, 'xrpl', ENABLED - 5)).toBe(false);
       // one below it does not matter: no MPT existed then
       const below = await fresh();
       await below.insert(Table.Ledgers, [

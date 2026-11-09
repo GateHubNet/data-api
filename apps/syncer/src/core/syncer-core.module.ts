@@ -17,6 +17,7 @@ import { createNodeClient } from './node-client.provider';
 import {
   assertIssuedTokensSchema,
   assertMptSchema,
+  assertTokenHistorySchema,
   assertSupplySchema,
   assertTomlsSchema,
   assertValidatorsSchema,
@@ -103,6 +104,7 @@ export class SyncerCoreModule {
             await assertSupplySchema(ch, enabledWorkers(config), clickHouse.database, logger);
             await assertValidatorTomlSchema(ch, enabledWorkers(config), clickHouse.database, logger);
             await assertMptSchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            await assertTokenHistorySchema(ch, enabledWorkers(config), clickHouse.database, logger);
             return migrated;
           },
           inject: [ClickHouseService],

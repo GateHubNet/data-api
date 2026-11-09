@@ -122,7 +122,7 @@ export async function dexHoursFromPairHourly(ch: ClickHouseService, hour: Date):
 }
 
 /** The oldest hour whose `pair_hourly` set is final, of the current config: where the live DEX hours begin. */
-async function oldestFinalPairHour(ch: ClickHouseService): Promise<number | undefined> {
+export async function oldestFinalPairHour(ch: ClickHouseService): Promise<number | undefined> {
   const row = await ch.queryOne<{ hour: number | null }>(
     `SELECT toUnixTimestamp(minOrNull(hour)) AS hour FROM ${Table.PairHourly}
       WHERE base_currency = '' AND base_issuer = '' AND counter_currency = '' AND counter_issuer = ''

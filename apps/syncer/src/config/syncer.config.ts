@@ -30,7 +30,7 @@ import { IsIn, IsString, registerDecorator, ValidateIf, ValidationArguments } fr
  * that file is missing, so containers (NODE_ENV=production) must set `GH_ENV` to any value.
  */
 
-export const WORKER_NAMES = ['ingest', 'validations', 'fee_stats', 'aggregator', 'validators', 'tomls'] as const;
+export const WORKER_NAMES = ['ingest', 'validations', 'fee_stats', 'aggregator', 'validators', 'tomls', 'token_history'] as const;
 export type WorkerName = (typeof WORKER_NAMES)[number];
 
 /** `ledgerFetchTimeoutMs` -> `GH_LEDGER_FETCH_TIMEOUT_MS`: the name the ConfigService reads. */
@@ -265,7 +265,7 @@ export class SyncerConfig {
   @IsEndpointList()
   validationEndpoints!: string;
 
-  /** `GH_WORKERS`: comma separated subset of `ingest,validations,fee_stats,aggregator,validators,tomls`; empty runs none of them. */
+  /** `GH_WORKERS`: comma separated subset of `ingest,validations,fee_stats,aggregator,validators,tomls,token_history`; empty runs none of them. */
   @ConfigValue()
   @Transform(({ obj, key }) => (typeof obj[key] === 'string' ? obj[key].trim() : defaultOf(key)))
   @ValidateIf((config: SyncerConfig) => config.workers !== '')

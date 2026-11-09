@@ -3,6 +3,7 @@ import { WorkerName } from '../config/syncer.config';
 import {
   assertIssuedTokensSchema,
   assertMptSchema,
+  assertTokenHistorySchema,
   assertSupplySchema,
   assertTomlsSchema,
   assertValidatorsSchema,
@@ -10,6 +11,7 @@ import {
   ISSUED_TOKENS_MIGRATION,
   MPT_MIGRATION,
   SUPPLY_MIGRATION,
+  TOKEN_HISTORY_MIGRATION,
   TOMLS_MIGRATION,
   VALIDATOR_TOML_MIGRATION,
   VALIDATORS_MIGRATION,
@@ -514,5 +516,56 @@ describe('assertMptSchema', () => {
     await expect(assertMptSchema(ch, workers('ingest'), 'xrpl', { warn })).resolves.toBe(undefined);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(MPT_MIGRATION));
+  });
+});
+
+describe('assertTokenHistorySchema', () => {
+  const TABLES_019 = [
+    Table.TokenHolderChanges,
+    Table.TokenCheckpoints,
+    Table.TokenCheckpointHeads,
+    Table.TokenHourly,
+    Table.TokenHourlyDex,
+    Table.TokenHistoryState,
+    Table.TokenHistoryDirty,
+  ];
+  const READ = [
+    Table.StateTouches,
+    Table.TrustLineStates,
+    Table.MptTouches,
+    Table.MptHolderStates,
+    Table.TxByType,
+    Table.PairHourly,
+  ];
+
+  it('checks nothing when neither the token_history nor the aggregator worker is enabled', async () => {
+    const db = tablesOf();
+    await assertTokenHistorySchema(db.ch, workers('ingest', 'validations', 'tomls'), 'xrpl', { warn: jest.fn() });
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it('passes a database with the seven tables of 019 and the tables the worker reads', async () => {
+    const db = tablesOf(...TABLES_019, ...READ);
+    await expect(
+      assertTokenHistorySchema(db.ch, workers('token_history'), 'xrpl', { warn: jest.fn() }),
+    ).resolves.toBeUndefined();
+    expect(db.query.mock.calls[0][1]).toEqual({ tables: [...TABLES_019, ...READ] });
+  });
+
+  it('a database without 019 refuses the token_history worker with "lacks the schema of 019_token_history.sql"', async () => {
+    const check = assertTokenHistorySchema(tablesOf(...READ).ch, workers('token_history'), 'xrpl', { warn: jest.fn() });
+    await expect(check).rejects.toThrow('lacks the schema of 019_token_history.sql');
+    await expect(check).rejects.toThrow(`table ${Table.TokenHolderChanges}`);
+    await expect(check).rejects.toThrow('the token_history worker reads and writes');
+    expect(TOKEN_HISTORY_MIGRATION).toBe('019_token_history.sql');
+  });
+
+  it('the aggregator needs token_history_dirty, for its hook', async () => {
+    const db = tablesOf(Table.TokenHistoryDirty);
+    await expect(assertTokenHistorySchema(db.ch, workers('aggregator'), 'xahau', { warn: jest.fn() })).resolves.toBeUndefined();
+    expect(db.query.mock.calls[0][1]).toEqual({ tables: [Table.TokenHistoryDirty] });
+    const check = assertTokenHistorySchema(tablesOf().ch, workers('aggregator'), 'xahau', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(`(table ${Table.TokenHistoryDirty})`);
+    await expect(check).rejects.toThrow('the aggregator worker writes');
   });
 });

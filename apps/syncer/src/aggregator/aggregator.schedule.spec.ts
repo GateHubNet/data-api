@@ -1373,6 +1373,53 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       expect(logger.error).not.toHaveBeenCalled();
     });
 
+    it('the token history hook runs after mpt_state\'s and appends the slice\'s ledgers', async () => {
+      caughtUp();
+      markRange();
+      rolledAccount();
+      const marked: Array<[number, number]> = [];
+      await service({
+        tokenHistoryDirty: async (_ch, start, end) => {
+          note(`token_history_dirty ${iso(start)} ${iso(end)}`);
+          marked.push([start, end]);
+        },
+      }).tick();
+      const at = events().indexOf('mpt_state_of');
+      expect(at).toBeGreaterThan(0);
+      expect(events()[at + 1]).toBe(`token_history_dirty ${DIRTY_FROM} ${DIRTY_TO}`);
+      expect(marked).toEqual([[unix(DIRTY_FROM), unix(DIRTY_TO)]]);
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('it runs without the token_history worker and the other options; a failing one keeps the range (token_history_dirty)', async () => {
+      caughtUp();
+      markRange();
+      let fails: Error | undefined = new Error('memory limit');
+      const hook = async (_ch: unknown, start: number, end: number) => {
+        if (fails) throw fails;
+        note(`token_history_dirty ${iso(start)} ${iso(end)}`);
+      };
+      const svc = service({
+        volumes: undefined,
+        ammPools: undefined,
+        nfts: undefined,
+        escrows: undefined,
+        tokens: undefined,
+        supply: undefined,
+        ammDaily: undefined,
+        aggregates: undefined,
+        mptState: undefined,
+        tokenHistoryDirty: hook,
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'token_history_dirty' }]]);
+      expect(ch.dirty).toHaveLength(1);
+      fails = undefined;
+      await svc.tick();
+      expect(events()).toContain(`token_history_dirty ${DIRTY_FROM} ${DIRTY_TO}`);
+      expect(ch.dirty).toEqual([]);
+    });
+
     it('runs the hook of mpt_state without the other options, which only the other hooks need', async () => {
       caughtUp();
       markRange();

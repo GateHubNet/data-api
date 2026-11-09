@@ -3,6 +3,7 @@ import {
   ClickHouseService,
   DailyRates,
   loadMarketsConfig,
+  markTokenHistoryDirty,
   NetworkProfile,
   RatesService,
 } from '@gatehub/data-api-shared';
@@ -58,6 +59,8 @@ export function aggregatorOptions(
     tokens: { profile, rates },
     supply: { profile },
     mptState: { rates },
+    // the eighth hook of agg_dirty, whether or not the token_history worker runs (spec 4.7)
+    tokenHistoryDirty: markTokenHistoryDirty,
     ammDaily: { rates },
     aggregates: { rates, accountRollupMinRows: config.accountRollupMinRows },
   };

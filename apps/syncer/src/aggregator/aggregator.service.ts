@@ -342,6 +342,12 @@ export interface AggregatorOptions {
    * issuances of their ledgers, with or without the other options; without it they do not.
    */
   mptState?: AggregatorMptState;
+  /**
+   * The eighth hook of a slice of `agg_dirty`, after `mpt_state`'s: it marks the slice's ledgers in `token_history_dirty` for the
+   * `token_history` worker to repair (`markTokenHistoryDirty`), and rebuilds nothing. The module always sets it, whether or not the
+   * worker runs; without it there is no such hook.
+   */
+  tokenHistoryDirty?: (ch: ClickHouseService, start: number, end: number) => Promise<void>;
   /** Replaces the `mpt_state` functions of the shared package; for tests. */
   mptStateFunctions?: Partial<MptStateFunctions>;
   /**
@@ -588,6 +594,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly supply?: SupplyJobRunner;
   /** The `mpt_state` job and its hook in the slices of `agg_dirty` (with the `mptState` option). */
   private readonly mptState?: MptStateJobRunner;
+  private readonly tokenHistoryDirty?: AggregatorOptions['tokenHistoryDirty'];
   /** The `amm_daily` job and its hook in the slices of `agg_dirty` (with the `ammDaily` option). */
   private readonly ammDaily?: AmmDailyJobRunner;
   /** How many ticks have run their jobs: the cadence of the jobs that do not run at every tick. */
@@ -642,6 +649,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       ...options.budgetsMs,
     };
     this.volumes = options.volumes;
+    this.tokenHistoryDirty = options.tokenHistoryDirty;
     this.volumeFns = {
       computeLiveSet: computeLiveVolumeSet,
       computeDailySet: computeDailyVolumeSet,
@@ -1171,7 +1179,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
    * days (`rates_daily`), its hours of `pair_hourly`, the day rollups of the heavy accounts (`account_rollups`), and then
    * the hook of `nft_state`, which marks the ledgers of the slice in `nft_dirty` (it rebuilds nothing), the hook of `escrows`,
    * which recomputes the escrows of the slice's ledgers, the hook of `tokens`, which marks the slice for the repair of the
-   * generations of the issued tokens, and last the hook of `mpt_state`, which rebuilds the issuances the slice names. Each gets the
+   * generations of the issued tokens, the hook of `mpt_state`, which rebuilds the issuances the slice names, and last the hook of the
+   * token history, which marks the slice's ledgers in `token_history_dirty`. Each gets the
    * slice and the tick, and `marked`, when the range was marked (the day rollups do not roll a day again for a range that was marked
    * before the roll of it began, as `volumesOfSlice` does). Without the `aggregates` option there are none of the first three, without
    * the `nfts` option no hook of `nft_state`, without the `escrows` option none of `escrows`, without the `tokens` option none of `tokens`
@@ -1220,6 +1229,14 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     } catch (err) {
       this.failed('mpt_state_dirty', err, ` in ${iso(start)} - ${iso(end)}`);
       return false;
+    }
+    if (this.tokenHistoryDirty !== undefined && !this.closing) {
+      try {
+        await this.tokenHistoryDirty(this.ch, start, end);
+      } catch (err) {
+        this.failed('token_history_dirty', err, ` in ${iso(start)} - ${iso(end)}`);
+        return false;
+      }
     }
     return true;
   }

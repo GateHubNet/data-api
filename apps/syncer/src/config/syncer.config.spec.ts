@@ -72,6 +72,12 @@ describe('enabledWorkers', () => {
     expect(() => enabledWorkers(cfg('INGEST'))).toThrow('Unknown worker "INGEST"');
   });
 
+  it('GH_WORKERS accepts token_history and the default includes it', () => {
+    expect(enabledWorkers(cfg('token_history'))).toEqual(new Set(['token_history']));
+    expect(enabledWorkers(cfg('aggregator,token_history'))).toEqual(new Set(['aggregator', 'token_history']));
+    expect(enabledWorkers(new SyncerConfig())).toContain('token_history');
+  });
+
   it('treats an empty list as no workers', () => {
     expect(enabledWorkers(cfg(''))).toEqual(new Set());
     expect(enabledWorkers(cfg(' , '))).toEqual(new Set());
@@ -86,7 +92,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       network: 'xrpl',
       nodeEndpoints: 'wss://s2.ripple.com',
       validationEndpoints: 'wss://s2.ripple.com',
-      workers: 'ingest,validations,fee_stats,aggregator,validators,tomls',
+      workers: 'ingest,validations,fee_stats,aggregator,validators,tomls,token_history',
       unlPublishers: getNetworkProfile('xrpl').defaultUnlPublishers,
       unlValidators: '',
       unlThreshold: 0,

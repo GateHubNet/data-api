@@ -503,3 +503,30 @@ describe('PrometheusService', () => {
     }
   });
 });
+
+describe('the metrics of the token_history worker', () => {
+  it('the metrics are registered and seeded', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    const text = await service.getMetrics();
+    const declared: Array<[string, string]> = [
+      ['syncer_token_history_lag_ledgers', 'gauge'],
+      ['syncer_token_history_rebuild_needed', 'gauge'],
+      ['syncer_token_history_building', 'gauge'],
+      ['syncer_token_history_window_seconds', 'histogram'],
+      ['syncer_token_history_errors_total', 'counter'],
+      ['syncer_token_history_unfit_sums_total', 'counter'],
+    ];
+    for (const [name, type] of declared) expect(text).toMatch(new RegExp(`^# TYPE ${name} ${type}$`, 'm'));
+    // every step's error series starts at 0, so that its first failure raises an increase()
+    for (const step of ['live', 'repair', 'catch_up', 'dex', 'drop']) {
+      expect(text).toMatch(new RegExp(`^syncer_token_history_errors_total\\{step="${step}"\\} 0$`, 'm'));
+    }
+    expect(text).toMatch(/^syncer_token_history_unfit_sums_total 0$/m);
+    // no reason and no lag until the worker has read the state: a 0 would say "nothing due" and "caught up"
+    expect(text).not.toMatch(/^syncer_token_history_rebuild_needed\{/m);
+    expect(text).not.toMatch(/^syncer_token_history_lag_ledgers \d/m);
+    expect((service.registry.getSingleMetric('syncer_token_history_rebuild_needed') as unknown as { labelNames: string[] }).labelNames).toEqual(['reason']);
+    expect((service.registry.getSingleMetric('syncer_token_history_building') as unknown as { labelNames: string[] }).labelNames).toEqual(['phase']);
+  });
+});

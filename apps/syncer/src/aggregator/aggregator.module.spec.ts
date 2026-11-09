@@ -1,6 +1,7 @@
 import {
   ClickHouseService,
   getNetworkProfile,
+  markTokenHistoryDirty,
   NFT_VOLUME_CONFIG_VERSION,
   RatesService,
   ShutdownSignals,
@@ -276,6 +277,19 @@ describe('AggregatorModule', () => {
       expect(options.mptState?.rates).toBeInstanceOf(RatesService);
       expect(options.mptState?.rates).toBe(options.ammPools?.rates);
       expect(log).toHaveBeenCalledWith(expect.stringMatching(/^MPT state job on: /));
+    }
+  });
+
+  it('always gives the aggregator the hook of the token history, with the token_history worker or without it', () => {
+    const ch = { query: jest.fn() } as unknown as ClickHouseService;
+    for (const workers of ['aggregator', 'aggregator,token_history']) {
+      const options = aggregatorOptions(
+        ch,
+        getNetworkProfile('xahau'),
+        { accountRollupMinRows: 1, workers } as SyncerConfig,
+        { log: jest.fn() } as never,
+      );
+      expect(options.tokenHistoryDirty).toBe(markTokenHistoryDirty);
     }
   });
 

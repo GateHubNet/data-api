@@ -724,7 +724,14 @@ export async function seedTokenHistoryWorld(
   writer: LedgerWriter,
   o: TokensWorldOptions = {},
 ): Promise<TokenHistoryWorld> {
-  const world = await seedTokensWorld(ch, writer, o);
+  return seedTokenHistoryWorldLater(writer, await seedTokensWorld(ch, writer, o));
+}
+
+/**
+ * The second part of `seedTokenHistoryWorld`, after the tokens world's first batch: its second batch and the clawback ledger. A suite
+ * that needs a database at the first batch's head first (a build there, then live windows) calls the two parts apart.
+ */
+export async function seedTokenHistoryWorldLater(writer: LedgerWriter, world: TokensWorld): Promise<TokenHistoryWorld> {
   const later = await seedTokensWorldLater(writer, world);
   const { gate, pool } = world;
   const clawed: Line = {

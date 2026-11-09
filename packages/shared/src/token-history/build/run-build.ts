@@ -213,7 +213,7 @@ class HeldLease {
 }
 
 /** Whether a coverage that starts at `from` is complete for issued tokens (spec 6): at or before the network's first ledger. */
-function issuedComplete(network: string, from: number): boolean {
+export function issuedComplete(network: string, from: number): boolean {
   const first = getNetworkProfile(network as NetworkName).firstLedger;
   return first !== undefined && from <= first;
 }
