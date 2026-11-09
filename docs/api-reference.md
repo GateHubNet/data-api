@@ -321,6 +321,13 @@ From the MPT data ([ADR-0020](adr/0020-mpt-data.md), [ADR-0010](adr/0010-ripple-
 an MPT payment is a payment, with `mpt_issuance_id` as the last key of its row in [`/v2/payments`](#payments) and of its [balance change](#get-v2accountsaddressbalance_changes), and a CSV column only when a row of the page has one; a balance change of an MPT is two rows, the holder's and the issuer's mirror, as on a trust line;
 `change_type` gains `clawback`, for every balance row of a `Clawback`, of an issued token too; and an asset can be written `<48hex>` or `<48hex>+<issuer>`, with the 400 `issuer does not match mpt issuance`.
 
+From the token history ([ADR-0021](adr/0021-token-history-in-clickhouse.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 12, items 118 to 124): the routes of
+[Token history](#token-history), [`GET /v2/issuers/{issuer}/tokens`](#get-v2issuersissuertokens) and, for one token,
+[`/summary`](#get-v2tokenstokensummary), [`/supply`](#get-v2tokenstokensupply), [`/flows`](#get-v2tokenstokenflows),
+[`/distribution`](#get-v2tokenstokendistribution) and [`/snapshot`](#get-v2tokenstokensnapshot), at any indexed ledger. Once the token
+history is built, D6's [`/holders`](#get-v2tokenscurrencyissuerholders) reads it: the same keys and two (an MPT's three) more at the end
+of a row, the ledger parameters and `descending`, an exact order and a new marker.
+
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
 
@@ -5204,6 +5211,12 @@ CSV (the `Link` header carries the next page as for every list):
 Errors, in the order they are checked: 400 `invalid currency`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid issuer address`, `invalid marker`, all before any read; 404 `token not found`
 (as the detail); 500 `unable to retrieve holders`.
 
+**Once the token history is built** ([Token history](#token-history)), the route reads it instead of the tokens job's lines, seconds
+behind the head: the holders at a ledger (the ledger parameters of that section; none is the newest of the token history), in the exact
+order of the balances (`descending=false` gives the smallest first), each row with `first_ledger` and `last_ledger` after D6's keys (and
+`escrowed` for an MPT, which the path can name by its issuance ID). Its marker then holds the holder and the balance text, so a marker of
+the answer above is 400 `invalid marker` once. Before the build, a ledger parameter or an issuance ID is 404 `token history is not built yet`.
+
 **Differences from data.ripple.com**: none, the endpoint is new.
 
 ### `GET /v2/tokens/{currency}.{issuer}/transfers`
@@ -5298,6 +5311,539 @@ Errors, in the order they are checked: 400 `invalid currency`, `XRP cannot have 
 the hash, the ledger and time, the two parties, the delivered amount and the tags, where `/v2/payments` serves the balance changes and the fee as well.
 
 ---
+
+## Token history
+
+The issuer analytics ([ADR-0021](adr/0021-token-history-in-clickhouse.md), the [design](superpowers/specs/2026-11-08-issuer-analytics-design.md)): a token's holders,
+supply and flows **at any indexed ledger**, not only at the head, read from the token history, a set of tables the `token_history`
+worker keeps in step with the head and the operator command `token-history-build` builds from the state history ([operations](operations.md)).
+Six routes are new, and [`GET /v2/tokens/{currency}.{issuer}/holders`](#get-v2tokenscurrencyissuerholders) reads the token history once one is built.
+
+What every route of the section shares:
+
+- **The envelope** is `result, coverage, ledger_index, close_time, …`. `ledger_index` is the ledger the answer is as of: the one the
+  request names, or the newest ledger of the token history (it follows the head by a few seconds). `coverage` is the feature
+  `token_history`: `from_ledger_index` is the first ledger of the history the token history was built on, and `complete` is true when
+  that is the network's first ledger (for an MPT: the ledger `MPTokensV1` was enabled in, with every ledger from there written by the parser that records
+  MPT states; `from_ledger_index` is that parser's start when it is later). Until the history is filled, a line untouched
+  since `from_ledger_index` is missing from every figure, and the first change of a line that existed before has no flow (`unknown_before`).
+- **`{token}`** is D6's `{currency}.{issuer}` (split at its last `.`, `+` or `|`, with D6's messages), or an MPT issuance ID: 48 hex
+  digits in any case, alone or as `{issuanceId}+{issuer}` (400 `issuer does not match mpt issuance` for another issuer). On a network
+  without MPT an issuance ID is 404 `token not found`.
+- **A ledger** (the routes marked so): `ledger_index` (alias `ledger`; `validated`, `closed` and `current` name the newest), `ledger_hash`
+  or `date` (alias `close_time`: the ledger closed at or before it), with the trust-lines route's messages (`invalid ledger hash`,
+  `invalid date format`). A ledger above the newest of the token history is 400 `ledger is not in the token history yet`; one below
+  `from_ledger_index`, or a date or hash no stored ledger answers, is 400 `the date provided is too old`.
+- **`exclude`**: 1 to 20 comma-separated addresses (400 `invalid ripple address`, `too many addresses to exclude`; duplicates are ignored).
+  The figures stay whole, and the answer adds `excluded` (the addresses, sorted) and `without_excluded`, the figures without them. The
+  issuer, or an account that never held the token, takes nothing off.
+- **Amounts** are exact decimal text (an MPT's in integer units, its escrowed part included). **Flows** are exact over the changes whose
+  earlier state is known; `unknown_before` counts the others (0 once the coverage is complete), and while it is above 0 a transfer to or
+  from such a line can count as issued or redeemed.
+- 404 `token history is not built yet` before the first build; 404 `token not found` for a token with no change in the token history,
+  and for an LP token. Every 400 is checked before any read, but the ledger's own: a ledger is read before it can be too old or too new.
+
+Keys of without_excluded, in order: `supply, holders, trust_lines`.
+
+Keys of the token, in order: `currency, issuer, kind, code?`.
+
+### `GET /v2/issuers/{issuer}/tokens`
+
+Every token of the issuer with a change at or before the ledger, issued tokens and MPTs together, by `currency` (an MPT by its issuance
+ID), at a ledger.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `issuer` (path) | | A classic address. |
+| `ledger_index`, `ledger_hash`, `date` | the newest | The ledger, as above. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `<issuer> - tokens.csv`, without `coverage`. |
+
+`supply` (exact), `holders` and `trust_lines` are the token's at the ledger, `first_ledger` and `last_ledger` the ledgers of its first and
+newest change; `code` is the currency as text, when it has one. An issuer with no token is an empty list, not a 404. `coverage` is that of
+issued tokens, the stricter of the two.
+
+Keys of the issuer tokens answer, in order: `result, coverage, ledger_index, close_time, count, marker?, tokens`.
+
+Keys of an issuer token, in order: `currency, code?, kind, supply, holders, trust_lines, first_ledger, last_ledger`.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 99000000,
+  "close_time": "2026-11-08T12:00:00Z",
+  "count": 2,
+  "marker": "WyJVU0QiXQ",
+  "tokens": [
+    {
+      "currency": "USD",
+      "code": "USD",
+      "kind": "issued",
+      "supply": "1250000.5",
+      "holders": 1204,
+      "trust_lines": 1530,
+      "first_ledger": 40000000,
+      "last_ledger": 98999000
+    },
+    {
+      "currency": "00000007B5F762798A53D543A014CAF8B297CFF8F2F937E8",
+      "kind": "mpt",
+      "supply": "500000",
+      "holders": 12,
+      "trust_lines": 14,
+      "first_ledger": 99226400,
+      "last_ledger": 99226500
+    }
+  ]
+}
+```
+
+Errors: 400 `invalid issuer address`, `invalid marker`, the ledger's; 404 `token history is not built yet`; 500 `unable to retrieve tokens`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{token}/summary`
+
+A token at a ledger and the flows of the 24 hours, 7 days and 30 days before it. Parameters: the ledger, `exclude`. No CSV.
+
+`supply`, `holders` and `trust_lines` are exact. `first_ledger` and `last_ledger` are the ledgers of the token's first and newest change
+up to the ledger, with their times; they are left out before its first change. Each window ends at the close of the ledger: `issued`,
+`redeemed`, `clawed_back` (a `Clawback` or `AMMClawback`), `transferred` (what moved from holder to holder) and `transfers` (the
+transactions that moved any), `changes` and `unknown_before`. `exchanged` and `trades` are the token's amounts in the trades and swaps of
+the DEX in the whole hours of the window up to `exchanged_through`; they are left out before the DEX history is computed, and are never
+estimated. With `exclude`, `without_excluded` is the levels without those holders.
+
+Keys of the summary answer, in order: `result, coverage, ledger_index, close_time, token, supply, holders, trust_lines, without_excluded?, excluded?, first_ledger?, first_time?, last_ledger?, last_time?, windows`.
+
+Keys of a window, in order: `start, end, issued, redeemed, clawed_back, transferred, transfers, changes, unknown_before, exchanged?, trades?, exchanged_through?`.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 99000000,
+  "close_time": "2026-11-08T12:00:00Z",
+  "token": {
+    "currency": "USD",
+    "issuer": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq",
+    "kind": "issued",
+    "code": "USD"
+  },
+  "supply": "1250000.5",
+  "holders": 1204,
+  "trust_lines": 1530,
+  "without_excluded": {
+    "supply": "250000.5",
+    "holders": 1203,
+    "trust_lines": 1529
+  },
+  "excluded": [
+    "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q"
+  ],
+  "first_ledger": 40000000,
+  "first_time": "2018-08-01T10:00:00Z",
+  "last_ledger": 98999000,
+  "last_time": "2026-11-08T11:00:00Z",
+  "windows": {
+    "24h": {
+      "start": "2026-11-07T12:00:00Z",
+      "end": "2026-11-08T12:00:00Z",
+      "issued": "1500",
+      "redeemed": "250.5",
+      "clawed_back": "0",
+      "transferred": "98000.25",
+      "transfers": 412,
+      "changes": 1031,
+      "unknown_before": 0,
+      "exchanged": "45000",
+      "trades": 87,
+      "exchanged_through": "2026-11-08T11:00:00Z"
+    },
+    "7d": {
+      "start": "2026-11-01T12:00:00Z",
+      "end": "2026-11-08T12:00:00Z",
+      "issued": "1500",
+      "redeemed": "250.5",
+      "clawed_back": "0",
+      "transferred": "98000.25",
+      "transfers": 412,
+      "changes": 1031,
+      "unknown_before": 0,
+      "exchanged": "45000",
+      "trades": 87,
+      "exchanged_through": "2026-11-08T11:00:00Z"
+    },
+    "30d": {
+      "start": "2026-10-09T12:00:00Z",
+      "end": "2026-11-08T12:00:00Z",
+      "issued": "1500",
+      "redeemed": "250.5",
+      "clawed_back": "0",
+      "transferred": "98000.25",
+      "transfers": 412,
+      "changes": 1031,
+      "unknown_before": 0,
+      "exchanged": "45000",
+      "trades": 87,
+      "exchanged_through": "2026-11-08T11:00:00Z"
+    }
+  }
+}
+```
+
+Errors: 400 the path's (`invalid currency`, `XRP cannot have an issuer`, `invalid issuer address`, `invalid mpt issuance id`,
+`issuer does not match mpt issuance`), `invalid ripple address`, `too many addresses to exclude`, the ledger's; 404
+`token history is not built yet`, `token not found`; 500 `unable to retrieve token summary`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{token}/supply`
+
+The token over time.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `interval` | `day` | `hour`, `day` (UTC) or `ledger`. |
+| `start`, `end` | the token's first change, now | The window; `end` is inclusive at its granularity. |
+| `descending` | false | |
+| `limit` | 200 (max 1000) | |
+| `marker` | | The start of the last bucket, or the last ledger. |
+| `exclude` | | As above. |
+| `format` | json | `csv`: file `<code or currency> <issuer> - supply.csv`; with `exclude`, three columns `without_excluded.supply`, `.holders` and `.trust_lines`. |
+
+By `hour` or `day`, every bucket of the window: the levels at its end, carried forward through buckets without a change, with
+`ledger_index` the newest change they are as of, and the flows in it (`net` is `issued − redeemed − clawed_back`, signed). By `ledger`,
+every ledger with a change of the token, the levels after it; the window is at most 100,000 ledgers, else 400
+`window too large for interval ledger`. With `exclude`, every row has `without_excluded`.
+
+Keys of the supply answer, in order: `result, coverage, ledger_index, close_time, interval, excluded?, count, marker?, rows`.
+
+Keys of a supply row, in order: `time, ledger_index, supply, holders, trust_lines, issued, redeemed, clawed_back, net, unknown_before, without_excluded?`.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 99000000,
+  "close_time": "2026-11-08T12:00:00Z",
+  "interval": "day",
+  "excluded": [
+    "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q"
+  ],
+  "count": 1,
+  "marker": "WzE3NjI1NjAwMDBd",
+  "rows": [
+    {
+      "time": "2026-11-07T00:00:00Z",
+      "ledger_index": 98980000,
+      "supply": "1250000.5",
+      "holders": 1204,
+      "trust_lines": 1530,
+      "issued": "1500",
+      "redeemed": "250.5",
+      "clawed_back": "0",
+      "net": "1249.5",
+      "unknown_before": 0,
+      "without_excluded": {
+        "supply": "250000.5",
+        "holders": 1203,
+        "trust_lines": 1529
+      }
+    }
+  ]
+}
+```
+
+Errors: 400 the path's, `invalid interval - use: day, hour, ledger`, `invalid start date format`, `invalid end date format`,
+`invalid marker`, `invalid ripple address`, `too many addresses to exclude`, `window too large for interval ledger` (after the window's
+ledgers are read); 404 `token history is not built yet`, `token not found`; 500 `unable to retrieve token supply`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{token}/flows`
+
+What was issued, redeemed, clawed back and transferred in a window, by period, and the holders that moved the most.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | required | The window; `end` is inclusive at its granularity. At most 366 days, 31 by the hour, else 400 `window too large`. |
+| `interval` | `day` | `hour`, `day` or `month` (UTC). |
+| `counterparties` | 10 (max 100) | |
+
+`totals` and every period of the window, the empty ones included. `exchanged` and `trades` are present only when the DEX history has
+every hour of the window, in the totals (with `exchanged_through`) and in every period; otherwise they are left out, never given as part
+of the window. `counterparties` are the holders with the largest `received + sent` in the window, then by account: what their lines rose
+and fell by over their changes whose earlier state is known, and the number of their changes. No CSV, no pagination.
+
+Keys of the flows answer, in order: `result, coverage, ledger_index, close_time, start, end, interval, totals, periods, counterparties`.
+
+Keys of the totals, in order: `issued, redeemed, clawed_back, transferred, transfers, unknown_before, exchanged?, trades?, exchanged_through?`.
+
+Keys of a period, in order: `start, issued, redeemed, clawed_back, transferred, transfers, unknown_before, exchanged?, trades?, exchanged_through?`.
+
+Keys of a counterparty, in order: `account, received, sent, net, changes`.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 99000000,
+  "close_time": "2026-11-08T12:00:00Z",
+  "start": "2026-10-01T00:00:00Z",
+  "end": "2026-11-01T00:00:00Z",
+  "interval": "day",
+  "totals": {
+    "issued": "1500",
+    "redeemed": "250.5",
+    "clawed_back": "0",
+    "transferred": "98000.25",
+    "transfers": 412,
+    "unknown_before": 0,
+    "exchanged": "45000",
+    "trades": 87,
+    "exchanged_through": "2026-11-01T00:00:00Z"
+  },
+  "periods": [
+    {
+      "start": "2026-10-01T00:00:00Z",
+      "issued": "1500",
+      "redeemed": "250.5",
+      "clawed_back": "0",
+      "transferred": "98000.25",
+      "transfers": 412,
+      "unknown_before": 0
+    }
+  ],
+  "counterparties": [
+    {
+      "account": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "received": "5000",
+      "sent": "7500.25",
+      "net": "-2500.25",
+      "changes": 31
+    }
+  ]
+}
+```
+
+Errors: 400 the path's, `invalid start date format`, `invalid end date format` (each also for a missing date),
+`invalid interval - use: day, hour, month`, `window too large`; 404 `token history is not built yet`, `token not found`; 500
+`unable to retrieve token flows`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{token}/distribution`
+
+How the supply is spread over the holders at a ledger. Parameters: the ledger, `exclude`. No CSV.
+
+`buckets` are one per power of ten from the smallest holding to the largest, the empty ones between included: `min` inclusive and `max`
+exclusive, as text (an MPT in raw units), with the `holders` in it and their `balance`. `top` is the sum of the largest 10 and 100
+holdings with their `share` of the supply (exact, rounded half up to 6 decimals, as D6's `share`). With `exclude`, `without_excluded` has
+the same figures without those holders, with buckets and a top of its own.
+
+Keys of the distribution answer, in order: `result, coverage, ledger_index, close_time, supply, holders, buckets, top, excluded?, without_excluded?`.
+
+Keys of a bucket, in order: `min, max, holders, balance`.
+
+Keys of an entry of top, in order: `balance, share`.
+
+Keys of the without_excluded of the distribution, in order: `supply, holders, trust_lines, buckets, top`.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 99000000,
+  "close_time": "2026-11-08T12:00:00Z",
+  "supply": "1250000.5",
+  "holders": 1204,
+  "buckets": [
+    {
+      "min": "0.1",
+      "max": "1",
+      "holders": 3,
+      "balance": "1.5"
+    },
+    {
+      "min": "1",
+      "max": "10",
+      "holders": 0,
+      "balance": "0"
+    }
+  ],
+  "top": {
+    "10": {
+      "balance": "1200000",
+      "share": "0.959999"
+    },
+    "100": {
+      "balance": "1250000.5",
+      "share": "1.000000"
+    }
+  },
+  "excluded": [
+    "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q"
+  ],
+  "without_excluded": {
+    "supply": "250000.5",
+    "holders": 1203,
+    "trust_lines": 1529,
+    "buckets": [
+      {
+        "min": "0.1",
+        "max": "1",
+        "holders": 3,
+        "balance": "1.5"
+      }
+    ],
+    "top": {
+      "10": {
+        "balance": "200000",
+        "share": "0.799998"
+      },
+      "100": {
+        "balance": "250000.5",
+        "share": "1.000000"
+      }
+    }
+  }
+}
+```
+
+Errors: 400 the path's, `invalid ripple address`, `too many addresses to exclude`, the ledger's; 404 `token history is not built yet`,
+`token not found`; 500 `unable to retrieve token distribution`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{token}/snapshot`
+
+Every holder of the token at a ledger, with a digest of the whole set. **A ledger is required**: 400 `a ledger is required` before any
+other check of the ledger.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `ledger_index`, `ledger_hash`, `date` | required | The ledger, as above. |
+| `limit` | 1000 (max 10,000) | |
+| `marker` | | |
+| `exclude` | | As above: the figures and `without_excluded`, never the digest. |
+| `format` | json | `csv`: file `<code or currency> <issuer> - snapshot <ledger_index>.csv`. |
+
+The holders (a balance above 0) by address, in byte order. `balance` is the served text, for an MPT `amount + escrowed` with `escrowed`
+beside it. `digest` is the lower-case hex SHA-256 of the UTF-8 text of one line `<holder>,<balance>\n` per holder of the whole set, in
+that order: the same on every page and whatever `exclude` says, so that any page can be checked against the whole and the whole against
+an independent recount. A ledger before the token's first change is an empty snapshot, not a 404.
+
+Keys of the snapshot answer, in order: `result, coverage, ledger_index, ledger_hash, close_time, token, supply, holders, trust_lines, digest, without_excluded?, excluded?, count, marker?, balances`.
+
+Keys of a balance, in order: `holder, balance, escrowed?, limit, frozen, authorized`.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 99000000,
+  "ledger_hash": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB",
+  "close_time": "2026-11-08T12:00:00Z",
+  "token": {
+    "currency": "USD",
+    "issuer": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq",
+    "kind": "issued",
+    "code": "USD"
+  },
+  "supply": "1250000.5",
+  "holders": 1204,
+  "trust_lines": 1530,
+  "digest": "7026d968e9ec57f2fee6c54aefb39a9a9ba0124f6900af79799c4e003c0dc589",
+  "without_excluded": {
+    "supply": "250000.5",
+    "holders": 1203,
+    "trust_lines": 1529
+  },
+  "excluded": [
+    "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q"
+  ],
+  "count": 1,
+  "marker": "WyJyTXdqWWVkamM3cXF0S1lWTGlBY2NKU21Dd2loNExuRTJxIl0",
+  "balances": [
+    {
+      "holder": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
+      "balance": "1000000",
+      "limit": "1000000000",
+      "frozen": false,
+      "authorized": false
+    }
+  ]
+}
+```
+
+Errors: 400 the path's, `a ledger is required`, `invalid marker`, `invalid ripple address`, `too many addresses to exclude`, the
+ledger's; 404 `token history is not built yet`, `token not found`; 500 `unable to retrieve token snapshot`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### What the token history changes on `GET /v2/tokens/{currency}.{issuer}/holders`
+
+Once a generation of the token history is live, [D6's route](#get-v2tokenscurrencyissuerholders) reads it instead of the tokens job's
+lines: its path, parameters, messages and keys stay, and it gains the ledger parameters, `descending` (default true; `false` gives the
+smallest balances first), the issuance ID form of the path, and three keys at the end of a row. The order is the exact order of the
+balances, then the address; `rank` is the place in the largest-first order over the whole set, whatever the page and the direction. The
+marker holds the holder and the balance text, so a marker of the earlier answer (a number first) is 400 `invalid marker` once, after the
+switch. Before the first build the route is D6's, and a ledger parameter, or an issuance ID, is 404 `token history is not built yet`.
+
+Keys of the keys a holder gains, in order: `first_ledger, last_ledger, escrowed?`.
+
+Keys of a holder from the token history, in order: `rank, holder, balance, share, limit, frozen, authorized, first_ledger, last_ledger, escrowed?`.
+
+`first_ledger` is the start of the holder's current run of holding (its first change that made the line count after the newest that
+made it stop), `last_ledger` its newest change, and `escrowed` an MPT holder's escrowed part.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 99000000,
+  "close_time": "2026-11-08T12:00:00Z",
+  "supply": "1250000.5",
+  "count": 2,
+  "marker": "WyJyTXdqWWVkamM3cXF0S1lWTGlBY2NKU21Dd2loNExuRTJxIiwiMTAwIl0",
+  "holders": [
+    {
+      "rank": 1,
+      "holder": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
+      "balance": "1000000",
+      "share": "0.799999",
+      "limit": "1000000000",
+      "frozen": false,
+      "authorized": false,
+      "first_ledger": 80000000,
+      "last_ledger": 98999000
+    }
+  ]
+}
+```
 
 ## MPT
 

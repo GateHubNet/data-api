@@ -17,10 +17,11 @@ The source of truth is the migration files of [`packages/shared/schema/`](../pac
 [`014_issued_tokens.sql`](../packages/shared/schema/014_issued_tokens.sql) and
 [`015_supply.sql`](../packages/shared/schema/015_supply.sql) and
 [`016_validator_toml_details.sql`](../packages/shared/schema/016_validator_toml_details.sql) and
-[`017_mpt.sql`](../packages/shared/schema/017_mpt.sql) (applied in file-name order, per network
+[`017_mpt.sql`](../packages/shared/schema/017_mpt.sql) and
+[`019_token_history.sql`](../packages/shared/schema/019_token_history.sql) (applied in file-name order, per network
 database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **85 tables** per network database, in fourteen groups:
+enum: queries use `${Table.X}`, never string literals). **92 tables** per network database, in fifteen groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
@@ -35,6 +36,7 @@ enum: queries use `${Table.X}`, never string literals). **85 tables** per networ
 | Issued tokens (3, migration 014) | `token_generations`, `token_lines`, `tokens` | the `aggregator` worker (job `tokens`) |
 | Supply (1, migration 015) | `network_supply` | the `aggregator` worker (job `supply`) |
 | MPT aggregates (2, migration 017) | `mpt_issuances`, `mpt_holders` | the `aggregator` worker (job `mpt_state`) |
+| Token history (7, migration 019) | `token_holder_changes`, `token_checkpoints`, `token_checkpoint_heads`, `token_hourly`, `token_hourly_dex`, `token_history_state`, `token_history_dirty` | the `token_history` worker (the head, repairs, the catch-up and promotion of a build, the live DEX hours) and the operator's `token-history-build` command (the build of a generation); the `aggregator` worker appends the ranges of `token_history_dirty` |
 | Operator-written (1, migration 009) | `account_network_names` | the operator, by hand, with plain SQL inserts ([operations](operations.md#name-an-account-on-one-network)) |
 | Internal (4) | `ingest_log`, `agg_dirty`, `nft_dirty` (migration 011), `syncer_lease` | the syncer |
 | Exports (1, migration 010) | `export_jobs` | the api (`queued`) and the exporter (`running`, `done`, `failed`) |
@@ -68,6 +70,8 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 | `token_lines` and `tokens` (migration 014) | `ReplacingMergeTree(version)` | **`generation`** | A generation is built whole beside the live one and swapped in, and a retired one is dropped as a partition |
 | `network_supply` (migration 015) | `ReplacingMergeTree(version)` | none | One row per snapshot of the supply, about 24 a day and no TTL; the newest `version` of a `ledger_index` wins |
 | `mpt_issuances` and `mpt_holders` (migration 017) | `ReplacingMergeTree(version)` | none | A row per issuance and per `MPToken` ever made; the newest `version` of a key wins |
+| The four generation tables of the token history (migration 019): `token_holder_changes`, `token_checkpoints`, `token_checkpoint_heads`, `token_hourly` | `ReplacingMergeTree` (`token_hourly`: `ReplacingMergeTree(version)`) | **`generation` first**: `(generation, intDiv(ledger_index, 10000000))`, `(generation, intDiv(checkpoint_ledger, 10000000))`, `generation` and `(generation, toYear(hour))` | A generation is built beside the live one, and a retired one is dropped as partitions; a repair deletes inside one partition |
+| `token_hourly_dex`, `token_history_state` and `token_history_dirty` (migration 019) | `ReplacingMergeTree(version)` (`token_history_dirty`: `ReplacingMergeTree(created_at)`) | `toYear(hour)` for `token_hourly_dex`, none for the other two | No generation: the DEX hours depend neither on the coverage nor on the token rules; the other two are small |
 | `fee_stats` | `MergeTree` | `toYYYYMM(ts)` | Append-only samples |
 | `account_network_names` (migration 009) | `MergeTree` | none | Append-only, the operator's history; small |
 | The nine tables of migration 003 | `ReplacingMergeTree(version)` | `toYear(day)` for the rates and the account rollups, `toDate(hour)` for `pair_hourly` (TTL 45 days, `ttl_only_drop_parts = 1`), none for the others | Recomputable aggregates written as complete sets; a year of days is a small partition, an hour table expires by whole days |
@@ -83,7 +87,9 @@ recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule))
 [its section](#account_domains-p7-order-by-account-migration-012), and [ADR-0007](adr/0007-ledger-index-axis-and-secondary-tables.md)
 for the rule it departs from. The 40 ledger-derived tables carry
 `non_replicated_deduplication_window = 1000` so that a retried insert with the same `insert_deduplication_token` is dropped; the
-two collector tables `validator_validations` and `validator_seen` (not ledger tables) carry a window of 100 for the same reason. The nine tables of
+two collector tables `validator_validations` and `validator_seen` (not ledger tables) carry a window of 100 for the same reason, and
+`token_holder_changes` (migration 019, not a ledger table) a window of 1000: its batches are written under dedup tokens, and a retried one must not count
+twice. The nine tables of
 migration 003 have no window: a set is written whole under a new `version`, so a retry is idempotent without one.
 There are no projections (they conflict with lightweight `DELETE`) and no materialized views.
 
@@ -702,6 +708,32 @@ Two tables, both `ReplacingMergeTree(version)` with no partition, **recomputable
 - `mpt_issuances` (`ORDER BY mpt_issuance_id`): the current state of each issuance. Columns: `mpt_issuance_id`, `issuer` and `sequence` (from the ID), `state_known` (`UInt8`, 0 when `mpt_issuance_states` has no row of it in the coverage), `flags`, `asset_scale`, `maximum_amount` (`Nullable`), `outstanding_amount`, `escrowed_amount` (the node's `LockedAmount`), `locked_amount` (what the issuer has locked: `outstanding_amount` when `lsfMPTLocked`, else the sum of the locked holders' `amount`), `locked_holders` (`holders` when `lsfMPTLocked`, else the holders with `lsfMPTLocked`), `holders` (those with `amount + escrowed_amount > 0`), `transfer_fee`, `metadata_hex`, `metadata` (the decoded object as JSON, `''` when the hex is not a JSON object), `metadata_conforms` (`UInt8`), `ticker` and `name` (from the metadata, cut to 16 and 128 characters, `''` when none), `created_ledger`, `created_time` and `created_tx_hash` (`Nullable`, `NULL` when the `MPTokenIssuanceCreate` is outside the coverage), `last_ledger` (the newest touch this row has seen), `destroyed` and `version`.
 - `mpt_holders` (`ORDER BY (mpt_issuance_id, holder)`): the current balance of each holder of each issuance, recomputed per touched pair. Columns: `mpt_issuance_id`, `holder`, `amount`, `escrowed_amount`, `flags`, `last_ledger`, `deleted` (`UInt8`, 1 when the `MPToken` was deleted: the holder opted out) and `version`.
 
+### Token history (migration 019)
+
+Seven tables, **derived** from `trust_line_states` and `mpt_holder_states` and written by the syncer's `token_history` worker (the head, the repairs, the
+catch-up and promotion of a build, the live DEX hours) and by the operator's `token-history-build` command (the build of a generation)
+([syncer](syncer.md#8b-the-token_history-worker), [spec](superpowers/specs/2026-11-08-issuer-analytics-design.md), [ADR-0021](adr/0021-token-history-in-clickhouse.md)).
+None is a ledger table: none is in `CHILD_TABLES` or `LEDGER_KEYED_TABLES`, so ingest recovery, `--reprocess` and the retention never delete from them; a
+re-ingest reaches them through `token_history_dirty`. A **generation** is one build of the token history, on one coverage start (`coverage_from`: the first
+ledger of the newest unbroken run of stored ledgers that reaches the head, never below the state coverage start) and one `TOKEN_HISTORY_CONFIG_VERSION` (1).
+The four **generation tables** (`token_holder_changes`, `token_checkpoints`, `token_checkpoint_heads`, `token_hourly`) carry `generation` first in their
+partition key, so a retired generation is dropped as partitions (`ALTER TABLE ... DROP PARTITION ID`) and a repair deletes inside one partition. A token is
+`(issuer, currency)`; an MPT is its issuance ID as `currency` and the issuer the ID holds as `issuer`, as the other tables keep it. Amounts are exact decimal
+text: an issued token's as the ledger writes them, an MPT's in integer units with the escrowed part included, never scaled. **`through_ledger` and
+`levels_through` of a generation's state row are the commit marker of the token history: no reader reads past the live generation's `levels_through`.**
+Readers of the generation tables name one generation (`generation = {g:UInt32}`); every reader starts from the token's prefix of the key, reads a row stored twice
+once (`LIMIT 1 BY` its key, the newest `version` first where there is one, or an `argMax` that a duplicate does not change), and never uses `FINAL` ([clickhouse](clickhouse.md#the-token-history-reads)).
+
+| Table | Key | Contents | Used by |
+| --- | --- | --- | --- |
+| `token_holder_changes` | `ORDER BY (issuer, currency, ledger_index, tx_index, node_index, holder)`, `PARTITION BY (generation, intDiv(ledger_index, 10000000))`, `non_replicated_deduplication_window = 1000` | The **change log**: a row for each node of a transaction that changed a line or an MPT balance for a token while the line counted before or after it (`counted_before`, `counted_after`). `close_time`; `clawback` (1 in a `Clawback` or `AMMClawback`); `amount_before` and `amount_after` (the holder's amount, `'0'` when the line does not count); `before_known` (0 on a line's first row when its earlier state is not known: in a coverage that does not reach the network's first ledger, every line's first row in it, as `trust_line_states` keeps no node type that would tell a creation); the state after, from the token's side (`limit`, `frozen`, `authorized`, `escrowed`: `'0'` for an issued token); and the order key of `amount_after` (`order_exp Int16`, `order_mant UInt64`: an issued amount's exponent and its mantissa normalised to `[10^15, 10^16)`, 0 as `(-32768, 0)`, an MPT amount as `(0, amount)`). One node can be a change of two tokens; `holder` keeps their keys apart | the worker, the build, every read |
+| `token_checkpoints` | `ORDER BY (issuer, currency, checkpoint_ledger, holder)`, `PARTITION BY (generation, intDiv(checkpoint_ledger, 10000000))` | A row for each counting line of a token at the end of `checkpoint_ledger`: `amount`, `escrowed`, `limit`, `frozen`, `authorized`, `order_exp`, `order_mant`, `first_ledger` (the start of the line's current run of counting) and `last_ledger` (its newest change). A token gets one when its changes since the last (or since its first) reach `max(its trust lines, TOKEN_HISTORY_CHECKPOINT_FLOOR)` (50,000), so the checkpoints never hold more rows than the change log | the fold of the holders at a ledger |
+| `token_checkpoint_heads` | `ORDER BY (issuer, currency, checkpoint_ledger)`, `PARTITION BY generation` | A row for each checkpoint, written **after** its rows (it is the checkpoint's commit marker: a reader reaches rows only through a head): `supply` (text), `holders`, `trust_lines` and `changes_since` (`UInt64`, the changes since the previous checkpoint), and the token's `first_ledger`. A token with no head at or before a ledger has an empty checkpoint at 0 | the fold, the totals |
+| `token_hourly` | `ORDER BY (issuer, currency, hour)`, `ReplacingMergeTree(version)`, `PARTITION BY (generation, toYear(hour))` | A row for each token and UTC hour with a change, written whole under a `version` above the key's newest: the **levels** at the end of the hour (`supply` text, `holders`, `trust_lines` `UInt64`), the **flows** of the hour (`issued`, `redeemed`, `clawed_back`, `transferred` text; `transfers`, `changes`, `unknown_before` `UInt32`), the hour's `first_ledger` and `last_ledger` with a change, and `final` (`UInt8`: whether the hour had ended when the row was written; a row is not written again when its hour ends without another change, so a reader takes an hour as final once the generation's `through_ledger` closes in a later hour) | the series, the windows of the summary and the flows, an issuer's tokens |
+| `token_hourly_dex` | `ORDER BY (issuer, currency, hour)`, `ReplacingMergeTree(version)`, `PARTITION BY toYear(hour)`, **no generation** | A row for each token and UTC hour with trades: `exchanged` (text, the token's amounts on either side of the pair, order-book trades and AMM swaps) and `trades` (`UInt32`). The hour's **sentinel** (`issuer = ''`, `currency = ''`) is written after the hour's rows, under the same `version`, and carries `config_version`: a missing row means no trades only where the sentinel exists, and a row counts only when its `version` is at least its hour's sentinel's | the DEX figures of the summary and the flows |
+| `token_history_state` | `ORDER BY generation`, `ReplacingMergeTree(version)`, no partition | A row for every change of a generation's state, the newest `version` of a `generation` its state (as `token_generations`): `state` (`Enum8`: `building`, `live`, `retired`), `config_version UInt16`, `coverage_from`, `h0` (the commit marker when the build started), `h1` (the ledger the build's levels are made up to), `phase` (`Enum8`: `changes`, `mpt_changes`, `levels`, `dex`, `done`) with its cursors `account_cursor`, `token_cursor_issuer`, `token_cursor_currency`, `through_ledger` (every change up to it is written), `levels_through` (every level and checkpoint up to it is written), `started_at` and `changed_at` (`DateTime64(3, 'UTC')`) and `version` (the server's clock in milliseconds, above every version stored). The live generation is the highest whose newest row is `live`. Each writer patches only its own fields, copying the others from the newest row in the same statement | the worker, the build, every read |
+| `token_history_dirty` | `ORDER BY (from_ledger, to_ledger)`, `ReplacingMergeTree(created_at)`, no partition | The ledger ranges a re-ingest rewrote (`from_ledger`, `to_ledger UInt32`, `created_at DateTime64(3, 'UTC')`), appended by the aggregator's eighth `agg_dirty` hook and deleted by the worker once repaired, dropped or covered by a promoted build, as `nft_dirty` is for NFTs | the aggregator, the worker |
+
 ## 4. Relationships
 
 ```
@@ -725,6 +757,9 @@ Two tables, both `ReplacingMergeTree(version)` with no partition, **recomputable
  genesis_mints + imports + reward_claims (Xahau mints, by ledger slice) + ledgers (fee_total, total_coins) + escrows + amm_pools + account_states + network_state ──▶ network_supply (one row per snapshot)
  mpt_issuance_states (issuance prefix), mpt_holder_states (holder prefix)  ◀── mpt_touches (ledger order: which issuances and holders, since when);  mpt_touches + mpt_holder_states ──▶ mpt_holders ──▶ mpt_issuances (+ mpt_issuance_states)
  mpt_transfers (ledger order: the token list's 24 h counts)  ──▶ mpt_issuance_transfers (copy by issuance, /v2/mpt/{issuanceId}/transfers)
+ trust_line_states + mpt_holder_states (per-line prefixes)  ◀── state_touches, mpt_touches (ledger order: which lines and pairs, since when);  those + tx_by_type (Clawback, AMMClawback) ──▶ token_holder_changes (per generation, in token order)
+ token_holder_changes ──▶ token_checkpoints (rows, then their token_checkpoint_heads), token_hourly (hour sets);  holders at N = the newest head at or before N + its rows + the changes after it
+ pair_hourly (final hours) + exchanges (the hours before them) ──▶ token_hourly_dex (rows, then the hour's sentinel);  token_history_state (each generation's state and the commit marker);  agg_dirty slices ──▶ token_history_dirty (re-ingest ranges)
  exchanges ──▶ native_rates_daily, pair_hourly ──▶ markets_live;  balance_changes + account_transactions + account_exchanges ──▶
  account_lines_daily / account_tx_daily / account_trades_daily (heavy accounts only; sentinels in account_rollup_days)
 ```
@@ -762,6 +797,7 @@ The files so far:
 | `015_supply.sql` | Four `CREATE TABLE IF NOT EXISTS` statements, nothing else: the ledger-derived Xahau mint tables `genesis_mints`, `imports` and `reward_claims` (written from parser version 9, `MINT_PARSER_VERSION`, and empty on XRPL) and the `network_supply` aggregate of the `supply` job. Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. Required before a syncer with parser version 9 (on Xahau that syncer's inserts fail without the three ledger tables) and before the API serves the supply routes |
 | `016_validator_toml_details.sql` | One `ALTER TABLE validator_domains` that adds `owner_country`, `server_country`, `toml_network`, `toml_unl` and `toml_version`, each `IF NOT EXISTS`. Additive. The syncer's `validators` worker refuses to boot without the five columns, and the api's validators routes read them, so `migrate` runs first, then the syncer, then the api. |
 | `017_mpt.sql` | Seven `CREATE TABLE IF NOT EXISTS` statements, nothing else: the ledger-derived `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers` (written from parser version 10, `MPT_PARSER_VERSION`, and empty on Xahau) and the `mpt_issuances` and `mpt_holders` aggregates of the `mpt_state` job. Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. Required before a syncer with parser version 10 (on XRPL and XRPL Testnet an insert into a missing table fails the batch, whenever a ledger has MPT rows: a syncer with the `ingest` worker refuses to boot without the five ledger tables, and one with the `aggregator` worker without the tables the `mpt_state` job reads and writes, on every network, as the schema is one) and before the api (the MPT routes answer 500 until the tables exist) |
+| `019_token_history.sql` | Seven `CREATE TABLE IF NOT EXISTS` statements, nothing else: the token history's `token_holder_changes`, `token_checkpoints`, `token_checkpoint_heads`, `token_hourly`, `token_hourly_dex`, `token_history_state` and `token_history_dirty` (none of them a ledger table). Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. 018 is the number of the destination-tag change (#26); the runner applies whatever files there are in file-name order, so the gap is harmless. Required before a syncer with the `token_history` worker (it refuses to boot without the seven tables and the tables it reads, `state_touches`, `trust_line_states`, `mpt_touches`, `mpt_holder_states`, `tx_by_type` and `pair_hourly`: `lacks the schema of 019_token_history.sql`) or with the `aggregator` worker (its eighth hook writes `token_history_dirty`, and the boot checks for it), before `token-history-build`, and before the api of this release (the token history routes read the tables, and D6's `/v2/tokens/{token}/holders` reads `token_history_state` first to choose its source) |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are
@@ -775,7 +811,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox run --
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 
-To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`, `011_nft_data.sql`, `012_display_names.sql`, `013_ledger_objects.sql`, `014_issued_tokens.sql`, `015_supply.sql`, `016_validator_toml_details.sql`, `017_mpt.sql`). A database created by the
+To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`, `011_nft_data.sql`, `012_display_names.sql`, `013_ledger_objects.sql`, `014_issued_tokens.sql`, `015_supply.sql`, `016_validator_toml_details.sql`, `017_mpt.sql`, `019_token_history.sql`). A database created by the
 earlier stack (`001_tables.sql` / `002_materialized_views.sql`) cannot be migrated: recreate it (`docker compose down -v` for
 local volumes).
 
@@ -796,6 +832,11 @@ local volumes).
 - `network_supply` (migration 015) is not a ledger table either, so no ledger retention touches it: it is kept (about 24 rows a day, no TTL). The three mint
   tables of migration 015 are ledger tables and go with the rest of a dropped ledger block.
 - `mpt_issuances` and `mpt_holders` (migration 017) are not ledger tables either, so no ledger retention touches them. The five MPT tables of migration 017 are ledger tables and go with the rest of a dropped ledger block.
+- The seven tables of the token history (migration 019) are not ledger tables either, so no ledger retention touches them. The `token_history` worker drops
+  the partitions of a retired generation from the four generation tables 15 minutes after it was retired, and keeps `token_history_state` (a row for
+  each change of a generation), `token_hourly_dex` (no generation) and `token_history_dirty` (emptied by the repairs). On XRPL the change log is planned at 1 to
+  3.5 billion rows of 60 to 90 bytes (60 to 315 GB; synthetic rows measured 31.7 bytes, a floor) and the whole token history at 70 to 350 GB, twice the
+  generation tables while a build exists beside the live generation ([operations](operations.md#the-token-history)).
 - Rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and `fee_stats` are small; keep them.
 - `export_jobs` expires by TTL 7 days after a job was created, as its file does (a lifecycle rule of the bucket).
 

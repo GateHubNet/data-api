@@ -194,7 +194,9 @@ Production compose (`docker-compose.prod.yaml`):
 - **Dev compose:** everything is published on `127.0.0.1` only, and the dev API key is `dev-api-key`.
 - **ClickHouse users:** a dedicated `data_api` user (access management enabled), not `default`. The api and the syncers share it
   (full access); a read-only user for the api would be better. **A narrower user for the syncer still needs `ALTER DELETE` on `token_lines` and `tokens`** (the privilege that `ALTER TABLE ... DROP PARTITION` asks for): the `tokens` job drops the
-  partitions of a retired generation (the number is made by the job and checked as an integer, the one statement that takes no bound parameter; [clickhouse](clickhouse.md), [syncer](syncer.md#the-tokens-job)), and on `mpt_holders` and `mpt_issuances` for the `DELETE` of the `mpt_state` job, whose values are bound.
+  partitions of a retired generation (the number is made by the job and checked as an integer, the one statement that takes no bound parameter; [clickhouse](clickhouse.md), [syncer](syncer.md#the-tokens-job)), and on `mpt_holders` and `mpt_issuances` for the `DELETE` of the `mpt_state` job, whose values are bound. Since migration 019 it also needs it on the four generation tables of the token history (`token_holder_changes`, `token_checkpoints`,
+  `token_checkpoint_heads`, `token_hourly`: the `token_history` worker drops a retired generation's partitions and deletes the rows a repair rewrites)
+  and on `token_history_dirty` ([clickhouse](clickhouse.md)).
 
 ### Outbound HTTPS to arbitrary public hosts (syncer)
 

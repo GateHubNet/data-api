@@ -30,12 +30,13 @@ no `GH_CLICKHOUSE_DATABASE`, so each network's database is the name its profile 
 | Account network names | `INSERT INTO xrpl.account_network_names ...` (or `xahau.`), shows within 60 s on that network only: [Name an account on one network](#name-an-account-on-one-network) |
 | Labels | `INSERT INTO shared.account_labels ...`, shows within 60 s: [Label an address](#label-an-address) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
-| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `nft_state`, `escrows`, `pair_hourly`, `markets_live`, `tokens`, `stats_live`, `stats_dirty`, `mpt_state`, `amm_daily`, `nft_collections`, `rates_daily`, `account_rollups`, `volume_backfill`, `supply`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`, `tokens_dirty`, `mpt_state_dirty`) |
+| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `nft_state`, `escrows`, `pair_hourly`, `markets_live`, `tokens`, `stats_live`, `stats_dirty`, `mpt_state`, `amm_daily`, `nft_collections`, `rates_daily`, `account_rollups`, `volume_backfill`, `supply`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`, `tokens_dirty`, `mpt_state_dirty`, `token_history_dirty`) |
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
 | NFT data | `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending`, `syncer_nft_skipped_total`, the `nft_state` / `nft_state_dirty` / `nft_collections` error labels, [the NFT data](#the-nft-data) |
 | Ledger objects | `syncer_escrows_lag_ledgers`, `syncer_escrows_open`, `syncer_objects_unclassified_total`, the `escrows` / `escrows_dirty` error labels; the rollout and the re-ingest: [Ledger objects and delegation](#ledger-objects-and-delegation) |
 | Issued tokens | `syncer_tokens_live`, `syncer_tokens_lag_ledgers`, `syncer_tokens_building`, `syncer_tokens_repair_ledgers`, the `tokens` / `tokens_dirty` error labels; the rollout, the first build and the runbook: [Issued tokens](#issued-tokens) |
 | MPT state | `syncer_mpt_state_lag_ledgers`, the `mpt_state` / `mpt_state_dirty` error labels: [The MPT state job](#the-mpt-state-job) |
+| Token history | `syncer_token_history_lag_ledgers`, `syncer_token_history_rebuild_needed{reason}`, `syncer_token_history_building{phase}`, `syncer_token_history_errors_total{step}`, the `token_history_dirty` error label; the rollout, `token-history-build` and `token-history-check`: [The token history](#the-token-history) |
 | Supply | `syncer_supply_snapshot_age_seconds`, `syncer_supply_cycle_seconds`, `syncer_parser_anomalies_total{kind}`, the `supply` error label; reading the newest row and the re-ingests: [Supply snapshots](#supply-snapshots) |
 | Display names | `syncer_tomls_due`, `syncer_tomls_domains{status}`, `syncer_tomls_checks_total{outcome}`, `syncer_tomls_discovery_seconds`; the rollout and the seed: [The display names](#the-display-names) |
 | Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
@@ -114,6 +115,7 @@ database without the three mint tables, and one with the `aggregator` worker aga
 on every network (on Xahau an insert into a missing mint table fails the batch and the `supply` job reads them; the check is the same on both networks, as the schema is). Run the migrate job first (the compose files do), then deploy the syncer, then the api (the supply routes answer 500 until the tables exist).
 **The `validators` worker needs migration `016_validator_toml_details.sql` applied before it starts, and the api after it.** The domain checker reads and writes the five columns it adds to `validator_domains`, and every validators route of the api reads them, so a syncer with the `validators` worker refuses to boot without them (`lacks the schema of 016_validator_toml_details.sql`), and those routes answer 500 until they exist. Run the migrate job first (the compose files do), then deploy the syncer, then the api.
 **The ingest and the aggregator need migration `017_mpt.sql` applied before a syncer with parser version 10 starts, and the api after it.** That syncer writes `mpt_issuance_states`, `mpt_holder_states`, `mpt_touches`, `mpt_transfers` and `mpt_issuance_transfers` on XRPL and XRPL Testnet, whenever a ledger has MPT rows (on Xahau and Xahau Testnet there are none), and an insert into a missing table fails the batch, so the live runner would retry the same ledgers without end. The `mpt_state` job of the aggregator reads the five tables and writes `mpt_issuances` and `mpt_holders`. A syncer with the `ingest` worker therefore refuses to boot against a database without the five, and one with the `aggregator` worker without `mpt_touches`, the two state tables and the two aggregates: the message names the file and the tables (`lacks the schema of 017_mpt.sql`), on every network, since the schema is one. Run the migrate job first (the compose files do), then deploy the syncer, then the api (the MPT routes answer 500 until the tables exist).
+**The `token_history` worker and the aggregator need migration `019_token_history.sql` applied before they start, and the api after it.** The worker reads and writes its seven tables, and the aggregator's eighth hook writes `token_history_dirty`, so a syncer with the `token_history` worker refuses to boot without the seven (and the tables it reads), and one with the `aggregator` worker without `token_history_dirty` (`lacks the schema of 019_token_history.sql`). The api's token history routes read the tables, and `/v2/tokens/{token}/holders` reads `token_history_state` first to choose its source. Run the migrate job first (the compose files do), then deploy the syncer, then the api ([The token history](#the-token-history)).
 **The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,
 [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)), numbered from 001 and recorded in `shared.schema_migrations`. One job applies it
 for both networks, `dc run --rm migrate-shared` (the command `migrate.js shared`); never run it from two places at once. **It must run before an api
@@ -384,7 +386,7 @@ has not changed since that block, until its next change, and nothing can bring i
 whose rows of the block are dropped too. A `range-ingest` of the block later writes the same rows again (the same `version`), and `--reprocess` deletes and
 rewrites them as it does in every table.
 
-The rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and the issued token tables (`token_generations`, `token_lines`, `tokens`: [Retention of the token tables](#retention-of-the-token-tables)) and the MPT aggregates (`mpt_issuances`, `mpt_holders`: [Retention of the MPT tables](#retention-of-the-mpt-tables)) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats`, `validations`, the tables of the validators and amendments data (migration 002) and the account and market aggregates (migration 003) are independent: a dropped block reaches the aggregates only through `agg_dirty` when it is ingested again. A block dropped from the AMM tables and
+The rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and the issued token tables (`token_generations`, `token_lines`, `tokens`: [Retention of the token tables](#retention-of-the-token-tables)) and the MPT aggregates (`mpt_issuances`, `mpt_holders`: [Retention of the MPT tables](#retention-of-the-mpt-tables)) and the token history (migration 019: [Retention of the token history](#retention-of-the-token-history)) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats`, `validations`, the tables of the validators and amendments data (migration 002) and the account and market aggregates (migration 003) are independent: a dropped block reaches the aggregates only through `agg_dirty` when it is ingested again. A block dropped from the AMM tables and
 brought back by `range-ingest` marks `agg_dirty`, and the aggregator rebuilds the pools and days it covers.
 
 To **bring a dropped block back**, run `range-ingest` over the same range: with no `ledgers` rows left it ingests everything. To repair a **partial** loss (some tables
@@ -411,6 +413,8 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_tokens_lag_ledgers` | 0 to a few ledgers (0 also while no generation is live) | Above 300 for 15 minutes (alert, paired with `rate(syncer_aggregator_errors_total{job=~"tokens.*"}[15m])`): the live generation is not following the head, see [Issued tokens](#issued-tokens) |
 | `syncer_tokens_building` / `syncer_tokens_repair_ledgers` | 0 / 0 outside a build and a re-ingest | `building` 1 for days with the log's cursor not moving, or a log line every ten minutes saying the generation `was stale while it built`: a coverage start that keeps moving, finish the fill; `repair_ledgers` above 0 and not falling: a repair waiting for the replacement generation |
 | `syncer_mpt_state_lag_ledgers` | 0 to a few ledgers once caught up (0 also before its first run); climbing at about 20 a minute during a stats catch-up, when the job gets no budget | Above 300 for 15 minutes outside a catch-up (alert, with `increase(syncer_aggregator_errors_total{job=~"mpt_state.*"}[2h])`): see [The MPT state job](#the-mpt-state-job) |
+| `syncer_token_history_lag_ledgers` | 0 to a few ledgers once a generation is live (no sample before) | Above 30 for 10 minutes (alert, with `syncer_token_history_errors_total`): see [The token history](#the-token-history) |
+| `syncer_token_history_rebuild_needed{reason}` | no series | A series at 1: a build is due, for its `reason`; run `token-history-build` ([A forced rebuild](#a-forced-rebuild-of-the-token-history)). Not an alert |
 | `syncer_supply_snapshot_age_seconds` | up to about an hour plus the cycle (no series until the job has seen a snapshot) | Above 3 hours for 5 minutes outside a catch-up: see [Supply snapshots](#supply-snapshots) |
 | `syncer_parser_anomalies_total{kind="import_minted_negative"}` | 0 | Any rise: a Xahau `Import` came out below 0 minted drops, which the network cannot produce, and was stored as 0 |
 | `syncer_parser_anomalies_total{kind="mpt_unreadable"}` | 0 | Any rise: an MPT amount was not a `UInt64`, which the network cannot produce, and was stored as 0, or an MPT node had no ID that could be made and has no row |
@@ -1032,7 +1036,7 @@ block has no row left to rebuild it from, and drops out of the tokens it belonge
 
 ### A persistent `tokens_dirty`
 
-`syncer_aggregator_errors_total{job="tokens_dirty"}` rises at each tick and `SELECT count() FROM xrpl.agg_dirty` does not fall. The hook of `tokens` comes before only the hook of `mpt_state`, which waits with the slice, and **throws, by design, while the job
+`syncer_aggregator_errors_total{job="tokens_dirty"}` rises at each tick and `SELECT count() FROM xrpl.agg_dirty` does not fall. The hook of `tokens` comes before only the hooks of `mpt_state` and of the token history, which wait with the slice, and **throws, by design, while the job
 has not read its version floor or when the reads that open its last run failed**, so that a range is never marked without the job being able to repair it; a slice that fails stays in `agg_dirty` and its earlier hooks
 run again at each tick. Look in the log for `Aggregator job tokens failed...` and `Aggregator job tokens_dirty failed in <from> - <to>: ...`:
 - **A missing table** (`Table xrpl.token_generations doesn't exist`): migration 014 was not applied before the syncer, and the boot check could not be made (ClickHouse was unreachable then: the boot log has
@@ -1090,6 +1094,203 @@ SELECT countIf(state_known = 0) FROM (SELECT * FROM xrpl.mpt_issuances ORDER BY 
 
 To bring a block back run `range-ingest` over it ([Retention](#retention)); its marks reach the job through `agg_dirty`.
 
+## The token history
+
+The issuer analytics routes (`/v2/issuers/{issuer}/tokens`, and `/summary`, `/supply`, `/flows`, `/distribution` and `/snapshot` of a token; [api-reference](api-reference.md))
+and, once it is built, D6's `/v2/tokens/{token}/holders` are served from the **token history** ([ADR-0021](adr/0021-token-history-in-clickhouse.md),
+[data-model](data-model.md#token-history-migration-019)): a change log of every issued token and MPT, its checkpoints and its hourly rollups, one generation at a time.
+**Two writers share it.** The syncer's `token_history` worker follows the head, repairs after a re-ingest, catches a finished build up and promotes it
+([syncer](syncer.md#8b-the-token_history-worker)). The operator's **`token-history-build`** command does the heavy one-off work of a generation: the worker never starts one,
+it only says when one is due. The pieces, all per network:
+
+| Piece | Cadence | Healthy | Watch |
+| --- | --- | --- | --- |
+| The `token_history` worker | a pass a second; whether a build is due every 10 minutes | once a generation is live, `syncer_token_history_lag_ledgers` 0 to a few ledgers, no `syncer_token_history_rebuild_needed` series, `syncer_token_history_errors_total` flat | the gauges; the log lines `Token history: ...` |
+| `token-history-build` | when the operator runs it | exit status 0, then the worker catches the generation up to the head and promotes it (`Token history: generation <g> is live`) | its log; `token_history_state` (below) |
+| The aggregator's eighth `agg_dirty` hook | with each `agg_dirty` slice | `token_history_dirty` empties as the worker repairs | `syncer_aggregator_errors_total{job="token_history_dirty"}` |
+| The routes of the api | the live generation read every 5 s | an answer is as of the live generation's `levels_through`, seconds behind the head | 404 `token history is not built yet` before the first generation is live |
+
+**What the owner does to deploy** (per network, the sandbox first, then production):
+1. **Apply migration `019`** (`dc run --rm migrate-xrpl` / `migrate-xahau`) before the syncer and the api of this release ([above](#apply-a-schema-migration)).
+2. **Deploy the syncer with `token_history` in `GH_WORKERS`.** It is in the default list and in the lists of `deploy/.env.prod.example`, `deploy/.env.sandbox.example`
+   and `apps/syncer/.env.example`; a deployment whose `GH_WORKERS` was copied from an earlier example names the six workers before it: add `token_history`, or the
+   worker does not run and `token-history-build` refuses to start ([configuration](configuration.md#5-syncer-appssyncer)). The worker follows the head with no generation to write to and
+   reports `syncer_token_history_rebuild_needed{reason="none"}`; the aggregator's hook marks every re-ingest from now on, whether the worker runs or not.
+3. **Deploy the api.** The new routes answer 404 `token history is not built yet`; `/v2/tokens/{token}/holders` serves D6's answer as before (a ledger parameter or an
+   MPT is that 404) until a generation is live.
+4. **Fill the history** with `range-ingest` from the network's first ledger (32,570 on XRPL, 1 on Xahau), as [backfill](backfill.md#token-history) says. The build
+   refuses to start while it runs.
+5. **Run `token-history-build`** once the fill is done (below). The worker catches its levels up to the head and promotes it; on XRPL and Xahau the answers then
+   say `complete: true` (the coverage reaches the network's first ledger). The testnets have no first ledger to reach and stay `complete: false`.
+6. **Run `token-history-check`** against a node GateHub runs, EURGH among the tokens (below), and add its report to the verification file of the plan
+   (`docs/superpowers/plans/2026-11-08-issuer-analytics.verification.md`).
+7. **The explorer** moves to the extended `/holders` when it wants: its order is exact and its marker holds the holder and the balance text, so a marker from D6's
+   answer is `invalid marker` once after the switch.
+
+**For analytics before the fill ends**, run the build after step 3: it builds on the head's unbroken run of stored ledgers (`complete: false`). When the fill joins
+that run the worker says `rebuild_needed{reason="coverage"}`, and one more run of the build replaces the generation.
+
+### The build: `token-history-build`
+
+```bash
+# production compose (the syncer keeps running: the build needs its token_history worker)
+dc run --rm --no-deps syncer-xrpl node dist/cli/token-history-build.js
+dc run --rm --no-deps syncer-xrpl node dist/cli/token-history-build.js --threads 2      # fewer threads, less load on the server
+# the same from source: `token-history:build` runs the compiled dist/cli/token-history-build.js, so `pnpm build` first; it needs the syncer's GH_* environment
+pnpm build && GH_ENV=local pnpm --filter @gatehub/data-syncer token-history:build
+```
+
+Options: `--threads <n>` (`max_threads` of every statement, a whole number from 1, default `TOKEN_HISTORY_BUILD_THREADS` = 4; more is faster and loads the
+ClickHouse server more) and `--help`. The network and ClickHouse come from the same `GH_*` environment as the syncer; its client has no 30 s guards (a request timeout
+of 6 hours and no `max_execution_time`, unless `GH_CLICKHOUSE_REQUEST_TIMEOUT` or `GH_CLICKHOUSE_MAX_EXECUTION_TIME` is set). It resumes a building generation of the
+current config and coverage, else it starts a new one at `h0` = the commit marker (a building one of another config or coverage is retired first), and runs the phases
+`changes`, `mpt_changes` (where the network has MPTs), `levels` and `dex` ([syncer](syncer.md#the-build-command)), writing its state row after every batch.
+
+**It refuses to start** (exit status 2) with a message that names why:
+- `another token-history-build holds the lease (<holder>)`: a build holds the lease `<network>:token_history_build` (fresh for 30 s after its last heartbeat). Two
+  builds that start together each read the lease back after a second, and the one that finds the other newest leaves (`another token-history-build took the lease`).
+- `a range-ingest is running: build the token history once the fill is done`: an `ingest_log` range whose newest row is `started` (a `range-ingest` or a
+  `--reprocess` in progress). **A run that died leaves its chunk `started`** until a rerun of it redoes the chunk, and the build refuses until then (the query
+  below finds it).
+- `no token_history worker holds a fresh lease: the build needs it to write the changes above its start`: no syncer runs the worker (not in `GH_WORKERS`, or the
+  syncer is down).
+
+**Exit status:** `0` the build is done (`Generation <g> is built; the token_history worker catches it up to the head and promotes it`); `1` it failed or was
+interrupted: run it again to resume; `2` it refused to start, or the command line is wrong; `3` it was stopped while it ran: a `range-ingest` started, and the
+generation is retired (`a range-ingest started: generation <g> is retired; build again once the fill is done`), or it lost its lease (`token-history-build lost its
+lease (...)`: another holder is newest, or no renewal landed for 20 s). A lost lease leaves the generation `building`: look for the other build before running it
+again, or wait 30 s if none runs. Two failures name their cause: `no ledger is committed: there is nothing to
+build the token history from` and `no unbroken run of stored ledgers reaches the head <h>`.
+
+**Stopping it.** Ctrl-C (SIGINT) or a SIGTERM (`docker stop`) stops it after the statement in flight (`Interrupted: stopping after the statement in flight ...`),
+exit status 1, and it resumes from its state row when run again. A second signal exits at once (130), without releasing the lease: wait 30 s before running it
+again. So it can be run off-peak, stopped and started again with fewer threads.
+
+**Its log**, as `range-ingest`'s: `Building the token history of <network> in database "<db>" at <url>, <n> thread(s)`, then `token-history-build: generation <g>
+started at h0 <h>, coverage from <f>`, a line after every batch (`token-history-build: generation <g> phase <phase> cursor <cursor> rows <n> (<r> rows/s)`) and
+`token-history-build: generation <g> done, levels through <l>`. Every statement carries the `log_comment` `token-history-build`. The command has no metrics endpoint;
+the syncer's `syncer_token_history_building{phase}` follows its state row.
+
+```sql
+-- the generations: the newest row of each (state building, live or retired; the build's phase and cursors; how far each is)
+SELECT generation, state, config_version, coverage_from, h0, h1, phase, account_cursor, token_cursor_issuer, token_cursor_currency,
+       through_ledger, levels_through, started_at, changed_at
+FROM xrpl.token_history_state ORDER BY generation, version DESC LIMIT 1 BY generation;
+-- the head, for the lag of the live generation
+SELECT max(ledger_index) AS head FROM xrpl.ledgers;
+-- is a range-ingest in progress, or did one die? (the build refuses while one of these is listed)
+SELECT range_start, range_end FROM xrpl.ingest_log WHERE NOT startsWith(run_id, 'live:')
+GROUP BY range_start, range_end HAVING argMax(status, updated_at) = 'started';
+-- the build's statements of the last hour
+SELECT count() AS statements, sum(query_duration_ms) / 1000 AS seconds, sum(read_rows), sum(written_rows), formatReadableSize(max(memory_usage)) AS peak
+FROM system.query_log WHERE type = 'QueryFinish' AND log_comment = 'token-history-build' AND event_time > now() - 3600;
+-- the ranges a re-ingest left for the worker to repair
+SELECT * FROM xrpl.token_history_dirty ORDER BY from_ledger, to_ledger;
+-- the partitions of the generation tables: a retired generation should be gone 15 minutes after it was retired
+SELECT table, partition, sum(rows) AS rows, formatReadableSize(sum(bytes_on_disk)) AS size FROM system.parts
+WHERE database = 'xrpl' AND table IN ('token_holder_changes', 'token_checkpoints', 'token_checkpoint_heads', 'token_hourly') AND active
+GROUP BY table, partition ORDER BY table, partition;
+```
+
+**What it costs the rest of the system.** The ingest never waits for the build: they are separate processes, and the build's work happens in ClickHouse. But they
+share the server: while the build runs it reads hundreds of GB and writes tens to hundreds on XRPL, and the merges of what it writes follow, so the ingest's inserts
+and the api's reads can be slower. That effect was not measured. Run it off-peak, with fewer `--threads`, and stop it if the api suffers: it resumes.
+
+### Measured on synthetic data (the build)
+
+Measured on 2026-11-08 with `token-history-build --threads 4` against a ClickHouse 26.8.14.3 of its own in Docker (16 CPUs and 16 GB for the VM, a laptop shared with other
+work, the tables warm), from `system.query_log` of the statements tagged `token-history-build`; the record is
+[the verification file](superpowers/plans/2026-11-08-issuer-analytics.verification.md#build-measurement). **Synthetic means that the shape is made up**, as for the issued
+tokens above: `trust_line_states` held 1,000,000 lines in 50,000 accounts, 5 state rows each (5,000,000 rows; one issuer has 200,000 of the lines in 3 currencies), and the
+8x tables 8 copies of it (40,000,000 rows); `ledgers` every ledger from 70,000,000 to 98,000,999; 100,000 `mpt_holder_states` rows; 2,000,000 `exchanges`. No live window
+ran beside the build (a fake lease stood in for the worker), so `h1 = h0`.
+
+| | 1x | 8x |
+| --- | --- | --- |
+| **Whole build** (wall time) | **18 s** | **111 s** |
+| `changes` | 6 s, 100 batches: 5,000,000 state rows into 3,000,000 change rows, about 1.25 million state rows a second of statement time | 51 s, 800 batches: 40,000,000 into 24,000,000, 1.14 million a second of statement time (0.78 million of wall time) |
+| `mpt_changes` | 1 s | 2 s |
+| `levels` | 7 s: 257,130 hour rows, 15 checkpoints of 947,000 rows | 54 s: 400,026 tokens, 120 checkpoints of 7,576,000 rows; about 630,000 changes a second of statement time (440,000 of wall time) |
+| `dex` | 3 s, 1,711,123 rows of `token_hourly_dex` | 3 s |
+| **Peak memory** | 665 MiB (the `changes` batch of the issuer of 200,000 lines); `dex` 552 MiB | 667 MiB (the same batch: it grows with the largest account of a batch, not with the table); `dex` 575 MiB |
+| Bytes a row | 31.5 a change, 24.4 a checkpoint row, 34.0 an hour row | 31.7, 24.2 and 32.9 |
+
+**Estimated for the XRP Ledger**, from those rates, assumed linear (as they were from 1x to 8x), warm, at 4 threads: `changes` reads 2 to 7 billion
+`trust_line_states` rows, **30 minutes to 2.5 hours**; `levels` reads 1 to 3.5 billion changes, **30 minutes to 2.2 hours**; `mpt_changes` minutes; **in all 1 to 5
+hours** before the DEX history and a cold disk (the spec's estimate was half a day to two days). On a cold disk the read rate bounds `changes` and `levels`: at 200 to 500
+MB/s, 300 GB of state rows take 10 to 25 minutes to read, the same order as the warm figures. **Not measured:** real-shaped tables, the DEX history at scale (its
+synthetic reads were mostly `ledgers`), a cold disk, the catch-up and the promotion, and the build's effect on the ingest and the api. **Disk:** the synthetic rows
+compress far better than real ones (their addresses and amounts repeat), so 60 to 90 bytes a change stays the planning figure: 60 to 315 GB for the change log (the
+synthetic 32 to 110 GB is a floor), about 70 to 350 GB for the whole token history, and twice the generation tables while a build exists beside the live generation.
+Record the real figures (the build's duration per phase, the rows and the disk of each table) in the verification file at the rollout.
+
+The worker's check of whether a build is due searches the start of the head's unbroken run every 10 minutes: about 27 counts of distinct ledgers over ranges of
+`ledgers`, each 0.08 s over 90 million ledgers (`groupBitmap`, measured in PR 1's review), so a few seconds every 10 minutes on XRPL.
+
+### A forced rebuild of the token history
+
+**Running `token-history-build` while a generation is live builds a new one beside it**, whatever the worker says: the live generation keeps serving and being kept at
+the head, the worker catches the new one up and promotes it, and the old one's partitions are dropped 15 minutes after its retirement. There is no outage and nothing
+else to run; the cost is that of the first build, and twice the generation tables on disk until the drop. A run that finds a building generation of the current config
+and coverage resumes it instead, and one of another config or coverage is retired and started again.
+
+The worker says when a rebuild is due (`syncer_token_history_rebuild_needed{reason}` and one log line, `Token history: a build is due (<reason>); run token-history-build`),
+and builds nothing:
+- `config`: a release raised `TOKEN_HISTORY_CONFIG_VERSION` in `packages/shared/src/token-history/constants.ts` (a change of the token side, the checkpoint floor or the
+  flow rules): the answers follow the old rules until the new generation is promoted;
+- `coverage`: a fill has joined the head's unbroken run, so the history reaches further back than the live generation's `coverage_from`;
+- `repair`: the oldest range of `token_history_dirty` holds a ledger of a parser older than the token history reads (8, or 10 on a network with MPTs): it is not
+  repaired, and the ranges after it wait until the promotion of the new generation clears them;
+- `none`: there is no generation yet.
+
+No reason is given while a building generation exists. **A due build raises no alert**: it waits for the operator by design, and the gauge and the `complete: false`
+of the answers say so.
+
+### Alerts and errors of the token history
+
+The recommended alerts ([observability](observability.md#recommended-alerts); no alert rules ship in the repository): `syncer_token_history_lag_ledgers > 30` for 10
+minutes while a generation is live (the answers are behind the head), and `syncer_token_history_errors_total` rising for 15 minutes. A step of the worker that fails is
+tried again at the next pass, a second later, with no backoff, and the log says which (`Token history: the <step> step failed: <message>`):
+- **`drop`**: most often the `ALTER DELETE` privilege that `DROP PARTITION` asks for, if the syncer's access was narrowed ([clickhouse](clickhouse.md#memory-and-safety-guards));
+  the retired partitions stay and the disk grows by a generation at each rebuild.
+- **`live`**: a window the worker cannot apply. The lag grows with the head, and the answers stay at the last `levels_through`.
+- **`repair`**, **`catch_up`**, **`dex`**: ClickHouse refusing a read or an insert. A failing repair keeps its range, and the ranges after it wait.
+- **`token_history_dirty`** (an aggregator label) rising with `agg_dirty` not falling: the hook of a slice cannot append its range; the slice stays queued, as for every hook.
+
+### Retention of the token history
+
+- **A retired generation is dropped by the worker**, by partition from the four generation tables, 15 minutes after it was retired (`TOKEN_HISTORY_RETIRED_KEEP_MS`).
+  `token_history_state` keeps a row for each change of a generation, and `token_hourly_dex` (no generation) is kept: once the DEX history is written, `pair_hourly`'s
+  45 days do not matter to it.
+- **The ledger retention never touches the seven tables** ([Retention](#retention)): the live generation keeps its rows and its coverage after a block is dropped, and no
+  reason for a build is given (the start of the head's run moved up, not down). A build after a dropped block starts its coverage above it (`complete: false`), and a
+  line whose state rows were all in the dropped block is missing from it, as for D6's tables. Bringing the block back with `range-ingest` changes nothing for a
+  generation built before the drop (the repair of the block's ranges writes the same rows again); for one built after it, the worker says `coverage` once the fill
+  joins the head's run.
+
+### The mainnet check: `token-history-check`
+
+The success check of the rollout, run by an operator against mainnet, not in CI (`apps/syncer/src/cli/token-history-check.ts`). For every token of a file and every
+ledger of a list it walks `/v2/tokens/{token}/snapshot` of the api (pages of 10,000) and the issuer's `account_lines` at the ledger on a node, compares every holder's
+balance exactly (a holder's balance is the issuer side's negated, where the issuer owes), and compares the snapshot's `supply` with the issuer's obligation in
+`gateway_balances`. One request is in flight at a time, to the api and to the node. It needs no ClickHouse and no `GH_*` environment, only an api key in an environment
+variable that `--key-env` names.
+
+```bash
+# from source (it runs the compiled dist/cli/token-history-check.js; the image has it too, as node dist/cli/token-history-check.js)
+pnpm build
+export DATA_API_KEY=<an api key of the deployment>
+pnpm --filter @gatehub/data-syncer token-history:check --api https://xrpl.data.gatehub.net --key-env DATA_API_KEY \
+  --node wss://<a node GateHub runs> --tokens tokens.txt --ledgers 90000000,100000000,<a recent ledger>
+```
+
+All five options are required: `--api` (the api's base URL), `--key-env` (the name of the variable that holds its key, sent as `X-API-Key`), `--node` (a WebSocket URL),
+`--tokens` (a file of one `{currency}.{issuer}` a line; blank lines and `#` comments are left out) and `--ledgers` (comma-separated ledger numbers). The report goes to
+stdout, a line a sample, `<token> @ <ledger>: match (<n> holders, supply <s>)`, or `DIFFERENT: ...` followed by a line for each holder that differs, or `skipped: <why>`
+(an MPT, which has no trust lines, or a sample the api refused, with its message), and last `summary: <m> matched, <d> different, <s> skipped`. **Exit status:** `0` every
+sample matched or was skipped, `1` one differed (or the command failed), `2` a wrong command line or no key in the variable. Use a node GateHub runs: public nodes
+pushed back on D9's comparison after 39 requests. Report fewer samples than asked as such.
+
 ## Supply snapshots
 
 The `supply` job of the aggregator ([syncer](syncer.md#the-supply-job)) writes one row of `network_supply` an hour, every figure as of one ledger, and `GET /v2/network/supply` serves the newest. Rows are kept and have no TTL.
@@ -1138,6 +1339,9 @@ dc run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 
   of the rerun), and marks the hours of all its committed ledgers in `agg_dirty` (Ruling R110).
 - **Aggregates follow by themselves:** every chunk marks `agg_dirty`, the aggregator recomputes the affected hours and days within
   its per-tick budgets. Watch `SELECT count() FROM xrpl.agg_dirty`.
+- **The token history:** while a run is in progress (or one died and was not run again) `token-history-build` refuses to start, and a build that runs stops with
+  its generation retired (exit status 3). A fill below the head's unbroken run is not repaired into the live generation; once it joins the run the worker says a build
+  is due (`coverage`). A `--reprocess` inside the generation's coverage is repaired by the worker from `token_history_dirty` ([backfill](backfill.md#token-history)).
 - **Do not** run two range ingests over overlapping ranges at once.
 
 ## Account and market aggregates

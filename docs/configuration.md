@@ -36,7 +36,7 @@ truth are
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GH_ENV` | unset | Any non-empty value: do not load an env file, the environment is the configuration. Set by both images. |
-| `GH_NETWORK` | `xrpl` | `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`; any other value fails the boot with `GH_NETWORK must be one of xrpl, xahau, xrpl-testnet, xahau-testnet`. A testnet is a network of its own (its own database and files), and its boot line says `kind=testnet`. Also read by `migrate` and `range-ingest`. |
+| `GH_NETWORK` | `xrpl` | `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`; any other value fails the boot with `GH_NETWORK must be one of xrpl, xahau, xrpl-testnet, xahau-testnet`. A testnet is a network of its own (its own database and files), and its boot line says `kind=testnet`. Also read by `migrate`, `range-ingest` and `token-history-build`. |
 | `GH_NODE_ENDPOINTS` | the public endpoints of the network (XRPL `wss://s2.ripple.com,wss://xrplcluster.com`, Xahau `wss://xahau.network`, XRPL Testnet `wss://s.altnet.rippletest.net:51233,wss://testnet.xrpl-labs.com`, Xahau Testnet `wss://xahau-test.net`) | Comma separated `ws://` / `wss://` URLs of rippled / xahaud, tried in order with failover. A node that answers with a rate limit (`retry in ~<N>ms`, `slowDown`, `tooBusy`) gets nothing from the process, no request and no connection attempt, for as long as it asked (at most 20 min; 10 s without a hint); another endpoint of the list is used meanwhile. **API:** the live-state endpoints (balances, orders). **Syncer:** the ingest source (and the fee poller). A Xahau process never falls back to an XRPL node. For full-history ingest point it at your own node or at a full-history server such as `wss://s2.ripple.com`. Credentials in a URL are never logged: logs show only `scheme://host:port`. |
 | `GH_HTTP_API_PORT` | API `3001`, syncer `3002`, exporter `3005` | The main HTTP port: the REST API and the probe (API), the probe (syncer, exporter). 1-65535. |
 | `GH_METRICZ_PORT` | `3000` | Prometheus `GET /metricz` on a second HTTP app. 1-65535. |
@@ -60,6 +60,10 @@ network, and the shared database that the apis of every network read ([ADR-0014]
 | `GH_CLICKHOUSE_MAX_QUERY_MEMORY` | `0` | `max_memory_usage` of every SELECT, bytes; 0 = the server's default. |
 
 The numeric ones are parsed with `Number()` and are not range-checked: a typo gives `NaN` and a client that does not work.
+
+`token-history-build` reads the same variables (it loads the syncer's configuration), with two defaults of its own: its request timeout is 6 hours
+(21,600,000 ms) and `max_execution_time` is off, unless `GH_CLICKHOUSE_REQUEST_TIMEOUT` or `GH_CLICKHOUSE_MAX_EXECUTION_TIME` is set, since no statement of a
+mainnet build stays under the syncer's 30 s ([operations](operations.md#the-build-token-history-build)). Its threads are a flag, `--threads` (default 4), not a variable.
 
 ## 4. API (`apps/api`)
 
@@ -87,7 +91,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GH_VALIDATION_ENDPOINTS` | the value of `GH_NODE_ENDPOINTS` | Nodes the validations collector subscribes to, one client per endpoint (each is a distinct reporter). Use several independent nodes for a good validations picture. |
-| `GH_WORKERS` | `ingest,validations,fee_stats,aggregator,validators,tomls` | Comma separated subset of the six workers; empty runs none. An unknown name fails the boot (`Unknown worker "x"`). Run **exactly one syncer per network and database**; see [syncer](syncer.md). |
+| `GH_WORKERS` | `ingest,validations,fee_stats,aggregator,validators,tomls,token_history` | Comma separated subset of the seven workers; empty runs none. An unknown name fails the boot (`Unknown worker "x"`). Run **exactly one syncer per network and database**; see [syncer](syncer.md). `token_history` keeps the token history at the head ([syncer](syncer.md#8b-the-token_history-worker)); it needs no node, and `token-history-build` refuses to start without it (`no token_history worker holds a fresh lease ...`). `deploy/.env.prod.example`, `deploy/.env.sandbox.example` and `apps/syncer/.env.example` list it; **a deployment whose `GH_WORKERS` was copied from an earlier example names the six workers before it**, and runs no `token_history` worker until `token_history` is added to its list. The aggregator's hook that marks re-ingests for the token history runs with the `aggregator` worker, whether or not `token_history` is in the list. |
 | `GH_SYNC_START_LEDGER` | unset: the validated head at the first boot | Where the very first run starts. **Ignored once the database has a committed ledger.** |
 | `GH_LEDGER_FETCH_TIMEOUT_MS` | `120000` | Timeout of one expanded `ledger` request (a busy ledger is big). |
 | `GH_CATCHUP_CONCURRENCY` | `4` | Ledgers the **live runner** fetches in parallel while catching up. Observed on the public nodes: `wss://s2.ripple.com` throttled at 2 in flight (2026-10-18), so use 1 in flight at about 1.5 requests a second or less, or your own node; `wss://xahau.network` throttles even at 1, which the syncer waits out (see [syncer](syncer.md#rate-limits)). Raise it with your own node. It is not read by `range-ingest`, which has its own `--concurrency` flag (default 8; see [backfill](backfill.md#public-nodes-and-rate-limits) for public nodes). |

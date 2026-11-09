@@ -16,7 +16,8 @@
 #    API's key and no path references them.
 #  - Errors are `{"result":"error","message":"..."}` (429: `{"error":"Rate limit exceeded, retry in N.NNsec"}`), see api-reference.md.
 #  - The generated document lists parameters and descriptions, not response schemas: the bodies are documented in
-#    api-reference.md.
+#    api-reference.md. The exceptions are the token history routes and /v2/tokens/{token}/holders, which carry the JSON
+#    Schema of their answer (the one their e2e suite validates every answer against).
 #  - One deployment serves one network (XRPL or Xahau); the paths are the same on both.
 ---
 openapi: 3.0.0
@@ -5635,16 +5636,24 @@ paths:
     get:
       operationId: TokensController_holders
       summary: Get the holders of a token
-      description: The accounts that hold a positive balance of the token, the largest
+      description: 'The accounts that hold a positive balance of the token, the largest
         balance first, then by address, as of the last run of the tokens job (`ledger_index`
-        and `close_time` are the ledger it is through). `rank` is the holder's place
+        and `close_time` are the ledger it is through). `rank` is the holder''s place
         in that order among all the holders, whatever the page; `share` is its balance
         over the token `supply` (exact, rounded half up to 6 decimals); `limit` is
-        the holder's limit; `frozen` and `authorized` are the issuer's freeze and
+        the holder''s limit; `frozen` and `authorized` are the issuer''s freeze and
         authorization of the line. The path names the token like the detail does;
         a token the job does not know (no live row, an LP token, no generation yet)
         is a 404. `format=csv` gives the holders as a CSV file `<code or currency>
-        <issuer> - holders.csv` (without `coverage`).
+        <issuer> - holders.csv` (without `coverage`). Once the token history is built,
+        the route reads it instead, seconds behind the head: the holders at a ledger
+        (`ledger_index`, `ledger_hash` or `date`; none is the newest of the token
+        history), in the exact order of the balances (`descending=false` gives the
+        smallest first), each row with `first_ledger` and `last_ledger` (the start
+        of its current run of holding and its newest change) and, for an MPT (its
+        issuance ID in the path), `escrowed`. The marker then holds the balance text
+        and the holder, so a marker of the earlier answer is `invalid marker` once.
+        Before the build, a ledger is 404 `token history is not built yet`.'
       parameters:
       - name: token
         required: true
@@ -5675,9 +5684,118 @@ paths:
         description: Default 200, at most 1000.
         schema:
           type: number
+      - name: descending
+        required: false
+        in: query
+        description: The largest balances first. Default true.
+        schema:
+          type: boolean
+      - name: date
+        required: false
+        in: query
+        description: The ledger closed at or before this time (alias `close_time`).
+          A ledger above the token history is 400 `ledger is not in the token history
+          yet`; one below its coverage `the date provided is too old`.
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of a stored ledger, 64 hex digits.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: A ledger number (alias `ledger`), or `validated`, `closed`, `current`
+          for the newest ledger of the token history.
+        schema: {}
       responses:
         '200':
           description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum:
+                    - success
+                  coverage:
+                    type: object
+                    properties:
+                      from_ledger_index:
+                        type: integer
+                        minimum: 0
+                      complete:
+                        type: boolean
+                    required:
+                    - complete
+                    additionalProperties: false
+                  ledger_index:
+                    type: integer
+                    minimum: 0
+                  close_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  supply:
+                    type: string
+                    pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                  count:
+                    type: integer
+                    minimum: 0
+                  marker:
+                    type: string
+                    minLength: 1
+                  holders:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        rank:
+                          type: integer
+                          minimum: 1
+                        holder:
+                          type: string
+                          pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                        balance:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        share:
+                          type: string
+                          pattern: "^\\d+\\.\\d{6}$"
+                        limit:
+                          type: string
+                        frozen:
+                          type: boolean
+                        authorized:
+                          type: boolean
+                        first_ledger:
+                          type: integer
+                          minimum: 0
+                        last_ledger:
+                          type: integer
+                          minimum: 0
+                        escrowed:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      required:
+                      - rank
+                      - holder
+                      - balance
+                      - share
+                      - limit
+                      - frozen
+                      - authorized
+                      additionalProperties: false
+                required:
+                - result
+                - coverage
+                - ledger_index
+                - close_time
+                - supply
+                - count
+                - holders
+                additionalProperties: false
       tags:
       - tokens
   "/v2/tokens/{token}/transfers":
@@ -5774,6 +5892,1293 @@ paths:
       responses:
         '200':
           description: ''
+      tags:
+      - tokens
+  "/v2/issuers/{issuer}/tokens":
+    get:
+      operationId: IssuersController_tokens
+      summary: Get an issuer's tokens at a ledger
+      description: 'Every token of the issuer with a change in the token history at
+        or before the ledger, issued tokens and MPTs together, by `currency` (an MPT
+        by its issuance ID): its `supply` (exact), `holders`, `trust_lines`, and the
+        ledgers of its first and newest change. The ledger is `ledger_index` (alias
+        `ledger`), `ledger_hash` or `date` (alias `close_time`); none is the newest
+        ledger of the token history. An issuer with no token is an empty list. `coverage`
+        is the token history of issued tokens. 404 `token history is not built yet`
+        before the first build. `format=csv` gives `<issuer> - tokens.csv`.'
+      parameters:
+      - name: issuer
+        required: true
+        in: path
+        description: A classic address.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: date
+        required: false
+        in: query
+        description: The ledger closed at or before this time (alias `close_time`).
+          A ledger above the token history is 400 `ledger is not in the token history
+          yet`; one below its coverage `the date provided is too old`.
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of a stored ledger, 64 hex digits.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: A ledger number (alias `ledger`), or `validated`, `closed`, `current`
+          for the newest ledger of the token history.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum:
+                    - success
+                  coverage:
+                    type: object
+                    properties:
+                      from_ledger_index:
+                        type: integer
+                        minimum: 0
+                      complete:
+                        type: boolean
+                    required:
+                    - complete
+                    additionalProperties: false
+                  ledger_index:
+                    type: integer
+                    minimum: 0
+                  close_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  count:
+                    type: integer
+                    minimum: 0
+                  marker:
+                    type: string
+                    minLength: 1
+                  tokens:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        currency:
+                          type: string
+                        code:
+                          type: string
+                        kind:
+                          type: string
+                          enum:
+                          - issued
+                          - mpt
+                        supply:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        holders:
+                          type: integer
+                          minimum: 0
+                        trust_lines:
+                          type: integer
+                          minimum: 0
+                        first_ledger:
+                          type: integer
+                          minimum: 0
+                        last_ledger:
+                          type: integer
+                          minimum: 0
+                      required:
+                      - currency
+                      - kind
+                      - supply
+                      - holders
+                      - trust_lines
+                      - first_ledger
+                      - last_ledger
+                      additionalProperties: false
+                required:
+                - result
+                - coverage
+                - ledger_index
+                - close_time
+                - count
+                - tokens
+                additionalProperties: false
+      tags:
+      - issuers
+  "/v2/tokens/{token}/summary":
+    get:
+      operationId: TokenSummaryController_summary
+      summary: Get the summary of a token at a ledger
+      description: 'The token at the ledger: its exact `supply`, `holders`, `trust_lines`,
+        its first and newest change (`first_ledger`, `last_ledger`, with their times),
+        and the flows of the 24 hours, 7 days and 30 days before the close of the
+        ledger: `issued`, `redeemed`, `clawed_back`, `transferred`, `transfers`, `changes`,
+        exact over the changes whose earlier state is known, and `unknown_before`,
+        the changes whose earlier state is not (0 once the coverage is complete).
+        `exchanged` and `trades` are the DEX figures of the whole hours of the window
+        up to `exchanged_through`; they are left out before the DEX history is computed.
+        No CSV. 404 `token history is not built yet` before the first build, `token
+        not found` for a token with no change in it.'
+      parameters:
+      - name: token
+        required: true
+        in: path
+        description: An issued token, `{currency}.{issuer}` (or with `+` or `|` for
+          the dot), as `/v2/tokens/{token}` names it; or an MPT, its issuance ID (48
+          hex digits, any case), alone or as `{issuanceId}+{issuer}`.
+        schema:
+          type: string
+      - name: exclude
+        required: false
+        in: query
+        description: 'Up to 20 comma-separated addresses (the issuer''s own wallets,
+          say): the figures stay whole, and the answer adds `excluded` and `without_excluded`,
+          the figures without them. Duplicates are ignored.'
+        schema: {}
+      - name: date
+        required: false
+        in: query
+        description: The ledger closed at or before this time (alias `close_time`).
+          A ledger above the token history is 400 `ledger is not in the token history
+          yet`; one below its coverage `the date provided is too old`.
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of a stored ledger, 64 hex digits.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: A ledger number (alias `ledger`), or `validated`, `closed`, `current`
+          for the newest ledger of the token history.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum:
+                    - success
+                  coverage:
+                    type: object
+                    properties:
+                      from_ledger_index:
+                        type: integer
+                        minimum: 0
+                      complete:
+                        type: boolean
+                    required:
+                    - complete
+                    additionalProperties: false
+                  ledger_index:
+                    type: integer
+                    minimum: 0
+                  close_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  token:
+                    type: object
+                    properties:
+                      currency:
+                        type: string
+                      issuer:
+                        type: string
+                        pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                      kind:
+                        type: string
+                        enum:
+                        - issued
+                        - mpt
+                      code:
+                        type: string
+                    required:
+                    - currency
+                    - issuer
+                    - kind
+                    additionalProperties: false
+                  supply:
+                    type: string
+                    pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                  holders:
+                    type: integer
+                    minimum: 0
+                  trust_lines:
+                    type: integer
+                    minimum: 0
+                  without_excluded:
+                    type: object
+                    properties:
+                      supply:
+                        type: string
+                        pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      holders:
+                        type: integer
+                        minimum: 0
+                      trust_lines:
+                        type: integer
+                        minimum: 0
+                    required:
+                    - supply
+                    - holders
+                    - trust_lines
+                    additionalProperties: false
+                  excluded:
+                    type: array
+                    items:
+                      type: string
+                      pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                  first_ledger:
+                    type: integer
+                    minimum: 0
+                  first_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  last_ledger:
+                    type: integer
+                    minimum: 0
+                  last_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  windows:
+                    type: object
+                    properties:
+                      24h:
+                        type: object
+                        properties:
+                          start:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                          end:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                          issued:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          redeemed:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          clawed_back:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          transferred:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          transfers:
+                            type: integer
+                            minimum: 0
+                          changes:
+                            type: integer
+                            minimum: 0
+                          unknown_before:
+                            type: integer
+                            minimum: 0
+                          exchanged:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          trades:
+                            type: integer
+                            minimum: 0
+                          exchanged_through:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                        required:
+                        - start
+                        - end
+                        - issued
+                        - redeemed
+                        - clawed_back
+                        - transferred
+                        - transfers
+                        - changes
+                        - unknown_before
+                        additionalProperties: false
+                      7d:
+                        type: object
+                        properties:
+                          start:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                          end:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                          issued:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          redeemed:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          clawed_back:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          transferred:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          transfers:
+                            type: integer
+                            minimum: 0
+                          changes:
+                            type: integer
+                            minimum: 0
+                          unknown_before:
+                            type: integer
+                            minimum: 0
+                          exchanged:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          trades:
+                            type: integer
+                            minimum: 0
+                          exchanged_through:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                        required:
+                        - start
+                        - end
+                        - issued
+                        - redeemed
+                        - clawed_back
+                        - transferred
+                        - transfers
+                        - changes
+                        - unknown_before
+                        additionalProperties: false
+                      30d:
+                        type: object
+                        properties:
+                          start:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                          end:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                          issued:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          redeemed:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          clawed_back:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          transferred:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          transfers:
+                            type: integer
+                            minimum: 0
+                          changes:
+                            type: integer
+                            minimum: 0
+                          unknown_before:
+                            type: integer
+                            minimum: 0
+                          exchanged:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          trades:
+                            type: integer
+                            minimum: 0
+                          exchanged_through:
+                            type: string
+                            pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                        required:
+                        - start
+                        - end
+                        - issued
+                        - redeemed
+                        - clawed_back
+                        - transferred
+                        - transfers
+                        - changes
+                        - unknown_before
+                        additionalProperties: false
+                    required:
+                    - 24h
+                    - 7d
+                    - 30d
+                    additionalProperties: false
+                required:
+                - result
+                - coverage
+                - ledger_index
+                - close_time
+                - token
+                - supply
+                - holders
+                - trust_lines
+                - windows
+                additionalProperties: false
+      tags:
+      - tokens
+  "/v2/tokens/{token}/supply":
+    get:
+      operationId: TokenSupplyController_supply
+      summary: Get the supply series of a token
+      description: 'The token over time: by `hour` or `day` (UTC), every bucket of
+        the window with the levels at its end (`supply`, `holders`, `trust_lines`,
+        carried forward through buckets without a change, and `ledger_index`, the
+        newest change they are as of) and the flows in it (`issued`, `redeemed`, `clawed_back`,
+        `net` = issued − redeemed − clawed back, `unknown_before`); by `ledger`, every
+        ledger with a change of the token, at most 100,000 ledgers. `start` defaults
+        to the first change of the token, `end` (inclusive at its granularity) to
+        the newest ledger of the token history. With `exclude` every row adds `without_excluded`.
+        `format=csv` gives `<code or currency> <issuer> - supply.csv`.'
+      parameters:
+      - name: token
+        required: true
+        in: path
+        description: An issued token, `{currency}.{issuer}` (or with `+` or `|` for
+          the dot), as `/v2/tokens/{token}` names it; or an MPT, its issuance ID (48
+          hex digits, any case), alone or as `{issuanceId}+{issuer}`.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: exclude
+        required: false
+        in: query
+        description: 'Up to 20 comma-separated addresses (the issuer''s own wallets,
+          say): the figures stay whole, and the answer adds `excluded` and `without_excluded`,
+          the figures without them. Duplicates are ignored.'
+        schema: {}
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first. Default false.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'The end of the window, inclusive at its granularity. Default:
+          now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'The start of the window. Default: the first change of the token.'
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day.'
+        schema:
+          enum:
+          - day
+          - hour
+          - ledger
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum:
+                    - success
+                  coverage:
+                    type: object
+                    properties:
+                      from_ledger_index:
+                        type: integer
+                        minimum: 0
+                      complete:
+                        type: boolean
+                    required:
+                    - complete
+                    additionalProperties: false
+                  ledger_index:
+                    type: integer
+                    minimum: 0
+                  close_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  interval:
+                    type: string
+                    enum:
+                    - day
+                    - hour
+                    - ledger
+                  excluded:
+                    type: array
+                    items:
+                      type: string
+                      pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                  count:
+                    type: integer
+                    minimum: 0
+                  marker:
+                    type: string
+                    minLength: 1
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        time:
+                          type: string
+                          pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                        ledger_index:
+                          type: integer
+                          minimum: 0
+                        supply:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        holders:
+                          type: integer
+                          minimum: 0
+                        trust_lines:
+                          type: integer
+                          minimum: 0
+                        issued:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        redeemed:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        clawed_back:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        net:
+                          type: string
+                          pattern: "^-?\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        unknown_before:
+                          type: integer
+                          minimum: 0
+                        without_excluded:
+                          type: object
+                          properties:
+                            supply:
+                              type: string
+                              pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                            holders:
+                              type: integer
+                              minimum: 0
+                            trust_lines:
+                              type: integer
+                              minimum: 0
+                          required:
+                          - supply
+                          - holders
+                          - trust_lines
+                          additionalProperties: false
+                      required:
+                      - time
+                      - ledger_index
+                      - supply
+                      - holders
+                      - trust_lines
+                      - issued
+                      - redeemed
+                      - clawed_back
+                      - net
+                      - unknown_before
+                      additionalProperties: false
+                required:
+                - result
+                - coverage
+                - ledger_index
+                - close_time
+                - interval
+                - count
+                - rows
+                additionalProperties: false
+      tags:
+      - tokens
+  "/v2/tokens/{token}/flows":
+    get:
+      operationId: TokenFlowsController_flows
+      summary: Get the flows of a token over a window
+      description: 'The flows of the window `[start, end]` (`end` inclusive at its
+        granularity; at most 366 days, 31 by the hour, else 400 `window too large`):
+        `totals` and every `period` of the `interval` (UTC), the empty ones included:
+        `issued`, `redeemed`, `clawed_back`, `transferred`, `transfers` and `unknown_before`.
+        `exchanged` and `trades` are there only when the DEX history has every hour
+        of the window. `counterparties` (default 10, at most 100) are the holders
+        with the largest `received + sent` in the window, then by account. No CSV,
+        no pagination.'
+      parameters:
+      - name: token
+        required: true
+        in: path
+        description: An issued token, `{currency}.{issuer}` (or with `+` or `|` for
+          the dot), as `/v2/tokens/{token}` names it; or an MPT, its issuance ID (48
+          hex digits, any case), alone or as `{issuanceId}+{issuer}`.
+        schema:
+          type: string
+      - name: counterparties
+        required: false
+        in: query
+        description: Default 10, at most 100.
+        schema:
+          type: number
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day.'
+        schema:
+          enum:
+          - day
+          - hour
+          - month
+          type: string
+      - name: end
+        required: true
+        in: query
+        description: The end of the window, inclusive at its granularity.
+        schema: {}
+      - name: start
+        required: true
+        in: query
+        description: The start of the window.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum:
+                    - success
+                  coverage:
+                    type: object
+                    properties:
+                      from_ledger_index:
+                        type: integer
+                        minimum: 0
+                      complete:
+                        type: boolean
+                    required:
+                    - complete
+                    additionalProperties: false
+                  ledger_index:
+                    type: integer
+                    minimum: 0
+                  close_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  start:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  end:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  interval:
+                    type: string
+                    enum:
+                    - day
+                    - hour
+                    - month
+                  totals:
+                    type: object
+                    properties:
+                      issued:
+                        type: string
+                        pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      redeemed:
+                        type: string
+                        pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      clawed_back:
+                        type: string
+                        pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      transferred:
+                        type: string
+                        pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      transfers:
+                        type: integer
+                        minimum: 0
+                      unknown_before:
+                        type: integer
+                        minimum: 0
+                      exchanged:
+                        type: string
+                        pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      trades:
+                        type: integer
+                        minimum: 0
+                      exchanged_through:
+                        type: string
+                        pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                    required:
+                    - issued
+                    - redeemed
+                    - clawed_back
+                    - transferred
+                    - transfers
+                    - unknown_before
+                    additionalProperties: false
+                  periods:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        start:
+                          type: string
+                          pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                        issued:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        redeemed:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        clawed_back:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        transferred:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        transfers:
+                          type: integer
+                          minimum: 0
+                        unknown_before:
+                          type: integer
+                          minimum: 0
+                        exchanged:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        trades:
+                          type: integer
+                          minimum: 0
+                        exchanged_through:
+                          type: string
+                          pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                      required:
+                      - start
+                      - issued
+                      - redeemed
+                      - clawed_back
+                      - transferred
+                      - transfers
+                      - unknown_before
+                      additionalProperties: false
+                  counterparties:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        account:
+                          type: string
+                          pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                        received:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        sent:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        net:
+                          type: string
+                          pattern: "^-?\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        changes:
+                          type: integer
+                          minimum: 0
+                      required:
+                      - account
+                      - received
+                      - sent
+                      - net
+                      - changes
+                      additionalProperties: false
+                required:
+                - result
+                - coverage
+                - ledger_index
+                - close_time
+                - start
+                - end
+                - interval
+                - totals
+                - periods
+                - counterparties
+                additionalProperties: false
+      tags:
+      - tokens
+  "/v2/tokens/{token}/distribution":
+    get:
+      operationId: TokenDistributionController_distribution
+      summary: Get the distribution of a token at a ledger
+      description: 'The holders of the token at the ledger by the power of ten of
+        their balance: one bucket from the smallest holding to the largest, the empty
+        ones between included, `min` inclusive and `max` exclusive as text (an MPT
+        in raw units), with its `holders` and their `balance`; and `top`, the sum
+        of the largest 10 and 100 holdings with their `share` of the supply (exact,
+        rounded half up to 6 decimals). With `exclude`, `without_excluded` has the
+        same figures without those holders. No CSV.'
+      parameters:
+      - name: token
+        required: true
+        in: path
+        description: An issued token, `{currency}.{issuer}` (or with `+` or `|` for
+          the dot), as `/v2/tokens/{token}` names it; or an MPT, its issuance ID (48
+          hex digits, any case), alone or as `{issuanceId}+{issuer}`.
+        schema:
+          type: string
+      - name: exclude
+        required: false
+        in: query
+        description: 'Up to 20 comma-separated addresses (the issuer''s own wallets,
+          say): the figures stay whole, and the answer adds `excluded` and `without_excluded`,
+          the figures without them. Duplicates are ignored.'
+        schema: {}
+      - name: date
+        required: false
+        in: query
+        description: The ledger closed at or before this time (alias `close_time`).
+          A ledger above the token history is 400 `ledger is not in the token history
+          yet`; one below its coverage `the date provided is too old`.
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of a stored ledger, 64 hex digits.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: A ledger number (alias `ledger`), or `validated`, `closed`, `current`
+          for the newest ledger of the token history.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum:
+                    - success
+                  coverage:
+                    type: object
+                    properties:
+                      from_ledger_index:
+                        type: integer
+                        minimum: 0
+                      complete:
+                        type: boolean
+                    required:
+                    - complete
+                    additionalProperties: false
+                  ledger_index:
+                    type: integer
+                    minimum: 0
+                  close_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  supply:
+                    type: string
+                    pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                  holders:
+                    type: integer
+                    minimum: 0
+                  buckets:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        min:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        max:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        holders:
+                          type: integer
+                          minimum: 0
+                        balance:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      required:
+                      - min
+                      - max
+                      - holders
+                      - balance
+                      additionalProperties: false
+                  top:
+                    type: object
+                    properties:
+                      '10':
+                        type: object
+                        properties:
+                          balance:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          share:
+                            type: string
+                            pattern: "^\\d+\\.\\d{6}$"
+                        required:
+                        - balance
+                        - share
+                        additionalProperties: false
+                      '100':
+                        type: object
+                        properties:
+                          balance:
+                            type: string
+                            pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          share:
+                            type: string
+                            pattern: "^\\d+\\.\\d{6}$"
+                        required:
+                        - balance
+                        - share
+                        additionalProperties: false
+                    required:
+                    - '10'
+                    - '100'
+                    additionalProperties: false
+                  excluded:
+                    type: array
+                    items:
+                      type: string
+                      pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                  without_excluded:
+                    type: object
+                    properties:
+                      supply:
+                        type: string
+                        pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      holders:
+                        type: integer
+                        minimum: 0
+                      trust_lines:
+                        type: integer
+                        minimum: 0
+                      buckets:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            min:
+                              type: string
+                              pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                            max:
+                              type: string
+                              pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                            holders:
+                              type: integer
+                              minimum: 0
+                            balance:
+                              type: string
+                              pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                          required:
+                          - min
+                          - max
+                          - holders
+                          - balance
+                          additionalProperties: false
+                      top:
+                        type: object
+                        properties:
+                          '10':
+                            type: object
+                            properties:
+                              balance:
+                                type: string
+                                pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                              share:
+                                type: string
+                                pattern: "^\\d+\\.\\d{6}$"
+                            required:
+                            - balance
+                            - share
+                            additionalProperties: false
+                          '100':
+                            type: object
+                            properties:
+                              balance:
+                                type: string
+                                pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                              share:
+                                type: string
+                                pattern: "^\\d+\\.\\d{6}$"
+                            required:
+                            - balance
+                            - share
+                            additionalProperties: false
+                        required:
+                        - '10'
+                        - '100'
+                        additionalProperties: false
+                    required:
+                    - supply
+                    - holders
+                    - trust_lines
+                    - buckets
+                    - top
+                    additionalProperties: false
+                required:
+                - result
+                - coverage
+                - ledger_index
+                - close_time
+                - supply
+                - holders
+                - buckets
+                - top
+                additionalProperties: false
+      tags:
+      - tokens
+  "/v2/tokens/{token}/snapshot":
+    get:
+      operationId: TokenSnapshotController_snapshot
+      summary: Get the snapshot of a token at a ledger
+      description: 'Every holder of the token at the ledger (a balance above 0), by
+        address in byte order, with its `balance` (an MPT: amount and `escrowed` together),
+        `limit`, `frozen` and `authorized`, paged (default 1000, at most 10,000).
+        `digest` is the lower-case hex SHA-256 of one line `<holder>,<balance>\n`
+        per holder of the whole set, in that order: the same on every page and whatever
+        `exclude` says. A ledger is required (400 `a ledger is required`). `format=csv`
+        gives `<code or currency> <issuer> - snapshot <ledger_index>.csv`.'
+      parameters:
+      - name: token
+        required: true
+        in: path
+        description: An issued token, `{currency}.{issuer}` (or with `+` or `|` for
+          the dot), as `/v2/tokens/{token}` names it; or an MPT, its issuance ID (48
+          hex digits, any case), alone or as `{issuanceId}+{issuer}`.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: exclude
+        required: false
+        in: query
+        description: 'Up to 20 comma-separated addresses (the issuer''s own wallets,
+          say): the figures stay whole, and the answer adds `excluded` and `without_excluded`,
+          the figures without them. Duplicates are ignored.'
+        schema: {}
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 1000, at most 10,000.
+        schema:
+          type: number
+      - name: date
+        required: false
+        in: query
+        description: The ledger closed at or before this time (alias `close_time`).
+          A ledger above the token history is 400 `ledger is not in the token history
+          yet`; one below its coverage `the date provided is too old`.
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of a stored ledger, 64 hex digits.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: A ledger number (alias `ledger`), or `validated`, `closed`, `current`
+          for the newest ledger of the token history. One of the three is required.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum:
+                    - success
+                  coverage:
+                    type: object
+                    properties:
+                      from_ledger_index:
+                        type: integer
+                        minimum: 0
+                      complete:
+                        type: boolean
+                    required:
+                    - complete
+                    additionalProperties: false
+                  ledger_index:
+                    type: integer
+                    minimum: 0
+                  close_time:
+                    type: string
+                    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+                  ledger_hash:
+                    type: string
+                    pattern: "^[0-9A-F]{64}$"
+                  token:
+                    type: object
+                    properties:
+                      currency:
+                        type: string
+                      issuer:
+                        type: string
+                        pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                      kind:
+                        type: string
+                        enum:
+                        - issued
+                        - mpt
+                      code:
+                        type: string
+                    required:
+                    - currency
+                    - issuer
+                    - kind
+                    additionalProperties: false
+                  supply:
+                    type: string
+                    pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                  holders:
+                    type: integer
+                    minimum: 0
+                  trust_lines:
+                    type: integer
+                    minimum: 0
+                  digest:
+                    type: string
+                    pattern: "^[0-9a-f]{64}$"
+                  without_excluded:
+                    type: object
+                    properties:
+                      supply:
+                        type: string
+                        pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                      holders:
+                        type: integer
+                        minimum: 0
+                      trust_lines:
+                        type: integer
+                        minimum: 0
+                    required:
+                    - supply
+                    - holders
+                    - trust_lines
+                    additionalProperties: false
+                  excluded:
+                    type: array
+                    items:
+                      type: string
+                      pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                  count:
+                    type: integer
+                    minimum: 0
+                  marker:
+                    type: string
+                    minLength: 1
+                  balances:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        holder:
+                          type: string
+                          pattern: "^r[1-9A-HJ-NP-Za-km-z]{24,34}$"
+                        balance:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        escrowed:
+                          type: string
+                          pattern: "^\\d+(\\.\\d+)?(e[-+]?\\d+)?$"
+                        limit:
+                          type: string
+                        frozen:
+                          type: boolean
+                        authorized:
+                          type: boolean
+                      required:
+                      - holder
+                      - balance
+                      - limit
+                      - frozen
+                      - authorized
+                      additionalProperties: false
+                required:
+                - result
+                - coverage
+                - ledger_index
+                - close_time
+                - ledger_hash
+                - token
+                - supply
+                - holders
+                - trust_lines
+                - digest
+                - count
+                - balances
+                additionalProperties: false
       tags:
       - tokens
 info:

@@ -281,6 +281,42 @@ _Avoid_: snapshot, version (alone)
 A record, in ledger order, that a transaction changed a trust line or an issuer's settings, so that the token aggregate knows what to recompute.
 _Avoid_: dirty mark
 
+**Token history**:
+The record of every token's holders, supply and flows at every ledger since its coverage start: a change log in the order of the token, checkpoints and hourly rollups, from which the holders and totals at any ledger are worked out.
+_Avoid_: supply history, holders history, token snapshot
+
+**Token history generation**:
+One build of the token history, on one coverage start and one set of rules: built by the operator's command, kept at the head by the syncer, served whole once it is live and dropped whole once it is retired.
+_Avoid_: token generation (the issued-token aggregate's), build (the work that makes one)
+
+**Token side**:
+A trust line or an MPT balance as one token sees it: the holder, the holder's amount, the limit, the freeze and authorization flags, and whether the line counts for that token. A trust line has a side for each of its two accounts' tokens, and a line with a balance of 0 can count for both.
+_Avoid_: orientation, direction
+
+**Change**:
+What one node of a transaction did to a trust line or an MPT balance, seen from one token's side, while the line counted for the token before or after it: the holder's amount before and after. The token history's change log holds a row for each.
+_Avoid_: delta, event, balance change (an account's word)
+
+**Checkpoint**:
+The full set of a token's counting lines at the end of one ledger, so that its holders at a later ledger are the checkpoint and the changes after it. A token gets one each time its changes since the last reach its trust lines or 50,000, whichever is more.
+_Avoid_: snapshot (the route's word), supply snapshot (the native supply's)
+
+**Issued**:
+What a transaction added to a token's supply: the rise of its holders' amounts, net over the transaction's changes of the token.
+_Avoid_: minted (the native currency's word), created
+
+**Redeemed**:
+What a transaction that is not a clawback took out of a token's supply: the fall of its holders' amounts, net over the transaction's changes of the token. A transfer fee is redeemed.
+_Avoid_: burned (the native currency's word), destroyed
+
+**Clawed back**:
+What a `Clawback` or `AMMClawback` transaction took out of a token's supply, net over its changes of the token.
+_Avoid_: redeemed (for a clawback), seized
+
+**Exchanged**:
+A token's amounts in the network's DEX trades (order-book trades and AMM swaps), on whichever side of the pair it is.
+_Avoid_: volume (a pair's or the network's word), traded
+
 **Export**:
 A file of a list of the indexed data, in CSV or PDF, that is made in the background and downloaded once it is ready.
 _Avoid_: download, report, statement

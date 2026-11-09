@@ -140,6 +140,9 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
+- **The token history:** while a run is in progress `token-history-build` refuses to start (and a build that runs stops); a fill is not repaired into the
+  live generation but makes a build due once it joins the head's unbroken run, and a `--reprocess` inside the generation's coverage is repaired by the
+  `token_history` worker. See [Token history](#token-history).
 
 ### AMM data re-ingest
 
@@ -562,6 +565,65 @@ Check it:
 SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 99226369 GROUP BY parser_version;
 -- the issuances with no known state: 0 once the reprocess has been through the job
 SELECT countIf(state_known = 0) FROM (SELECT * FROM xrpl.mpt_issuances ORDER BY mpt_issuance_id, version DESC LIMIT 1 BY mpt_issuance_id);
+```
+
+### Token history
+
+The token history of the issuer analytics routes ([operations](operations.md#the-token-history), [ADR-0021](adr/0021-token-history-in-clickhouse.md)) needs no parser version
+and no re-ingest of its own: `token-history-build` builds a generation from `trust_line_states`, `mpt_holder_states` and `exchanges`, and the `token_history` worker keeps
+it at the head. What decides how far back it reaches is the **head's unbroken run of stored ledgers**: a generation's `coverage_from` is the first ledger of the newest run
+with no ledger number missing that reaches the head, never below the state coverage start (above the newest ledger of a parser older than 3). Unlike the coverage of the
+other features it never reaches across a gap, because its levels add up ledger by ledger and a missing ledger would be wrong in every figure after it. A generation
+keeps the coverage it was built on: filling the history changes the answers only through a new build.
+
+| | XRPL | Xahau |
+| --- | --- | --- |
+| `complete` when `coverage_from` is at or before | **32,570** for issued tokens, **99,226,369** (`MPTokensV1`) for MPTs | **1** |
+| Fill the history with | `--from 32570` | `--from 1` (`--concurrency 1` on the public node) |
+
+The testnets are not backfilled, and their token history stays `complete: false`.
+
+**MPTs need their own data first.** The build reads `mpt_holder_states` as it is, and the `complete` of an MPT answer compares `coverage_from` with the ledger of
+`MPTokensV1` only: it does not check that the ledgers from there on were written by parser version 10. On XRPL, give those ledgers their MPT rows
+([MPT data re-ingest](#mpt-data-re-ingest), the program's one reprocess) before the build that is meant to be complete.
+
+**What a fill does** (a `range-ingest` of ledgers that are not stored):
+- **While it runs the build waits.** `token-history-build` refuses to start while an `ingest_log` range's newest row is `started`, and a build that runs retires its
+  generation and stops (exit status 3): it would read a history that is changing. A run that died leaves its chunk `started` until a rerun redoes it, so rerun it (or
+  finish the fill) before the build. The worker goes on at the head meanwhile.
+- **It is not repaired into the live generation.** Its chunks mark `agg_dirty`, and the aggregator's eighth hook appends their ledgers to `token_history_dirty`; they
+  lie below the live generation's `coverage_from` (the fill writes below the head's run), so the worker drops those ranges.
+- **When it joins the head's run** the start of the run moves below the live generation's `coverage_from`, and at its next check (within 10 minutes) the worker says a
+  build is due: `syncer_token_history_rebuild_needed{reason="coverage"}` and `Token history: a build is due (coverage); run token-history-build`. An ascending fill from
+  the first ledger joins the run at its end; a fill from the top down joins it with its first chunk. The answers stay the live generation's, with its `complete: false`,
+  until the operator's build replaces it: run the build once the fill is done.
+- **A fill that leaves a gap** below the run moves nothing: the run that reaches the head still starts above the gap. Find the gaps with the SQL in
+  [operations](operations.md#sql-health-checks).
+
+**What a `--reprocess` does** (a rewrite of stored ledgers):
+- **It keeps the build from starting too**, and stops a build that runs, as a fill does.
+- **Its part inside the coverage is repaired.** Each chunk marks `agg_dirty`, the eighth hook appends the slice's ledgers to `token_history_dirty`, and the worker takes
+  the oldest range at each pass that has nothing else to do: for the live generation, and a building one whose build is `done`, it deletes and writes again the change
+  rows of the tokens the range's touches name, then builds their checkpoints and hour rows again from the hour of the range's first ledger on. While a build is not
+  `done` the ranges wait. Its part below the live generation's `coverage_from` is dropped, as a fill's. Between the rewrite and the repair the token history shows the
+  old data (eventual, as every aggregate after a re-ingest).
+- **A range that holds a ledger of an older parser is not repaired**: older than `TOKEN_PARSER_VERSION` (8), or than `MPT_PARSER_VERSION` (10) on XRPL and XRPL
+  Testnet, which have MPTs (the touches the repair reads are missing there). The worker says `rebuild_needed{reason="repair"}`, the ranges after it wait behind it,
+  and a new build is the way out: its promotion deletes the ranges that a re-ingest left before the build started, up to its `h0` (the build read the state they
+  rewrote).
+- **For the program's one reprocess** (the whole history, about 108 million ledgers), run `token-history-build` once it has ended: the ranges wait while the build
+  runs, and its promotion deletes those the reprocess left before it started. Repairing them one at a time instead was not measured at that scale.
+
+Check it:
+
+```sql
+-- the generations: their coverage and how far each is (the newest row of each)
+SELECT generation, state, phase, coverage_from, h0, through_ledger, levels_through
+FROM xrpl.token_history_state ORDER BY generation, version DESC LIMIT 1 BY generation;
+-- the ranges waiting for the worker's repair
+SELECT count(), min(from_ledger), max(to_ledger) FROM xrpl.token_history_dirty;
+-- the state tables cover the ledgers above this one (NULL: every stored ledger); coverage_from is never below it
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 3;
 ```
 
 ### Public nodes and rate limits
