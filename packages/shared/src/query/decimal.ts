@@ -121,6 +121,43 @@ export function sumOf(unfit: number, exact: string | null, float: number | null)
   return unfit > 0 ? new BigNumber(float ?? 0) : new BigNumber(exact ?? 0);
 }
 
+/**
+ * The exact decimal of any amount column (code, never input), signed or not, with no Float64 shadow beside it: the rule of
+ * `exactAmount` (at most `EXACT_SCALE` decimal places, a magnitude below `EXACT_LIMIT`), and `NULL` when the decimal cannot hold
+ * the amount whole. The token history's tables have no shadow, so the magnitude is read from the text.
+ */
+export function exactAmountOfText(column: string): string {
+  const places =
+    `toInt64(if(position(${column}, '.') = 0, 0, length(splitByChar('e', ${column})[1]) - position(${column}, '.')))` +
+    ` - toInt64OrZero(replaceOne(splitByChar('e', ${column})[2], '+', ''))`;
+  return `if(${places} <= ${EXACT_SCALE} AND abs(toFloat64OrZero(${column})) < ${EXACT_LIMIT}, toDecimal256OrNull(${column}, ${EXACT_SCALE}), NULL)`;
+}
+
+/**
+ * The exact sum of an amount column (code, never input), signed amounts included, as `<alias>_exact` (decimal text; a `NULL`
+ * reads as 0), and the count of the amounts the decimal cannot hold whole as `<alias>_unfit`. Unlike `exactSum`, it never comes
+ * with a Float64 sum: read it back with `exactSumOf`, which sums the rows in BigNumber when one is unfit (ADR-0021).
+ */
+export function exactSumColumns(column: string, alias: string): string {
+  const exact = exactAmountOfText(column);
+  return `toString(sum(${exact})) AS ${alias}_exact, toUInt32(countIf((${exact}) IS NULL)) AS ${alias}_unfit`;
+}
+
+/**
+ * A sum of `exactSumColumns` read back, exactly: the decimal when every amount fitted (`unfit === 0`), else the BigNumber sum of
+ * the same rows, which `rowsIfUnfit` reads again (a bounded read, the caller's). A Float64 sum is never served.
+ */
+export async function exactSumOf(
+  exact: string | null,
+  unfit: number,
+  rowsIfUnfit: () => Promise<string[]>,
+): Promise<BigNumber> {
+  if (unfit === 0) return new BigNumber(exact ?? 0);
+  let sum = new BigNumber(0);
+  for (const amount of await rowsIfUnfit()) sum = sum.plus(amount);
+  return sum;
+}
+
 /** The two volumes of an aggregation (`volumeColumns`), each by `sumOf`. */
 export function volumesOf(row: VolumeSums): { base: BigNumber; counter: BigNumber } {
   return {

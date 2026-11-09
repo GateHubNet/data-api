@@ -355,6 +355,42 @@ const SHAPES: Record<Table, Shape> = {
     partition: '',
     order: 'mpt_issuance_id, holder',
   },
+  // the token history (migration 019): the change log, the checkpoints and their heads and the hourly rollups of a generation,
+  // partitioned by it so a retired one drops whole; the DEX hours, the generations' state and the dirty ranges
+  [Table.TokenHolderChanges]: {
+    engine: 'ReplacingMergeTree',
+    partition: '(generation, intDiv(ledger_index, 10000000))',
+    order: 'issuer, currency, ledger_index, tx_index, node_index, holder',
+  },
+  [Table.TokenCheckpoints]: {
+    engine: 'ReplacingMergeTree',
+    partition: '(generation, intDiv(checkpoint_ledger, 10000000))',
+    order: 'issuer, currency, checkpoint_ledger, holder',
+  },
+  [Table.TokenCheckpointHeads]: {
+    engine: 'ReplacingMergeTree',
+    partition: 'generation',
+    order: 'issuer, currency, checkpoint_ledger',
+  },
+  [Table.TokenHourly]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '(generation, toYear(hour))',
+    order: 'issuer, currency, hour',
+  },
+  [Table.TokenHourlyDex]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'toYear(hour)',
+    order: 'issuer, currency, hour',
+  },
+  [Table.TokenHistoryState]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'generation' },
+  [Table.TokenHistoryDirty]: {
+    engine: 'ReplacingMergeTree',
+    version: 'created_at',
+    partition: '',
+    order: 'from_ledger, to_ledger',
+  },
   // what the tomls worker read of a domain (migration 012): one row per check, the newest wins
   [Table.DomainTomls]: { engine: 'ReplacingMergeTree', version: 'checked_at', partition: '', order: 'domain' },
   [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
@@ -462,6 +498,25 @@ const MIGRATION_017_TABLES: Table[] = [
   Table.MptIssuances,
   Table.MptHolders,
 ];
+/** The token history (issuer analytics): the change log, the checkpoints, the hourly rollups, the generations' state and the dirty ranges. */
+const MIGRATION_019 = '019_token_history.sql';
+/** The tables of migration 019, in the file's order. */
+const MIGRATION_019_TABLES: Table[] = [
+  Table.TokenHolderChanges,
+  Table.TokenCheckpoints,
+  Table.TokenCheckpointHeads,
+  Table.TokenHourly,
+  Table.TokenHourlyDex,
+  Table.TokenHistoryState,
+  Table.TokenHistoryDirty,
+];
+/** The four generation tables of 019: partitioned by generation first, so a retired generation drops as partitions. */
+const GENERATION_TABLES: Table[] = [
+  Table.TokenHolderChanges,
+  Table.TokenCheckpoints,
+  Table.TokenCheckpointHeads,
+  Table.TokenHourly,
+];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -505,6 +560,8 @@ const DEDUP_TABLES: Table[] = [
   Table.MptTouches,
   Table.MptTransfers,
   Table.MptIssuanceTransfers,
+  // Not ledger-derived, but written by batches with dedup tokens too: a retried batch of the change log must not count twice.
+  Table.TokenHolderChanges,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -634,6 +691,26 @@ describe('migrations (e2e)', () => {
       it('creates exactly the tables of the Table enum (plus schema_migrations)', async () => {
         const names = (await systemTables()).map((t) => t.name);
         expect(names).toEqual([...tables, 'schema_migrations'].sort());
+      });
+
+      it('a fresh database has 92 tables', async () => {
+        expect(tables).toHaveLength(92);
+        expect((await systemTables()).filter((t) => t.name !== 'schema_migrations')).toHaveLength(92);
+      });
+
+      it('partitions the four generation tables by generation first, and keeps the newest version of an hour', async () => {
+        const actual = new Map((await systemTables()).map((t) => [t.name, t]));
+        for (const table of GENERATION_TABLES) {
+          expect({ table, partition: actual.get(table)?.partition_key.replace(/^\(/, '').split(',')[0] }).toEqual({
+            table,
+            partition: 'generation',
+          });
+        }
+        const changes = actual.get(Table.TokenHolderChanges)!;
+        expect(changes.sorting_key).toBe('issuer, currency, ledger_index, tx_index, node_index, holder');
+        expect(changes.engine_full).toMatch(/non_replicated_deduplication_window = 1000(?!\d)/);
+        expect(actual.get(Table.TokenHourly)!.engine_full.split(' ')[0]).toBe('ReplacingMergeTree(version)');
+        expect(actual.get(Table.TokenHourlyDex)!.engine_full.split(' ')[0]).toBe('ReplacingMergeTree(version)');
       });
 
       it.each(tables)('%s is queryable', async (table) => {
@@ -2569,6 +2646,174 @@ describe('migrations (e2e)', () => {
       } finally {
         await svc.close();
       }
+    });
+  });
+
+  describe('migration 019', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-019-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('is seven CREATE TABLE IF NOT EXISTS and nothing else', () => {
+      const statements = statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_019), 'utf8'));
+      expect(statements).toHaveLength(MIGRATION_019_TABLES.length);
+      expect(statements.map((s) => /^CREATE TABLE IF NOT EXISTS (\w+)\s/.exec(s)?.[1])).toEqual(MIGRATION_019_TABLES);
+    });
+
+    it('applies 019 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_019_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_019);
+      expect(realFiles()).toContain(MIGRATION_019);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_019_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_019]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_019], skipped: before });
+      for (const table of MIGRATION_019_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('gives the seven tables the columns of the spec, in order', async () => {
+      const config = { ...ch.config, database: 'ctl_019_columns' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const columnsOf = async (table: Table): Promise<Array<[string, string]>> =>
+        (
+          await admin.query<{ name: string; type: string }>(
+            `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} ORDER BY position`,
+            { db: config.database, table },
+          )
+        ).map((c) => [c.name, c.type]);
+
+      expect(await columnsOf(Table.TokenHolderChanges)).toEqual([
+        ['generation', 'UInt32'],
+        ['issuer', 'String'],
+        ['currency', 'LowCardinality(String)'],
+        ['ledger_index', 'UInt32'],
+        ['tx_index', 'UInt32'],
+        ['node_index', 'UInt16'],
+        ['holder', 'String'],
+        ['close_time', "DateTime('UTC')"],
+        ['clawback', 'UInt8'],
+        ['amount_before', 'String'],
+        ['amount_after', 'String'],
+        ['counted_before', 'UInt8'],
+        ['counted_after', 'UInt8'],
+        ['before_known', 'UInt8'],
+        ['limit', 'String'],
+        ['frozen', 'UInt8'],
+        ['authorized', 'UInt8'],
+        ['escrowed', 'String'],
+        ['order_exp', 'Int16'],
+        ['order_mant', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.TokenCheckpoints)).toEqual([
+        ['generation', 'UInt32'],
+        ['issuer', 'String'],
+        ['currency', 'LowCardinality(String)'],
+        ['checkpoint_ledger', 'UInt32'],
+        ['holder', 'String'],
+        ['amount', 'String'],
+        ['escrowed', 'String'],
+        ['limit', 'String'],
+        ['frozen', 'UInt8'],
+        ['authorized', 'UInt8'],
+        ['order_exp', 'Int16'],
+        ['order_mant', 'UInt64'],
+        ['first_ledger', 'UInt32'],
+        ['last_ledger', 'UInt32'],
+      ]);
+      expect(await columnsOf(Table.TokenCheckpointHeads)).toEqual([
+        ['generation', 'UInt32'],
+        ['issuer', 'String'],
+        ['currency', 'LowCardinality(String)'],
+        ['checkpoint_ledger', 'UInt32'],
+        ['supply', 'String'],
+        ['holders', 'UInt64'],
+        ['trust_lines', 'UInt64'],
+        ['changes_since', 'UInt64'],
+        ['first_ledger', 'UInt32'],
+      ]);
+      expect(await columnsOf(Table.TokenHourly)).toEqual([
+        ['generation', 'UInt32'],
+        ['issuer', 'String'],
+        ['currency', 'LowCardinality(String)'],
+        ['hour', "DateTime('UTC')"],
+        ['supply', 'String'],
+        ['holders', 'UInt64'],
+        ['trust_lines', 'UInt64'],
+        ['issued', 'String'],
+        ['redeemed', 'String'],
+        ['clawed_back', 'String'],
+        ['transferred', 'String'],
+        ['transfers', 'UInt32'],
+        ['changes', 'UInt32'],
+        ['unknown_before', 'UInt32'],
+        ['first_ledger', 'UInt32'],
+        ['last_ledger', 'UInt32'],
+        ['final', 'UInt8'],
+        ['version', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.TokenHourlyDex)).toEqual([
+        ['issuer', 'String'],
+        ['currency', 'LowCardinality(String)'],
+        ['hour', "DateTime('UTC')"],
+        ['exchanged', 'String'],
+        ['trades', 'UInt32'],
+        ['config_version', 'UInt16'],
+        ['version', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.TokenHistoryState)).toEqual([
+        ['generation', 'UInt32'],
+        ['state', "Enum8('building' = 1, 'live' = 2, 'retired' = 3)"],
+        ['config_version', 'UInt16'],
+        ['coverage_from', 'UInt32'],
+        ['h0', 'UInt32'],
+        ['h1', 'UInt32'],
+        ['phase', "Enum8('changes' = 1, 'mpt_changes' = 2, 'levels' = 3, 'dex' = 4, 'done' = 5)"],
+        ['account_cursor', 'String'],
+        ['token_cursor_issuer', 'String'],
+        ['token_cursor_currency', 'String'],
+        ['through_ledger', 'UInt32'],
+        ['levels_through', 'UInt32'],
+        ['started_at', "DateTime64(3, 'UTC')"],
+        ['changed_at', "DateTime64(3, 'UTC')"],
+        ['version', 'UInt64'],
+      ]);
+      expect(await columnsOf(Table.TokenHistoryDirty)).toEqual([
+        ['from_ledger', 'UInt32'],
+        ['to_ledger', 'UInt32'],
+        ['created_at', "DateTime64(3, 'UTC')"],
+      ]);
     });
   });
 });

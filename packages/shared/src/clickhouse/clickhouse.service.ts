@@ -23,6 +23,12 @@ export interface CommandOptions {
   settings?: ClickHouseSettings;
 }
 
+/** What the server says a command did. */
+export interface CommandSummary {
+  read_rows: number;
+  written_rows: number;
+}
+
 /**
  * Thin, typed wrapper around the official ClickHouse client.
  *
@@ -107,12 +113,25 @@ export class ClickHouseService implements OnApplicationShutdown {
 
   /** Run a DDL / DML command (CREATE TABLE, ALTER, lightweight DELETE …). Values go through `params`. */
   async command(query: string, params: Record<string, unknown> = {}, opts: CommandOptions = {}): Promise<void> {
-    await this.client.command({
+    await this.commandSummary(query, params, opts);
+  }
+
+  /**
+   * `command`, resolving to the server's summary of the statement (the rows it read and wrote; 0 when the server sent none),
+   * complete because the command waits for the end of the query. For an `INSERT … SELECT` whose writer counts what it wrote.
+   */
+  async commandSummary(
+    query: string,
+    params: Record<string, unknown> = {},
+    opts: CommandOptions = {},
+  ): Promise<CommandSummary> {
+    const result = await this.client.command({
       query,
       query_params: params,
       ...(opts.queryId !== undefined && { query_id: opts.queryId }),
       clickhouse_settings: { wait_end_of_query: 1, ...opts.settings },
     });
+    return { read_rows: Number(result?.summary?.read_rows ?? 0), written_rows: Number(result?.summary?.written_rows ?? 0) };
   }
 
   /** Liveness probe used by the health module. */
