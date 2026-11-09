@@ -1,16 +1,22 @@
 import { NetworkProfile } from '@gatehub/data-api-shared';
 import { Get, Inject, Param, Query, Req, Res } from '@nestjs/common';
-import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
+import { ApiOkResponse, ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // `import type`: the decorated parameters below would otherwise make Nest's metadata `require('express')`, which is
 // not a dependency of this app (only its types are)
 import type { Request, Response } from 'express';
+import { isValidClassicAddress } from 'ripple-address-codec';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
-import { notFound } from '../common/errors';
+import { badRequest, notFound } from '../common/errors';
 import { fmtTime } from '../common/format';
-import { setLinkHeader } from '../common/pagination';
+import { decodeMarker, setLinkHeader } from '../common/pagination';
 import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { NETWORK_PROFILE } from '../config/api.config';
+import { HOLDERS_SCHEMA } from '../token-history/schemas';
+import { LEDGER_QUERIES } from '../token-history/token-history-docs';
+import { parseAnyToken } from '../token-history/token-history-param';
+import { TokenHistoryReadsService } from '../token-history/token-history-reads.service';
+import { TokenHistoryService } from '../token-history/token-history.service';
 import { decodeHoldersMarker } from './token-holders.service';
 import {
   parseTokenListQuery,
@@ -30,6 +36,58 @@ import { TokensService } from './tokens.service';
  * path names, whatever its spelling.
  */
 const holdersFilename = (req: Request): string => `${tokenFileStemOfPath(String(req.params.token))} - holders`;
+
+/** The parameters that name a ledger (spec 5.0): the token history's, which D6's route did not have. */
+const LEDGER_PARAMS = ['ledger_index', 'ledger', 'ledger_hash', 'date', 'close_time'] as const;
+const namesLedger = (q: QueryParams): boolean => LEDGER_PARAMS.some((name) => (first(q, name) ?? '') !== '');
+
+/** A marker's balance: the exact decimal text of the served balance. */
+const MARKER_BALANCE = /^\d+(\.\d+)?$/;
+
+/**
+ * The marker of the holders, read for both sources before the route knows which one answers: 400 `invalid marker` at once when it is
+ * a marker of neither, else each source takes its own (and a marker of the other is `invalid marker` then).
+ */
+function holdersMarkers(marker: string | undefined): {
+  d6: () => ReturnType<typeof decodeHoldersMarker>;
+  tokenHistory: () => ReturnType<typeof decodeTokenHistoryHoldersMarker>;
+} {
+  const read = <T>(decode: () => T): { value?: T; error?: unknown } => {
+    try {
+      return { value: decode() };
+    } catch (error) {
+      return { error };
+    }
+  };
+  const d6 = read(() => decodeHoldersMarker(marker));
+  const th = read(() => decodeTokenHistoryHoldersMarker(marker));
+  if (d6.error !== undefined && th.error !== undefined) throw th.error;
+  const take =
+    <T>(r: { value?: T; error?: unknown }) =>
+    (): T => {
+      if (r.error !== undefined) throw r.error;
+      return r.value as T;
+    };
+  return { d6: take(d6), tokenHistory: take(th) };
+}
+
+/**
+ * The marker of the holders once the route reads the token history (spec 5.5): base64url JSON `[holder, balance text]`. A marker of
+ * D6's route (a number first), a holder that is no classic address, or a balance that is not a decimal text, is 400 `invalid marker`:
+ * a marker that neither source could have written is refused before the route reads which source answers.
+ */
+export function decodeTokenHistoryHoldersMarker(
+  marker: string | undefined,
+): { balance: string; holder: string } | undefined {
+  const values = decodeMarker(marker, [
+    { column: 'holder', type: 'String' },
+    { column: 'balance', type: 'String' },
+  ]);
+  if (values === undefined) return undefined;
+  const [holder, balance] = values as [string, string];
+  if (!isValidClassicAddress(holder) || !MARKER_BALANCE.test(balance)) throw badRequest('invalid marker');
+  return { balance, holder };
+}
 
 /** The name of the CSV file of the transfers, `<code or currency> <issuer> - transfers` (`@Csv` adds the `.csv`), as that of the holders. */
 const transfersFilename = (req: Request): string => `${tokenFileStemOfPath(String(req.params.token))} - transfers`;
@@ -61,6 +119,8 @@ export class TokensController {
     private readonly tokens: TokensService,
     private readonly transferPages: TokenTransfersService,
     @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
+    private readonly history: TokenHistoryService,
+    private readonly reads: TokenHistoryReadsService,
   ) {}
 
   @Get()
@@ -132,9 +192,25 @@ export class TokensController {
       'among all the holders, whatever the page; `share` is its balance over the token `supply` (exact, rounded half up to 6 ' +
       "decimals); `limit` is the holder's limit; `frozen` and `authorized` are the issuer's freeze and authorization of the line. " +
       'The path names the token like the detail does; a token the job does not know (no live row, an LP token, no generation ' +
-      'yet) is a 404. `format=csv` gives the holders as a CSV file `<code or currency> <issuer> - holders.csv` (without `coverage`).',
+      'yet) is a 404. `format=csv` gives the holders as a CSV file `<code or currency> <issuer> - holders.csv` (without `coverage`). ' +
+      'Once the token history is built, the route reads it instead, seconds behind the head: the holders at a ledger (`ledger_index`, ' +
+      '`ledger_hash` or `date`; none is the newest of the token history), in the exact order of the balances (`descending=false` ' +
+      'gives the smallest first), each row with `first_ledger` and `last_ledger` (the start of its current run of holding and its ' +
+      'newest change) and, for an MPT (its issuance ID in the path), `escrowed`. The marker then holds the balance text and the ' +
+      'holder, so a marker of the earlier answer is `invalid marker` once. Before the build, a ledger is 404 `token history is not ' +
+      'built yet`.',
   })
   @ApiParam(TOKEN_PARAM)
+  @ApiQuery(LEDGER_QUERIES[0])
+  @ApiQuery(LEDGER_QUERIES[1])
+  @ApiQuery(LEDGER_QUERIES[2])
+  @ApiQuery({
+    name: 'descending',
+    required: false,
+    type: Boolean,
+    description: 'The largest balances first. Default true.',
+  })
+  @ApiOkResponse({ schema: HOLDERS_SCHEMA as never })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
   @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
   @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
@@ -144,10 +220,27 @@ export class TokensController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Record<string, unknown>> {
-    // everything the request can get wrong is checked before the first read
-    const ref = parseTokenParam(raw, this.profile.nativeCurrency);
+    // everything the request can get wrong is checked before the first read: the path, a token no source can have (an LP token,
+    // an MPT on a network without), the limit, and a marker that neither source's could be
+    const token = parseAnyToken(raw, this.profile.nativeCurrency);
     const limit = limitParam(query, { def: 200, max: 1000 });
-    const after = decodeHoldersMarker(first(query, 'marker'));
+    const markers = holdersMarkers(first(query, 'marker'));
+    this.reads.assertPossible(token);
+    // then the source: the token history once a generation is live, else D6's lines
+    const live = await this.history.live();
+    if (live !== undefined) {
+      const after = markers.tokenHistory();
+      const descending = (first(query, 'descending') ?? '') === '' || bool(query, 'descending');
+      const n = await this.history.resolveLedger(query, live);
+      await this.reads.assertToken(live, token);
+      const body = await this.reads.holders(live, token, n, { descending, ...(after && { after }), limit });
+      setLinkHeader(req, res, body.marker as string | undefined);
+      return body;
+    }
+    // before the first generation: D6's route, unchanged; a ledger, or an MPT, names the token history
+    if (token.kind === 'mpt' || namesLedger(query)) throw notFound('token history is not built yet');
+    const ref = { currency: token.currency, issuer: token.issuer };
+    const after = markers.d6();
     const found = await this.tokens.holders(ref, { limit, ...(after && { after }) });
     if (found === undefined) throw notFound('token not found');
     setLinkHeader(req, res, found.marker);

@@ -159,3 +159,15 @@ and the aggregator now needs the token history's dirty ranges of 019 as well. Th
 Run again at 0dfa8a2, after PR 1's review fixes were merged in (SIGTERM, the build lease read back, the exact coverage count):
 build passed; unit shared 3,098, exporter 12, syncer 1,966, api 2,708; e2e shared 38 suites and 1,865 tests, syncer 21 and 445,
 api 61 and 3,617, all passed.
+
+## Gates of PR 3
+
+Run on 2026-11-08 in the worktree at 3fcc730, every ClickHouse a testcontainer (`GH_CLICKHOUSE_URL` pointed at a closed port):
+
+| Gate | Result |
+| --- | --- |
+| `pnpm build` | passed |
+| `pnpm test` | passed: shared 3,101, exporter 12, syncer 1,968, api 2,743 |
+| `pnpm --filter @gatehub/data-api-shared test:e2e` | 39 suites, 1,873 tests passed |
+| `pnpm --filter @gatehub/data-syncer test:e2e` | 21 suites, 445 tests passed |
+| `pnpm --filter @gatehub/data-api-service test:e2e` | 62 suites, 3,653 tests passed |

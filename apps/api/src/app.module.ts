@@ -52,6 +52,7 @@ import { NftModule } from './nft/nft.module';
 import { PathPaymentsModule } from './path-payments/path-payments.module';
 import { PaymentsModule } from './payments/payments.module';
 import { StatsModule } from './stats/stats.module';
+import { TokenHistoryModule } from './token-history/token-history.module';
 import { TokensModule } from './tokens/tokens.module';
 import { TransactionsModule } from './transactions/transactions.module';
 import { ValidationsModule } from './validations/validations.module';
@@ -105,6 +106,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   LedgerObjectsModule,
   TokensModule,
   MptModule,
+  TokenHistoryModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */
