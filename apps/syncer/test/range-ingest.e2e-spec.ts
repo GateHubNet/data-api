@@ -721,8 +721,83 @@ describe('rangeIngest (e2e)', () => {
       expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(4), L(14)));
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(14)));
       await expectRows(svc, hourly.slice(0, 14), CHAIN_TABLES);
-      // the hours of L(1)..L(3), which the crashed run committed but never marked, are marked with the rest
-      expect(await dirtyWindows(svc)).toEqual([[T0, T0 + 14 * 3600]]);
+      // the hours of L(1)..L(3), which the crashed run committed but never marked, are marked as well as those of the
+      // piece written (L(4)..L(14), marked as it was written)
+      expect(await dirtyWindows(svc)).toEqual([
+        [T0, T0 + 3 * 3600],
+        [T0 + 3 * 3600, T0 + 14 * 3600],
+      ]);
+      expect((await intents(svc)).filter((i) => i.status !== 'done')).toEqual([]);
+    });
+
+    it('redoes an unfinished intent wider than the chunks of this run in pieces of the chunk size, so --chunk bounds its memory', async () => {
+      const svc = await freshService();
+      const T0 = hourFloor(CHAIN_RAW[0].header.close_time);
+      const hourly = CHAIN_RAW.map((raw, i) => ({ ...raw, header: { ...raw.header, close_time: T0 + i * 3600 + 5 } }));
+      // A run over L(1)..L(14) died after it committed L(1)..L(3), with child rows of L(4)..L(8) without a commit.
+      await new LedgerWriter(svc, ctx, { runId: 'crashed-run' }).write(hourly.slice(0, 3));
+      await insertUncommitted(svc, hourly.slice(3, 8));
+      await seedIntent(svc, L(1), L(14), 'crashed-run');
+      const source = new TestSource(hourly);
+      const logger = captureLogger();
+
+      // Chunks of 5 are the buckets L(0)..L(4), L(5)..L(9) and L(10)..L(14).
+      const result = await rangeIngest(source, svc, ctx, { from: L(1), to: L(14), chunkSize: 5, ...FAST, logger });
+
+      // Each piece was written on its own, as a chunk of this run, and closed.
+      expect(logger.lines.filter((l) => l.message.startsWith('Unfinished intent piece')).map((l) => l.message)).toEqual(
+        [
+          `Unfinished intent piece [${L(1)},${L(4)}]: 1 ledgers written`,
+          `Unfinished intent piece [${L(5)},${L(9)}]: 5 ledgers written`,
+          `Unfinished intent piece [${L(10)},${L(14)}]: 5 ledgers written`,
+        ],
+      );
+      expect(result.ledgers).toBe(11);
+      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(4), L(14)));
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(14)));
+      await expectRows(svc, hourly.slice(0, 14), CHAIN_TABLES);
+      await expectNoDuplicateTransactions(svc);
+      expect((await intents(svc)).map((i) => [i.start, i.end, i.status])).toEqual([
+        [L(1), L(4), 'done'],
+        [L(1), L(14), 'done'],
+        [L(5), L(9), 'done'],
+        [L(10), L(14), 'done'],
+      ]);
+      // the hours of every piece, marked as it was written, and of the committed L(1)..L(3), marked at the end
+      expect(await dirtyWindows(svc)).toEqual([
+        [T0, T0 + 3 * 3600],
+        [T0 + 3 * 3600, T0 + 4 * 3600],
+        [T0 + 4 * 3600, T0 + 9 * 3600],
+        [T0 + 9 * 3600, T0 + 14 * 3600],
+      ]);
+    });
+
+    it('a redo in pieces that fails keeps the pieces it finished: the rerun fetches only from the piece that failed', async () => {
+      const svc = await freshService();
+      await insertUncommitted(svc, CHAIN_RAW.slice(0, 8));
+      await seedIntent(svc, L(1), L(14), 'crashed-run');
+      // The node lacks L(12) for now: the third piece fails.
+      const lacking = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(12)));
+      const options = { from: L(1), to: L(14), chunkSize: 5, ...FAST };
+
+      await expect(rangeIngest(lacking, svc, ctx, options)).rejects.toBeInstanceOf(LedgerNotAvailableError);
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(9)));
+      expect((await intents(svc, `range_start = ${L(1)} AND range_end = ${L(14)}`))[0].status).toBe('started');
+      // The pieces that were written are marked in agg_dirty already, before the run died.
+      const marked = await dirtyWindows(svc);
+      for (const raw of CHAIN_RAW.slice(0, 9)) {
+        const close = raw.header.close_time;
+        expect(marked.some(([from, to]) => from <= close && close < to)).toBe(true);
+      }
+
+      const source = new TestSource(CHAIN_RAW);
+      await rangeIngest(source, svc, ctx, options);
+
+      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(10), L(14)));
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(14)));
+      await expectRows(svc, CHAIN_RAW.slice(0, 14), CHAIN_TABLES);
+      await expectNoDuplicateTransactions(svc);
       expect((await intents(svc)).filter((i) => i.status !== 'done')).toEqual([]);
     });
 

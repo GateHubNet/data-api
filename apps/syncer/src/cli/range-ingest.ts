@@ -202,7 +202,7 @@ class FetchPhase {
 class FetchAbandoned extends Error {}
 
 /** A run of ledgers that is ingested and logged as one: it lies inside one aligned `chunkSize` bucket. */
-interface Chunk {
+export interface Chunk {
   /** Lowest and highest ledger of `targets`: the key of the chunk in `ingest_log`. */
   start: number;
   end: number;
@@ -838,12 +838,17 @@ class RangeRunner {
    *    is: neither fetched nor rewritten;
    *  - the ledgers to write are all the uncommitted ones of the recorded range, also those outside `[from, to]` (a
    *    narrower rerun must not close an intent over ledgers it never wrote); inside `[from, to]` an index-list run writes
-   *    its listed ones only. They are fetched and parsed, then every uncommitted span of the range is deleted (which also
-   *    takes the child rows a crashed write left for ledgers that are not written now), then they are written, as one
-   *    chunk with its own intent row (nothing of this when the whole range is committed);
-   *  - every intent of the range gets a 'done' row;
-   *  - `agg_dirty` gets the close-time window of every committed ledger of the range, the ones that were committed before
-   *    as well: the run that died may have committed them and never marked them.
+   *    its listed ones only. They are written in the aligned pieces of `chunkSize` ledgers of the range (`redoPieces`),
+   *    one after the other, each as a chunk with its own intent row: its ledgers are fetched and parsed, then every
+   *    uncommitted span of the piece is deleted (which also takes the child rows a crashed write left for ledgers that
+   *    are not written now), then they are written, the piece is marked in `agg_dirty` and its ledgers are dropped
+   *    before the next piece. So `--chunk` bounds the memory of a redo as it does that of a chunk, however wide the
+   *    intent is (a redo of a 10 000-ledger intent in one piece ran the heap out on heavy ledgers, and every rerun redid
+   *    it the same way). A piece with nothing uncommitted is skipped, so a redo that died keeps the pieces it finished;
+   *  - every intent of the range gets a 'done' row, once every piece is written;
+   *  - `agg_dirty` gets the close-time window of every committed ledger of the range: each piece its own as it is written,
+   *    and the ones that were committed before one window at the end, since the run that died may have committed them and
+   *    never marked them.
    * A redo that fails leaves the intents open, and the next run redoes them again; one that succeeds closes them, so no
    * intent is redone by every run after it (F5: a run with a smaller `--chunk` than the one that died kept rewriting the
    * first chunk of a wider intent and never closed it).
@@ -870,33 +875,35 @@ class RangeRunner {
         group.end,
         [...committed.keys()].sort((a, b) => a - b),
       );
-      let ledgers: RawLedger[] = [];
-      let groupClosed = false;
-      if (gaps.length > 0) {
-        const chunk: Chunk = { start: group.start, end: group.end, targets: toWrite };
-        ledgers = await this.writeWithRecovery(chunk, toWrite, gaps, true);
-        await this.logIntent(chunk, this.writer.runId, 'done');
-        groupClosed = true;
+      let written = 0;
+      for (const piece of redoPieces(group.start, group.end, this.chunkSize, toWrite, gaps)) {
+        const ledgers = await this.writeWithRecovery(piece.chunk, piece.chunk.targets, piece.spans, true);
+        await this.logIntent(piece.chunk, this.writer.runId, 'done');
+        // Marked now, as a chunk is: a run that is killed before the last piece loses no mark of the pieces it wrote.
+        if (ledgers.length > 0) await this.markAggregatesDirty(closeWindowOf(ledgers));
+        for (const ledger of ledgers) this.redone.add(ledger.header.ledger_index);
+        written += ledgers.length;
+        this.logger.log(
+          `Unfinished intent piece [${piece.chunk.start},${piece.chunk.end}]: ${ledgers.length} ledgers written`,
+        );
       }
       for (const intent of group.members) {
-        if (groupClosed && intent.start === group.start && intent.end === group.end) continue;
         await this.writeIntent(intent.start, intent.end, this.writer.runId, 'done');
       }
-      // the window of everything committed in the range now: what was there, and what was written
+      // the window of the ledgers that were committed before: the run that died may have committed and not marked them
       let window: CloseWindow | undefined;
-      for (const close of [...committed.values(), ...ledgers.map((l) => l.header.close_time)]) {
+      for (const close of committed.values()) {
         window = window
           ? { min: Math.min(window.min, close), max: Math.max(window.max, close) }
           : { min: close, max: close };
       }
       if (window) await this.markAggregatesDirty(window);
       for (const index of committed.keys()) this.redone.add(index);
-      for (const ledger of ledgers) this.redone.add(ledger.header.ledger_index);
-      this.ledgersWritten += ledgers.length;
+      this.ledgersWritten += written;
       this.logger.log(
         `Unfinished intent${group.members.length > 1 ? 's' : ''} ` +
           `${group.members.map((i) => `[${i.start},${i.end}]`).join(', ')} redone in ${Date.now() - startedAt} ms: ` +
-          `${ledgers.length} ledgers written, closed`,
+          `${written} ledgers written, closed`,
       );
     }
     this.open = [];
@@ -1006,6 +1013,47 @@ export function networkOf(ctx: Pick<ParseContext, 'networkId'>): NetworkName {
     if (getNetworkProfile(name).networkId === ctx.networkId) return name;
   }
   throw new Error(`No network has the CTID network id ${ctx.networkId}: pass the network option`);
+}
+
+/**
+ * The pieces a redo of the unfinished range `[start, end]` writes: the parts of the range in the aligned buckets of
+ * `chunkSize` ledgers (the boundaries of the chunks, so that no piece spans two `ledgers` partitions) that hold an
+ * uncommitted span. Each piece is a chunk (its key is the part of the range in the bucket) with the `targets` (ascending)
+ * and the parts of the uncommitted `spans` (ascending, disjoint, inside the range) that fall in it. A bucket with no
+ * uncommitted span is no piece: everything in it is committed.
+ */
+export function* redoPieces(
+  start: number,
+  end: number,
+  chunkSize: number,
+  targets: number[],
+  spans: Array<[number, number]>,
+): Generator<{ chunk: Chunk; spans: Array<[number, number]> }> {
+  let t = 0;
+  let s = 0;
+  // the first uncommitted ledger that is in no piece yet: the start of `spans[s]`, or past it when that span went on
+  // beyond the previous piece
+  let from = spans.length > 0 ? spans[0][0] : 0;
+  while (s < spans.length) {
+    const bucket = Math.floor(from / chunkSize);
+    const pieceStart = Math.max(start, bucket * chunkSize);
+    const pieceEnd = Math.min(end, (bucket + 1) * chunkSize - 1);
+    const pieceSpans: Array<[number, number]> = [];
+    while (s < spans.length && from <= pieceEnd) {
+      const spanEnd = spans[s][1];
+      pieceSpans.push([from, Math.min(spanEnd, pieceEnd)]);
+      if (spanEnd > pieceEnd) {
+        from = pieceEnd + 1;
+        break;
+      }
+      s++;
+      if (s < spans.length) from = spans[s][0];
+    }
+    while (t < targets.length && targets[t] < pieceStart) t++;
+    const pieceTargets: number[] = [];
+    while (t < targets.length && targets[t] <= pieceEnd) pieceTargets.push(targets[t++]);
+    yield { chunk: { start: pieceStart, end: pieceEnd, targets: pieceTargets }, spans: pieceSpans };
+  }
 }
 
 /** The spans of `[start, end]` that hold no ledger of `committed` (ascending, all inside the range). */

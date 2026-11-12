@@ -3,6 +3,7 @@ import {
   main,
   networkOf,
   parseRangeIngestArgs,
+  redoPieces,
   uncommittedSpans,
   USAGE,
   UsageError,
@@ -154,6 +155,71 @@ describe('uncommittedSpans', () => {
     expect(uncommittedSpans(10, 20, [12])).toEqual([
       [10, 11],
       [13, 20],
+    ]);
+  });
+});
+
+describe('redoPieces', () => {
+  const pieces = (start: number, end: number, chunkSize: number, targets: number[], spans: Array<[number, number]>) =>
+    [...redoPieces(start, end, chunkSize, targets, spans)].map(({ chunk, spans }) => [
+      chunk.start,
+      chunk.end,
+      chunk.targets,
+      spans,
+    ]);
+  const range = (a: number, b: number) => Array.from({ length: b - a + 1 }, (_, k) => a + k);
+
+  it('splits an unfinished range into the aligned buckets of the chunk size, so that --chunk bounds a redo', () => {
+    expect(pieces(1003, 1012, 5, range(1003, 1012), [[1003, 1012]])).toEqual([
+      [1003, 1004, [1003, 1004], [[1003, 1004]]],
+      [1005, 1009, range(1005, 1009), [[1005, 1009]]],
+      [1010, 1012, [1010, 1011, 1012], [[1010, 1012]]],
+    ]);
+  });
+
+  it('is no piece for a bucket whose ledgers are all committed, so a redo that died keeps what it finished', () => {
+    // 1000..1004 and 1006 committed
+    expect(
+      pieces(
+        1000,
+        1012,
+        5,
+        [1005, ...range(1007, 1012)],
+        [
+          [1005, 1005],
+          [1007, 1012],
+        ],
+      ),
+    ).toEqual([
+      [
+        1005,
+        1009,
+        [1005, 1007, 1008, 1009],
+        [
+          [1005, 1005],
+          [1007, 1009],
+        ],
+      ],
+      [1010, 1012, [1010, 1011, 1012], [[1010, 1012]]],
+    ]);
+  });
+
+  it('is nothing when the whole range is committed', () => {
+    expect(pieces(1000, 1012, 5, [], [])).toEqual([]);
+  });
+
+  it('keeps a piece with spans to clean but no target: an index-list run writes its listed ledgers only', () => {
+    expect(pieces(1000, 1009, 5, [1007], [[1000, 1009]])).toEqual([
+      [1000, 1004, [], [[1000, 1004]]],
+      [1005, 1009, [1007], [[1005, 1009]]],
+    ]);
+  });
+
+  it('is one piece per ledger with a chunk size of 1', () => {
+    expect(pieces(7, 9, 1, [7, 8, 9], [[7, 9]])).toEqual([
+      [7, 7, [7], [[7, 7]]],
+      [8, 8, [8], [[8, 8]]],
+      [9, 9, [9], [[9, 9]]],
     ]);
   });
 });
