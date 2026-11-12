@@ -79,7 +79,10 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   closed: its committed ledgers are kept, every other ledger of the recorded range is cleaned and written, also those outside the
   range of the rerun, and the hours of all its committed ledgers are marked in `agg_dirty` (the run that died may have committed
   some and never marked them). It is redone once, whatever the chunk size or range of the rerun (Rulings R100, R110). The redo
-  fetches the ledgers of the recorded range from the same node as the rest, so a rerun can fetch more than it names.
+  fetches the ledgers of the recorded range from the same node as the rest, so a rerun can fetch more than it names. It writes
+  them in the aligned pieces of the rerun's `--chunk`, one after the other, each closed as it is written: a smaller `--chunk`
+  bounds the memory of a redo as it does that of a chunk, however wide the intent is, and a redo that dies keeps the pieces it
+  finished.
 - **Resume a `--reprocess` differently.** The skipping above is for a plain run. With `--reprocess` the run writes **every** chunk it is
   given, whether or not the chunk was finished before, so rerunning the same command rewrites the whole range again. Restart with `--from`
   just after the last chunk the failed run finished: the last log line `Chunk [a,b] done in ... ms: N ledgers written (redone)` gives it
@@ -578,7 +581,8 @@ again, however long the chunk takes in all. What keeps it moving:
   spends the quota on fetches that are refused. On XRPL's public nodes use 1 as well: `wss://s2.ripple.com` throttled at 2 in flight
   (2026-10-18); 1 in flight at about 1.5 requests a second or less, or your own node.
 - `--chunk 100`: a chunk is written only once all of its ledgers are in, and a chunk that fails (a ledger the node lacks, or a
-  pause longer than `--max-wait`) is redone by the next run; a small chunk keeps both the memory and that redo cheap.
+  pause longer than `--max-wait`) is redone by the next run, in pieces of that run's `--chunk`; a small chunk keeps both the memory and
+  that redo cheap.
 - `--max-wait` longer than the pauses the node asks for. The 10-second quota asks for seconds. The hourly quota asked for about
   930 s in the verification run: the default 1200 rides that out when it starts within about 4.5 minutes of the last ledger
   fetched, which is the usual case (the answer comes on the next fetch); raise `--max-wait` for margin. A pause the node client
